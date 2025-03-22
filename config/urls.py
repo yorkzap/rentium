@@ -34,6 +34,8 @@ if settings.DEBUG:
 
 # API URLS
 urlpatterns += [
+    # Include user API URLs first (order matters)
+    path("api/users/", include("rentium.users.api.urls")),
     # API base url
     path("api/", include("config.api_router")),
     # DRF auth token
