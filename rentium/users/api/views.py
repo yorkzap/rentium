@@ -1,3 +1,4 @@
+from django.db import IntegrityError
 from rest_framework import status
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -36,23 +37,6 @@ class UserViewSet(RetrieveModelMixin, ListModelMixin, UpdateModelMixin, GenericV
         return Response(status=status.HTTP_200_OK, data=serializer.data)
 
 
-class UserRegistrationView(APIView):
-    """
-    API view for user registration.
-    Allows anyone to register without authentication.
-    """
-
-    permission_classes = [AllowAny]
-
-    def post(self, request):
-        serializer = UserRegistrationSerializer(data=request.data)
-        if serializer.is_valid():
-            user = serializer.save()
-            response_serializer = UserSerializer(user, context={"request": request})
-            return Response(response_serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
 class LandlordProfileViewSet(viewsets.ModelViewSet):
     serializer_class = LandlordProfileSerializer
     permission_classes = [IsAuthenticated]
@@ -67,3 +51,36 @@ class TenantProfileViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return TenantProfile.objects.filter(user=self.request.user)
+
+
+class UserRegistrationView(APIView):
+    """
+    API endpoint for user registration.
+    """
+
+    permission_classes = [AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        serializer = UserRegistrationSerializer(data=request.data)
+
+        if serializer.is_valid():
+            try:
+                user = serializer.save()
+                return Response(
+                    {"message": "User registered successfully", "user_id": user.id},
+                    status=status.HTTP_201_CREATED,
+                )
+            except IntegrityError as e:
+                # Check if this is a duplicate email error
+                if "users_user_email_key" in str(e):
+                    return Response(
+                        {"error": "A user with this email already exists."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                # Handle other integrity errors
+                return Response(
+                    {"error": "Registration failed due to a database constraint."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
