@@ -384,3 +384,11 @@ CORS_ALLOW_HEADERS = [
     "x-csrftoken",
     "x-requested-with",
 ]
+
+
+# Frontend URL for email verification
+FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000")
+
+# Email confirmation settings
+ACCOUNT_EMAIL_CONFIRMATION_AUTHENTICATED_REDIRECT_URL = f"{FRONTEND_URL}/dashboard"
+ACCOUNT_EMAIL_CONFIRMATION_ANONYMOUS_REDIRECT_URL = f"{FRONTEND_URL}/auth/login"
