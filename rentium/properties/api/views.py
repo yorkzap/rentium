@@ -1,105 +1,481 @@
-from django.db.models import Count
-from django.db.models import Q
+# rentium/properties/api/views.py
+
+from django.db import models  # Import models for Q objects
+from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import BasePermission
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+# from rentium.users.models import LandlordProfile # Not directly used here
+from ..models import InventoryItem
 from ..models import Property
+from ..models import PropertyArea
+from ..models import PropertyGroup
+from ..models import PropertyImage
+from ..models import SharedInventoryItem
+from .serializers import InventoryItemSerializer
+from .serializers import PropertyAreaSerializer
+from .serializers import PropertyGroupDetailSerializer
+from .serializers import PropertyGroupSerializer
+from .serializers import PropertyImageSerializer
 from .serializers import PropertyListSerializer
 from .serializers import PropertySerializer
+from .serializers import PropertySummaryForGroupSerializer
+from .serializers import SharedInventoryItemSerializer
 
 
+# --- IsLandlordOwner Permission ---
+class IsLandlordOwner(BasePermission):
+    """
+    Checks if the request.user's landlord profile owns the object.
+    Handles different object types.
+    """
+
+    def has_object_permission(self, request, view, obj):
+        if not hasattr(request.user, "landlord_profile"):
+            return False
+
+        owner_profile = None
+        # Determine owner based on object type
+        if isinstance(obj, (Property, PropertyGroup)):
+            owner_profile = obj.landlord
+        elif isinstance(obj, SharedInventoryItem):
+            owner_profile = obj.group.landlord
+        elif isinstance(obj, PropertyArea):
+            owner_profile = obj.property.landlord  # Check primary property owner
+            # More complex check needed if editing shared_by involving other landlords?
+            # Let serializer/view validation handle cross-landlord sharing rules.
+        elif isinstance(obj, InventoryItem):
+            owner_profile = obj.property.landlord
+        elif isinstance(obj, PropertyImage):
+            owner_profile = obj.property.landlord
+
+        return owner_profile == request.user.landlord_profile
+
+
+# --- PropertyViewSet ---
 class PropertyViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows properties to be viewed, created, edited, or deleted.
-
-    Permissions:
-    - Landlords can create, view, edit, and delete their own properties
-    - Tenants currently have no access to property endpoints
-    """
-
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsLandlordOwner]
 
     def get_serializer_class(self):
         if self.action == "list":
             return PropertyListSerializer
+        # Use the detail serializer for retrieve, create, update, partial_update
         return PropertySerializer
 
     def get_queryset(self):
         user = self.request.user
-
-        # If user is a landlord, show their properties
         if hasattr(user, "landlord_profile"):
-            return Property.objects.filter(landlord=user.landlord_profile)
-
-        # For now, return empty queryset for tenants
+            # Update prefetching for new M2M relations and related_names
+            return (
+                Property.objects.filter(landlord=user.landlord_profile)
+                .select_related(
+                    "group", "landlord__user"
+                )  # Select related landlord user for name
+                .prefetch_related(
+                    # Prefetch areas owned by the property and the properties sharing them
+                    models.Prefetch(
+                        "primary_area_associations",  # Use new related_name
+                        queryset=PropertyArea.objects.prefetch_related("shared_by"),
+                    ),
+                    # Prefetch areas shared BY this property (M2M reverse) and their primary owner
+                    models.Prefetch(
+                        "shared_areas",  # Use new related_name
+                        queryset=PropertyArea.objects.select_related(
+                            "property"
+                        ).prefetch_related("shared_by"),
+                    ),
+                    # Prefetch inventory and images using new related_names
+                    "inventory_items",
+                    "property_images",
+                    # Prefetch shared inventory via the group
+                    "group__group_shared_inventory",
+                )
+            )
         return Property.objects.none()
 
     def perform_create(self, serializer):
-        # Ensure the landlord is set to the current user's landlord profile
-        if hasattr(self.request.user, "landlord_profile"):
-            serializer.save(landlord=self.request.user.landlord_profile)
-        else:
-            from rest_framework.exceptions import PermissionDenied
+        if not hasattr(self.request.user, "landlord_profile"):
+            raise PermissionDenied("Only Landlords can create properties.")
+        serializer.save(landlord=self.request.user.landlord_profile)
 
-            raise PermissionDenied("Only landlords can create properties")
+    def get_serializer_context(self):
+        """Add request and property instance (if applicable) to context."""
+        context = super().get_serializer_context()
+        context["request"] = self.request
+        # Pass property instance for area/inventory creation/validation context
+        # Use self.lookup_url_kwarg or default 'pk'
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        if lookup_url_kwarg in self.kwargs:
+            try:
+                # Get object without triggering full permission checks again if needed
+                context["property"] = self.get_object()
+            except (AssertionError, NotFound, PermissionDenied):
+                # If object not found or not permitted here, let standard DRF flow handle it
+                pass
+        return context
 
-    @action(detail=False, methods=["get"])
-    def dashboard_stats(self, request):
-        """Return statistics for landlord dashboard"""
-        if not hasattr(request.user, "landlord_profile"):
+    # --- Area Actions (Using new PropertyAreaSerializer) ---
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="areas",  # Endpoint to manage areas primarily associated with this property
+        serializer_class=PropertyAreaSerializer,
+    )
+    def areas(self, request, pk=None):
+        """List or Create areas primarily associated with this Property."""
+        property_obj = self.get_object()  # Ensures property exists and user owns it
+        context = self.get_serializer_context()  # Get context including property
+
+        if request.method == "GET":
+            # Use the updated related_name
+            queryset = property_obj.primary_area_associations.prefetch_related(
+                "shared_by"
+            )
+            serializer = PropertyAreaSerializer(queryset, many=True, context=context)
+            return Response(serializer.data)
+
+        elif request.method == "POST":
+            serializer = PropertyAreaSerializer(data=request.data, context=context)
+            if serializer.is_valid():
+                # Serializer validation already checked group/landlord consistency
+                # Save the area, primarily linking it to property_obj
+                serializer.save(property=property_obj)
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(
+        detail=True,
+        methods=["get", "put", "patch", "delete"],
+        url_path="areas/(?P<area_pk>[^/.]+)",  # Endpoint for specific area detail
+        serializer_class=PropertyAreaSerializer,
+    )
+    def area_detail(self, request, pk=None, area_pk=None):
+        """Retrieve, Update, or Delete a specific PropertyArea."""
+        property_obj = (
+            self.get_object()
+        )  # Context property (might not be the primary owner)
+        # Fetch the area ensuring it's somehow linked (primarily or via sharing?)
+        # For simplicity, let's fetch based on PK and let serializer validate context.
+        # More robust: Ensure area is either primarily owned OR shared by property_obj?
+        area = get_object_or_404(PropertyArea, pk=area_pk)
+        # Check if the user owns the *primary* property of the area being modified
+        self.check_object_permissions(request, area)
+        context = self.get_serializer_context()  # Includes request
+        context["property"] = (
+            area.property
+        )  # Ensure context property is the primary owner for validation
+
+        if request.method == "GET":
+            serializer = PropertyAreaSerializer(area, context=context)
+            return Response(serializer.data)
+
+        elif request.method in ["PUT", "PATCH"]:
+            serializer = PropertyAreaSerializer(
+                area,
+                data=request.data,
+                partial=(request.method == "PATCH"),
+                context=context,  # Pass context for validation
+            )
+            if serializer.is_valid():
+                # Validation includes checking M2M group consistency
+                serializer.save()
+                return Response(serializer.data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        elif request.method == "DELETE":
+            # Add logic: What happens when deleting a shared area?
+            # Option 1: Delete it entirely (simplest).
+            # Option 2: Only remove the 'property_obj' from shared_by? (More complex)
+            # Let's go with Option 1 for now.
+            area.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # --- PRIVATE Inventory Actions (Using updated related_name) ---
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="inventory",
+        serializer_class=InventoryItemSerializer,
+    )
+    def inventory(self, request, pk=None):
+        property_obj = self.get_object()
+        context = self.get_serializer_context()
+        if request.method == "GET":
+            queryset = property_obj.inventory_items.all()  # Use updated related_name
+            serializer = InventoryItemSerializer(queryset, many=True, context=context)
+            return Response(serializer.data)
+        elif request.method == "POST":
+            serializer = InventoryItemSerializer(data=request.data, context=context)
+            if serializer.is_valid():
+                serializer.save(property=property_obj)
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(
+        detail=True,
+        methods=["get", "put", "patch", "delete"],
+        url_path="inventory/(?P<item_pk>[^/.]+)",
+        serializer_class=InventoryItemSerializer,
+    )
+    def inventory_detail(self, request, pk=None, item_pk=None):
+        property_obj = self.get_object()
+        # Use updated related_name for filtering
+        item = get_object_or_404(InventoryItem, pk=item_pk, property=property_obj)
+        # self.check_object_permissions(request, item) # Already covered by property check + query filter
+        context = self.get_serializer_context()
+        if request.method == "GET":
+            serializer = InventoryItemSerializer(item, context=context)
+            return Response(serializer.data)
+        elif request.method in ["PUT", "PATCH"]:
+            serializer = InventoryItemSerializer(
+                item,
+                data=request.data,
+                partial=(request.method == "PATCH"),
+                context=context,
+            )
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        elif request.method == "DELETE":
+            item.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # --- Image Actions (Assume PropertyImageViewSet exists or handle here) ---
+    # Add actions for listing, creating, updating, deleting PropertyImages if needed
+    # Example:
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="images",
+        serializer_class=PropertyImageSerializer,
+    )
+    def images(self, request, pk=None):
+        property_obj = self.get_object()
+        context = self.get_serializer_context()
+        if request.method == "GET":
+            # Use updated related_name
+            queryset = property_obj.property_images.all()
+            serializer = PropertyImageSerializer(queryset, many=True, context=context)
+            return Response(serializer.data)
+        elif request.method == "POST":
+            serializer = PropertyImageSerializer(data=request.data, context=context)
+            if serializer.is_valid():
+                # Ensure image file is handled correctly (requires multipart/form-data)
+                serializer.save(property=property_obj)
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(
+        detail=True,
+        methods=["get", "put", "patch", "delete"],
+        url_path="images/(?P<image_pk>[^/.]+)",
+        serializer_class=PropertyImageSerializer,
+    )
+    def image_detail(self, request, pk=None, image_pk=None):
+        property_obj = self.get_object()
+        # Use updated related_name
+        image = get_object_or_404(PropertyImage, pk=image_pk, property=property_obj)
+        # self.check_object_permissions(request, image) # Covered by property check + filter
+        context = self.get_serializer_context()
+
+        if request.method == "GET":
+            serializer = PropertyImageSerializer(image, context=context)
+            return Response(serializer.data)
+        elif request.method in ["PUT", "PATCH"]:
+            serializer = PropertyImageSerializer(
+                image,
+                data=request.data,
+                partial=request.method == "PATCH",
+                context=context,
+            )
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        elif request.method == "DELETE":
+            image.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# --- PropertyGroupViewSet (Updated related_names) ---
+class PropertyGroupViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, IsLandlordOwner]
+
+    def get_serializer_class(self):
+        if self.action in ["retrieve", "update", "partial_update"]:
+            return PropertyGroupDetailSerializer
+        return PropertyGroupSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        if hasattr(user, "landlord_profile"):
+            # Use updated related_names for prefetching
+            return PropertyGroup.objects.filter(
+                landlord=user.landlord_profile
+            ).prefetch_related(
+                "grouped_properties",  # Properties primarily in this group
+                "group_shared_inventory",  # Shared inventory for this group
+                # Maybe prefetch areas shared within the group? Complex query.
+                # models.Prefetch(
+                #    'grouped_properties__shared_areas',
+                #    queryset=PropertyArea.objects.filter(...) # Filter areas shared only by properties in THIS group
+                # )
+            )
+        return PropertyGroup.objects.none()
+
+    def perform_create(self, serializer):
+        if not hasattr(self.request.user, "landlord_profile"):
+            raise PermissionDenied("Landlords only.")
+        serializer.save(landlord=self.request.user.landlord_profile)
+
+    def get_serializer_context(self):
+        """Add request and group instance (if applicable) to context."""
+        context = super().get_serializer_context()
+        context["request"] = self.request
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        if lookup_url_kwarg in self.kwargs:
+            try:
+                context["group"] = self.get_object()
+            except (AssertionError, NotFound, PermissionDenied):
+                pass
+        return context
+
+    # --- Property add/remove actions (Keep logic, check constraints) ---
+    @action(detail=True, methods=["post"], url_path="add-property")
+    def add_property(self, request, pk=None):
+        group = self.get_object()  # Checks ownership
+        property_id = request.data.get("property_id")
+        if not property_id:
+            raise ValidationError("Missing 'property_id'.")
+
+        try:
+            # Ensure property exists and is owned by the user
+            prop = Property.objects.get(
+                pk=property_id, landlord=request.user.landlord_profile
+            )
+        except Property.DoesNotExist:
+            raise NotFound("Property not found or not owned by you.")
+
+        # Validation checks
+        if prop.property_category != Property.PropertyCategory.ROOM:
+            raise ValidationError("Only Room properties can be added to a group.")
+        if prop.group == group:
             return Response(
-                {"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN
+                {"message": "Property already in this group."},
+                status=status.HTTP_200_OK,
+            )
+        if prop.group is not None:
+            raise ValidationError(
+                f"Property '{prop.name}' is already assigned to group '{prop.group.name}'. Remove it first."
             )
 
-        landlord = request.user.landlord_profile
-        properties = Property.objects.filter(landlord=landlord)
+        # Assign property to the group
+        prop.group = group
+        try:
+            prop.full_clean()  # Run model validation before saving
+        except DjangoValidationError as e:
+            raise ValidationError(
+                serializers.as_serializer_error(e)
+            )  # Convert to DRF error
+        prop.save()
 
-        # Get counts by category and status
-        stats = {
-            "total_properties": properties.count(),
-            "complete_units": properties.filter(
-                property_category=Property.PropertyCategory.COMPLETE_UNIT
-            ).count(),
-            "rooms": properties.filter(
-                property_category=Property.PropertyCategory.ROOM
-            ).count(),
-            "available_properties": properties.filter(
-                status=Property.PropertyStatus.AVAILABLE
-            ).count(),
-            "occupied_properties": properties.filter(
-                status=Property.PropertyStatus.OCCUPIED
-            ).count(),
-            "maintenance_properties": properties.filter(
-                status=Property.PropertyStatus.MAINTENANCE
-            ).count(),
-        }
-
-        return Response(stats)
-
-    @action(detail=False, methods=["get"])
-    def available(self, request):
-        """Return only available properties"""
-        queryset = self.get_queryset().filter(status=Property.PropertyStatus.AVAILABLE)
-        serializer = PropertyListSerializer(queryset, many=True)
-        return Response(serializer.data)
-
-    @action(detail=False, methods=["get"])
-    def complete_units(self, request):
-        """Return only complete unit properties"""
-        queryset = self.get_queryset().filter(
-            property_category=Property.PropertyCategory.COMPLETE_UNIT
+        # Return summary of the added property
+        serializer = PropertySummaryForGroupSerializer(
+            prop, context={"request": request}
         )
-        serializer = PropertyListSerializer(queryset, many=True)
-        return Response(serializer.data)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @action(detail=False, methods=["get"])
-    def rooms(self, request):
-        """Return only room properties"""
-        queryset = self.get_queryset().filter(
-            property_category=Property.PropertyCategory.ROOM
+    @action(detail=True, methods=["post"], url_path="remove-property")
+    def remove_property(self, request, pk=None):
+        group = self.get_object()  # Checks ownership
+        property_id = request.data.get("property_id")
+        if not property_id:
+            raise ValidationError("Missing 'property_id'.")
+
+        try:
+            # Ensure property is owned and currently in this group
+            prop = Property.objects.get(
+                pk=property_id, landlord=request.user.landlord_profile, group=group
+            )
+        except Property.DoesNotExist:
+            raise NotFound("Property not found in this group or not owned by you.")
+
+        # Check if removing would violate area sharing rules?
+        # If this property shares areas with others ONLY via this group, removing it
+        # might invalidate those PropertyArea.shared_by settings.
+        # This requires careful consideration. Simplest: Allow removal, but maybe
+        # add a cleanup task or warning later. For now, just remove from group.
+        prop.group = None
+        try:
+            prop.full_clean()
+        except DjangoValidationError as e:
+            raise ValidationError(serializers.as_serializer_error(e))
+        prop.save()
+
+        return Response(
+            {"message": "Property removed from group."}, status=status.HTTP_200_OK
         )
-        serializer = PropertyListSerializer(queryset, many=True)
-        return Response(serializer.data)
+
+    # --- SHARED Inventory Actions (Using updated related_name) ---
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="shared-inventory",
+        serializer_class=SharedInventoryItemSerializer,
+    )
+    def shared_inventory(self, request, pk=None):
+        group = self.get_object()  # Ownership checked
+        context = self.get_serializer_context()  # Includes group context
+        if request.method == "GET":
+            queryset = group.group_shared_inventory.all()  # Use updated related_name
+            serializer = SharedInventoryItemSerializer(
+                queryset, many=True, context=context
+            )
+            return Response(serializer.data)
+        elif request.method == "POST":
+            serializer = SharedInventoryItemSerializer(
+                data=request.data, context=context
+            )
+            if serializer.is_valid():
+                serializer.save(group=group)  # Associate with this group
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(
+        detail=True,
+        methods=["get", "put", "patch", "delete"],
+        url_path="shared-inventory/(?P<item_pk>[^/.]+)",
+        serializer_class=SharedInventoryItemSerializer,
+    )
+    def shared_inventory_detail(self, request, pk=None, item_pk=None):
+        group = self.get_object()  # Group ownership checked
+        # Use updated related_name for filtering
+        item = get_object_or_404(SharedInventoryItem, pk=item_pk, group=group)
+        # self.check_object_permissions(request, item) # Covered by group check + filter
+        context = self.get_serializer_context()
+
+        if request.method == "GET":
+            serializer = SharedInventoryItemSerializer(item, context=context)
+            return Response(serializer.data)
+        elif request.method in ["PUT", "PATCH"]:
+            serializer = SharedInventoryItemSerializer(
+                item,
+                data=request.data,
+                partial=(request.method == "PATCH"),
+                context=context,
+            )
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        elif request.method == "DELETE":
+            item.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)

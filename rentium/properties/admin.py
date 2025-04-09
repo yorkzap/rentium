@@ -1,6 +1,15 @@
+# Updated admin.py file
+
 from django.contrib import admin
 
 from .models import Property
+from .models import PropertyImage
+
+
+class PropertyImageInline(admin.TabularInline):
+    model = PropertyImage
+    extra = 1  # Number of empty forms to display
+    fields = ("image", "caption", "order")
 
 
 @admin.register(Property)
@@ -12,11 +21,19 @@ class PropertyAdmin(admin.ModelAdmin):
         "property_category",
         "get_type_display",
         "status",
+        "has_primary_image",
         "landlord",
     )
     list_filter = ("status", "property_category", "unit_type", "room_type", "city")
     search_fields = ("name", "address", "city", "landlord__user__name")
     readonly_fields = ("created_at", "updated_at")
+    inlines = [PropertyImageInline]
+
+    def has_primary_image(self, obj):
+        return bool(obj.primary_image)
+
+    has_primary_image.boolean = True
+    has_primary_image.short_description = "Has Primary Image"
 
     def get_type_display(self, obj):
         if obj.property_category == Property.PropertyCategory.COMPLETE_UNIT:
@@ -37,13 +54,16 @@ class PropertyAdmin(admin.ModelAdmin):
                 "Location",
                 {"fields": ("address", "city", "province", "postal_code", "country")},
             ),
+            (
+                "Images",
+                {"fields": ("primary_image",)},
+            ),
             ("Status", {"fields": ("status",)}),
             (
                 "Timestamps",
                 {"fields": ("created_at", "updated_at"), "classes": ("collapse",)},
             ),
         ]
-
         # Insert category-specific fields after property_category
         if (
             obj is None
@@ -69,7 +89,6 @@ class PropertyAdmin(admin.ModelAdmin):
                 },
             )
             common_fieldsets.insert(2, complete_unit_fieldset)
-
         if obj is None or obj.property_category == Property.PropertyCategory.ROOM:
             room_fieldset = (
                 "Room Details",
@@ -89,7 +108,6 @@ class PropertyAdmin(admin.ModelAdmin):
                 },
             )
             common_fieldsets.insert(2, room_fieldset)
-
         return common_fieldsets
 
     def get_form(self, request, obj=None, **kwargs):
@@ -105,7 +123,6 @@ class PropertyAdmin(admin.ModelAdmin):
                 ]:
                     if field in form.base_fields:
                         form.base_fields[field].widget.attrs["disabled"] = True
-
             elif obj.property_category == Property.PropertyCategory.ROOM:
                 for field in [
                     "unit_type",
@@ -116,5 +133,12 @@ class PropertyAdmin(admin.ModelAdmin):
                 ]:
                     if field in form.base_fields:
                         form.base_fields[field].widget.attrs["disabled"] = True
-
         return form
+
+
+@admin.register(PropertyImage)
+class PropertyImageAdmin(admin.ModelAdmin):
+    list_display = ("id", "property", "caption", "order", "created_at")
+    list_filter = ("property",)
+    search_fields = ("property__name", "caption")
+    ordering = ("property", "order", "created_at")
