@@ -419,3 +419,50 @@ class SharedInventoryItem(models.Model):
 
     def __str__(self):
         return f"{self.name} (Qty: {self.quantity}) (Shared in {self.group.name})"
+
+# Add these methods to the PropertyGroup model in rentium/properties/models.py
+
+@property
+def total_occupancy(self):
+    """Total possible occupancy (number of rooms in group)"""
+    return self.grouped_properties.count()
+
+@property
+def current_occupancy(self):
+    """Current occupancy (rooms with active leases)"""
+    from rentium.leases.models import Lease
+    
+    leased_rooms = set()
+    for lease in self.group_leases.filter(status=Lease.LeaseStatus.ACTIVE):
+        for lease_tenant in lease.lease_tenants.all():
+            if lease_tenant.room:
+                leased_rooms.add(lease_tenant.room.id)
+    
+    return len(leased_rooms)
+
+@property
+def current_tenants(self):
+    """List of current tenants across all rooms in the group"""
+    from rentium.leases.models import Lease
+    
+    tenant_data = []
+    for lease in self.group_leases.filter(status=Lease.LeaseStatus.ACTIVE):
+        for lease_tenant in lease.lease_tenants.all():
+            tenant_data.append({
+                'name': lease_tenant.tenant.user.name,
+                'room': lease_tenant.room.name if lease_tenant.room else "Unassigned",
+                'move_in': lease.start_date,
+                'tenant_id': str(lease_tenant.tenant.id),
+                'lease_id': str(lease.id)
+            })
+    
+    return tenant_data
+
+# occupancy_percentage property in PropertyGroup model
+@property
+def occupancy_percentage(self):
+    """Calculate occupancy percentage"""
+    total = self.total_occupancy
+    if total == 0:
+        return 0
+    return round((self.current_occupancy / total) * 100)

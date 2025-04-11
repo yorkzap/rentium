@@ -27,10 +27,10 @@ urlpatterns = [
     path("users/", include("rentium.users.urls", namespace="users")),
     path("accounts/", include("allauth.urls")),
     # Your stuff: custom urls includes go here
-    # ...
     # Media files
     *static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT),
 ]
+
 if settings.DEBUG:
     # Static file serving when using Gunicorn + Uvicorn for local web socket development
     urlpatterns += staticfiles_urlpatterns()
@@ -39,8 +39,13 @@ if settings.DEBUG:
 urlpatterns += [
     # Include user API URLs first (order matters)
     path("api/users/", include("rentium.users.api.urls")),
-    # API base url
+    
+    # Register hierarchical endpoints - all under leases namespace
+    path("api/leases/", include("rentium.leases.api.urls", namespace="leases_api")),
+    
+    # API base url for root-level resources
     path("api/", include("config.api_router")),
+    
     # DRF auth token
     path("api/auth-token/", CustomObtainAuthToken.as_view(), name="auth-token"),
     path("api/schema/", SpectacularAPIView.as_view(), name="api-schema"),

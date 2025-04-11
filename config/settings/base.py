@@ -84,12 +84,14 @@ THIRD_PARTY_APPS = [
     "corsheaders",
     "drf_spectacular",
     "webpack_loader",
+    "django_filters",
 ]
 
 LOCAL_APPS = [
     "rentium.users",
     # Your stuff: custom apps go here
     "rentium.properties",
+    "rentium.leases",
 ]
 # https://docs.djangoproject.com/en/dev/ref/settings/#installed-apps
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
