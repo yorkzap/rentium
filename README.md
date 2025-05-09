@@ -1,9 +1,19 @@
+<!-- README.md -->
 # Rentium
 
 Simply Smart Rentals
 
-[![Built with Cookiecutter Django](https://img.shields.io/badge/built%20with-Cookiecutter%20Django-ff69b4.svg?logo=cookiecutter)](https://github.com/cookiecutter/cookiecutter-django/)
-[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+Set up details:
+
+- Start the frontend
+- Extract the `.envs` zip file and place the extacted `.envs` directory in the root directory of the app. It might be hidden so you might have to use terminal/cmd
+- Inside VS Code, install the `dev containers` extension by Microsoft.
+- Start Docker desktop on side
+- Open the project in VS Code
+- On the bottom right side you should see a popup saying Reopen in container. Click it.
+- Go to http://localhost:8000/ to see if its working
+- Run git checkout dev
+- Inside VS Code (which should now be working with dev container) - run python manage.py makemigrations and then python manage.py migrate, in that order.
 
 ## Settings
 
