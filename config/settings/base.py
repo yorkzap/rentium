@@ -372,6 +372,7 @@ WEBPACK_LOADER = {
 # django-cors-headers settings
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",  # Next.js development server
+    "http://localhost:8081",  # Ignite Mobile development server
 ]
 
 CORS_ALLOW_CREDENTIALS = True
