@@ -442,3 +442,63 @@ def deposits_held(landlord) -> Decimal:
         landlord=landlord, entry_type=EntryType.DEPOSIT_RETURN
     ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
     return received - returned
+
+
+def deposits_collected_between(landlord, start, end, property_id=None) -> Decimal:
+    """
+    Deposit payments RECEIVED in [start, end) — inflow, not net liability.
+
+    Deposits stay excluded from income (they're refundable), but a landlord
+    looking at "collected $0 this month" after banking a $425 deposit is
+    being told something false. This is the number that fixes that.
+    """
+    from django.db.models import Sum
+
+    qs = LedgerEntry.objects.not_voided().filter(
+        landlord=landlord,
+        entry_type=EntryType.PAYMENT,
+        settles__entry_type=EntryType.DEPOSIT_CHARGE,
+        effective_date__gte=start,
+        effective_date__lt=end,
+    )
+    if property_id:
+        qs = qs.filter(property_id=property_id)
+    return qs.aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+
+
+def next_upcoming_charge(landlord, property_id=None) -> dict | None:
+    """
+    The earliest not-yet-settled charge with a future due date, or None.
+
+    Lets the dashboard say "next charge: Aug 1 — $850" instead of showing a
+    dead $0 month when the tenancy simply hasn't started billing yet.
+    """
+    from datetime import date
+
+    from .models import CHARGE_TYPES
+
+    qs = (
+        LedgerEntry.objects.with_settlement()
+        .filter(
+            landlord=landlord,
+            entry_type__in=CHARGE_TYPES,
+            reversed_by__isnull=True,
+            due_date__gt=date.today(),
+            outstanding__gt=0,
+        )
+        .select_related("property")
+        .order_by("due_date", "id")
+    )
+    if property_id:
+        qs = qs.filter(property_id=property_id)
+
+    charge = qs.first()
+    if charge is None:
+        return None
+    return {
+        "due_date": charge.due_date.isoformat(),
+        "amount": str(charge.amount),
+        "entry_type": charge.entry_type,
+        "lease_id": charge.lease_id,
+        "property_name": charge.property.name if charge.property else "",
+    }
