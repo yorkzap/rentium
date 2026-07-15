@@ -809,6 +809,13 @@ def summary_view(request):
             effective_date__lt=end,
         ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
 
+        # Deposits stay out of income (refundable liability) but the UI must
+        # be able to say what actually hit the bank this month.
+        deposits_in = services.deposits_collected_between(
+            landlord, start, end,
+            property_id=request.query_params.get("property") or None,
+        )
+
         monthly.append(
             {
                 "month": start.strftime("%Y-%m"),
@@ -817,6 +824,7 @@ def summary_view(request):
                 "collected_income": str(collected),
                 "expenses": str(spent),
                 "net": str(collected - spent),
+                "deposits_collected": str(deposits_in),
             }
         )
 
@@ -835,6 +843,13 @@ def summary_view(request):
         entry_type=EntryType.EXPENSE, paid_on__isnull=True
     ).aggregate(total=Sum("amount"), count=Count("id"))
 
+    # Income + deposit payments received in the current calendar month —
+    # "what hit the bank", regardless of how the accounting classifies it.
+    current = monthly[-1]
+    collected_this_month_total = (
+        Decimal(current["collected_income"]) + Decimal(current["deposits_collected"])
+    )
+
     return Response(
         {
             "monthly": monthly,
@@ -844,5 +859,10 @@ def summary_view(request):
             "deposits_held": str(services.deposits_held(landlord)),
             "expenses_not_yet_paid": str(unsettled["total"] or Decimal("0.00")),
             "expenses_not_yet_paid_count": unsettled["count"] or 0,
+            "collected_this_month_total": str(collected_this_month_total),
+            "next_charge": services.next_upcoming_charge(
+                landlord,
+                property_id=request.query_params.get("property") or None,
+            ),
         }
     )
