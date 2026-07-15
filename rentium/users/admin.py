@@ -6,6 +6,8 @@ from django.utils.translation import gettext_lazy as _
 
 from .forms import UserAdminChangeForm
 from .forms import UserAdminCreationForm
+from .models import LandlordProfile
+from .models import TenantProfile
 from .models import User
 
 if settings.DJANGO_ADMIN_FORCE_ALLAUTH:
@@ -48,3 +50,17 @@ class UserAdmin(auth_admin.UserAdmin):
             },
         ),
     )
+
+
+@admin.register(LandlordProfile)
+class LandlordProfileAdmin(admin.ModelAdmin):
+    list_display = ("user",)
+    search_fields = ("user__name", "user__email")
+    autocomplete_fields = ["user"]
+
+
+@admin.register(TenantProfile)
+class TenantProfileAdmin(admin.ModelAdmin):
+    list_display = ("user",)
+    search_fields = ("user__name", "user__email")
+    autocomplete_fields = ["user"]

@@ -1,59 +1,125 @@
+from rest_framework.permissions import BasePermission
 from rest_framework.permissions import IsAuthenticated
+
+
+def _resolve_lease(obj):
+    """
+    Given any of Lease / LeaseTenant / LeaseDocument / Payment / PaymentReminder /
+    RentAdjustment, walk to the parent Lease. Returns None if it can't be resolved.
+    """
+    # It's a Lease itself
+    if hasattr(obj, "landlord") and hasattr(obj, "lease_tenants"):
+        return obj
+
+    # It's a RentAdjustment -> lease_tenant -> lease
+    if hasattr(obj, "lease_tenant"):
+        return obj.lease_tenant.lease
+
+    # It's a LeaseTenant / LeaseDocument / Payment -> lease
+    if hasattr(obj, "lease"):
+        return obj.lease
+
+    # It's a PaymentReminder -> payment -> lease
+    if hasattr(obj, "payment") and hasattr(obj.payment, "lease"):
+        return obj.payment.lease
+
+    return None
+
 
 class IsLandlordOwner(IsAuthenticated):
     """
-    Permission to check if the user is a landlord who owns the object.
+    Permission to check if the user is a landlord who owns the object
+    (directly, or via the object's parent lease).
     """
+
     def has_object_permission(self, request, view, obj):
-        if not hasattr(request.user, 'landlord_profile'):
+        if not hasattr(request.user, "landlord_profile"):
             return False
-            
-        # Check ownership based on object type
-        if hasattr(obj, 'landlord'):
-            return obj.landlord == request.user.landlord_profile
-        elif hasattr(obj, 'lease') and hasattr(obj.lease, 'landlord'):
-            return obj.lease.landlord == request.user.landlord_profile
-        elif hasattr(obj, 'payment') and hasattr(obj.payment, 'lease'):
-            return obj.payment.lease.landlord == request.user.landlord_profile
-            
-        return False
+
+        lease = _resolve_lease(obj)
+        if lease is None:
+            return False
+
+        return lease.landlord == request.user.landlord_profile
+
 
 class IsLandlordOrTenantMember(IsAuthenticated):
     """
     Permission to allow:
-    - Landlords who own the object
-    - Tenants who are members of the lease
+    - Landlords who own the object's lease
+    - Tenants who are linked members of the lease (LeaseTenant.tenant matches)
+    - Tenants with a *pending invite* on the lease that matches their account
+      email, so they can view/claim/sign before their TenantProfile is linked
     """
+
     def has_object_permission(self, request, view, obj):
         user = request.user
-        
-        # Find the associated lease for various object types
-        target_lease = None
-        if hasattr(obj, 'landlord') and hasattr(obj, 'lease_tenants'):  # It's a Lease
-            target_lease = obj
-        elif hasattr(obj, 'lease'):  # It's a LeaseTenant, LeaseDocument, or Payment
-            target_lease = obj.lease
-        elif hasattr(obj, 'payment') and hasattr(obj.payment, 'lease'):  # It's a PaymentReminder
-            target_lease = obj.payment.lease
-            
-        if not target_lease:
+        lease = _resolve_lease(obj)
+
+        if lease is None:
             return False
-            
-        # Check landlord permission
-        if hasattr(user, 'landlord_profile'):
-            return target_lease.landlord == user.landlord_profile
-            
-        # Check tenant permission
-        elif hasattr(user, 'tenant_profile'):
-            # Check if tenant is part of the lease
-            is_lease_member = target_lease.lease_tenants.filter(tenant=user.tenant_profile).exists()
-            
-            if is_lease_member:
-                # Extra check: If accessing a specific tenant or payment record, ensure it's theirs
-                if hasattr(obj, 'tenant') and hasattr(obj.tenant, 'id'):
-                    return obj.tenant.id == user.tenant_profile.id
-                    
-                # For other objects, allow access if they're on the lease
-                return True
-                
+
+        # Landlord who owns the lease
+        if hasattr(user, "landlord_profile"):
+            return lease.landlord == user.landlord_profile
+
+        # Tenant path
+        if hasattr(user, "tenant_profile"):
+            tenant_profile = user.tenant_profile
+
+            is_linked_member = lease.lease_tenants.filter(
+                tenant=tenant_profile
+            ).exists()
+            is_invited_member = lease.lease_tenants.filter(
+                tenant__isnull=True, invited_email__iexact=user.email
+            ).exists()
+
+            if not (is_linked_member or is_invited_member):
+                return False
+
+            # Extra scoping: if the object itself carries a `tenant` FK (LeaseTenant,
+            # Payment, RentAdjustment via lease_tenant), make sure it's actually theirs
+            # and not just any tenant's record on a lease they happen to share.
+            if hasattr(obj, "tenant") and obj.tenant_id is not None:
+                return obj.tenant_id == tenant_profile.id
+
+            if hasattr(obj, "lease_tenant"):
+                lt = obj.lease_tenant
+                if lt.tenant_id is not None:
+                    return lt.tenant_id == tenant_profile.id
+                return lt.invited_email.lower() == user.email.lower()
+
+            if hasattr(obj, "invited_email"):  # obj is a LeaseTenant itself
+                if obj.tenant_id is not None:
+                    return obj.tenant_id == tenant_profile.id
+                return obj.invited_email.lower() == user.email.lower()
+
+            # Otherwise (Lease, LeaseDocument, etc.) — membership on the lease is enough
+            return True
+
         return False
+
+
+class LeaseNotLocked(BasePermission):
+    """
+    Blocks unsafe methods on a Lease (or anything hanging off one) once
+    Lease.is_locked() is True — i.e. ACTIVE or beyond. Read access is always
+    allowed; past that point only Django admin can modify the lease.
+
+    Stack this alongside IsLandlordOwner / IsLandlordOrTenantMember, it does
+    not replace ownership checks.
+    """
+
+    message = "This lease has been fully executed and can no longer be edited here."
+
+    SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in self.SAFE_METHODS:
+            return True
+
+        lease = _resolve_lease(obj)
+        if lease is None:
+            return True  # not lease-related; let other permission classes decide
+
+        return not lease.is_locked()

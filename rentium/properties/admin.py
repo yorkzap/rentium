@@ -1,14 +1,17 @@
-# Updated admin.py file
-
 from django.contrib import admin
 
+from .areas import Area
+from .models import InventoryItem
 from .models import Property
+from .models import PropertyArea
+from .models import PropertyGroup
 from .models import PropertyImage
+from .models import SharedInventoryItem
 
 
 class PropertyImageInline(admin.TabularInline):
     model = PropertyImage
-    extra = 1  # Number of empty forms to display
+    extra = 1
     fields = ("image", "caption", "order")
 
 
@@ -64,7 +67,6 @@ class PropertyAdmin(admin.ModelAdmin):
                 {"fields": ("created_at", "updated_at"), "classes": ("collapse",)},
             ),
         ]
-        # Insert category-specific fields after property_category
         if (
             obj is None
             or obj.property_category == Property.PropertyCategory.COMPLETE_UNIT
@@ -113,7 +115,6 @@ class PropertyAdmin(admin.ModelAdmin):
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
         if obj:
-            # If editing existing object, hide irrelevant fields based on property_category
             if obj.property_category == Property.PropertyCategory.COMPLETE_UNIT:
                 for field in [
                     "room_type",
@@ -142,3 +143,48 @@ class PropertyImageAdmin(admin.ModelAdmin):
     list_filter = ("property",)
     search_fields = ("property__name", "caption")
     ordering = ("property", "order", "created_at")
+
+
+@admin.register(PropertyGroup)
+class PropertyGroupAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "landlord",
+        "total_occupancy",
+        "current_occupancy",
+        "occupancy_percentage",
+    )
+    search_fields = ("name", "landlord__user__name")
+    autocomplete_fields = ["landlord"]
+
+
+@admin.register(PropertyArea)
+class PropertyAreaAdmin(admin.ModelAdmin):
+    list_display = ("area_type", "property", "count", "shared_with_landlord")
+    list_filter = ("area_type", "shared_with_landlord")
+    search_fields = ("property__name",)
+    autocomplete_fields = ["property", "shared_by"]
+
+
+@admin.register(InventoryItem)
+class InventoryItemAdmin(admin.ModelAdmin):
+    list_display = ("name", "property", "quantity", "condition", "location_description")
+    list_filter = ("condition",)
+    search_fields = ("name", "property__name")
+    autocomplete_fields = ["property"]
+
+
+@admin.register(SharedInventoryItem)
+class SharedInventoryItemAdmin(admin.ModelAdmin):
+    list_display = ("name", "group", "quantity", "condition")
+    list_filter = ("condition",)
+    search_fields = ("name", "group__name")
+    autocomplete_fields = ["group"]
+
+
+@admin.register(Area)
+class AreaAdmin(admin.ModelAdmin):
+    list_display = ("name", "kind", "group", "property", "exclusive_to")
+    list_filter = ("kind",)
+    search_fields = ("name",)
+    autocomplete_fields = ["group", "property", "exclusive_to"]

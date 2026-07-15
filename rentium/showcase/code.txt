@@ -1,0 +1,1736 @@
+
+========================================
+FILE: ./services.py
+========================================
+
+"""
+Every public read goes through here. Views are thin; the visibility rule is
+Property.objects.public() and lives in ONE place (properties/models.py).
+"""
+
+from __future__ import annotations
+
+import hashlib
+from decimal import Decimal
+
+from django.db.models import Count
+from django.db.models import Max
+from django.db.models import Min
+from django.utils.text import slugify
+
+from rentium.properties.models import PROVINCE_NAMES
+from rentium.properties.models import Property
+
+from .models import Showcase
+from .models import ShowcaseSlugHistory
+
+# How far to blur a public map marker, in degrees (~0.0025° ≈ 275 m of
+# latitude). Deterministic per property, so the pin doesn't jitter on reload
+# and can't be averaged out by repeated requests.
+JITTER_DEGREES = Decimal("0.0025")
+
+
+def jittered_coords(prop: Property) -> tuple[float, float] | None:
+    """
+    A stable, seeded offset from the true coordinates. NEVER return
+    prop.latitude/longitude to a logged-out visitor — a precise pin on an
+    otherwise-anonymous listing is a street address with extra steps.
+    """
+    if prop.latitude is None or prop.longitude is None:
+        return None
+
+    seed = hashlib.sha256(str(prop.pk).encode()).digest()
+    # Map two bytes to [-1, 1] each.
+    dx = (seed[0] / 127.5) - 1.0
+    dy = (seed[1] / 127.5) - 1.0
+
+    lat = float(prop.latitude) + float(JITTER_DEGREES) * dy
+    lng = float(prop.longitude) + float(JITTER_DEGREES) * dx
+    return round(lat, 6), round(lng, 6)
+
+
+# --------------------------------------------------------------- showcases
+def resolve_showcase(slug: str) -> tuple[Showcase | None, str | None]:
+    """
+    -> (showcase, redirect_to_slug)
+
+    A live public slug returns (showcase, None). A retired slug returns
+    (showcase, "new-slug") so the caller can 301. A slug for a landlord who
+    has since opted OUT returns (None, None) — i.e. a 404, not a redirect.
+    Turning your page off must actually turn it off.
+    """
+    key = (slug or "").strip().lower()
+    showcase = (
+        Showcase.objects.filter(slug=key, is_public=True)
+        .select_related("landlord__user")
+        .first()
+    )
+    if showcase:
+        return showcase, None
+
+    old = (
+        ShowcaseSlugHistory.objects.filter(slug=key)
+        .select_related("showcase__landlord__user")
+        .first()
+    )
+    if old and old.showcase.is_public and old.showcase.slug:
+        return old.showcase, old.showcase.slug
+
+    return None, None
+
+
+def rename_slug(showcase: Showcase, new_slug: str) -> Showcase:
+    """Retire the current slug into history, then adopt the new one."""
+    new_slug = slugify(new_slug or "")[:60]
+    if showcase.slug and showcase.slug != new_slug:
+        ShowcaseSlugHistory.objects.get_or_create(
+            slug=showcase.slug, defaults={"showcase": showcase}
+        )
+    # Reclaiming a slug you previously used: drop it from history so it stops
+    # redirecting to itself.
+    ShowcaseSlugHistory.objects.filter(slug=new_slug, showcase=showcase).delete()
+    showcase.slug = new_slug
+    showcase.save()
+    return showcase
+
+
+def slug_is_available(slug: str, *, exclude_showcase: Showcase | None = None) -> bool:
+    key = slugify(slug or "")[:60]
+    if not key or len(key) < 3:
+        return False
+    from .models import RESERVED_SLUGS
+
+    if key in RESERVED_SLUGS:
+        return False
+    taken = Showcase.objects.filter(slug=key)
+    history = ShowcaseSlugHistory.objects.filter(slug=key)
+    if exclude_showcase:
+        taken = taken.exclude(pk=exclude_showcase.pk)
+        history = history.exclude(showcase=exclude_showcase)
+    return not taken.exists() and not history.exists()
+
+
+# ------------------------------------------------------------------ cities
+def city_properties(province_code: str, city_slug: str):
+    return (
+        Property.objects.public()
+        .filter(province_code=province_code.lower(), city_slug=city_slug.lower())
+        .select_related("landlord__user", "landlord__showcase")
+        .prefetch_related("property_images")
+    )
+
+
+def city_facets(qs) -> dict:
+    """Everything the city page's filter UI needs, in one aggregate."""
+    agg = qs.aggregate(
+        total=Count("id"),
+        min_rent=Min("asking_rent"),
+        max_rent=Max("asking_rent"),
+    )
+    by_type = {
+        "private_room": qs.filter(
+            property_category=Property.PropertyCategory.ROOM,
+            room_type=Property.RoomType.PRIVATE,
+        ).count(),
+        "shared_room": qs.filter(
+            property_category=Property.PropertyCategory.ROOM,
+            room_type=Property.RoomType.SHARED,
+        ).count(),
+        "full_suite": qs.filter(
+            property_category=Property.PropertyCategory.COMPLETE_UNIT
+        ).count(),
+    }
+    return {
+        "total": agg["total"] or 0,
+        "min_rent": str(agg["min_rent"]) if agg["min_rent"] is not None else None,
+        "max_rent": str(agg["max_rent"]) if agg["max_rent"] is not None else None,
+        "counts": by_type,
+        "furnished": qs.filter(is_furnished=True).count(),
+    }
+
+
+def known_city(province_code: str, city_slug: str) -> dict | None:
+    """
+    Does this city exist in our data AT ALL (regardless of current vacancy)?
+
+    A city page must keep rendering — with real, useful content — when it has
+    zero available listings, or every vacancy gap silently deletes the page
+    from Google and we start again from nothing each time. So we resolve the
+    city from ANY property we hold there, public or not, and let the page
+    render its evergreen content with an empty results grid.
+    """
+    prop = (
+        Property.objects.filter(
+            province_code=province_code.lower(), city_slug=city_slug.lower()
+        )
+        .only("city", "province_code")
+        .first()
+    )
+    if not prop:
+        return None
+    return {
+        "city": prop.city,
+        "city_slug": prop.city_slug,
+        "province_code": prop.province_code,
+        "province_name": PROVINCE_NAMES.get(prop.province_code, ""),
+    }
+
+
+def all_public_cities() -> list[dict]:
+    """For the sitemap and the city index."""
+    rows = (
+        Property.objects.public()
+        .values("city", "city_slug", "province_code")
+        .annotate(count=Count("id"))
+        .order_by("province_code", "city")
+    )
+    return [
+        {
+            **r,
+            "province_name": PROVINCE_NAMES.get(r["province_code"], ""),
+        }
+        for r in rows
+        if r["city_slug"] and r["province_code"]
+    ]
+
+
+========================================
+FILE: ./tasks.py
+========================================
+
+"""
+Geo housekeeping.
+
+Autocomplete gives us coordinates the moment a landlord picks an address, so in
+the normal path there is nothing to do here. These tasks exist for the two
+abnormal paths: properties that predate autocomplete, and addresses that were
+typed by hand or imported.
+"""
+
+import logging
+
+from celery import shared_task
+
+logger = logging.getLogger(__name__)
+
+
+@shared_task
+def geocode_property(property_id: int):
+    """
+    Resolve one property's address to coordinates + neighbourhood.
+
+    Enqueued on save when the address changed (properties/signals.py) so a new
+    property has a map pin within seconds rather than waiting up to an hour for
+    the sweep below — a property that appears on the city page with no pin looks
+    broken, and it looks broken to the person we most want to impress.
+    """
+    from rentium.core.geo import geocode
+    from rentium.properties.models import Property
+    from rentium.properties.models import normalise_postal_code
+
+    prop = Property.objects.filter(pk=property_id).first()
+    if not prop or not prop.address:
+        return False
+
+    result = geocode(
+        prop.address, prop.city, prop.get_province_display() if prop.province else ""
+    )
+    if not result:
+        logger.info("No geocode match for property %s (%s)", prop.pk, prop.address)
+        return False
+
+    from django.utils import timezone
+
+    updates = {
+        "latitude": result["latitude"],
+        "longitude": result["longitude"],
+        "geocoded_at": timezone.now(),
+    }
+    # Never overwrite what the landlord typed themselves — the neighbourhood is
+    # the ONLY location a stranger ever sees, so how their place is described is
+    # their editorial call, not the geocoder's.
+    if result["neighbourhood"] and not prop.neighbourhood:
+        updates["neighbourhood"] = result["neighbourhood"]
+    if result["province_code"] and not prop.province:
+        updates["province"] = result["province_code"]
+        updates["province_code"] = result["province_code"]
+    if result["postal_code"] and not prop.postal_code:
+        updates["postal_code"] = normalise_postal_code(result["postal_code"])
+
+    Property.objects.filter(pk=prop.pk).update(**updates)
+    return True
+
+
+@shared_task
+def geocode_pending(limit: int = 50):
+    """Hourly sweep. The net that catches anything the save-time task missed."""
+    from rentium.properties.models import Property
+
+    pending = Property.objects.filter(latitude__isnull=True).exclude(address="")[:limit]
+    done = 0
+    for prop in pending:
+        if geocode_property(prop.pk):
+            done += 1
+    return {"geocoded": done}
+
+
+========================================
+FILE: ./models.py
+========================================
+
+"""
+The public, logged-out layer.
+
+Two ideas, kept deliberately separate from the properties app:
+
+  Showcase   A landlord's public page. Exists for every landlord (created
+             lazily), but `is_public` DEFAULTS TO FALSE — a landlord who
+             never opens Settings has no public presence whatsoever. Nothing
+             here is a "profile"; it's a consent record with a URL attached.
+
+  Inquiry    A prospective tenant's message about one showcased property.
+             No account, no tenant profile, no lease. It reaches the landlord
+             by email + in-app notification, and the landlord can convert it
+             into a viewing Appointment in one click.
+
+SlugHistory exists so a landlord can rename their URL without 404ing every
+link they've ever shared — the old slug 301s to the new one, forever.
+
+PRIVACY INVARIANT (enforced in serializers, not just convention): nothing in
+this app may ever emit Property.address, Property.postal_code, exact
+lat/lng, tenant names, lease data, or the landlord's personal email/phone.
+The public sees a neighbourhood and a contact form. That's it.
+"""
+
+import uuid
+
+from django.core.exceptions import ValidationError
+from django.core.validators import MinLengthValidator
+from django.core.validators import RegexValidator
+from django.db import models
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+
+from rentium.core.phone import PhoneField
+from rentium.properties.models import Property
+from rentium.users.models import LandlordProfile
+
+# Slugs that would collide with real routes or be confusing/abusive.
+RESERVED_SLUGS = {
+    "admin",
+    "api",
+    "app",
+    "about",
+    "auth",
+    "blog",
+    "contact",
+    "dashboard",
+    "help",
+    "invite",
+    "l",
+    "legal",
+    "login",
+    "logout",
+    "media",
+    "pricing",
+    "privacy",
+    "public",
+    "rentium",
+    "settings",
+    "signup",
+    "sitemap",
+    "static",
+    "support",
+    "terms",
+    "viewing",
+    "www",
+    # every province code, so /l/<slug> can never shadow /<province>/<city>
+    "ab",
+    "bc",
+    "mb",
+    "nb",
+    "nl",
+    "ns",
+    "nt",
+    "nu",
+    "on",
+    "pe",
+    "qc",
+    "sk",
+    "yt",
+}
+
+slug_validator = RegexValidator(
+    regex=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    message=_(
+        "Use lowercase letters, numbers and hyphens only — e.g. raj-rentals. "
+        "No spaces, no leading or trailing hyphen."
+    ),
+)
+
+
+class Showcase(models.Model):
+    """One per landlord. Their public page at /l/<slug>."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.OneToOneField(
+        LandlordProfile, on_delete=models.CASCADE, related_name="showcase"
+    )
+
+    # --- The consent switch. This is the whole ballgame. ---
+    is_public = models.BooleanField(
+        _("Show my properties publicly"),
+        default=False,
+        help_text=_(
+            "OFF by default and stays off until the landlord explicitly turns it "
+            "on. While off, /l/<slug> 404s and none of their properties appear on "
+            "any city page or in the sitemap."
+        ),
+    )
+
+    slug = models.SlugField(
+        _("Public URL"),
+        max_length=60,
+        unique=True,
+        null=True,
+        blank=True,
+        validators=[slug_validator, MinLengthValidator(3)],
+        help_text=_("Their page lives at /l/<slug>. Renameable; old slugs redirect."),
+    )
+    display_name = models.CharField(
+        _("Display Name"),
+        max_length=120,
+        blank=True,
+        help_text=_(
+            "Shown publicly instead of their account name. Blank falls back to the "
+            "account name — they may prefer 'McKenzie Rentals' to their legal name."
+        ),
+    )
+    bio = models.TextField(
+        _("About"),
+        blank=True,
+        max_length=1200,
+        help_text=_("Optional. A few sentences for prospective tenants."),
+    )
+    photo = models.ImageField(
+        _("Photo or Logo"),
+        upload_to="showcase/%Y/%m/",
+        null=True,
+        blank=True,
+    )
+
+    # Where inquiries go. Falls back to the account email; kept separate so a
+    # landlord can route tenant enquiries somewhere other than their login.
+    contact_email = models.EmailField(_("Inquiry Email"), blank=True)
+
+    first_published_at = models.DateTimeField(null=True, blank=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = _("Showcase Page")
+        verbose_name_plural = _("Showcase Pages")
+
+    def __str__(self):
+        state = "public" if self.is_public else "private"
+        return f"/l/{self.slug or '(no slug)'} [{state}]"
+
+    def clean(self):
+        super().clean()
+        if self.slug and self.slug.lower() in RESERVED_SLUGS:
+            raise ValidationError({"slug": _("That URL is reserved. Pick another.")})
+        if self.is_public and not self.slug:
+            raise ValidationError(
+                {"slug": _("Choose a public URL before making your page public.")}
+            )
+
+    def save(self, *args, **kwargs):
+        if self.slug:
+            self.slug = self.slug.strip().lower()
+        if self.is_public and not self.first_published_at:
+            self.first_published_at = timezone.now()
+        self.full_clean(exclude=None if self.pk is None else [])
+        super().save(*args, **kwargs)
+
+    # -------------------------------------------------------------- helpers
+    @property
+    def public_name(self) -> str:
+        return self.display_name or self.landlord.user.name or "Landlord"
+
+    @property
+    def inquiry_email(self) -> str:
+        return self.contact_email or self.landlord.user.email
+
+    def public_properties(self):
+        """This landlord's showcased properties. Runs the ONE visibility rule."""
+        return (
+            Property.objects.public()
+            .filter(landlord=self.landlord)
+            .order_by("asking_rent", "name")
+        )
+
+    @classmethod
+    def for_landlord(cls, landlord: LandlordProfile) -> "Showcase":
+        """Lazily create. Created rows are PRIVATE — creation is not consent."""
+        showcase, _created = cls.objects.get_or_create(landlord=landlord)
+        return showcase
+
+
+class ShowcaseSlugHistory(models.Model):
+    """
+    Every slug a showcase has ever had. Renaming is allowed precisely because
+    the old URL keeps working (301 → the new one), so a landlord who put their
+    link on a poster in March isn't punished for tidying it up in June.
+    """
+
+    slug = models.SlugField(max_length=60, unique=True, db_index=True)
+    showcase = models.ForeignKey(
+        Showcase, on_delete=models.CASCADE, related_name="slug_history"
+    )
+    retired_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = _("Retired Showcase URL")
+        verbose_name_plural = _("Retired Showcase URLs")
+        ordering = ["-retired_at"]
+
+    def __str__(self):
+        return f"{self.slug} -> {self.showcase.slug}"
+
+
+class Inquiry(models.Model):
+    """
+    "I'm interested in this place." No account required — that's the point.
+    Carries only what the landlord needs to reply, and nothing that could
+    identify a current tenant.
+    """
+
+    class Status(models.TextChoices):
+        NEW = "NEW", _("New")
+        REPLIED = "REPLIED", _("Replied")
+        ARCHIVED = "ARCHIVED", _("Archived")
+        SPAM = "SPAM", _("Spam")
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    property = models.ForeignKey(
+        Property, on_delete=models.CASCADE, related_name="inquiries"
+    )
+    landlord = models.ForeignKey(
+        LandlordProfile, on_delete=models.CASCADE, related_name="inquiries"
+    )
+
+    name = models.CharField(_("Name"), max_length=150)
+    email = models.EmailField(_("Email"))
+    phone = PhoneField(_("Phone"))
+    message = models.TextField(_("Message"), max_length=2000)
+    move_in_target = models.DateField(_("Hoping to move in"), null=True, blank=True)
+
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.NEW, db_index=True
+    )
+    landlord_notes = models.TextField(blank=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    # Abuse forensics only. Never exposed through any API.
+    source_ip = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=300, blank=True)
+
+    # Once the landlord turns this into a showing, the two link up rather than
+    # living as two disconnected records of the same person.
+    appointment = models.ForeignKey(
+        "appointments.Appointment",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="inquiries",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = _("Inquiry")
+        verbose_name_plural = _("Inquiries")
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["landlord", "status", "created_at"])]
+
+    def __str__(self):
+        return f"{self.name} re: {self.property.name} [{self.status}]"
+
+    def mark_replied(self):
+        self.status = self.Status.REPLIED
+        self.responded_at = timezone.now()
+        self.save(update_fields=["status", "responded_at"])
+
+    def publish_event(self):
+        from rentium.events.registry import publish
+
+        publish(
+            "inquiry.created",
+            {
+                "inquiry_id": str(self.pk),
+                "property_name": self.property.name,
+                "name": self.name,
+                "email": self.email,
+                "phone": self.phone,
+                "message": self.message[:200],
+            },
+            property_id=self.property_id,
+        )
+
+
+========================================
+FILE: ./emails.py
+========================================
+
+"""
+Real outbound email. Until now events/handlers.py logged a stub and tenant
+invites were a `# TODO: fire invite email` — which meant the invite link only
+worked if the landlord copy-pasted it by hand, and an inquiry from a stranger
+would have reached nobody at all.
+
+Dev: cookiecutter's Mailpit catches everything at http://localhost:8025.
+Prod: set the SMTP env vars in config/settings/base.py (Postmark/Mailgun/SES).
+"""
+
+import logging
+
+from django.conf import settings
+from django.core.mail import EmailMultiAlternatives
+from django.template.loader import render_to_string
+from django.utils.html import strip_tags
+
+logger = logging.getLogger(__name__)
+
+
+def send(template: str, *, to: list[str], subject: str, context: dict, reply_to=None):
+    """Renders emails/<template>.html, derives the text part, sends. Never raises."""
+    if not to:
+        return False
+    ctx = {
+        "site_url": settings.PUBLIC_SITE_URL.rstrip("/"),
+        "subject": subject,
+        **context,
+    }
+    try:
+        html = render_to_string(f"emails/{template}.html", ctx)
+        msg = EmailMultiAlternatives(
+            subject=subject,
+            body=strip_tags(html),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=to,
+            reply_to=reply_to or None,
+        )
+        msg.attach_alternative(html, "text/html")
+        msg.send(fail_silently=False)
+        return True
+    except Exception:
+        logger.exception("Email '%s' to %s failed", template, to)
+        return False
+
+
+def send_inquiry_to_landlord(inquiry):
+    """
+    reply_to is the prospective tenant, so the landlord just hits Reply and
+    is talking to them directly — no in-app relay to build, no message the
+    tenant can't see. The inquiry is a lead, not a chat thread.
+    """
+    showcase = getattr(inquiry.landlord, "showcase", None)
+    to = showcase.inquiry_email if showcase else inquiry.landlord.user.email
+    return send(
+        "inquiry_received",
+        to=[to],
+        subject=f"New inquiry — {inquiry.property.name}",
+        context={"inquiry": inquiry, "property": inquiry.property},
+        reply_to=[inquiry.email],
+    )
+
+
+def send_tenant_invite(lease_tenant):
+    """The invite link that was previously never actually emailed."""
+    if not lease_tenant.invited_email or lease_tenant.tenant_id:
+        return False
+    url = lease_tenant.get_invite_url(settings.FRONTEND_URL)
+    if not url:
+        return False
+    lease = lease_tenant.lease
+    return send(
+        "tenant_invite",
+        to=[lease_tenant.invited_email],
+        subject=f"{lease.landlord.user.name} invited you to sign a lease",
+        context={
+            "name": lease_tenant.invited_name or "",
+            "landlord_name": lease.landlord.user.name,
+            "property_label": (
+                lease.property.name
+                if lease.property_id
+                else (lease.group.name if lease.group_id else lease.lease_number)
+            ),
+            "rent": lease.total_rent,
+            "start_date": lease.start_date,
+            "invite_url": url,
+        },
+    )
+
+
+========================================
+FILE: ./management/commands/backfill_public_fields.py
+========================================
+
+"""
+Backfill + repair. Safe to re-run; everything it writes is derived.
+
+    python manage.py backfill_public_fields
+    python manage.py backfill_public_fields --geocode   # slow, hits Geoapify
+
+What it repairs, and why it matters: the province field used to be free text, so
+your existing rows contain "BC", "British Columbia", "bc " and — the killer —
+anything mistyped, which normalises to '' and makes the property permanently,
+silently unpublishable. This command reports every one it can't resolve, by name,
+so you can fix them by hand instead of discovering them six months from now when
+a landlord asks why their listing never appeared.
+"""
+
+from django.core.management.base import BaseCommand
+
+from rentium.core.phone import to_e164
+from rentium.properties.furnishing import compute_is_furnished
+from rentium.properties.models import Property
+from rentium.properties.models import normalise_province
+from rentium.showcase.models import Showcase
+from rentium.showcase.tasks import geocode_property
+from rentium.users.models import LandlordProfile
+from rentium.users.models import User
+
+
+class Command(BaseCommand):
+    help = "Backfill showcases, province codes, slugs, furnishing, phones."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--geocode", action="store_true")
+
+    def handle(self, *args, **options):
+        # 1. A Showcase row per landlord. PRIVATE by default — creating the row
+        #    is bookkeeping, not consent. Nobody becomes visible here.
+        made = sum(
+            Showcase.objects.get_or_create(landlord=ll)[1]
+            for ll in LandlordProfile.objects.all()
+        )
+        self.stdout.write(f"Showcases created (all private): {made}")
+
+        # 2. Province: free text -> code.
+        fixed, unresolved = 0, []
+        for prop in Property.objects.all().iterator():
+            if prop.province and len(prop.province) == 2:
+                continue  # already a code
+            code = normalise_province(prop.province)
+            if code:
+                Property.objects.filter(pk=prop.pk).update(
+                    province=code, province_code=code
+                )
+                fixed += 1
+            else:
+                unresolved.append(prop)
+        self.stdout.write(f"Provinces normalised: {fixed}")
+
+        if unresolved:
+            self.stdout.write(
+                self.style.ERROR(
+                    f"\n{len(unresolved)} propert{'y' if len(unresolved) == 1 else 'ies'} "
+                    "have an unreadable province and CANNOT BE PUBLISHED until it's "
+                    "fixed. Re-enter their address in the app and pick from the "
+                    "dropdown:"
+                )
+            )
+            for p in unresolved:
+                self.stdout.write(f"    #{p.pk}  {p.name}  (province: {p.province!r})")
+
+        # 3. Slugs + city slugs (Property.save() derives them).
+        for prop in Property.objects.all().iterator():
+            prop.save()
+        self.stdout.write("Slugs and city slugs rebuilt.")
+
+        # 4. Furnishing, from inventory.
+        furnished = 0
+        for prop in Property.objects.all().iterator():
+            value = compute_is_furnished(prop)
+            if prop.is_furnished != value:
+                Property.objects.filter(pk=prop.pk).update(is_furnished=value)
+                furnished += int(value)
+        self.stdout.write(f"Properties marked furnished: {furnished}")
+
+        # 5. Phones -> E.164. Anything unparseable is BLANKED and reported —
+        #    a phone field containing "call me maybe" is worse than an empty one,
+        #    because a Twilio call against it fails at 3am instead of at import.
+        bad_phones = []
+        for user in User.objects.exclude(phone=""):
+            try:
+                canonical = to_e164(user.phone)
+                if canonical != user.phone:
+                    User.objects.filter(pk=user.pk).update(phone=canonical)
+            except Exception:
+                bad_phones.append((user.email, user.phone))
+                User.objects.filter(pk=user.pk).update(phone="")
+        self.stdout.write("Phone numbers normalised to E.164.")
+        if bad_phones:
+            self.stdout.write(
+                self.style.WARNING(f"\n{len(bad_phones)} unreadable phone(s), cleared:")
+            )
+            for email, raw in bad_phones:
+                self.stdout.write(f"    {email}: {raw!r}")
+
+        # 6. Geocode.
+        if options["geocode"]:
+            pending = Property.objects.filter(latitude__isnull=True).exclude(address="")
+            self.stdout.write(f"Geocoding {pending.count()} propert(ies)...")
+            done = sum(1 for p in pending if geocode_property(p.pk))
+            self.stdout.write(f"Geocoded: {done}")
+
+        self.stdout.write(self.style.SUCCESS("\nDone. No landlord was made public."))
+
+
+========================================
+FILE: ./handlers.py
+========================================
+
+"""
+Event handlers for the showcase app. Registered by ShowcaseConfig.ready().
+
+Why this is a handler and not a line inside the inquiry view:
+
+The view's job is to accept the message and return 201. Sending an email is a
+call to an external service that can be slow, can time out, and — on a bad day —
+can fail entirely. If that happened inside the view, a prospective tenant would
+get a 500 and assume their message didn't send, when in fact it's sitting in the
+database perfectly intact. Worse, ATOMIC_REQUESTS is on, so a raised exception
+would roll the inquiry back and the message would be genuinely lost.
+
+So the write commits, the event goes to the outbox, and delivery happens
+downstream where a failure is a retry rather than a lost lead.
+
+The in-app Notification is NOT created here — that's ROUTES in events/notify.py,
+which fans every event out to the right audience in one place. This handler owns
+only the email.
+"""
+
+import logging
+
+from rentium.events.registry import on
+
+logger = logging.getLogger(__name__)
+
+
+@on("inquiry.created")
+def email_landlord_on_inquiry(event):
+    """
+    A stranger is interested in a property. Tell the landlord, by email, with the
+    prospective tenant set as reply-to — so hitting Reply talks to that person
+    directly. No in-app relay to build, no message the tenant can't see, and no
+    thread for anyone to forget to check. An inquiry is a lead, not a chat.
+    """
+    from .emails import send_inquiry_to_landlord
+    from .models import Inquiry
+
+    inquiry_id = (event.payload or {}).get("inquiry_id")
+    if not inquiry_id:
+        return
+
+    inquiry = (
+        Inquiry.objects.filter(pk=inquiry_id)
+        .select_related("property", "landlord__user", "landlord__showcase")
+        .first()
+    )
+    if not inquiry:
+        # The inquiry was deleted between publish and dispatch. Nothing to do,
+        # and nothing worth shouting about.
+        logger.info("inquiry.created for a missing inquiry (%s)", inquiry_id)
+        return
+
+    if not send_inquiry_to_landlord(inquiry):
+        # send() never raises — it logs and returns False — so a dead SMTP server
+        # can't take down the dispatcher and poison every other handler on the
+        # event. Raising here would make the Celery task retry, which is what we
+        # want: a transient mail failure should get another go.
+        raise RuntimeError(f"Could not email the landlord about inquiry {inquiry.pk}")
+
+
+========================================
+FILE: ./__init__.py
+========================================
+
+
+
+========================================
+FILE: ./apps.py
+========================================
+
+from django.apps import AppConfig
+
+
+class ShowcaseConfig(AppConfig):
+    name = "rentium.showcase"
+    verbose_name = "Public Showcase"
+
+    def ready(self):
+        from . import handlers  # noqa: F401
+
+
+========================================
+FILE: ./admin.py
+========================================
+
+from django.contrib import admin
+
+from .models import Inquiry
+from .models import Showcase
+from .models import ShowcaseSlugHistory
+
+
+@admin.register(Showcase)
+class ShowcaseAdmin(admin.ModelAdmin):
+    list_display = ("slug", "public_name", "is_public", "first_published_at")
+    list_filter = ("is_public",)
+    search_fields = ("slug", "display_name", "landlord__user__email")
+
+
+@admin.register(ShowcaseSlugHistory)
+class SlugHistoryAdmin(admin.ModelAdmin):
+    list_display = ("slug", "showcase", "retired_at")
+
+
+@admin.register(Inquiry)
+class InquiryAdmin(admin.ModelAdmin):
+    list_display = ("name", "property", "status", "created_at")
+    list_filter = ("status", "created_at")
+    search_fields = ("name", "email", "message")
+    readonly_fields = ("source_ip", "user_agent", "created_at")
+
+
+========================================
+FILE: ./api/serializers.py
+========================================
+
+"""
+PUBLIC serializers. Read this file as the privacy contract.
+
+These are deliberately NOT the internal PropertySerializer with fields popped —
+that pattern fails open. Someone adds a field to the internal serializer six
+months from now, and it silently ships to the open internet without anyone
+deciding that it should. These are separate classes with explicit, closed field
+lists, in a separate app, so publishing something takes a deliberate act.
+
+The fields that must never appear anywhere below, and the reason isn't
+sentimental — a rental listing with a precise address is a rental listing that
+tells a stranger which door a person they've never met sleeps behind:
+
+    Property.address, Property.postal_code
+    exact latitude / longitude (only the jittered pair is ever emitted)
+    landlord's email or phone (contact goes through a form)
+    anything from leases, tenants, payments, inspections, or maintenance
+"""
+
+from rest_framework import serializers
+
+from rentium.properties.models import Property
+
+from ..models import Inquiry
+from ..services import jittered_coords
+
+
+class PublicImageSerializer(serializers.Serializer):
+    url = serializers.SerializerMethodField()
+    caption = serializers.CharField()
+
+    def get_url(self, obj):
+        request = self.context.get("request")
+        try:
+            return (
+                request.build_absolute_uri(obj.image.url) if request else obj.image.url
+            )
+        except Exception:
+            return None
+
+
+class PublicPropertyCardSerializer(serializers.ModelSerializer):
+    """The grid card on a city page or a landlord's showcase."""
+
+    slug = serializers.CharField(source="public_slug")
+    type_label = serializers.CharField(source="public_type_label")
+    location = serializers.CharField(source="public_location")
+    province = serializers.CharField(source="province_code")
+    image = serializers.SerializerMethodField()
+    coords = serializers.SerializerMethodField()
+    landlord_slug = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Property
+        fields = [
+            "slug",
+            "name",
+            "type_label",
+            "location",
+            "city",
+            "city_slug",
+            "province",
+            "asking_rent",
+            "available_from",
+            "is_furnished",
+            "bedrooms",
+            "bathrooms",
+            "square_footage",
+            "image",
+            "coords",
+            "landlord_slug",
+        ]
+
+    def get_image(self, obj):
+        request = self.context.get("request")
+        if not obj.primary_image:
+            return None
+        try:
+            url = obj.primary_image.url
+            return request.build_absolute_uri(url) if request else url
+        except Exception:
+            return None
+
+    def get_coords(self, obj):
+        """
+        BLURRED. Never obj.latitude / obj.longitude.
+
+        A precise pin on an otherwise-anonymous listing is a street address with
+        extra steps — drop it into Street View and read the house number. The
+        offset is deterministic per property (see services.jittered_coords), so
+        reloading the page fifty times can't average it away.
+        """
+        c = jittered_coords(obj)
+        return {"lat": c[0], "lng": c[1]} if c else None
+
+    def get_landlord_slug(self, obj):
+        showcase = getattr(obj.landlord, "showcase", None)
+        return showcase.slug if showcase else None
+
+
+class PublicPropertyDetailSerializer(PublicPropertyCardSerializer):
+    images = serializers.SerializerMethodField()
+    furnishings = serializers.SerializerMethodField()
+    shared_spaces = serializers.SerializerMethodField()
+    building_amenities = serializers.SerializerMethodField()
+    landlord = serializers.SerializerMethodField()
+
+    class Meta(PublicPropertyCardSerializer.Meta):
+        fields = PublicPropertyCardSerializer.Meta.fields + [
+            "description",
+            "max_occupancy",
+            "images",
+            "furnishings",
+            "shared_spaces",
+            "building_amenities",
+            "landlord",
+        ]
+
+    def get_images(self, obj):
+        return PublicImageSerializer(
+            obj.property_images.all(), many=True, context=self.context
+        ).data
+
+    def get_furnishings(self, obj):
+        """
+        What actually comes with the place, straight from the landlord's own
+        inventory — so it's never out of date and never typed twice. The same
+        list ends up on the roommate agreement and the condition inspection.
+        """
+        summary = obj.furnishing_summary()
+        return {
+            "is_furnished": obj.is_furnished,
+            "sleeping": summary["sleeping"],
+            "furniture": summary["furniture"],
+            "appliances": summary["appliances"],
+        }
+
+    def get_shared_spaces(self, obj):
+        """
+        For a ROOM: the suite's common areas, and — crucially — whether the
+        landlord is one of the people you'd be sharing them with. That single
+        fact determines whether the provincial tenancy act applies to the tenancy
+        at all, so someone deciding whether to get in a car and go and view the
+        room deserves to know it before they do.
+
+        For a COMPLETE_UNIT: nothing. A unit is self-contained.
+        """
+        if obj.property_category != Property.PropertyCategory.ROOM or not obj.group_id:
+            return []
+
+        from rentium.properties.models import PropertyArea
+
+        areas = (
+            PropertyArea.objects.filter(property__group_id=obj.group_id)
+            .distinct()
+            .order_by("area_type")
+        )
+
+        seen, out = set(), []
+        for area in areas:
+            if area.area_type in seen:
+                continue
+            seen.add(area.area_type)
+            out.append(
+                {
+                    "name": area.get_area_type_display(),
+                    "shared_with_landlord": area.shared_with_landlord,
+                }
+            )
+        return out
+
+    def get_building_amenities(self, obj):
+        labels = dict(Property.BuildingAmenity.choices)
+        return [labels.get(a, a) for a in (obj.building_amenities or [])]
+
+    def get_landlord(self, obj):
+        showcase = getattr(obj.landlord, "showcase", None)
+        if not showcase or not showcase.is_public:
+            return None
+
+        request = self.context.get("request")
+        photo = None
+        if showcase.photo:
+            try:
+                photo = (
+                    request.build_absolute_uri(showcase.photo.url)
+                    if request
+                    else showcase.photo.url
+                )
+            except Exception:
+                photo = None
+
+        # NOTE: no email, no phone. Contact happens through the inquiry form, so
+        # a landlord's inbox never ends up scraped off a public page.
+        return {"slug": showcase.slug, "name": showcase.public_name, "photo": photo}
+
+
+class PublicShowcaseSerializer(serializers.Serializer):
+    slug = serializers.CharField()
+    name = serializers.CharField(source="public_name")
+    bio = serializers.CharField()
+    photo = serializers.SerializerMethodField()
+    properties = serializers.SerializerMethodField()
+
+    def get_photo(self, obj):
+        if not obj.photo:
+            return None
+        request = self.context.get("request")
+        try:
+            return (
+                request.build_absolute_uri(obj.photo.url) if request else obj.photo.url
+            )
+        except Exception:
+            return None
+
+    def get_properties(self, obj):
+        return PublicPropertyCardSerializer(
+            obj.public_properties(), many=True, context=self.context
+        ).data
+
+
+class InquiryCreateSerializer(serializers.ModelSerializer):
+    property_slug = serializers.CharField(write_only=True)
+    # Honeypot. A real person never sees this field; bots fill in everything they
+    # find. Cheap, silent, and it catches the overwhelming majority of them.
+    website = serializers.CharField(required=False, allow_blank=True, write_only=True)
+
+    class Meta:
+        model = Inquiry
+        fields = [
+            "property_slug",
+            "name",
+            "email",
+            "phone",
+            "message",
+            "move_in_target",
+            "website",
+        ]
+
+    def validate_name(self, value):
+        if len(value.strip()) < 2:
+            raise serializers.ValidationError("Please tell the landlord who you are.")
+        return value.strip()
+
+    def validate_message(self, value):
+        if len(value.strip()) < 10:
+            raise serializers.ValidationError(
+                "Say a little more — what are you looking for?"
+            )
+        return value.strip()
+
+    def validate(self, data):
+        if data.get("website"):
+            raise serializers.ValidationError({"detail": "Submission rejected."})
+
+        # Resolve through .public(), so an inquiry can only ever be sent about a
+        # property that is genuinely, currently public. Someone with an old link
+        # to a room that has since been rented gets a clean "not available",
+        # not a message that quietly reaches a landlord who has no room to offer.
+        prop = (
+            Property.objects.public()
+            .filter(public_slug=data["property_slug"])
+            .select_related("landlord")
+            .first()
+        )
+        if not prop:
+            raise serializers.ValidationError(
+                {"property_slug": "This place isn't available."}
+            )
+
+        data["_property"] = prop
+        return data
+
+
+class InquirySerializer(serializers.ModelSerializer):
+    """The landlord's OWN view of their inbox (authenticated)."""
+
+    property_name = serializers.CharField(source="property.name", read_only=True)
+    property_slug = serializers.CharField(source="property.public_slug", read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = Inquiry
+        fields = [
+            "id",
+            "property",
+            "property_name",
+            "property_slug",
+            "name",
+            "email",
+            "phone",
+            "message",
+            "move_in_target",
+            "status",
+            "status_display",
+            "landlord_notes",
+            "responded_at",
+            "appointment",
+            "created_at",
+        ]
+        # source_ip and user_agent are deliberately absent. They exist for abuse
+        # forensics and are nobody's business otherwise — including the
+        # landlord's.
+        read_only_fields = [f for f in fields if f not in ("status", "landlord_notes")]
+
+
+========================================
+FILE: ./api/__init__.py
+========================================
+
+
+
+========================================
+FILE: ./api/urls.py
+========================================
+
+"""
+Two url lists, deliberately kept apart.
+
+`public_urlpatterns` carries NO authentication. `urlpatterns` requires a
+landlord. Keeping them in separate names — rather than one list with mixed
+permissions — means config/urls.py has to mount them separately, which means the
+project's root URLconf makes it obvious at a glance which routes are open to the
+internet. A reviewer shouldn't have to open a viewset to find that out.
+"""
+
+from django.urls import include
+from django.urls import path
+from rest_framework.routers import DefaultRouter
+
+from .views import InquiryViewSet
+from .views import ShowcaseSettingsViewSet
+from .views import address_search
+from .views import public_cities_index
+from .views import public_city
+from .views import public_inquiry
+from .views import public_property_detail
+from .views import public_showcase
+from .views import sitemap_data
+
+app_name = "showcase"
+
+# --- Unauthenticated. Every view here declares AllowAny explicitly + throttles. ---
+public_urlpatterns = [
+    path("cities/", public_cities_index, name="cities-index"),
+    path("cities/<str:province>/<str:city>/", public_city, name="city"),
+    path("l/<slug:slug>/", public_showcase, name="showcase"),
+    path("listings/<slug:slug>/", public_property_detail, name="property"),
+    path("inquiries/", public_inquiry, name="inquiry"),
+    path("sitemap-data/", sitemap_data, name="sitemap-data"),
+]
+
+# --- Landlord-authenticated. ---
+router = DefaultRouter()
+router.register("inquiries", InquiryViewSet, basename="landlord-inquiry")
+router.register("settings", ShowcaseSettingsViewSet, basename="showcase-settings")
+
+urlpatterns = [
+    # Address autocomplete, proxied through us so the Geoapify key never reaches
+    # a browser. MUST come before the router include: DefaultRouter's generated
+    # detail routes match a single path segment, and "address-search" is a single
+    # path segment — registered after the router, it would be swallowed as a
+    # lookup for an inquiry with pk="address-search". This is the same collision
+    # already documented at length in leases/api/urls.py.
+    path("address-search/", address_search, name="address-search"),
+    path("", include(router.urls)),
+]
+
+
+========================================
+FILE: ./api/views.py
+========================================
+
+"""
+Public (AllowAny + throttled) reads, plus the landlord's own showcase settings,
+inquiry inbox, and address autocomplete.
+
+The project-wide DEFAULT_PERMISSION_CLASSES is IsAuthenticated, so every AllowAny
+in this file is an explicit, deliberate act. That's the property we want: you
+cannot accidentally publish an endpoint in this codebase — you have to mean it,
+and it has to be visible in a diff.
+"""
+
+from django.utils.text import slugify
+from rest_framework import status
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.decorators import api_view
+from rest_framework.decorators import permission_classes
+from rest_framework.decorators import throttle_classes
+from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import AllowAny
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle
+from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.throttling import UserRateThrottle
+
+from rentium.core.geo import GeoError
+from rentium.core.geo import autocomplete
+from rentium.properties.models import Property
+
+from .. import services
+from ..models import Inquiry
+from ..models import Showcase
+from .serializers import InquiryCreateSerializer
+from .serializers import InquirySerializer
+from .serializers import PublicPropertyCardSerializer
+from .serializers import PublicPropertyDetailSerializer
+from .serializers import PublicShowcaseSerializer
+
+
+class PublicReadThrottle(AnonRateThrottle):
+    scope = "public_read"
+
+
+class InquiryThrottle(ScopedRateThrottle):
+    scope = "inquiry"
+
+
+class AddressSearchThrottle(UserRateThrottle):
+    scope = "address_search"
+
+
+def _client_ip(request):
+    fwd = request.META.get("HTTP_X_FORWARDED_FOR")
+    return fwd.split(",")[0].strip() if fwd else request.META.get("REMOTE_ADDR")
+
+
+# ------------------------------------------------------------------- cities
+@api_view(["GET"])
+@permission_classes([AllowAny])
+@throttle_classes([PublicReadThrottle])
+def public_city(request, province, city):
+    """
+    GET /api/public/cities/<province>/<city>/?type=&furnished=&min_rent=&max_rent=
+
+    Returns 200 with an EMPTY results list when the city is known but has no
+    vacancies right now — and that is the whole reason known_city() exists.
+
+    A city page that 404s the moment its rooms fill up gets dropped from Google's
+    index, and then has to climb back from nothing every single time inventory
+    turns over. For rentals, inventory turns over constantly. A page whose entire
+    value is "here are today's listings" is structurally guaranteed to spend most
+    of its life deindexed. So the page survives the gap, and the frontend renders
+    its evergreen content around an empty grid.
+    """
+    known = services.known_city(province, city)
+    if not known:
+        raise NotFound("We don't have any properties in that city yet.")
+
+    qs = services.city_properties(province, city)
+
+    # Facets describe the UNFILTERED market, so the filter chips can honestly say
+    # "3 private rooms" while you're currently looking at the shared ones.
+    facets = services.city_facets(qs)
+
+    kind = request.query_params.get("type")
+    if kind == "private_room":
+        qs = qs.filter(
+            property_category=Property.PropertyCategory.ROOM,
+            room_type=Property.RoomType.PRIVATE,
+        )
+    elif kind == "shared_room":
+        qs = qs.filter(
+            property_category=Property.PropertyCategory.ROOM,
+            room_type=Property.RoomType.SHARED,
+        )
+    elif kind == "full_suite":
+        qs = qs.filter(property_category=Property.PropertyCategory.COMPLETE_UNIT)
+
+    if request.query_params.get("furnished") in ("1", "true", "yes"):
+        qs = qs.filter(is_furnished=True)
+
+    for param, lookup in (
+        ("min_rent", "asking_rent__gte"),
+        ("max_rent", "asking_rent__lte"),
+    ):
+        raw = request.query_params.get(param)
+        if raw:
+            try:
+                qs = qs.filter(**{lookup: float(raw)})
+            except ValueError:
+                raise ValidationError({param: "Must be a number."})
+
+    return Response(
+        {
+            **known,
+            "facets": facets,
+            "results": PublicPropertyCardSerializer(
+                qs, many=True, context={"request": request}
+            ).data,
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+@throttle_classes([PublicReadThrottle])
+def public_cities_index(request):
+    return Response({"cities": services.all_public_cities()})
+
+
+# ---------------------------------------------------------------- showcases
+@api_view(["GET"])
+@permission_classes([AllowAny])
+@throttle_classes([PublicReadThrottle])
+def public_showcase(request, slug):
+    """
+    GET /api/public/l/<slug>/
+
+    A live slug returns the page. A RETIRED slug returns {"redirect_to": "..."} so
+    the frontend can 301 — a landlord who tidies up their URL shouldn't 404 every
+    link they've already put on a poster, and a redirect carries the ranking the
+    old URL earned. A slug belonging to a landlord who has since opted OUT returns
+    404, not a redirect: turning your page off has to actually turn it off.
+    """
+    showcase, redirect_to = services.resolve_showcase(slug)
+    if not showcase:
+        raise NotFound("No public page at that address.")
+    if redirect_to:
+        return Response({"redirect_to": redirect_to}, status=status.HTTP_200_OK)
+    return Response(
+        PublicShowcaseSerializer(showcase, context={"request": request}).data
+    )
+
+
+# ----------------------------------------------------------------- property
+@api_view(["GET"])
+@permission_classes([AllowAny])
+@throttle_classes([PublicReadThrottle])
+def public_property_detail(request, slug):
+    prop = (
+        Property.objects.public()
+        .filter(public_slug=slug)
+        .select_related("landlord__showcase", "landlord__user", "group")
+        .prefetch_related("property_images", "inventory_items")
+        .first()
+    )
+    if not prop:
+        raise NotFound("This place isn't available.")
+    return Response(
+        PublicPropertyDetailSerializer(prop, context={"request": request}).data
+    )
+
+
+# ---------------------------------------------------------------- inquiries
+@api_view(["POST"])
+@permission_classes([AllowAny])
+@throttle_classes([InquiryThrottle])
+def public_inquiry(request):
+    """POST /api/public/inquiries/ — the contact form. No account required."""
+    payload = InquiryCreateSerializer(data=request.data)
+    payload.is_valid(raise_exception=True)
+
+    prop = payload.validated_data.pop("_property")
+    payload.validated_data.pop("property_slug", None)
+    payload.validated_data.pop("website", None)  # honeypot
+
+    inquiry = Inquiry.objects.create(
+        property=prop,
+        landlord=prop.landlord,
+        source_ip=_client_ip(request),
+        user_agent=request.META.get("HTTP_USER_AGENT", "")[:300],
+        **payload.validated_data,
+    )
+    inquiry.publish_event()  # -> in-app notification + email to the landlord
+
+    return Response(
+        {
+            "ok": True,
+            "detail": (
+                "Sent. The landlord has your message and will reply to you by email."
+            ),
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+# ------------------------------------------------------------------ sitemap
+@api_view(["GET"])
+@permission_classes([AllowAny])
+@throttle_classes([PublicReadThrottle])
+def sitemap_data(request):
+    """
+    Everything the Next.js sitemap.ts needs, in one call.
+
+    Because it reads live from Property.objects.public(), the sitemap regenerates
+    as properties change with no rebuild step and no cron job that someone
+    eventually forgets to run: a room going OCCUPIED drops out of it on the next
+    revalidate, because the status automation already dropped it out of the public
+    queryset. The listings self-clean, so the sitemap does too.
+    """
+    props = (
+        Property.objects.public()
+        .values("public_slug", "city_slug", "province_code", "updated_at")
+        .order_by("-updated_at")
+    )
+    showcases = Showcase.objects.filter(is_public=True).values("slug", "updated_at")
+
+    return Response(
+        {
+            "cities": services.all_public_cities(),
+            "properties": list(props),
+            "showcases": [s for s in showcases if s["slug"]],
+        }
+    )
+
+
+# ============================================================== LANDLORD SIDE
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AddressSearchThrottle])
+def address_search(request):
+    """
+    GET /api/showcase/address-search/?q=3213+wasca
+
+    -> {"results": [{label: "3213 Wascana Street, Victoria, BC V8Z 3T7",
+                     address, city, province, province_code, postal_code,
+                     neighbourhood, latitude, longitude}]}
+
+    The landlord types a street address and picks one from the list. City,
+    province, postal code, neighbourhood and coordinates all arrive WITH it, so
+    those fields are derived rather than typed.
+
+    That is the entire point of this endpoint. The old form asked for city and
+    province as free text, which produced three separate "Victoria"s (splitting
+    the one URL we're trying to rank across three) and — worse — silently made a
+    property permanently unpublishable the moment anyone typed "Britsh Columbia",
+    with no error shown anywhere, ever. A field you don't ask for is a field
+    nobody can typo.
+
+    Authenticated and throttled because it proxies a metered API. The Geoapify key
+    stays server-side: a key in the browser is a key strangers spend, and 3,000
+    requests a day is a budget a bot burns in an afternoon.
+    """
+    query = request.query_params.get("q", "")
+    if len(query.strip()) < 3:
+        return Response({"results": []})
+
+    try:
+        results = autocomplete(query)
+    except GeoError as exc:
+        # 503, not 500. "The address service is down" is a different thing from
+        # "your form is broken", and the UI says so rather than blaming the user.
+        return Response(
+            {"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+
+    return Response({"results": results})
+
+
+class ShowcaseSettingsViewSet(viewsets.ViewSet):
+    """
+    /api/showcase/settings/                      GET
+    /api/showcase/settings/update_settings/      PATCH
+    /api/showcase/settings/check_slug/?slug=x    GET
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def _showcase(self, request):
+        if not hasattr(request.user, "landlord_profile"):
+            raise PermissionDenied("Landlords only.")
+        # Lazily created, and created PRIVATE. Making the row is bookkeeping;
+        # consent is a separate, explicit act.
+        return Showcase.for_landlord(request.user.landlord_profile)
+
+    def _payload(self, showcase, request):
+        landlord = showcase.landlord
+
+        # Properties that WOULD be public but can't be — no price, no photo, an
+        # address we couldn't place on a map.
+        #
+        # This list exists because the old failure was SILENT. A landlord flipped
+        # the switch, saw three of their five properties appear, and had no way
+        # whatsoever to find out why the other two didn't. Now they're named, with
+        # reasons, in words they can act on.
+        blocked = []
+        for prop in Property.objects.filter(
+            landlord=landlord,
+            is_publicly_visible=True,
+            status=Property.PropertyStatus.AVAILABLE,
+        ):
+            reasons = prop.publish_blockers()
+            if reasons:
+                blocked.append({"id": prop.pk, "name": prop.name, "reasons": reasons})
+
+        return {
+            "is_public": showcase.is_public,
+            "slug": showcase.slug,
+            "display_name": showcase.display_name,
+            "bio": showcase.bio,
+            "photo": request.build_absolute_uri(showcase.photo.url)
+            if showcase.photo
+            else None,
+            "contact_email": showcase.contact_email,
+            "effective_contact_email": showcase.inquiry_email,
+            "public_url": f"/l/{showcase.slug}" if showcase.slug else None,
+            "public_property_count": showcase.public_properties().count()
+            if showcase.is_public
+            else 0,
+            "hidden_property_count": Property.objects.filter(
+                landlord=landlord, is_publicly_visible=False
+            ).count(),
+            "blocked_properties": blocked,
+        }
+
+    def list(self, request):
+        return Response(self._payload(self._showcase(request), request))
+
+    @action(detail=False, methods=["patch"])
+    def update_settings(self, request):
+        showcase = self._showcase(request)
+        data = request.data
+
+        if "slug" in data:
+            new_slug = slugify(str(data["slug"] or ""))[:60]
+            if not services.slug_is_available(new_slug, exclude_showcase=showcase):
+                raise ValidationError({"slug": "That URL isn't available."})
+            # Retires the old slug into history so it keeps redirecting.
+            services.rename_slug(showcase, new_slug)
+
+        for field in ("display_name", "bio", "contact_email"):
+            if field in data:
+                setattr(showcase, field, data[field] or "")
+
+        if "photo" in request.FILES:
+            showcase.photo = request.FILES["photo"]
+
+        if "is_public" in data:
+            wants_public = str(data["is_public"]).lower() in ("1", "true", "yes")
+            if wants_public and not showcase.slug:
+                raise ValidationError(
+                    {"slug": "Choose your public URL before turning your page on."}
+                )
+            showcase.is_public = wants_public
+
+        showcase.save()
+        return Response(self._payload(showcase, request))
+
+    @action(detail=False, methods=["get"])
+    def check_slug(self, request):
+        showcase = self._showcase(request)
+        clean = slugify(request.query_params.get("slug", ""))[:60]
+        return Response(
+            {
+                "slug": clean,
+                "available": services.slug_is_available(
+                    clean, exclude_showcase=showcase
+                ),
+            }
+        )
+
+
+class InquiryViewSet(viewsets.ModelViewSet):
+    """The landlord's inquiry inbox."""
+
+    serializer_class = InquirySerializer
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "patch", "post", "head", "options"]
+
+    def get_queryset(self):
+        user = self.request.user
+        if not hasattr(user, "landlord_profile"):
+            return Inquiry.objects.none()
+
+        qs = Inquiry.objects.filter(landlord=user.landlord_profile).select_related(
+            "property"
+        )
+        wanted = self.request.query_params.get("status")
+        if wanted:
+            qs = qs.filter(status=wanted)
+        return qs
+
+    @action(detail=True, methods=["post"])
+    def mark_replied(self, request, pk=None):
+        inquiry = self.get_object()
+        inquiry.mark_replied()
+        return Response(self.get_serializer(inquiry).data)
+
+    @action(detail=True, methods=["post"])
+    def to_appointment(self, request, pk=None):
+        """
+        Turn an inquiry into a confirmed viewing in one click, carrying the
+        person's name, email and phone across so the landlord retypes nothing.
+
+        This is why Inquiry and Appointment are separate models that link, rather
+        than one model doing both jobs: an inquiry is a lead (it may go nowhere),
+        an appointment is a commitment (tenants currently in the property get an
+        entry notice from it). Conflating them would mean every idle enquiry
+        notified somebody's tenants.
+
+        Body: {starts_at: ISO}
+        """
+        from django.utils.dateparse import parse_datetime
+
+        from rentium.appointments.models import Appointment
+
+        inquiry = self.get_object()
+        when = parse_datetime(str(request.data.get("starts_at") or ""))
+        if not when:
+            raise ValidationError({"starts_at": "Pick a date and time."})
+
+        appt = Appointment.objects.create(
+            landlord=inquiry.landlord,
+            property=inquiry.property,
+            kind=Appointment.Kind.VIEWING,
+            status=Appointment.Status.SCHEDULED,
+            starts_at=when,
+            contact_name=inquiry.name,
+            contact_email=inquiry.email,
+            contact_phone=inquiry.phone,
+            notes=f"From inquiry: {inquiry.message[:200]}",
+        )
+        appt.publish_event("appointment.scheduled")
+
+        inquiry.appointment = appt
+        inquiry.mark_replied()
+        inquiry.save(update_fields=["appointment"])
+
+        return Response(self.get_serializer(inquiry).data, status=201)
+

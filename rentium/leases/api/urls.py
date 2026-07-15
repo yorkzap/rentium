@@ -1,56 +1,130 @@
-from django.urls import path, include
+from django.urls import include
+from django.urls import path
 from rest_framework_nested import routers
 
-from .views import (
-    LeaseViewSet, LeaseTenantViewSet, LeaseDocumentViewSet,
-    PaymentViewSet, PaymentReminderViewSet, lease_types_view
-)
+from .document_views import lease_document
+from .document_views import lease_pdf
+from .inspection_views import ConditionInspectionViewSet
+from .moveout_views import MoveOutViewSet
+from .moveout_views import lease_moveout_rules
+from .views import LeaseDocumentViewSet
+from .views import LeaseTenantViewSet
+from .views import LeaseViewSet
+from .views import PaymentReminderViewSet
+from .views import PaymentViewSet
+from .views import RentAdjustmentViewSet
+from .views import check_overlap_view
+from .views import lease_types_view
 
 app_name = "leases_api"
 
-# Create routers for leases
+# --- Flat routes ---
+#
+# CRITICAL ORDERING NOTE: DRF routers try URL patterns in registration order,
+# and LeaseViewSet's detail route (^(?P<pk>[^/.]+)/$) matches ANY single path
+# segment — including literal words like "documents" or "payments". If
+# LeaseViewSet is registered at the empty "" prefix BEFORE the sub-resources
+# below, requests like GET /leases/documents/ get intercepted as "retrieve lease
+# with pk=documents" and 404, never reaching LeaseDocumentViewSet. All non-""
+# prefixes MUST be registered before "".
 leases_router = routers.SimpleRouter()
-leases_router.register("", LeaseViewSet, basename="lease-main")
-
-# Register sub-resources under leases
 leases_router.register("tenants", LeaseTenantViewSet, basename="lease-tenant")
 leases_router.register("documents", LeaseDocumentViewSet, basename="lease-document")
-
-# Register payment resources under leases
 leases_router.register("payments", PaymentViewSet, basename="lease-payment")
-payments_router = routers.SimpleRouter()
-payments_router.register("payments/reminders", PaymentReminderViewSet, basename="payment-reminder")
+leases_router.register(
+    "rent-adjustments", RentAdjustmentViewSet, basename="rent-adjustment"
+)
+leases_router.register("inspections", ConditionInspectionViewSet, basename="inspection")
+leases_router.register("moveouts", MoveOutViewSet, basename="lease-moveout")
+leases_router.register(
+    "payment-reminders", PaymentReminderViewSet, basename="payment-reminder"
+)
+leases_router.register("", LeaseViewSet, basename="lease-main")  # MUST STAY LAST
 
-# Optional: Create nested routes for specific lease IDs
+# --- Nested under a specific lease: /leases/{lease_pk}/tenants/, etc. ---
 lease_specific_router = routers.SimpleRouter()
 lease_specific_router.register("", LeaseViewSet, basename="lease-specific")
 
-lease_nested_router = routers.NestedSimpleRouter(lease_specific_router, "", lookup="lease")
-lease_nested_router.register("tenants", LeaseTenantViewSet, basename="lease-specific-tenants")
-lease_nested_router.register("documents", LeaseDocumentViewSet, basename="lease-specific-documents")
-lease_nested_router.register("payments", PaymentViewSet, basename="lease-specific-payments")
+lease_nested_router = routers.NestedSimpleRouter(
+    lease_specific_router, "", lookup="lease"
+)
+lease_nested_router.register(
+    "tenants", LeaseTenantViewSet, basename="lease-specific-tenants"
+)
+lease_nested_router.register(
+    "documents", LeaseDocumentViewSet, basename="lease-specific-documents"
+)
+lease_nested_router.register(
+    "payments", PaymentViewSet, basename="lease-specific-payments"
+)
 
-# Optional: Create nested routes for specific payment IDs
+# --- Nested under a specific lease tenant ---
+lease_tenant_specific_router = routers.SimpleRouter()
+lease_tenant_specific_router.register(
+    "tenants", LeaseTenantViewSet, basename="lease-tenant-specific"
+)
+lease_tenant_nested_router = routers.NestedSimpleRouter(
+    lease_tenant_specific_router, "tenants", lookup="lease_tenant"
+)
+lease_tenant_nested_router.register(
+    "rent-adjustments", RentAdjustmentViewSet, basename="lease-tenant-rent-adjustments"
+)
+
+# --- Nested under a specific payment ---
 payment_specific_router = routers.SimpleRouter()
-payment_specific_router.register("payments", PaymentViewSet, basename="payment-specific")
-
-payment_nested_router = routers.NestedSimpleRouter(payment_specific_router, "payments", lookup="payment")
-payment_nested_router.register("reminders", PaymentReminderViewSet, basename="payment-specific-reminders")
+payment_specific_router.register(
+    "payments", PaymentViewSet, basename="payment-specific"
+)
+payment_nested_router = routers.NestedSimpleRouter(
+    payment_specific_router, "payments", lookup="payment"
+)
+payment_nested_router.register(
+    "reminders", PaymentReminderViewSet, basename="payment-specific-reminders"
+)
 
 urlpatterns = [
-    # Critical: Place custom function views BEFORE the router includes!
-    # Custom endpoint for lease types must come first
+    # Custom function views must come before the router includes so their fixed
+    # path segments ("types/", "<id>/pdf/") don't get swallowed by the "" lease
+    # detail route.
     path("types/", lease_types_view, name="lease-types"),
-    
-    # Include the lease router endpoints
+    path("check-overlap/", check_overlap_view, name="lease-check-overlap"),
+    path(
+        "<uuid:lease_id>/moveout-rules/",
+        lease_moveout_rules,
+        name="lease-moveout-rules",
+    ),
+    # --- The lease AS A DOCUMENT (leases/documents.py) ---
+    # `pdf/` keeps its original URL, so the frontend's existing download button
+    # needs no change — but it now resolves here instead of to the @action that
+    # used to live on LeaseViewSet (see the deletion note below).
+    path("<uuid:lease_id>/document/", lease_document, name="lease-document-render"),
+    path("<uuid:lease_id>/pdf/", lease_pdf, name="lease-pdf"),
     path("", include(leases_router.urls)),
-    
-    # Include payments router endpoints
-    path("", include(payments_router.urls)),
-    
-    # Include nested specific-lease endpoints
     path("", include(lease_nested_router.urls)),
-    
-    # Include nested specific-payment endpoints
+    path("", include(lease_tenant_nested_router.urls)),
     path("", include(payment_nested_router.urls)),
 ]
+
+# --- Endpoint summary this produces (all under /api/leases/...) ---
+#
+# GET/POST         /leases/
+# GET/PUT/PATCH/DELETE /leases/{id}/
+# GET  /leases/{id}/document/              <- NEW: the rendered agreement (JSON)
+# GET  /leases/{id}/pdf/                   <- now rendered from the SAME source
+# GET  /leases/{id}/calculate_bill_share/
+# GET  /leases/{id}/all_bill_shares/
+# GET  /leases/bill_providers/
+# POST /leases/{id}/create_utility_payment/
+# POST /leases/{id}/terminate/
+# POST /leases/{id}/renew/
+# GET  /leases/available_tenants/
+# POST /leases/{id}/landlord_sign/
+# POST /leases/{id}/preview-split/
+#
+# GET/POST         /leases/tenants/
+# POST /leases/tenants/{id}/sign/ | /decline/ | /claim/ | /activate-account/
+# POST /leases/tenants/{id}/resend_invite/
+#
+# GET/POST         /leases/inspections/  ... (see inspection_views.py)
+# GET/POST         /leases/moveouts/?lease=<id>
+# GET  /leases/{lease_id}/moveout-rules/

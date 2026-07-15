@@ -5,6 +5,7 @@ import ssl
 from pathlib import Path
 
 import environ
+from celery.schedules import crontab
 
 BASE_DIR = Path(__file__).resolve(strict=True).parent.parent.parent
 # rentium/
@@ -18,44 +19,23 @@ if READ_DOT_ENV_FILE:
 
 # GENERAL
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#debug
 DEBUG = env.bool("DJANGO_DEBUG", False)
-# Local time zone. Choices are
-# http://en.wikipedia.org/wiki/List_of_tz_zones_by_name
-# though not all of them may be available with every OS.
-# In Windows, this must be set to your system time zone.
 TIME_ZONE = "UTC"
-# https://docs.djangoproject.com/en/dev/ref/settings/#language-code
 LANGUAGE_CODE = "en-us"
-# https://docs.djangoproject.com/en/dev/ref/settings/#languages
-# from django.utils.translation import gettext_lazy as _
-# LANGUAGES = [
-#     ('en', _('English')),
-#     ('fr-fr', _('French')),
-#     ('pt-br', _('Portuguese')),
-# ]
-# https://docs.djangoproject.com/en/dev/ref/settings/#site-id
 SITE_ID = 1
-# https://docs.djangoproject.com/en/dev/ref/settings/#use-i18n
 USE_I18N = True
-# https://docs.djangoproject.com/en/dev/ref/settings/#use-tz
 USE_TZ = True
-# https://docs.djangoproject.com/en/dev/ref/settings/#locale-paths
 LOCALE_PATHS = [str(BASE_DIR / "locale")]
 
 # DATABASES
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#databases
 DATABASES = {"default": env.db("DATABASE_URL")}
 DATABASES["default"]["ATOMIC_REQUESTS"] = True
-# https://docs.djangoproject.com/en/stable/ref/settings/#std:setting-DEFAULT_AUTO_FIELD
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # URLS
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#root-urlconf
 ROOT_URLCONF = "config.urls"
-# https://docs.djangoproject.com/en/dev/ref/settings/#wsgi-application
 WSGI_APPLICATION = "config.wsgi.application"
 
 # APPS
@@ -67,7 +47,7 @@ DJANGO_APPS = [
     "django.contrib.sites",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    # "django.contrib.humanize", # Handy template tags
+    "django.contrib.humanize",  # Handy template tags
     "django.contrib.admin",
     "django.forms",
 ]
@@ -92,40 +72,42 @@ LOCAL_APPS = [
     # Your stuff: custom apps go here
     "rentium.properties",
     "rentium.leases",
+    "rentium.events",
+    "rentium.ledger",
+    "rentium.maintenance",
+    "rentium.messaging",
+    "rentium.agenda",
+    "rentium.appointments",
+    # The public, logged-out layer: landlord showcase pages, city pages, property
+    # pages, inquiries. Deliberately its own app so its serializers can never
+    # accidentally inherit an internal one and leak a street address.
+    "rentium.showcase",
 ]
-# https://docs.djangoproject.com/en/dev/ref/settings/#installed-apps
+
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 
 # MIGRATIONS
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#migration-modules
 MIGRATION_MODULES = {"sites": "rentium.contrib.sites.migrations"}
 
 # AUTHENTICATION
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#authentication-backends
 AUTHENTICATION_BACKENDS = [
     "django.contrib.auth.backends.ModelBackend",
     "allauth.account.auth_backends.AuthenticationBackend",
 ]
-# https://docs.djangoproject.com/en/dev/ref/settings/#auth-user-model
 AUTH_USER_MODEL = "users.User"
-# https://docs.djangoproject.com/en/dev/ref/settings/#login-redirect-url
 LOGIN_REDIRECT_URL = "users:redirect"
-# https://docs.djangoproject.com/en/dev/ref/settings/#login-url
 LOGIN_URL = "account_login"
 
 # PASSWORDS
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#password-hashers
 PASSWORD_HASHERS = [
-    # https://docs.djangoproject.com/en/dev/topics/auth/passwords/#using-argon2-with-django
     "django.contrib.auth.hashers.Argon2PasswordHasher",
     "django.contrib.auth.hashers.PBKDF2PasswordHasher",
     "django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher",
     "django.contrib.auth.hashers.BCryptSHA256PasswordHasher",
 ]
-# https://docs.djangoproject.com/en/dev/ref/settings/#auth-password-validators
 AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
@@ -137,7 +119,6 @@ AUTH_PASSWORD_VALIDATORS = [
 
 # MIDDLEWARE
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#middleware
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
@@ -154,13 +135,9 @@ MIDDLEWARE = [
 
 # STATIC
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#static-root
 STATIC_ROOT = str(BASE_DIR / "staticfiles")
-# https://docs.djangoproject.com/en/dev/ref/settings/#static-url
 STATIC_URL = "/static/"
-# https://docs.djangoproject.com/en/dev/ref/contrib/staticfiles/#std:setting-STATICFILES_DIRS
 STATICFILES_DIRS = [str(APPS_DIR / "static")]
-# https://docs.djangoproject.com/en/dev/ref/contrib/staticfiles/#staticfiles-finders
 STATICFILES_FINDERS = [
     "django.contrib.staticfiles.finders.FileSystemFinder",
     "django.contrib.staticfiles.finders.AppDirectoriesFinder",
@@ -168,24 +145,34 @@ STATICFILES_FINDERS = [
 
 # MEDIA
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#media-root
 MEDIA_ROOT = str(APPS_DIR / "media")
-# https://docs.djangoproject.com/en/dev/ref/settings/#media-url
 MEDIA_URL = "/media/"
+
+# CACHE
+# ------------------------------------------------------------------------------
+# Redis is already here for Celery. The address-autocomplete proxy caches results
+# (rentium/core/geo.py) — a street address does not move, and the Geoapify free
+# tier is 3,000 requests a day, so caching a repeated lookup is the difference
+# between "fine forever" and "broken by Tuesday".
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": env("REDIS_URL", default="redis://redis:6379/0"),
+    }
+}
 
 # TEMPLATES
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#templates
+# NOTE: the ONLY server-rendered templates in this project are outbound EMAIL
+# bodies (rentium/templates/emails/*). Every user-facing surface is the Next.js
+# app talking to this API. An email body is a string handed to an SMTP server —
+# there's no browser involved, so the frontend cannot produce it.
 TEMPLATES = [
     {
-        # https://docs.djangoproject.com/en/dev/ref/settings/#std:setting-TEMPLATES-BACKEND
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        # https://docs.djangoproject.com/en/dev/ref/settings/#dirs
         "DIRS": [str(APPS_DIR / "templates")],
-        # https://docs.djangoproject.com/en/dev/ref/settings/#app-dirs
         "APP_DIRS": True,
         "OPTIONS": {
-            # https://docs.djangoproject.com/en/dev/ref/settings/#template-context-processors
             "context_processors": [
                 "django.template.context_processors.debug",
                 "django.template.context_processors.request",
@@ -201,54 +188,57 @@ TEMPLATES = [
     },
 ]
 
-# https://docs.djangoproject.com/en/dev/ref/settings/#form-renderer
 FORM_RENDERER = "django.forms.renderers.TemplatesSetting"
-
-# http://django-crispy-forms.readthedocs.io/en/latest/install.html#template-packs
 CRISPY_TEMPLATE_PACK = "bootstrap5"
 CRISPY_ALLOWED_TEMPLATE_PACKS = "bootstrap5"
 
 # FIXTURES
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#fixture-dirs
 FIXTURE_DIRS = (str(APPS_DIR / "fixtures"),)
 
 # SECURITY
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#session-cookie-httponly
 SESSION_COOKIE_HTTPONLY = True
-# https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-httponly
 CSRF_COOKIE_HTTPONLY = True
-# https://docs.djangoproject.com/en/dev/ref/settings/#x-frame-options
 X_FRAME_OPTIONS = "DENY"
 
 # EMAIL
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#email-backend
+# DEV: cookiecutter ships Mailpit. Nothing to sign up for — it listens on
+# mailpit:1025, swallows every outbound message, and you read them at
+# http://localhost:8025. In your local .env:
+#     DJANGO_EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
+#     EMAIL_HOST=mailpit
+#     EMAIL_PORT=1025
+#
+# PROD: sign up with a transactional provider (Postmark, Mailgun, SendGrid, SES)
+# and paste their SMTP credentials into these same env vars — the config is
+# provider-agnostic on purpose. You ALSO need SPF + DKIM DNS records for
+# rentium.ca at your registrar, or lease invites will land in spam.
 EMAIL_BACKEND = env(
     "DJANGO_EMAIL_BACKEND",
     default="django.core.mail.backends.smtp.EmailBackend",
 )
-# https://docs.djangoproject.com/en/dev/ref/settings/#email-timeout
-EMAIL_TIMEOUT = 5
+EMAIL_HOST = env("EMAIL_HOST", default="mailpit")
+EMAIL_PORT = env.int("EMAIL_PORT", default=1025)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
+EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=False)
+EMAIL_TIMEOUT = 10
+DEFAULT_FROM_EMAIL = env(
+    "DJANGO_DEFAULT_FROM_EMAIL", default="Rentium <no-reply@rentium.ca>"
+)
+SERVER_EMAIL = env("DJANGO_SERVER_EMAIL", default=DEFAULT_FROM_EMAIL)
 
 # ADMIN
 # ------------------------------------------------------------------------------
-# Django Admin URL.
 ADMIN_URL = "admin/"
-# https://docs.djangoproject.com/en/dev/ref/settings/#admins
 ADMINS = [("""Raj Singh""", "raj-singh@rentium.ca")]
-# https://docs.djangoproject.com/en/dev/ref/settings/#managers
 MANAGERS = ADMINS
-# https://cookiecutter-django.readthedocs.io/en/latest/settings.html#other-environment-settings
-# Force the `admin` sign in process to go through the `django-allauth` workflow
 DJANGO_ADMIN_FORCE_ALLAUTH = env.bool("DJANGO_ADMIN_FORCE_ALLAUTH", default=False)
 
 # LOGGING
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#logging
-# See https://docs.djangoproject.com/en/dev/topics/logging for
-# more details on how to customize your logging configuration.
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -273,68 +263,87 @@ REDIS_SSL = REDIS_URL.startswith("rediss://")
 # Celery
 # ------------------------------------------------------------------------------
 if USE_TZ:
-    # https://docs.celeryq.dev/en/stable/userguide/configuration.html#std:setting-timezone
     CELERY_TIMEZONE = TIME_ZONE
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#std:setting-broker_url
 CELERY_BROKER_URL = REDIS_URL
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#redis-backend-use-ssl
 CELERY_BROKER_USE_SSL = {"ssl_cert_reqs": ssl.CERT_NONE} if REDIS_SSL else None
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#std:setting-result_backend
 CELERY_RESULT_BACKEND = REDIS_URL
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#redis-backend-use-ssl
 CELERY_REDIS_BACKEND_USE_SSL = CELERY_BROKER_USE_SSL
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#result-extended
 CELERY_RESULT_EXTENDED = True
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#result-backend-always-retry
-# https://github.com/celery/celery/pull/6122
 CELERY_RESULT_BACKEND_ALWAYS_RETRY = True
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#result-backend-max-retries
 CELERY_RESULT_BACKEND_MAX_RETRIES = 10
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#std:setting-accept_content
 CELERY_ACCEPT_CONTENT = ["json"]
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#std:setting-task_serializer
 CELERY_TASK_SERIALIZER = "json"
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#std:setting-result_serializer
 CELERY_RESULT_SERIALIZER = "json"
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#task-time-limit
-# TODO: set to whatever value is adequate in your circumstances
 CELERY_TASK_TIME_LIMIT = 5 * 60
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#task-soft-time-limit
-# TODO: set to whatever value is adequate in your circumstances
 CELERY_TASK_SOFT_TIME_LIMIT = 60
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#beat-scheduler
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#worker-send-task-events
 CELERY_WORKER_SEND_TASK_EVENTS = True
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#std-setting-task_send_sent_event
 CELERY_TASK_SEND_SENT_EVENT = True
-# https://docs.celeryq.dev/en/stable/userguide/configuration.html#worker-hijack-root-logger
 CELERY_WORKER_HIJACK_ROOT_LOGGER = False
+
+# Beat schedule
+# ------------------------------------------------------------------------------
+# THIS WAS MISSING ENTIRELY. CELERY_BEAT_SCHEDULER was configured but no schedule
+# was ever defined, which means nothing in rentium/ledger/daily.py has ever run:
+# rent charges silently stop generating once the 45-day horizon lapses (around
+# month two of a quiet lease, "Expected This Month" just drops to $0), leases
+# never flip to EXPIRED, tenants never get "rent due soon" nudges, and
+# maintenance SLA breaches are never detected. Every one of those jobs was
+# written, wired, and then never scheduled.
+#
+# Requires BOTH a worker and beat to be running:
+#   celeryworker:  celery -A config.celery_app worker -l info
+#   celerybeat:    celery -A config.celery_app beat -l info
+#
+# Every task below is idempotent — a double-run posts nothing twice.
+CELERY_BEAT_SCHEDULE = {
+    # expire ended leases -> generate rent charges -> due-soon reminders ->
+    # inspection delivery deadlines -> SLA check. The order matters and is
+    # enforced inside daily.run_all().
+    "rentium-daily-housekeeping": {
+        "task": "rentium.ledger.tasks.run_daily_housekeeping",
+        "schedule": crontab(hour=6, minute=15),
+    },
+    # SLA breaches are the one time-sensitive job — an RTA emergency work order
+    # blowing its deadline at 9am shouldn't wait until tomorrow to alert anyone.
+    "rentium-sla-breach-check": {
+        "task": "rentium.ledger.tasks.check_sla_breaches",
+        "schedule": crontab(minute=5),  # hourly at :05
+    },
+    # Safety net: re-dispatch DomainEvents published but never processed (worker
+    # down, broker hiccup). Without it, a dropped event is a notification that
+    # silently never arrives and nobody ever finds out it didn't.
+    "rentium-replay-unprocessed-events": {
+        "task": "rentium.events.tasks.replay_unprocessed_events",
+        "schedule": crontab(minute="*/10"),
+    },
+    # Backfill net for properties that got an address without going through the
+    # autocomplete (admin, import, hand-typed). The normal path already has
+    # coordinates before this ever runs.
+    "rentium-geocode-pending": {
+        "task": "rentium.showcase.tasks.geocode_pending",
+        "schedule": crontab(minute=25),  # hourly at :25
+    },
+}
+
 # django-allauth
 # ------------------------------------------------------------------------------
 ACCOUNT_ALLOW_REGISTRATION = env.bool("DJANGO_ACCOUNT_ALLOW_REGISTRATION", True)
-# https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_LOGIN_METHODS = {"email"}
-# https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_EMAIL_REQUIRED = True
-# https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_USERNAME_REQUIRED = False
-# https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_USER_MODEL_USERNAME_FIELD = None
-# https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_EMAIL_VERIFICATION = "mandatory"
-# https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_ADAPTER = "rentium.users.adapters.AccountAdapter"
-# https://docs.allauth.org/en/latest/account/forms.html
 ACCOUNT_FORMS = {"signup": "rentium.users.forms.UserSignupForm"}
-# https://docs.allauth.org/en/latest/socialaccount/configuration.html
 SOCIALACCOUNT_ADAPTER = "rentium.users.adapters.SocialAccountAdapter"
-# https://docs.allauth.org/en/latest/socialaccount/configuration.html
 SOCIALACCOUNT_FORMS = {"signup": "rentium.users.forms.UserSocialSignupForm"}
 
 # django-rest-framework
 # -------------------------------------------------------------------------------
-# django-rest-framework - https://www.django-rest-framework.org/api-guide/settings/
+# The default permission is IsAuthenticated. Every public endpoint in
+# rentium.showcase therefore has to declare AllowAny *explicitly* — which is
+# exactly the property we want: you cannot accidentally publish an endpoint.
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework.authentication.SessionAuthentication",
@@ -342,13 +351,24 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    # Throttles are opt-in per view (no global default class), but the RATES all
+    # live here so there's one place to look. appointments/public_views.py had a
+    # comment literally asking for this and it was never added.
+    "DEFAULT_THROTTLE_CLASSES": [],
+    "DEFAULT_THROTTLE_RATES": {
+        "public_read": "120/min",  # city / property / showcase page reads
+        "inquiry": "5/hour",  # contact form: generous for a human, brutal for a bot
+        "viewing_request": "5/hour",
+        # Address autocomplete proxies a METERED api (Geoapify, 3k/day free). One
+        # landlord typing an address fires maybe 8 requests. A bot could burn the
+        # daily quota in ninety seconds, so this is a real limit, not a formality.
+        "address_search": "60/min",
+    },
 }
 
 # django-cors-headers - https://github.com/adamchainz/django-cors-headers#setup
 CORS_URLS_REGEX = r"^/api/.*$"
 
-# By Default swagger ui is available only to admin user(s). You can change permission classes to change that
-# See more configuration options at https://drf-spectacular.readthedocs.io/en/latest/settings.html#settings
 SPECTACULAR_SETTINGS = {
     "TITLE": "Rentium API",
     "DESCRIPTION": "Documentation of API endpoints of Rentium",
@@ -356,6 +376,7 @@ SPECTACULAR_SETTINGS = {
     "SERVE_PERMISSIONS": ["rest_framework.permissions.IsAdminUser"],
     "SCHEMA_PATH_PREFIX": "/api/",
 }
+
 # django-webpack-loader
 # ------------------------------------------------------------------------------
 WEBPACK_LOADER = {
@@ -366,17 +387,14 @@ WEBPACK_LOADER = {
         "IGNORE": [r".+\.hot-update.js", r".+\.map"],
     },
 }
+
 # Your stuff...
 # ------------------------------------------------------------------------------
-
-# django-cors-headers settings
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",  # Next.js development server
     "http://localhost:8081",  # Ignite Mobile development server
 ]
-
 CORS_ALLOW_CREDENTIALS = True
-
 CORS_ALLOW_HEADERS = [
     "accept",
     "accept-encoding",
@@ -389,9 +407,27 @@ CORS_ALLOW_HEADERS = [
     "x-requested-with",
 ]
 
-
-# Frontend URL for email verification
+# The logged-in app (invite links, dashboard deep links).
 FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000")
+
+# The PUBLIC, indexable site — canonical origin for /l/<slug> and
+# /<province>/<city>. Same host as FRONTEND_URL today; split them the day the
+# public site moves to its own domain, without touching any other code.
+PUBLIC_SITE_URL = env("PUBLIC_SITE_URL", default=FRONTEND_URL)
+
+# GEOAPIFY — address autocomplete AND geocoding, on one key.
+# Free tier: 3,000 requests/day, no card. https://myprojects.geoapify.com
+#
+# Deliberately NOT exposed to the browser (no NEXT_PUBLIC_ twin): the frontend
+# calls OUR endpoint (/api/showcase/address-search/) and Django proxies. A key in
+# the browser is a key strangers spend, and 3k/day is a budget a bot burns in an
+# afternoon.
+#
+# NOT used for map TILES. A single map view loads 150-250 tiles, so roughly
+# fifteen visitors to one city page would exhaust the entire daily quota and the
+# map would go blank for everyone, silently. Tiles come from Carto/OSM — free,
+# unlimited, no key. See src/components/public/ListingMap.tsx.
+GEOAPIFY_KEY = env("GEOAPIFY_KEY", default="")
 
 # Email confirmation settings
 ACCOUNT_EMAIL_CONFIRMATION_AUTHENTICATED_REDIRECT_URL = f"{FRONTEND_URL}/dashboard"

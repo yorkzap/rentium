@@ -1,0 +1,26 @@
+{% extends "emails/base_email.html" %}
+{% block content %}
+  <h1 style="margin:0 0 6px;font-size:19px;font-weight:600;">New inquiry</h1>
+  <p style="margin:0 0 20px;color:#6b6862;font-size:14px;">
+    Someone is interested in <strong style="color:#1c1c1a;">{{ property.name }}</strong>.
+  </p>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;border:1px solid #eeece8;border-radius:8px;">
+    <tr><td style="padding:12px 14px;color:#8a8681;width:110px;">Name</td><td style="padding:12px 14px;font-weight:600;">{{ inquiry.name }}</td></tr>
+    <tr><td style="padding:12px 14px;color:#8a8681;border-top:1px solid #f4f2ef;">Email</td><td style="padding:12px 14px;border-top:1px solid #f4f2ef;"><a href="mailto:{{ inquiry.email }}" style="color:#0f766e;">{{ inquiry.email }}</a></td></tr>
+    {% if inquiry.phone %}<tr><td style="padding:12px 14px;color:#8a8681;border-top:1px solid #f4f2ef;">Phone</td><td style="padding:12px 14px;border-top:1px solid #f4f2ef;">{{ inquiry.phone }}</td></tr>{% endif %}
+    {% if inquiry.move_in_target %}<tr><td style="padding:12px 14px;color:#8a8681;border-top:1px solid #f4f2ef;">Move-in</td><td style="padding:12px 14px;border-top:1px solid #f4f2ef;">{{ inquiry.move_in_target }}</td></tr>{% endif %}
+  </table>
+
+  <p style="margin:20px 0 6px;font-size:13px;color:#8a8681;">Their message</p>
+  <div style="padding:14px;background:#faf9f7;border-radius:8px;font-size:14px;line-height:1.55;white-space:pre-wrap;">{{ inquiry.message }}</div>
+
+  <p style="margin:22px 0 0;font-size:14px;color:#6b6862;">
+    <strong style="color:#1c1c1a;">Just hit reply</strong> — this email goes straight to {{ inquiry.name }}.
+    Or open Rentium to schedule a viewing in one click.
+  </p>
+
+  <p style="margin:20px 0 0;">
+    <a href="{{ site_url }}/dashboard/inquiries" style="display:inline-block;padding:11px 18px;background:#0f766e;color:#ffffff;text-decoration:none;border-radius:8px;font-size:14px;font-weight:600;">Open in Rentium</a>
+  </p>
+{% endblock %}

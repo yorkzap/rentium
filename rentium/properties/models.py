@@ -2,12 +2,112 @@
 import uuid
 
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 from django.db import models
+from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 
 from rentium.users.models import LandlordProfile
 
-# from rentium.users.models import User # Not directly used here
+# --- Province normalisation -------------------------------------------------
+# `province` is free text the landlord typed ("BC", "British Columbia", "b.c.").
+# The public URL is /<province>/<city>/, so we need ONE canonical two-letter
+# code per property, computed on save and indexed.
+PROVINCE_CODES = {
+    "ab": "ab",
+    "alberta": "ab",
+    "bc": "bc",
+    "b c": "bc",
+    "british columbia": "bc",
+    "mb": "mb",
+    "manitoba": "mb",
+    "nb": "nb",
+    "new brunswick": "nb",
+    "nl": "nl",
+    "newfoundland": "nl",
+    "newfoundland and labrador": "nl",
+    "ns": "ns",
+    "nova scotia": "ns",
+    "nt": "nt",
+    "northwest territories": "nt",
+    "nu": "nu",
+    "nunavut": "nu",
+    "on": "on",
+    "ontario": "on",
+    "pe": "pe",
+    "pei": "pe",
+    "prince edward island": "pe",
+    "qc": "qc",
+    "quebec": "qc",
+    "québec": "qc",
+    "sk": "sk",
+    "saskatchewan": "sk",
+    "yt": "yt",
+    "yukon": "yt",
+}
+
+PROVINCE_NAMES = {
+    "ab": "Alberta",
+    "bc": "British Columbia",
+    "mb": "Manitoba",
+    "nb": "New Brunswick",
+    "nl": "Newfoundland and Labrador",
+    "ns": "Nova Scotia",
+    "nt": "Northwest Territories",
+    "nu": "Nunavut",
+    "on": "Ontario",
+    "pe": "Prince Edward Island",
+    "qc": "Quebec",
+    "sk": "Saskatchewan",
+    "yt": "Yukon",
+}
+
+
+class Province(models.TextChoices):
+    """
+    THE closed set. Province was free text, which meant "BC", "British Columbia",
+    "b.c." and "Britsh Columbia" were four different provinces — and the last one
+    normalised to '', which silently made the property unpublishable with no
+    error and no explanation anywhere. A dropdown of 13 options is not a
+    limitation; it's the only sane way to model a set of 13 things.
+    """
+
+    AB = "ab", "Alberta"
+    BC = "bc", "British Columbia"
+    MB = "mb", "Manitoba"
+    NB = "nb", "New Brunswick"
+    NL = "nl", "Newfoundland and Labrador"
+    NS = "ns", "Nova Scotia"
+    NT = "nt", "Northwest Territories"
+    NU = "nu", "Nunavut"
+    ON = "on", "Ontario"
+    PE = "pe", "Prince Edward Island"
+    QC = "qc", "Quebec"
+    SK = "sk", "Saskatchewan"
+    YT = "yt", "Yukon"
+
+
+postal_code_validator = RegexValidator(
+    regex=r"^[A-Za-z]\d[A-Za-z][ ]?\d[A-Za-z]\d$",
+    message="Enter a Canadian postal code, like V8Z 3T7.",
+)
+
+
+def normalise_postal_code(raw: str | None) -> str:
+    """'v8z3t7' -> 'V8Z 3T7'. One canonical form, so two identical codes match."""
+    if not raw:
+        return ""
+    clean = "".join(str(raw).split()).upper()
+    if len(clean) == 6:
+        return f"{clean[:3]} {clean[3:]}"
+    return clean
+
+
+def normalise_province(raw: str | None) -> str:
+    if not raw:
+        return ""
+    key = " ".join(str(raw).lower().replace(".", " ").split())
+    return PROVINCE_CODES.get(key, "")
 
 
 # --- PropertyGroup Model ---
@@ -34,8 +134,79 @@ class PropertyGroup(models.Model):
     def __str__(self):
         return f"{self.name} (Landlord: {self.landlord.user.name})"
 
+    @property
+    def total_occupancy(self):
+        """Total possible occupancy (number of rooms in group)."""
+        return self.grouped_properties.count()
 
-# --- Property Model (MODIFIED - added related_name for shared_areas) ---
+    @property
+    def current_occupancy(self):
+        """Current occupancy (rooms with active leases)."""
+        from rentium.leases.models import Lease
+
+        leased_rooms = set()
+        for lease in self.group_leases.filter(status=Lease.LeaseStatus.ACTIVE):
+            for lease_tenant in lease.lease_tenants.all():
+                if lease_tenant.room:
+                    leased_rooms.add(lease_tenant.room.id)
+        return len(leased_rooms)
+
+    @property
+    def current_tenants(self):
+        """List of current tenants across all rooms in the group."""
+        from rentium.leases.models import Lease
+
+        tenant_data = []
+        for lease in self.group_leases.filter(status=Lease.LeaseStatus.ACTIVE):
+            for lease_tenant in lease.lease_tenants.all():
+                if not lease_tenant.tenant:
+                    continue  # pending invite slots have no linked account yet
+                tenant_data.append(
+                    {
+                        "name": lease_tenant.tenant.user.name,
+                        "room": lease_tenant.room.name
+                        if lease_tenant.room
+                        else "Unassigned",
+                        "move_in": lease.start_date,
+                        "tenant_id": str(lease_tenant.tenant.id),
+                        "lease_id": str(lease.id),
+                    }
+                )
+        return tenant_data
+
+    @property
+    def occupancy_percentage(self):
+        total = self.total_occupancy
+        if total == 0:
+            return 0
+        return round((self.current_occupancy / total) * 100)
+
+
+# --- Public visibility -------------------------------------------------------
+class PropertyQuerySet(models.QuerySet):
+    def public(self):
+        """
+        THE visibility rule. Nothing anywhere in the codebase is allowed to
+        reimplement it — the public city pages, the landlord showcase pages,
+        the property detail page, the sitemap, and the appointments teaser all
+        go through here. Three conditions, ALL required:
+
+          1. The landlord opted in         (Showcase.is_public — default FALSE)
+          2. This property isn't hidden    (is_publicly_visible — default TRUE)
+          3. The property is AVAILABLE     (status automation keeps this true;
+                                            OCCUPIED / MAINTENANCE / NOT_AVAILABLE
+                                            self-clean out of the public site)
+
+        A landlord who has never opened Settings is invisible. That's the point.
+        """
+        return self.filter(
+            landlord__showcase__is_public=True,
+            is_publicly_visible=True,
+            status=Property.PropertyStatus.AVAILABLE,
+        )
+
+
+# --- Property Model ---
 class Property(models.Model):
     class PropertyCategory(models.TextChoices):
         COMPLETE_UNIT = "COMPLETE_UNIT", _("Complete Unit")
@@ -59,23 +230,71 @@ class Property(models.Model):
         MAINTENANCE = "MAINTENANCE", _("Under Maintenance")
         NOT_AVAILABLE = "NOT_AVAILABLE", _("Not Available")
 
+    class BuildingAmenity(models.TextChoices):
+        """
+        Only meaningful for COMPLETE_UNITs. A unit is self-contained — the only
+        things it can share are building facilities. (A ROOM's shared spaces
+        are the suite's common areas, which are already modelled by
+        PropertyGroup + Area/PropertyArea; don't duplicate them here.)
+        """
+
+        LAUNDRY = "LAUNDRY", _("Shared laundry room")
+        PARKING = "PARKING", _("Shared parking")
+        STORAGE = "STORAGE", _("Shared storage / locker")
+        LOBBY = "LOBBY", _("Shared entry / lobby")
+        YARD = "YARD", _("Shared yard / outdoor space")
+        BIKE = "BIKE", _("Bike storage")
+
     # Common fields
     landlord = models.ForeignKey(
         LandlordProfile, on_delete=models.CASCADE, related_name="properties"
     )
     name = models.CharField(_("Property Name"), max_length=255)
     description = models.TextField(_("Description"), blank=True)
-    address = models.CharField(_("Address"), max_length=255)
-    city = models.CharField(_("City"), max_length=100)
-    province = models.CharField(_("Province/State"), max_length=100)
-    postal_code = models.CharField(_("Postal/Zip Code"), max_length=20)
-    country = models.CharField(_("Country"), max_length=100)
+    # --- Location ---
+    # The landlord types ONE thing: the street address, into an autocomplete.
+    # Everything below it — city, province, postal code, neighbourhood,
+    # coordinates — is DERIVED from the address they picked (rentium/core/geo.py)
+    # and is not free text any more. A field you don't ask for is a field nobody
+    # can typo.
+    address = models.CharField(
+        _("Street Address"),
+        max_length=255,
+        help_text=_("Start typing and pick from the list — we'll fill in the rest."),
+    )
+    city = models.CharField(
+        _("City"),
+        max_length=100,
+        help_text=_("Filled in from the address you picked."),
+    )
+    province = models.CharField(
+        _("Province"),
+        max_length=2,
+        choices=Province.choices,
+        blank=True,
+        db_index=True,
+    )
+    postal_code = models.CharField(
+        _("Postal Code"),
+        max_length=7,
+        blank=True,
+        validators=[postal_code_validator],
+    )
+    country = models.CharField(_("Country"), max_length=100, default="Canada")
+
+    # Set when the address came from the autocomplete (rather than being typed
+    # blind or imported). An unverified address is the one thing that can quietly
+    # make a property unpublishable, so we track it explicitly and SAY SO on the
+    # property page instead of letting it vanish from the public site in silence.
+    address_verified = models.BooleanField(default=False, editable=False)
+
     status = models.CharField(
         _("Status"),
         max_length=20,
         choices=PropertyStatus.choices,
         default=PropertyStatus.AVAILABLE,
     )
+
     primary_image = models.ImageField(
         _("Primary Image"),
         upload_to="properties/primary/%Y/%m/",
@@ -83,6 +302,7 @@ class Property(models.Model):
         null=True,
         help_text=_("Main property image shown in listings"),
     )
+
     property_category = models.CharField(
         _("Property Category"), max_length=20, choices=PropertyCategory.choices
     )
@@ -97,6 +317,17 @@ class Property(models.Model):
     )
     max_occupancy = models.IntegerField(_("Maximum Occupancy"), null=True, blank=True)
     square_footage = models.IntegerField(_("Square Footage"), null=True, blank=True)
+
+    building_amenities = models.JSONField(
+        _("Shared Building Amenities"),
+        default=list,
+        blank=True,
+        help_text=_(
+            "Complete units only. Building facilities this unit shares with other "
+            "units (laundry, parking, storage...). A unit shares nothing else — "
+            "a ROOM's shared spaces come from its property group's common areas."
+        ),
+    )
 
     # Fields for Rooms
     room_type = models.CharField(
@@ -114,25 +345,143 @@ class Property(models.Model):
         help_text=_("Group this room belongs to (if sharing common areas)"),
     )
 
+    # ---------------------------------------------------------------- public
+    # Everything below drives the logged-out, public-facing pages. None of it
+    # is visible to anyone until the landlord opts in (see Showcase.is_public)
+    # AND this property is individually visible AND its status is AVAILABLE.
+    # See PropertyQuerySet.public() — the ONE place that rule lives.
+
+    is_publicly_visible = models.BooleanField(
+        _("Show this property publicly"),
+        default=True,
+        help_text=_(
+            "Per-property override. Turning this off hides ONE property while "
+            "leaving the rest of the landlord's public page intact. Has no effect "
+            "unless the landlord has also opted in to public pages at all."
+        ),
+    )
+    public_slug = models.SlugField(
+        _("Public URL slug"),
+        max_length=180,
+        unique=True,
+        null=True,
+        blank=True,
+        help_text=_("Auto-generated. Used in /<province>/<city>/<slug>/."),
+    )
+
+    asking_rent = models.DecimalField(
+        _("Asking Rent (monthly)"),
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=_(
+            "What you're advertising this space for. Distinct from Lease.total_rent, "
+            "which is what an ACTUAL tenancy costs — a vacant unit has no lease, so "
+            "there'd be nothing to show a prospective tenant without this."
+        ),
+    )
+    available_from = models.DateField(
+        _("Available From"),
+        null=True,
+        blank=True,
+        help_text=_("Blank = available now."),
+    )
+
+    is_furnished = models.BooleanField(
+        _("Furnished"),
+        default=False,
+        editable=False,
+        help_text=_(
+            "DERIVED, never entered by hand — computed from this property's "
+            "inventory (see properties/furnishing.py) and refreshed by signal "
+            "whenever inventory changes. Denormalised only so the public city "
+            "page can filter on it in SQL."
+        ),
+    )
+
+    # Location, coarsened. The public site NEVER renders `address` — it renders
+    # `neighbourhood, City` and a deliberately jittered map marker. Exact
+    # coordinates and street address are only ever revealed by the landlord,
+    # after an inquiry, out of band.
+    latitude = models.DecimalField(
+        max_digits=9, decimal_places=6, null=True, blank=True, editable=False
+    )
+    longitude = models.DecimalField(
+        max_digits=9, decimal_places=6, null=True, blank=True, editable=False
+    )
+    geocoded_at = models.DateTimeField(null=True, blank=True, editable=False)
+    neighbourhood = models.CharField(
+        _("Neighbourhood"),
+        max_length=120,
+        blank=True,
+        help_text=_(
+            "Shown publicly INSTEAD of the street address. Auto-filled from "
+            "geocoding; edit it if you'd rather show something else (or clear it "
+            "to show only the city)."
+        ),
+    )
+
+    # Canonical, indexed location keys for /<province>/<city>/ lookups.
+    province_code = models.CharField(
+        max_length=2, blank=True, db_index=True, editable=False
+    )
+    city_slug = models.SlugField(
+        max_length=100, blank=True, db_index=True, editable=False
+    )
+
     # Metadata
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = PropertyQuerySet.as_manager()
+
     def __str__(self):
         group_info = f" (Group: {self.group.name})" if self.group else ""
-        category_display = self.get_property_category_display()
         type_display = ""
         if self.property_category == self.PropertyCategory.COMPLETE_UNIT:
             type_display = self.get_unit_type_display() or "Unit"
         elif self.property_category == self.PropertyCategory.ROOM:
             type_display = self.get_room_type_display() or "Room"
-
         return f"{self.name} - {type_display} at {self.address}{group_info}"
 
     class Meta:
         verbose_name = _("Property")
         verbose_name_plural = _("Properties")
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["province_code", "city_slug", "status"]),
+            models.Index(fields=["is_publicly_visible", "status"]),
+        ]
+
+    # ------------------------------------------------------------------ save
+    def save(self, *args, **kwargs):
+        self.province_code = (self.province or "").lower()
+        self.postal_code = normalise_postal_code(self.postal_code)
+        self.city_slug = slugify(self.city or "")[:100]
+        if not self.public_slug:
+            self.public_slug = self._build_public_slug()
+        super().save(*args, **kwargs)
+
+    def _build_public_slug(self) -> str:
+        """
+        Stable, human, and address-free: "private-room-in-fernwood-a4f2".
+        Deliberately does NOT include the street address — the slug ends up in
+        the URL bar, in Google, and in shared links.
+        """
+        kind = (
+            self.get_room_type_display()
+            if self.property_category == self.PropertyCategory.ROOM
+            else self.get_unit_type_display()
+        ) or "rental"
+        where = self.neighbourhood or self.city or ""
+        base = slugify(f"{kind} in {where}")[:160] or "rental"
+        suffix = uuid.uuid4().hex[:4]
+        candidate = f"{base}-{suffix}"
+        while Property.objects.filter(public_slug=candidate).exists():
+            suffix = uuid.uuid4().hex[:4]
+            candidate = f"{base}-{suffix}"
+        return candidate
 
     def clean(self):
         super().clean()
@@ -147,29 +496,42 @@ class Property(models.Model):
                 raise ValidationError(
                     {"group": _("Complete units cannot belong to a property group.")}
                 )
-            # Check related areas - cannot have areas shared by others if it's a complete unit
-            if self.pk:  # Only check for existing properties
-                # Find areas primarily associated with this unit OR shared by this unit
+            if self.pk:
                 associated_areas = PropertyArea.objects.filter(
                     models.Q(property=self) | models.Q(shared_by=self)
                 ).distinct()
                 for area in associated_areas:
-                    # An area linked to a Complete Unit cannot be shared by definition
-                    # Check if its shared_by count > 1 OR if its primary property isn't this one
                     if area.shared_by.count() > 1 or (
                         area.shared_by.count() == 1 and area.shared_by.first() != self
                     ):
                         raise ValidationError(
                             _(
-                                "Areas associated with a 'Complete Unit' cannot be shared by other properties. Check area: %(area_name)s"
+                                "Areas associated with a 'Complete Unit' cannot be shared "
+                                "by other properties. Check area: %(area_name)s"
                             )
                             % {"area_name": area.get_area_type_display()}
                         )
         else:  # Room Validations
             if not self.room_type:
                 raise ValidationError({"room_type": _("Room type required for Rooms.")})
+            if self.building_amenities:
+                raise ValidationError(
+                    {
+                        "building_amenities": _(
+                            "Building amenities apply to complete units only. A room's "
+                            "shared spaces come from its property group's common areas."
+                        )
+                    }
+                )
 
-        # Group assignment consistency check
+        if self.building_amenities:
+            valid = {c.value for c in Property.BuildingAmenity}
+            invalid = set(self.building_amenities) - valid
+            if invalid:
+                raise ValidationError(
+                    {"building_amenities": _(f"Invalid amenities: {invalid}")}
+                )
+
         if self.group and self.group.landlord != self.landlord:
             raise ValidationError(
                 {
@@ -179,44 +541,98 @@ class Property(models.Model):
                 }
             )
 
-    # --- @property methods remain useful for easy access ---
+    # -------------------------------------------------------------- helpers
+    @property
+    def province_display(self) -> str:
+        return PROVINCE_NAMES.get(self.province_code, self.province or "")
+
+    @property
+    def public_location(self) -> str:
+        """The MOST precise location we will ever show a logged-out visitor."""
+        if self.neighbourhood:
+            return f"{self.neighbourhood}, {self.city}"
+        return self.city or ""
+
+    # ------------------------------------------------------- publishability
+    def publish_blockers(self) -> list[str]:
+        """
+        Why this property cannot appear publicly — in words a landlord can act on.
+
+        This exists because the old failure mode was SILENT. A typo'd province
+        produced an empty province_code, the property fell out of every public
+        query, and absolutely nothing anywhere told anyone why. The landlord's
+        experience was "I listed it and it never showed up", which is the worst
+        possible bug: invisible, unactionable, and blamed on us.
+
+        Now the property page shows exactly this list.
+        """
+        blockers = []
+
+        if not self.province:
+            blockers.append(
+                "We couldn't work out which province this is in. Re-enter the "
+                "address and pick it from the dropdown."
+            )
+        if not self.city_slug:
+            blockers.append("This property has no city.")
+        if self.asking_rent is None:
+            blockers.append(
+                "Set an asking rent — a listing without a price gets ignored."
+            )
+        if not self.primary_image:
+            blockers.append("Add at least one photo. Nobody enquires about a grey box.")
+        if self.latitude is None:
+            blockers.append(
+                "We couldn't place this address on a map. Re-enter it and pick "
+                "from the dropdown so we can find it."
+            )
+        return blockers
+
+    @property
+    def can_be_published(self) -> bool:
+        return not self.publish_blockers()
+
+    @property
+    def public_type_label(self) -> str:
+        if self.property_category == self.PropertyCategory.ROOM:
+            return {
+                self.RoomType.PRIVATE: "Private room",
+                self.RoomType.SHARED: "Shared room",
+            }.get(self.room_type, "Room")
+        return "Full suite"
+
+    def furnishing_summary(self) -> dict:
+        """{sleeping, furniture, appliances, other} — see furnishing.py."""
+        from .furnishing import summarise_inventory
+
+        return summarise_inventory(self.inventory_items.all())
+
+    # --- @property accessors kept from before ---
     @property
     def additional_images(self):
-        # Note: related_name changed from propertyimage_set to property_images
         return self.property_images.all()
 
     @property
     def primary_areas(self):
-        """Areas primarily associated (owned) by this property."""
-        # Note: related_name changed from areas to primary_area_associations
         return self.primary_area_associations.all()
 
     @property
     def private_inventory_items(self):
-        # Note: related_name changed from inventoryitem_set to inventory_items
         return self.inventory_items.all()
 
     @property
     def shared_inventory_items(self):
-        """Inventory items shared via the group this property belongs to."""
         if self.group:
-            # Note: related_name changed from shared_items to group_shared_inventory
             return self.group.group_shared_inventory.all()
-        try:
-            SharedInventoryItem  # Check if defined
-        except NameError:
-            return None
         return SharedInventoryItem.objects.none()
 
-    # We also have access to `self.shared_areas` via the M2M related_name
 
-
-# --- PropertyImage Model (MODIFIED related_name) ---
+# --- PropertyImage Model ---
 class PropertyImage(models.Model):
     property = models.ForeignKey(
         Property,
         on_delete=models.CASCADE,
-        related_name="property_images",  # Changed related_name
+        related_name="property_images",
     )
     image = models.ImageField(_("Image"), upload_to="properties/additional/%Y/%m/")
     caption = models.CharField(_("Caption"), max_length=255, blank=True)
@@ -232,14 +648,14 @@ class PropertyImage(models.Model):
         return f"Image for {self.property.name} ({self.id})"
 
 
-# --- PropertyArea Model (MAJOR CHANGES) ---
+# --- PropertyArea Model ---
 class PropertyArea(models.Model):
     class AreaType(models.TextChoices):
         KITCHEN = "KITCHEN", _("Kitchen")
         BATHROOM = "BATHROOM", _("Bathroom")
         LIVING_ROOM = "LIVING_ROOM", _("Living Room")
         DINING_ROOM = "DINING_ROOM", _("Dining Room")
-        BEDROOM = "BEDROOM", _("Bedroom")  # Could be private or shared common bedroom?
+        BEDROOM = "BEDROOM", _("Bedroom")
         LAUNDRY = "LAUNDRY", _("Laundry Area")
         OFFICE = "OFFICE", _("Office/Den")
         BALCONY = "BALCONY", _("Balcony/Patio")
@@ -249,11 +665,10 @@ class PropertyArea(models.Model):
         GARDEN = "GARDEN", _("Garden/Yard")
         OTHER = "OTHER", _("Other")
 
-    # Primary association - which property "owns" this area record?
     property = models.ForeignKey(
         Property,
         on_delete=models.CASCADE,
-        related_name="primary_area_associations",  # Changed related_name
+        related_name="primary_area_associations",
         help_text=_("The primary property this area belongs to."),
     )
     area_type = models.CharField(
@@ -265,18 +680,22 @@ class PropertyArea(models.Model):
     description = models.TextField(
         _("Area Description"), blank=True, help_text=_("Optional details")
     )
-
-    # NEW: ManyToMany field to define which properties share this specific area
     shared_by = models.ManyToManyField(
         Property,
-        related_name="shared_areas",  # Properties can access areas they share
-        blank=True,  # Can be empty if not shared (private to 'property')
+        related_name="shared_areas",
+        blank=True,
         verbose_name=_("Shared By Properties"),
         help_text=_("Select ROOM properties that share access to this area."),
     )
-    # REMOVED: is_shared (boolean)
-    # REMOVED: is_private_to_room (boolean)
-
+    shared_with_landlord = models.BooleanField(
+        _("Shared with Landlord"),
+        default=False,
+        help_text=_(
+            "The landlord or their immediate relatives also live here and "
+            "use this area (kitchen/bathroom/common space). Affects whether "
+            "the provincial tenancy act applies to leases on these rooms."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -284,38 +703,26 @@ class PropertyArea(models.Model):
         verbose_name = _("Property Area")
         verbose_name_plural = _("Property Areas")
         ordering = ["property", "area_type"]
-        # unique_together removed as an area type might be shared differently now
-        # unique_together = ("property", "area_type") # Reconsider if needed
 
     def __str__(self):
-        # The M2M field isn't available until saved, so str might not reflect sharing status accurately immediately
         share_count = self.shared_by.count() if self.pk else 0
-        status = ""
         if share_count == 1 and self.shared_by.first() == self.property:
-            status = " (Private)"  # Only shared by its primary property
+            status = " (Private)"
         elif share_count > 0:
             status = f" (Shared by {share_count} properties)"
         else:
-            status = (
-                " (Private - not explicitly shared)"  # Default if shared_by is empty
-            )
-
+            status = " (Private - not explicitly shared)"
+        if self.pk and self.shared_with_landlord:
+            status += " [shared with landlord]"
         return f"{self.get_area_type_display()} ({self.count}) in {self.property.name}{status}"
 
     def clean(self):
-        """
-        Basic clean. Complex M2M validation (group consistency) is better
-        handled in the serializer or view after M2M save.
-        """
         super().clean()
-        # Ensure the primary property isn't a COMPLETE_UNIT if trying to share
-        # (More robust checks needed post-M2M save)
         if hasattr(self, "property") and self.property:
             if (
                 self.property.property_category
                 == Property.PropertyCategory.COMPLETE_UNIT
             ):
-                # Check if shared_by has entries during update (can't check on create easily here)
                 if (
                     self.pk
                     and self.shared_by.exists()
@@ -326,12 +733,13 @@ class PropertyArea(models.Model):
                 ):
                     raise ValidationError(
                         _(
-                            "Areas primarily associated with a 'Complete Unit' cannot be shared by other properties."
+                            "Areas primarily associated with a 'Complete Unit' cannot be "
+                            "shared by other properties."
                         )
                     )
 
 
-# --- InventoryItem Model (Private - MODIFIED related_name) ---
+# --- InventoryItem Model (Private) ---
 class InventoryItem(models.Model):
     class ItemCondition(models.TextChoices):
         NEW = "NEW", _("New")
@@ -344,7 +752,7 @@ class InventoryItem(models.Model):
     property = models.ForeignKey(
         Property,
         on_delete=models.CASCADE,
-        related_name="inventory_items",  # Changed related_name
+        related_name="inventory_items",
     )
     name = models.CharField(
         _("Item Name"), max_length=200, help_text=_("e.g., Bedside Lamp")
@@ -376,9 +784,9 @@ class InventoryItem(models.Model):
         return f"{self.name} (Qty: {self.quantity}) in {self.property.name}"
 
 
-# --- SharedInventoryItem Model (New - MODIFIED related_name) ---
+# --- SharedInventoryItem Model ---
 class SharedInventoryItem(models.Model):
-    class ItemCondition(models.TextChoices):  # Keep consistent choices
+    class ItemCondition(models.TextChoices):
         NEW = "NEW", _("New")
         GOOD = "GOOD", _("Good")
         FAIR = "FAIR", _("Fair")
@@ -389,7 +797,7 @@ class SharedInventoryItem(models.Model):
     group = models.ForeignKey(
         PropertyGroup,
         on_delete=models.CASCADE,
-        related_name="group_shared_inventory",  # Changed related_name
+        related_name="group_shared_inventory",
     )
     name = models.CharField(
         _("Item Name"), max_length=200, help_text=_("e.g., Microwave Oven")
@@ -420,49 +828,5 @@ class SharedInventoryItem(models.Model):
     def __str__(self):
         return f"{self.name} (Qty: {self.quantity}) (Shared in {self.group.name})"
 
-# Add these methods to the PropertyGroup model in rentium/properties/models.py
 
-@property
-def total_occupancy(self):
-    """Total possible occupancy (number of rooms in group)"""
-    return self.grouped_properties.count()
-
-@property
-def current_occupancy(self):
-    """Current occupancy (rooms with active leases)"""
-    from rentium.leases.models import Lease
-    
-    leased_rooms = set()
-    for lease in self.group_leases.filter(status=Lease.LeaseStatus.ACTIVE):
-        for lease_tenant in lease.lease_tenants.all():
-            if lease_tenant.room:
-                leased_rooms.add(lease_tenant.room.id)
-    
-    return len(leased_rooms)
-
-@property
-def current_tenants(self):
-    """List of current tenants across all rooms in the group"""
-    from rentium.leases.models import Lease
-    
-    tenant_data = []
-    for lease in self.group_leases.filter(status=Lease.LeaseStatus.ACTIVE):
-        for lease_tenant in lease.lease_tenants.all():
-            tenant_data.append({
-                'name': lease_tenant.tenant.user.name,
-                'room': lease_tenant.room.name if lease_tenant.room else "Unassigned",
-                'move_in': lease.start_date,
-                'tenant_id': str(lease_tenant.tenant.id),
-                'lease_id': str(lease.id)
-            })
-    
-    return tenant_data
-
-# occupancy_percentage property in PropertyGroup model
-@property
-def occupancy_percentage(self):
-    """Calculate occupancy percentage"""
-    total = self.total_occupancy
-    if total == 0:
-        return 0
-    return round((self.current_occupancy / total) * 100)
+from .areas import Area  # noqa: E402,F401  (keeps migrations picking Area up)

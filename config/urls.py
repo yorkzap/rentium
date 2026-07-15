@@ -9,10 +9,12 @@ from django.views import defaults as default_views
 from django.views.generic import TemplateView
 from drf_spectacular.views import SpectacularAPIView
 from drf_spectacular.views import SpectacularSwaggerView
+
+from rentium.appointments.api import urls as appointments_urls
+from rentium.showcase.api import urls as showcase_urls
 from rentium.users.api.views import verify_email_confirm
 from rentium.users.api.views import CustomObtainAuthToken
 from rentium.users.api.views import resend_verification_email
-
 
 urlpatterns = [
     path("", TemplateView.as_view(template_name="pages/home.html"), name="home"),
@@ -26,26 +28,31 @@ urlpatterns = [
     # User management
     path("users/", include("rentium.users.urls", namespace="users")),
     path("accounts/", include("allauth.urls")),
-    # Your stuff: custom urls includes go here
     # Media files
     *static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT),
 ]
 
 if settings.DEBUG:
-    # Static file serving when using Gunicorn + Uvicorn for local web socket development
     urlpatterns += staticfiles_urlpatterns()
 
 # API URLS
 urlpatterns += [
-    # Include user API URLs first (order matters)
     path("api/users/", include("rentium.users.api.urls")),
-    
-    # Register hierarchical endpoints - all under leases namespace
     path("api/leases/", include("rentium.leases.api.urls", namespace="leases_api")),
-    
-    # API base url for root-level resources
+    path(
+        "api/properties/",
+        include("rentium.properties.api.urls", namespace="properties_api"),
+    ),
+    # Root-level cross-app resources ONLY (users/landlords/tenants). Do not add
+    # domain viewsets (leases, properties, etc.) here — see config/api_router.py
+    # for why: registering the same viewset in two places causes silent URL
+    # shadowing.
     path("api/", include("config.api_router")),
-    
+    # Notifications feed. The events router registers "notifications", so this
+    # include yields /api/notifications/, /unread_count/, etc. It must be a
+    # separate include because the events router was never part of
+    # config.api_router.
+    path("api/", include("rentium.events.api.urls")),
     # DRF auth token
     path("api/auth-token/", CustomObtainAuthToken.as_view(), name="auth-token"),
     path("api/schema/", SpectacularAPIView.as_view(), name="api-schema"),
@@ -64,11 +71,59 @@ urlpatterns += [
         resend_verification_email,
         name="resend-verification",
     ),
+    path("api/ledger/", include("rentium.ledger.api.urls")),
+    path("api/maintenance/", include("rentium.maintenance.api.urls")),
+    path("api/messaging/", include("rentium.messaging.api.urls")),
+    path("api/agenda/", include("rentium.agenda.api.urls")),
+    path(
+        "api/appointments/",
+        include(
+            (appointments_urls.urlpatterns, "appointments"),
+            namespace="appointments_api",
+        ),
+    ),
+    # =======================================================================
+    # PUBLIC, UNAUTHENTICATED SURFACE
+    #
+    # Every route below /api/public/ is reachable by anyone on the internet with
+    # no token. They are mounted here, together, deliberately: the whole public
+    # surface of this application is these eight lines, and a reviewer can see
+    # all of it without opening a single viewset.
+    #
+    # DEFAULT_PERMISSION_CLASSES is IsAuthenticated, so each of these views has to
+    # declare AllowAny explicitly to work at all. You cannot accidentally publish
+    # an endpoint in this codebase — publishing one requires writing the word
+    # AllowAny, and that shows up in a diff.
+    #
+    # Two includes share the prefix. They don't collide: appointments owns
+    # properties/ and viewing-requests/; showcase owns cities/, l/, listings/,
+    # inquiries/ and sitemap-data/. Keeping them as separate lists (rather than
+    # merging them) is what makes the auth boundary legible from this file.
+    # =======================================================================
+    path(
+        "api/public/",
+        include(
+            (appointments_urls.public_urlpatterns, "appointments_public"),
+            namespace="appointments_public",
+        ),
+    ),
+    path(
+        "api/public/",
+        include(
+            (showcase_urls.public_urlpatterns, "showcase_public"),
+            namespace="showcase_public",
+        ),
+    ),
+    # Landlord-authenticated showcase surface: the opt-in settings page, the
+    # inquiry inbox, and address autocomplete (which proxies Geoapify so its key
+    # never reaches a browser).
+    path(
+        "api/showcase/",
+        include((showcase_urls.urlpatterns, "showcase"), namespace="showcase"),
+    ),
 ]
 
 if settings.DEBUG:
-    # This allows the error pages to be debugged during development, just visit
-    # these url in browser to see how these error pages look like.
     urlpatterns += [
         path(
             "400/",
@@ -87,6 +142,7 @@ if settings.DEBUG:
         ),
         path("500/", default_views.server_error),
     ]
+
     if "debug_toolbar" in settings.INSTALLED_APPS:
         import debug_toolbar
 

@@ -1,0 +1,3140 @@
+
+========================================
+FILE: ./signals.py
+========================================
+
+# rentium/ledger/signals.py
+"""
+Integration signals — the glue that fires business hooks no matter how a row
+is created (API, admin, shell, or import). Wired in LedgerConfig.ready().
+
+Everything here is idempotent and skips fixture loads (`raw`), so it's safe
+to fire on every save. Lazy string senders ("app.Model") avoid import cycles.
+"""
+
+import logging
+
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+from django.utils import timezone
+
+logger = logging.getLogger(__name__)
+
+
+# --- RentAdjustment -> ledger reconciliation ------------------------------
+@receiver(
+    post_save, sender="leases.RentAdjustment", dispatch_uid="adjustment_to_ledger"
+)
+def apply_rent_adjustment(sender, instance, created, raw=False, **kwargs):
+    """
+    When a rent adjustment lands on an ACTIVE lease, reconcile existing rent
+    charges (void+repost unpaid ones, credit partially-paid ones — never
+    mutate a posted entry). Before activation there are no charges yet, so
+    this is a no-op and the first charge is simply generated at the adjusted
+    amount. Re-saves are naturally idempotent.
+    """
+    if raw:
+        return
+    lease = instance.lease_tenant.lease
+    if lease.status != lease.LeaseStatus.ACTIVE:
+        return
+    try:
+        from rentium.ledger.billing import apply_adjustment_to_ledger
+
+        apply_adjustment_to_ledger(instance.lease_tenant, instance)
+    except Exception:  # never let a hook break the save
+        logger.exception(
+            "apply_adjustment_to_ledger failed for adjustment %s", instance.pk
+        )
+
+
+# --- Default areas on property / group creation ---------------------------
+@receiver(post_save, sender="properties.PropertyGroup", dispatch_uid="seed_group_areas")
+def seed_group_areas(sender, instance, created, raw=False, **kwargs):
+    if raw or not created:
+        return
+    try:
+        from rentium.properties.areas import seed_default_areas
+
+        seed_default_areas(group=instance)
+    except Exception:
+        logger.exception("seed_default_areas(group=%s) failed", instance.pk)
+
+
+@receiver(post_save, sender="properties.Property", dispatch_uid="seed_property_areas")
+def seed_property_areas(sender, instance, created, raw=False, **kwargs):
+    """Standalone complete units get their own areas; rooms rely on the
+    group's areas (plus the room itself)."""
+    if raw or not created:
+        return
+    from rentium.properties.models import Property
+
+    if instance.property_category != Property.PropertyCategory.COMPLETE_UNIT:
+        return
+    try:
+        from rentium.properties.areas import seed_default_areas
+
+        seed_default_areas(property=instance)
+    except Exception:
+        logger.exception("seed_default_areas(property=%s) failed", instance.pk)
+
+
+# --- Lease end -> close occupancy log -------------------------------------
+@receiver(post_save, sender="leases.Lease", dispatch_uid="close_occupancies_on_end")
+def close_occupancies_on_end(sender, instance, raw=False, **kwargs):
+    """Terminated/expired leases close their open occupancy rows. Idempotent:
+    only rows still marked ongoing are touched."""
+    if raw:
+        return
+    if instance.status not in (
+        instance.LeaseStatus.TERMINATED,
+        instance.LeaseStatus.EXPIRED,
+    ):
+        return
+    try:
+        from rentium.leases.occupancy import close_lease_occupancies
+
+        move_out = instance.move_out_date or instance.end_date or timezone.now().date()
+        close_lease_occupancies(instance, move_out=move_out)
+    except Exception:
+        logger.exception("close_lease_occupancies failed for lease %s", instance.pk)
+
+
+# --- LeaseTenant join/leave on an ACTIVE lease ----------------------------
+@receiver(post_save, sender="leases.LeaseTenant", dispatch_uid="sync_tenant_occupancy")
+def sync_tenant_occupancy(sender, instance, raw=False, **kwargs):
+    """
+    Handles roommates who join or leave a lease that is ALREADY active
+    (initial activation is handled explicitly in check_and_activate):
+
+    - a tenant who becomes LINKED (claims their invite / gets attached to a
+      TenantProfile)          -> open their occupancy + materialize their
+      rent schedule right away (don't wait for the nightly task);
+    - a tenant who declines   -> close their occupancy.
+
+    NOTE — linked, not signed, is deliberately the trigger. This mirrors
+    check_and_activate(), which opens occupancy and generates charges for
+    every lease_tenants.filter(tenant__isnull=False, declined=False) row,
+    signed or not — and generate_rent_charges_for_lease() itself uses the
+    same filter. Per the joint-and-several policy, an unsigned-but-linked
+    tenant still owes rent, so "Expected This Month" must include them and
+    utility splits must weight them. The previous version gated all of
+    this on instance.has_signed, so a tenant who linked their account
+    AFTER activation never got a rent charge or occupancy row — that made
+    the landlord dashboard show only the signed tenants' shares (e.g.
+    $600 instead of $1,200 on a two-tenant, $1,200 lease) and dumped 100%
+    of any utility split on the signed tenant.
+
+    All operations are idempotent (occupancy open/close checks state;
+    charges use natural idempotency keys), so re-saves are safe.
+    """
+    if raw:
+        return
+    lease = instance.lease
+    if lease.status != lease.LeaseStatus.ACTIVE:
+        return
+    try:
+        from rentium.leases.occupancy import close_occupancy
+        from rentium.leases.occupancy import open_occupancy
+
+        if instance.declined:
+            close_occupancy(instance)
+            return
+        if instance.tenant_id:
+            open_occupancy(instance)
+            from rentium.ledger.billing import generate_rent_charges_for_lease
+
+            generate_rent_charges_for_lease(lease)
+    except Exception:
+        logger.exception(
+            "sync_tenant_occupancy failed for lease_tenant %s", instance.pk
+        )
+
+
+========================================
+FILE: ./migrations/0002_initial.py
+========================================
+
+# Generated by Django 5.0.12 on 2026-07-02 15:23
+
+import django.db.models.deletion
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    initial = True
+
+    dependencies = [
+        ('ledger', '0001_initial'),
+        ('maintenance', '0001_initial'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='ledgerentry',
+            name='work_order',
+            field=models.ForeignKey(blank=True, help_text='Expense/charge tied to a maintenance job, if any.', null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='ledger_entries', to='maintenance.workorder'),
+        ),
+        migrations.AddField(
+            model_name='ledgerattachment',
+            name='entry',
+            field=models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='attachments', to='ledger.ledgerentry'),
+        ),
+        migrations.AddIndex(
+            model_name='ledgerentry',
+            index=models.Index(fields=['landlord', 'entry_type', 'effective_date'], name='ledger_ledg_landlor_ce0587_idx'),
+        ),
+        migrations.AddIndex(
+            model_name='ledgerentry',
+            index=models.Index(fields=['lease', 'entry_type', 'due_date'], name='ledger_ledg_lease_i_e1afed_idx'),
+        ),
+        migrations.AddConstraint(
+            model_name='ledgerentry',
+            constraint=models.CheckConstraint(check=models.Q(('amount__gt', 0)), name='ledger_amount_positive'),
+        ),
+    ]
+
+
+========================================
+FILE: ./migrations/0003_alter_ledgerentry_tenant.py
+========================================
+
+# Generated by Django 5.0.12 on 2026-07-10 03:35
+
+import django.db.models.deletion
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('ledger', '0002_initial'),
+        ('users', '0005_alter_user_managers_remove_user_username_and_more'),
+    ]
+
+    operations = [
+        migrations.AlterField(
+            model_name='ledgerentry',
+            name='tenant',
+            field=models.ForeignKey(blank=True, help_text='Charges: who owes it — NULL with a lease set means the whole household owes it jointly. Payments: who paid.', null=True, on_delete=django.db.models.deletion.PROTECT, related_name='ledger_entries', to='users.tenantprofile'),
+        ),
+    ]
+
+
+========================================
+FILE: ./migrations/__init__.py
+========================================
+
+
+
+========================================
+FILE: ./migrations/0001_initial.py
+========================================
+
+# Generated by Django 5.0.12 on 2026-07-02 15:23
+
+import django.db.models.deletion
+import uuid
+from django.conf import settings
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    initial = True
+
+    dependencies = [
+        ('leases', '0007_alter_lease_lease_type'),
+        ('properties', '0007_area_area_area_belongs_to_group_xor_property'),
+        ('users', '0005_alter_user_managers_remove_user_username_and_more'),
+        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name='LedgerAttachment',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('file', models.FileField(upload_to='ledger_attachments/%Y/%m/', verbose_name='File')),
+                ('label', models.CharField(blank=True, max_length=150, verbose_name='Label')),
+                ('created_at', models.DateTimeField(auto_now_add=True)),
+                ('uploaded_by', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=settings.AUTH_USER_MODEL)),
+            ],
+            options={
+                'ordering': ['created_at'],
+            },
+        ),
+        migrations.CreateModel(
+            name='LedgerEntry',
+            fields=[
+                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                ('entry_type', models.CharField(choices=[('RENT_CHARGE', 'Rent Charge'), ('UTILITY_CHARGE', 'Utility Charge'), ('DEPOSIT_CHARGE', 'Deposit Charge'), ('FEE_CHARGE', 'Fee Charge'), ('OTHER_CHARGE', 'Other Charge'), ('PAYMENT', 'Payment Received'), ('CREDIT', 'Credit / Discount'), ('EXPENSE', 'Expense'), ('DEPOSIT_RETURN', 'Deposit Returned'), ('REVERSAL', 'Reversal (void)')], db_index=True, max_length=20, verbose_name='Type')),
+                ('amount', models.DecimalField(decimal_places=2, help_text='Always positive; the entry type carries the direction.', max_digits=12, verbose_name='Amount')),
+                ('due_date', models.DateField(blank=True, db_index=True, help_text='Charges only.', null=True, verbose_name='Due Date')),
+                ('effective_date', models.DateField(db_index=True, help_text='Service period start / payment date / date incurred.', verbose_name='Effective Date')),
+                ('description', models.CharField(max_length=255, verbose_name='Description')),
+                ('payment_method', models.CharField(blank=True, choices=[('ETRANSFER', 'e-Transfer'), ('CASH', 'Cash'), ('CHEQUE', 'Cheque'), ('OTHER', 'Other')], default='', help_text='PAYMENT / DEPOSIT_RETURN entries.', max_length=12, verbose_name='Payment Method')),
+                ('reference_number', models.CharField(blank=True, max_length=100, verbose_name='Reference #')),
+                ('category', models.CharField(blank=True, choices=[('MAINTENANCE', 'Maintenance / Repairs'), ('UTILITIES', 'Utilities (landlord-paid)'), ('INSURANCE', 'Insurance'), ('PROPERTY_TAX', 'Property Tax'), ('MORTGAGE', 'Mortgage / Financing'), ('STRATA', 'Strata / HOA Fees'), ('MANAGEMENT', 'Management / Professional Fees'), ('SUPPLIES', 'Supplies / Furnishings'), ('ADVERTISING', 'Advertising / Listing'), ('OTHER', 'Other')], default='', max_length=20, verbose_name='Expense Category')),
+                ('vendor', models.CharField(blank=True, max_length=150, verbose_name='Vendor / Payee')),
+                ('idempotency_key', models.CharField(blank=True, help_text='Natural key for generated entries; client-generated UUID for API writes. Duplicate submissions are rejected by the database.', max_length=180, null=True, unique=True, verbose_name='Idempotency Key')),
+                ('metadata', models.JSONField(blank=True, default=dict, verbose_name='Metadata')),
+                ('created_at', models.DateTimeField(auto_now_add=True, db_index=True)),
+                ('created_by', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='ledger_entries_created', to=settings.AUTH_USER_MODEL)),
+                ('landlord', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='ledger_entries', to='users.landlordprofile')),
+                ('lease', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='ledger_entries', to='leases.lease')),
+                ('property', models.ForeignKey(blank=True, help_text='The ledger this entry belongs to. NULL = portfolio-wide (e.g. accountant fees).', null=True, on_delete=django.db.models.deletion.PROTECT, related_name='ledger_entries', to='properties.property')),
+                ('reverses', models.OneToOneField(blank=True, help_text='For REVERSAL: the entry this voids. OneToOne — an entry can be voided exactly once.', null=True, on_delete=django.db.models.deletion.PROTECT, related_name='reversed_by', to='ledger.ledgerentry')),
+                ('settles', models.ForeignKey(blank=True, help_text='For PAYMENT/CREDIT: the charge this settles.', null=True, on_delete=django.db.models.deletion.PROTECT, related_name='settlements', to='ledger.ledgerentry')),
+                ('tenant', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='ledger_entries', to='users.tenantprofile')),
+            ],
+            options={
+                'verbose_name': 'Ledger Entry',
+                'verbose_name_plural': 'Ledger Entries',
+                'ordering': ['-effective_date', '-created_at'],
+            },
+        ),
+    ]
+
+
+========================================
+FILE: ./services.py
+========================================
+
+"""
+Service layer: every ledger write in the app goes through these functions,
+so idempotency, event publishing, and validation happen in exactly one place.
+Views, Celery tasks, and (later) the AI controller all call the same code.
+"""
+
+from datetime import date
+from decimal import Decimal
+
+from django.db import IntegrityError
+from django.db import transaction
+from django.utils import timezone
+
+from rentium.events.registry import publish
+
+from .models import CHARGE_TYPES
+from .models import INCOME_CHARGE_TYPES
+from .models import SETTLEMENT_TYPES
+from .models import EntryType
+from .models import LedgerEntry
+
+
+class LedgerError(Exception):
+    pass
+
+
+def _get_by_idempotency_key(key):
+    if not key:
+        return None
+    return LedgerEntry.objects.filter(idempotency_key=key).first()
+
+
+def post_entry(**fields) -> tuple[LedgerEntry, bool]:
+    """
+    Post one entry. Returns (entry, created). If the idempotency key already
+    exists, the ORIGINAL entry is returned with created=False — a duplicate
+    submission is a successful no-op, never an error and never a double-post.
+    """
+    key = fields.get("idempotency_key")
+    existing = _get_by_idempotency_key(key)
+    if existing:
+        return existing, False
+    try:
+        with transaction.atomic():
+            entry = LedgerEntry(**fields)
+            entry.save()
+    except IntegrityError:
+        # Raced with a concurrent identical submission — return the winner.
+        existing = _get_by_idempotency_key(key)
+        if existing:
+            return existing, False
+        raise
+    return entry, True
+
+
+def post_charge(
+    *,
+    landlord,
+    tenant,
+    amount,
+    due_date,
+    entry_type=EntryType.OTHER_CHARGE,
+    lease=None,
+    property=None,
+    description="",
+    idempotency_key=None,
+    created_by=None,
+    metadata=None,
+    work_order=None,
+) -> tuple[LedgerEntry, bool]:
+    """tenant=None with a lease = joint household charge (roommate leases)."""
+    if entry_type not in CHARGE_TYPES:
+        raise LedgerError(f"{entry_type} is not a charge type.")
+    if tenant is None and lease is None:
+        raise LedgerError("A charge needs a tenant, or a lease for a joint charge.")
+    entry, created = post_entry(
+        landlord=landlord,
+        property=property or (lease.property if lease and lease.property_id else None),
+        lease=lease,
+        tenant=tenant,
+        entry_type=entry_type,
+        amount=Decimal(amount),
+        due_date=due_date,
+        effective_date=due_date,
+        description=description,
+        idempotency_key=idempotency_key,
+        created_by=created_by,
+        metadata=metadata or {},
+        work_order=work_order,
+    )
+    if created:
+        publish(
+            "ledger.charge_posted",
+            {
+                "entry_id": str(entry.id),
+                "entry_type": entry.entry_type,
+                "amount": str(entry.amount),
+                "due_date": str(entry.due_date),
+                "tenant_id": str(tenant.pk) if tenant else None,
+                "joint": tenant is None,
+            },
+            property_id=entry.property_id,
+            lease_id=entry.lease_id,
+        )
+    return entry, created
+
+
+def record_payment(
+    *,
+    charge: LedgerEntry,
+    amount,
+    payment_method,
+    payment_date=None,
+    reference_number="",
+    idempotency_key=None,
+    created_by=None,
+    notes="",
+    paid_by=None,
+) -> tuple[LedgerEntry, bool]:
+    """
+    Landlord confirms money received (e-transfer arrived, cash in hand).
+    Money never moves through the app — this is the book entry.
+
+    `paid_by` (TenantProfile) records WHO paid. It matters most on joint
+    household charges (charge.tenant is None): either roommate can send
+    $400 — or the full $800 — and each payment still names its payer, so
+    the household balance clears collectively while who-paid-what stays
+    on the record. Defaults to charge.tenant for split-billing charges.
+    """
+    if charge.entry_type not in CHARGE_TYPES:
+        raise LedgerError("Payments must be recorded against a charge.")
+    if charge.voided:
+        raise LedgerError("This charge has been voided; post a new charge first.")
+    amount = Decimal(amount)
+    if amount <= 0:
+        raise LedgerError("Payment amount must be positive.")
+    payer = paid_by or charge.tenant
+    entry, created = post_entry(
+        landlord=charge.landlord,
+        property=charge.property,
+        lease=charge.lease,
+        tenant=payer,
+        entry_type=EntryType.PAYMENT,
+        amount=amount,
+        effective_date=payment_date or date.today(),
+        description=notes or f"Payment toward: {charge.description}",
+        settles=charge,
+        payment_method=payment_method,
+        reference_number=reference_number,
+        idempotency_key=idempotency_key,
+        created_by=created_by,
+    )
+    if created:
+        publish(
+            "ledger.payment_posted",
+            {
+                "entry_id": str(entry.id),
+                "charge_id": str(charge.id),
+                "amount": str(amount),
+                "method": payment_method,
+                "paid_by": str(payer.pk) if payer else None,
+                "charge_status": charge.charge_status(),
+            },
+            property_id=entry.property_id,
+            lease_id=entry.lease_id,
+        )
+    return entry, created
+
+
+def post_credit(
+    *,
+    charge: LedgerEntry,
+    amount,
+    reason,
+    idempotency_key=None,
+    created_by=None,
+    metadata=None,
+) -> tuple[LedgerEntry, bool]:
+    """A discount/goodwill credit against a charge. The charge keeps its
+    original amount (audit truth: 'rent was $1,300, landlord credited $200')."""
+    if charge.entry_type not in CHARGE_TYPES:
+        raise LedgerError("Credits apply to charges.")
+    if charge.voided:
+        raise LedgerError("This charge has been voided.")
+    amount = Decimal(amount)
+    if amount <= 0:
+        raise LedgerError("Credit amount must be positive.")
+    entry, created = post_entry(
+        landlord=charge.landlord,
+        property=charge.property,
+        lease=charge.lease,
+        tenant=charge.tenant,
+        entry_type=EntryType.CREDIT,
+        amount=amount,
+        effective_date=date.today(),
+        description=reason or f"Credit toward: {charge.description}",
+        settles=charge,
+        idempotency_key=idempotency_key,
+        created_by=created_by,
+        metadata=metadata or {},
+    )
+    if created:
+        publish(
+            "ledger.credit_posted",
+            {
+                "entry_id": str(entry.id),
+                "charge_id": str(charge.id),
+                "amount": str(amount),
+            },
+            property_id=entry.property_id,
+            lease_id=entry.lease_id,
+        )
+    return entry, created
+
+
+def post_expense(
+    *,
+    landlord,
+    amount,
+    category,
+    description,
+    incurred_date=None,
+    property=None,
+    vendor="",
+    work_order=None,
+    idempotency_key=None,
+    created_by=None,
+    metadata=None,
+) -> tuple[LedgerEntry, bool]:
+    entry, created = post_entry(
+        landlord=landlord,
+        property=property,
+        entry_type=EntryType.EXPENSE,
+        amount=Decimal(amount),
+        effective_date=incurred_date or date.today(),
+        description=description,
+        category=category,
+        vendor=vendor,
+        work_order=work_order,
+        idempotency_key=idempotency_key,
+        created_by=created_by,
+        metadata=metadata or {},
+    )
+    if created:
+        publish(
+            "ledger.expense_posted",
+            {
+                "entry_id": str(entry.id),
+                "amount": str(entry.amount),
+                "category": category,
+            },
+            property_id=entry.property_id,
+        )
+    return entry, created
+
+
+def void_entry(entry: LedgerEntry, *, reason, created_by=None) -> LedgerEntry:
+    """
+    Void = post an equal-and-opposite REVERSAL. Rules:
+    - a charge with live (non-voided) settlements can't be voided —
+      void the payments first, so money received is never orphaned;
+    - voiding a payment/credit automatically 'reopens' the charge,
+      because computed status ignores voided settlements.
+    """
+    if entry.voided:
+        raise LedgerError("Entry is already voided.")
+    if entry.entry_type == EntryType.REVERSAL:
+        raise LedgerError("Reversals cannot be voided.")
+    if entry.entry_type in CHARGE_TYPES:
+        live = entry.settlements.filter(
+            entry_type__in=SETTLEMENT_TYPES, reversed_by__isnull=True
+        ).exists()
+        if live:
+            raise LedgerError(
+                "This charge has payments/credits recorded against it. Void those first."
+            )
+    with transaction.atomic():
+        reversal = LedgerEntry(
+            landlord=entry.landlord,
+            property=entry.property,
+            lease=entry.lease,
+            tenant=entry.tenant,
+            entry_type=EntryType.REVERSAL,
+            amount=entry.amount,
+            effective_date=date.today(),
+            description=f"VOID: {entry.description} — {reason}",
+            reverses=entry,
+            created_by=created_by,
+            metadata={"reason": reason},
+        )
+        reversal.save()
+    publish(
+        "ledger.entry_voided",
+        {"entry_id": str(entry.id), "reversal_id": str(reversal.id), "reason": reason},
+        property_id=entry.property_id,
+        lease_id=entry.lease_id,
+    )
+    return reversal
+
+
+def correct_entry(
+    entry: LedgerEntry, *, created_by=None, reason="Correction", **new_fields
+) -> LedgerEntry:
+    """
+    The 'edit' the frontend exposes: atomically void the old entry and post
+    a corrected copy. Painless typo fix for the landlord, intact audit trail
+    for everyone else.
+    """
+    with transaction.atomic():
+        void_entry(entry, reason=reason, created_by=created_by)
+        data = {
+            "landlord": entry.landlord,
+            "property": entry.property,
+            "lease": entry.lease,
+            "tenant": entry.tenant,
+            "entry_type": entry.entry_type,
+            "amount": entry.amount,
+            "due_date": entry.due_date,
+            "effective_date": entry.effective_date,
+            "description": entry.description,
+            "settles": entry.settles,
+            "payment_method": entry.payment_method,
+            "reference_number": entry.reference_number,
+            "category": entry.category,
+            "vendor": entry.vendor,
+            "work_order": entry.work_order,
+            "metadata": {**entry.metadata, "corrects": str(entry.id)},
+            "created_by": created_by,
+        }
+        data.update(new_fields)
+        data.pop("idempotency_key", None)  # a correction is a new fact
+        replacement = LedgerEntry(**data)
+        replacement.save()
+    return replacement
+
+
+def post_deposit_return(
+    *,
+    landlord,
+    tenant,
+    amount,
+    lease=None,
+    property=None,
+    description="Deposit returned",
+    payment_method="ETRANSFER",
+    created_by=None,
+    idempotency_key=None,
+) -> tuple[LedgerEntry, bool]:
+    return post_entry(
+        landlord=landlord,
+        property=property or (lease.property if lease and lease.property_id else None),
+        lease=lease,
+        tenant=tenant,
+        entry_type=EntryType.DEPOSIT_RETURN,
+        amount=Decimal(amount),
+        effective_date=date.today(),
+        description=description,
+        payment_method=payment_method,
+        created_by=created_by,
+        idempotency_key=idempotency_key,
+    )
+
+
+def deposits_held(landlord) -> Decimal:
+    """Payments settling DEPOSIT_CHARGEs, minus deposit returns (liability)."""
+    from django.db.models import Sum
+
+    received = LedgerEntry.objects.not_voided().filter(
+        landlord=landlord,
+        entry_type=EntryType.PAYMENT,
+        settles__entry_type=EntryType.DEPOSIT_CHARGE,
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+    returned = LedgerEntry.objects.not_voided().filter(
+        landlord=landlord, entry_type=EntryType.DEPOSIT_RETURN
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+    return received - returned
+
+
+========================================
+FILE: ./tasks.py
+========================================
+
+# tasks.py
+"""
+Celery wrappers around rentium/ledger/daily.py.
+
+Cookiecutter-django projects created with use_celery=y expose the app at
+config.celery_app and autodiscover any tasks.py. If your project was
+generated WITHOUT Celery, don't add this file — use the cron path instead:
+
+    # crontab -e  (host or a sidecar container)
+    15 6 * * *  cd /app && python manage.py run_daily_tasks >> /var/log/rentium-daily.log 2>&1
+
+Each task delegates to daily.py, so cron and Celery are interchangeable
+and idempotent — running both by accident double-executes nothing.
+
+Beat schedule (config/settings/base.py or production.py):
+
+    from celery.schedules import crontab
+
+    CELERY_BEAT_SCHEDULE = {
+        # One combined run early morning local time is enough for all four
+        # jobs; they're cheap and idempotent.
+        "rentium-daily-housekeeping": {
+            "task": "rentium.ledger.tasks.run_daily_housekeeping",
+            "schedule": crontab(hour=6, minute=15),
+        },
+        # SLA breaches are the one time-sensitive job — check hourly so an
+        # RTA-emergency work order blowing its deadline at 9am doesn't wait
+        # until tomorrow's daily run to alert the landlord.
+        "rentium-sla-breach-check": {
+            "task": "rentium.ledger.tasks.check_sla_breaches",
+            "schedule": crontab(minute=5),  # hourly at :05
+        },
+    }
+
+And remember beat + a worker must both be running, e.g. in docker compose:
+    celeryworker: command: celery -A config.celery_app worker -l info
+    celerybeat:   command: celery -A config.celery_app beat -l info
+"""
+
+from config.celery_app import app
+
+from . import daily
+
+
+@app.task(bind=True, max_retries=2, default_retry_delay=300)
+def run_daily_housekeeping(self):
+    """Everything: expiry -> rent generation -> reminders -> SLA check."""
+    try:
+        return daily.run_all()
+    except Exception as exc:  # let transient DB hiccups retry
+        raise self.retry(exc=exc)
+
+
+@app.task
+def generate_rent_charges():
+    return daily.generate_all_rent_charges()
+
+
+@app.task
+def expire_leases():
+    return daily.expire_ended_leases()
+
+
+@app.task
+def send_due_soon_reminders():
+    return daily.publish_charge_due_reminders()
+
+
+@app.task
+def check_sla_breaches():
+    return daily.flag_sla_breaches()
+
+========================================
+FILE: ./billing.py
+========================================
+
+# billing.py
+
+"""
+Billing engine on top of the ledger.
+
+- Rent is charged on the 1st of the month, except the first billing period,
+  which is charged on the tenant's effective move-in date and prorated via
+  the auto-created PRORATION RentAdjustment.
+- Generation is idempotent by natural key. The daily task and the
+  activation hook can both run without double-charging.
+- A RentAdjustment created AFTER charges exist is applied by
+  apply_adjustment_to_ledger():
+    * untouched future/unpaid charge  -> void + repost at the new amount
+      (the schedule shows the right number, the audit trail keeps the old one)
+    * charge with money already on it -> post a CREDIT for the difference
+      (received money is historical fact and is never rewritten)
+- Utility bills are split by *temporal occupancy* (who actually lived there
+  during the billing period), not by today's room assignments — so
+  retroactive bills stay correct after roommate swaps.
+
+JOINT vs SPLIT billing
+======================
+Roommate agreements are joint-and-several: the WHOLE household owes the
+WHOLE rent and the WHOLE deposit, and either tenant may pay any of it.
+For those leases we post ONE household charge per period with tenant=None
+(natural key rent:<lease>:joint:<due_date>). Every tenant on the lease
+sees it (viewset scoping), any tenant's payment settles it (payments carry
+tenant=<payer> so who-paid-what is preserved), and it clears for everyone
+at once. This also fixes the "unlinked second tenant was never charged"
+hole: the joint amount is the sum over ALL non-declined LeaseTenant rows,
+linked or not.
+
+SPLIT mode (each tenant billed their own share) is kept for leases that
+genuinely bill individually and remains the old per-tenant behaviour.
+
+Mode selection: an optional Lease.billing_mode field ("JOINT"/"SPLIT")
+wins if present; otherwise any lease whose lease_type contains "ROOMMATE"
+is JOINT and everything else is SPLIT.
+"""
+from datetime import date, timedelta
+from decimal import ROUND_HALF_UP, Decimal
+
+from django.db.models import Q
+
+from rentium.leases.models import Lease, LeaseTenant
+
+from .models import EntryType, LedgerEntry
+from .services import post_charge, post_credit, post_expense, void_entry
+
+GENERATION_HORIZON_DAYS = 45
+
+
+# ---------------------------------------------------------------- helpers
+def _first_of_next_month(d: date) -> date:
+    return date(d.year + (d.month // 12), (d.month % 12) + 1, 1)
+
+
+def _effective_start(lt: LeaseTenant) -> date:
+    return lt.individual_start_date or lt.lease.move_in_date or lt.lease.start_date
+
+
+def _effective_end(lt: LeaseTenant):
+    return lt.individual_end_date or lt.lease.end_date  # None = month-to-month
+
+
+def lease_is_joint(lease: Lease) -> bool:
+    """
+    JOINT = one household bill, either tenant can pay (roommate agreements).
+    SPLIT = each tenant billed their own share.
+    An explicit Lease.billing_mode field wins; otherwise infer from type.
+    """
+    mode = (getattr(lease, "billing_mode", "") or "").upper()
+    if mode == "JOINT":
+        return True
+    if mode == "SPLIT":
+        return False
+    return "ROOMMATE" in ((getattr(lease, "lease_type", "") or "").upper())
+
+
+def rent_key(lt: LeaseTenant, due: date) -> str:
+    return f"rent:{lt.lease_id}:{lt.tenant_id}:{due.isoformat()}"
+
+
+def joint_rent_key(lease: Lease, due: date) -> str:
+    return f"rent:{lease.pk}:joint:{due.isoformat()}"
+
+
+def compute_rent_for_due_date(lt: LeaseTenant, due_date: date) -> Decimal:
+    """Base rent net of every RentAdjustment active on `due_date`."""
+    amount = Decimal(lt.rent_amount)
+    adjustments = (
+        lt.rent_adjustments.filter(effective_date__lte=due_date)
+        .filter(Q(end_date__isnull=True) | Q(end_date__gte=due_date))
+        .order_by("effective_date", "created_at")
+    )
+    for adj in adjustments:
+        amount = adj.get_adjusted_amount(amount)
+    return amount.quantize(Decimal("0.01"))
+
+
+def compute_joint_rent_for_due_date(lease: Lease, due_date: date) -> Decimal:
+    """
+    Household rent for the period: the sum over ALL non-declined
+    LeaseTenant rows — including pending invites (tenant=None), because
+    joint-and-several means the household owes the full rent whether or
+    not every roommate has linked an account yet.
+    Per-tenant RentAdjustments still apply (a discount on one roommate's
+    share lowers the household total).
+    """
+    total = Decimal("0.00")
+    for lt in lease.lease_tenants.filter(declined=False):
+        total += compute_rent_for_due_date(lt, due_date)
+    return total.quantize(Decimal("0.01"))
+
+
+def _rent_due_dates(lt: LeaseTenant, until: date):
+    start, end = _effective_start(lt), _effective_end(lt)
+    due = start
+    while due <= until:
+        if end and due > end:
+            return
+        yield due
+        due = _first_of_next_month(due)
+
+
+def _lease_rent_due_dates(lease: Lease, until: date):
+    """Lease-level schedule for joint billing (no per-tenant dates)."""
+    start = lease.move_in_date or lease.start_date
+    end = lease.end_date
+    due = start
+    while due <= until:
+        if end and due > end:
+            return
+        yield due
+        due = _first_of_next_month(due)
+
+
+# ------------------------------------------------------------ generation
+def ensure_rent_charge(lt: LeaseTenant, due_date: date):
+    """SPLIT mode: one tenant's own rent charge for the period."""
+    if lt.tenant_id is None:  # pending invite — no one to charge yet
+        return None, False
+    amount = compute_rent_for_due_date(lt, due_date)
+    if amount <= 0:
+        return None, False
+    return post_charge(
+        landlord=lt.lease.landlord,
+        tenant=lt.tenant,
+        lease=lt.lease,
+        amount=amount,
+        due_date=due_date,
+        entry_type=EntryType.RENT_CHARGE,
+        description=f"Monthly rent — period starting {due_date}",
+        idempotency_key=rent_key(lt, due_date),
+        metadata={"period_start": due_date.isoformat()},
+    )
+
+
+def ensure_joint_rent_charge(lease: Lease, due_date: date):
+    """JOINT mode: one household rent charge (tenant=None) for the period."""
+    amount = compute_joint_rent_for_due_date(lease, due_date)
+    if amount <= 0:
+        return None, False
+    return post_charge(
+        landlord=lease.landlord,
+        tenant=None,  # household charge — every tenant on the lease sees it
+        lease=lease,
+        amount=amount,
+        due_date=due_date,
+        entry_type=EntryType.RENT_CHARGE,
+        description=f"Monthly rent — period starting {due_date}",
+        idempotency_key=joint_rent_key(lease, due_date),
+        metadata={"period_start": due_date.isoformat(), "joint": True},
+    )
+
+
+def generate_rent_charges_for_lease(lease: Lease, horizon_days: int = GENERATION_HORIZON_DAYS) -> int:
+    if lease.status != Lease.LeaseStatus.ACTIVE:
+        return 0
+    until = date.today() + timedelta(days=horizon_days)
+    created = 0
+    if lease_is_joint(lease):
+        if not lease.lease_tenants.filter(declined=False).exists():
+            return 0
+        for due in _lease_rent_due_dates(lease, until):
+            _, was_created = ensure_joint_rent_charge(lease, due)
+            created += int(was_created)
+        return created
+    for lt in lease.lease_tenants.filter(tenant__isnull=False, declined=False):
+        for due in _rent_due_dates(lt, until):
+            _, was_created = ensure_rent_charge(lt, due)
+            created += int(was_created)
+    return created
+
+
+def generate_initial_charges(lease: Lease) -> None:
+    """
+    Called once when the lease flips ACTIVE: deposits + cleaning fees +
+    the rent schedule (first charge = prorated move-in period).
+    Idempotent via natural keys.
+
+    JOINT leases: the security/pet deposit and lease-level cleaning fee are
+    HOUSEHOLD charges (tenant=None) — "their deposit is together". Only the
+    explicitly individual per-tenant cleaning fees stay per-tenant.
+    SPLIT leases: unchanged — one-time charges go to the primary tenant.
+    """
+    due = lease.move_in_date or lease.start_date
+    joint = lease_is_joint(lease)
+
+    def _one_time(tenant, etype, amount, kind, note, *, joint_charge=False):
+        if not amount or Decimal(amount) <= 0:
+            return
+        if not joint_charge and tenant is None:
+            return
+        key_owner = "joint" if joint_charge else tenant.pk
+        post_charge(
+            landlord=lease.landlord,
+            tenant=None if joint_charge else tenant,
+            lease=lease,
+            amount=Decimal(amount),
+            due_date=due,
+            entry_type=etype,
+            description=note,
+            idempotency_key=f"{kind}:{lease.pk}:{key_owner}",
+            metadata={"kind": kind, **({"joint": True} if joint_charge else {})},
+        )
+
+    if joint:
+        _one_time(None, EntryType.DEPOSIT_CHARGE, lease.security_deposit,
+                  "security_deposit", "Security deposit", joint_charge=True)
+        _one_time(None, EntryType.DEPOSIT_CHARGE, lease.pet_deposit,
+                  "pet_deposit", "Pet deposit", joint_charge=True)
+        _one_time(None, EntryType.FEE_CHARGE, lease.cleaning_fee,
+                  "cleaning_fee_lease", "Cleaning fee (lease)", joint_charge=True)
+    else:
+        primary = (
+            lease.lease_tenants.filter(is_primary_tenant=True, tenant__isnull=False).first()
+            or lease.lease_tenants.filter(tenant__isnull=False).first()
+        )
+        primary_tenant = primary.tenant if primary else None
+        _one_time(primary_tenant, EntryType.DEPOSIT_CHARGE, lease.security_deposit,
+                  "security_deposit", "Security deposit")
+        _one_time(primary_tenant, EntryType.DEPOSIT_CHARGE, lease.pet_deposit,
+                  "pet_deposit", "Pet deposit")
+        _one_time(primary_tenant, EntryType.FEE_CHARGE, lease.cleaning_fee,
+                  "cleaning_fee_lease", "Cleaning fee (lease)")
+
+    # A per-tenant cleaning fee is that person's own obligation in either
+    # mode (it was negotiated individually on their LeaseTenant row).
+    for lt in lease.lease_tenants.filter(tenant__isnull=False, cleaning_fee__gt=0):
+        _one_time(lt.tenant, EntryType.FEE_CHARGE, lt.cleaning_fee,
+                  "cleaning_fee_individual", "Cleaning fee (individual)")
+
+    generate_rent_charges_for_lease(lease)
+
+
+# ------------------------------------------------------------ adjustments
+def apply_adjustment_to_ledger(lt: LeaseTenant, adjustment) -> dict:
+    """
+    Reconcile existing rent charges with a newly created/changed adjustment.
+    Never mutates a posted entry (see module docstring for the two paths).
+
+    JOINT leases: the adjustment changes one roommate's share, so the
+    HOUSEHOLD total for affected periods is recomputed and the joint
+    charges are voided+reposted (unpaid) or credited/delta-charged (paid).
+    """
+    lease = lt.lease
+    joint = lease_is_joint(lease)
+
+    charges = (
+        LedgerEntry.objects.with_settlement()
+        .filter(
+            lease=lease,
+            entry_type=EntryType.RENT_CHARGE,
+            reversed_by__isnull=True,
+            due_date__gte=adjustment.effective_date,
+        )
+    )
+    charges = charges.filter(tenant__isnull=True) if joint else charges.filter(tenant=lt.tenant)
+    if adjustment.end_date:
+        charges = charges.filter(due_date__lte=adjustment.end_date)
+
+    def _new_amount(due):
+        return compute_joint_rent_for_due_date(lease, due) if joint \
+            else compute_rent_for_due_date(lt, due)
+
+    def _key(due):
+        base = joint_rent_key(lease, due) if joint else rent_key(lt, due)
+        return f"{base}:adj{adjustment.pk}"
+
+    charge_tenant = None if joint else lt.tenant
+    reposted, credited = 0, 0
+    for charge in charges:
+        new_amount = _new_amount(charge.due_date)
+        if new_amount == charge.amount:
+            continue
+        if charge.settled_amount == 0:
+            void_entry(charge, reason=f"Rent adjustment #{adjustment.pk} applied")
+            post_charge(
+                landlord=lease.landlord,
+                tenant=charge_tenant,
+                lease=lease,
+                amount=new_amount,
+                due_date=charge.due_date,
+                entry_type=EntryType.RENT_CHARGE,
+                description=charge.description,
+                # replaces the voided charge's natural slot
+                idempotency_key=_key(charge.due_date),
+                metadata={**charge.metadata, "adjustment_id": adjustment.pk},
+            )
+            reposted += 1
+        elif new_amount < charge.amount:
+            post_credit(
+                charge=charge,
+                amount=charge.amount - new_amount,
+                reason=f"Rent adjustment #{adjustment.pk}",
+                idempotency_key=f"adjcredit:{adjustment.pk}:{charge.pk}",
+                metadata={"adjustment_id": adjustment.pk},
+            )
+            credited += 1
+        # An INCREASE on a partially-paid month: charge the delta separately.
+        else:
+            post_charge(
+                landlord=lease.landlord,
+                tenant=charge_tenant,
+                lease=lease,
+                amount=new_amount - charge.amount,
+                due_date=charge.due_date,
+                entry_type=EntryType.RENT_CHARGE,
+                description=f"Rent increase — period starting {charge.due_date}",
+                idempotency_key=f"adjdelta:{adjustment.pk}:{charge.pk}",
+                metadata={"adjustment_id": adjustment.pk, "delta_of": str(charge.pk)},
+            )
+            reposted += 1
+    return {"reposted": reposted, "credited": credited}
+
+
+# ------------------------------------------------------------ utilities
+def compute_tenant_utility_portion(lease: Lease, bill_key: str | None, total: Decimal):
+    """
+    How much of a utility bill the TENANTS owe, per the lease's own
+    bills_included configuration (the terms everyone signed):
+      - included in rent        -> $0 (landlord's cost entirely)
+      - tenant_responsibility:
+          full        -> the whole bill
+          percentage  -> value% of the bill
+          fixed       -> the fixed $ value (capped at the bill total)
+          none        -> $0
+      - bill_key None / not configured on the lease -> the whole bill
+        (a one-off the lease never contemplated — landlord decides by
+        simply not posting it, or posting it in full).
+    Returns (tenant_portion, meta) where meta lands in the charge metadata
+    so the ledger shows WHY the tenant owes what they owe.
+    """
+    total = Decimal(total)
+    info = (lease.bills_included or {}).get(bill_key) if bill_key else None
+    if info is None:
+        return total.quantize(Decimal("0.01")), {
+            "bill_key": bill_key,
+            "responsibility": "full",
+            "configured": False,
+        }
+    meta = {"bill_key": bill_key, "provider": info.get("provider", ""), "configured": True}
+    if info.get("included", False):
+        return Decimal("0.00"), {**meta, "responsibility": "included_in_rent"}
+    resp = info.get("tenant_responsibility", {}) or {}
+    rtype = resp.get("type", "none")
+    if rtype == "full":
+        portion = total
+    elif rtype == "percentage":
+        value = Decimal(str(resp.get("value", 0)))
+        portion = total * value / Decimal("100")
+        meta["percentage"] = str(value)
+    elif rtype == "fixed":
+        portion = min(Decimal(str(resp.get("value", 0))), total)
+        meta["fixed_amount"] = str(resp.get("value", 0))
+    else:  # "none"
+        portion = Decimal("0.00")
+    meta["responsibility"] = rtype
+    return portion.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), meta
+
+
+def split_utility_bill(
+    *, lease: Lease, total_amount, period_start: date, period_end: date,
+    description: str, due_date: date | None = None, created_by=None,
+    record_landlord_expense: bool = False, expense_vendor: str = "",
+    bill_key: str | None = None,
+) -> list[LedgerEntry]:
+    """
+    JOINT leases: the household owes the household's bill — ONE joint
+    UTILITY_CHARGE (tenant=None) for the full amount, payable by anyone.
+
+    SPLIT leases: fan the bill into per-tenant UTILITY_CHARGE entries,
+    weighted by days actually occupied during the billing period (temporal
+    occupancy log), falling back to an equal split among current
+    non-declined tenants when no occupancy rows exist yet.
+
+    Optionally also books the landlord's own EXPENSE for the bill.
+    """
+    total = Decimal(total_amount).quantize(Decimal("0.01"))
+    if total <= 0:
+        raise ValueError("Bill amount must be positive.")
+    due = due_date or period_end
+
+    # The tenants owe only their configured share of the bill (the terms
+    # they actually signed); the rest is the landlord's own cost, captured
+    # by the optional EXPENSE below. A $200 bill on a lease that says
+    # "tenant pays 50%" produces a $100 tenant charge, not $200.
+    tenant_total, share_meta = compute_tenant_utility_portion(lease, bill_key, total)
+
+    entries: list[LedgerEntry] = []
+
+    if tenant_total <= 0:
+        # Included in rent / responsibility "none": nothing to charge the
+        # tenants — only the landlord's expense (if requested) gets booked.
+        pass
+    elif lease_is_joint(lease):
+        if not lease.lease_tenants.filter(declined=False).exists():
+            raise ValueError("No tenants to bill on this lease.")
+        entry, _ = post_charge(
+            landlord=lease.landlord,
+            tenant=None,
+            lease=lease,
+            amount=tenant_total,
+            due_date=due,
+            entry_type=EntryType.UTILITY_CHARGE,
+            description=f"{description} ({period_start} – {period_end})",
+            idempotency_key=f"utility:{lease.pk}:joint:{period_start}:{period_end}:{description[:40]}",
+            created_by=created_by,
+            metadata={
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "bill_total": str(total),
+                "tenant_share": str(tenant_total),
+                "joint": True,
+                **share_meta,
+            },
+        )
+        entries.append(entry)
+    else:
+        from rentium.leases.occupancy import occupant_days_for_lease
+
+        weights = occupant_days_for_lease(lease, period_start, period_end)
+        if not weights:
+            tenants = [lt.tenant for lt in lease.lease_tenants.filter(tenant__isnull=False, declined=False)]
+            weights = {t: 1 for t in tenants}
+        if not weights:
+            raise ValueError("No tenants to bill on this lease.")
+        total_weight = sum(weights.values())
+        allocated = Decimal("0.00")
+        items = list(weights.items())
+        for i, (tenant, w) in enumerate(items):
+            if i < len(items) - 1:
+                share = (tenant_total * Decimal(w) / Decimal(total_weight)).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                allocated += share
+            else:
+                share = tenant_total - allocated  # last tenant absorbs rounding remainder
+            if share <= 0:
+                continue
+            entry, _ = post_charge(
+                landlord=lease.landlord,
+                tenant=tenant,
+                lease=lease,
+                amount=share,
+                due_date=due,
+                entry_type=EntryType.UTILITY_CHARGE,
+                description=f"{description} ({period_start} – {period_end})",
+                idempotency_key=f"utility:{lease.pk}:{tenant.pk}:{period_start}:{period_end}:{description[:40]}",
+                created_by=created_by,
+                metadata={
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat(),
+                    "bill_total": str(total),
+                    "tenant_share": str(tenant_total),
+                    "weight_days": w,
+                    **share_meta,
+                },
+            )
+            entries.append(entry)
+
+    if record_landlord_expense:
+        post_expense(
+            landlord=lease.landlord,
+            property=lease.property if lease.property_id else None,
+            amount=total,
+            category="UTILITIES",
+            description=f"{description} ({period_start} – {period_end})",
+            incurred_date=period_end,
+            vendor=expense_vendor,
+            idempotency_key=f"utilexp:{lease.pk}:{period_start}:{period_end}:{description[:40]}",
+            created_by=created_by,
+        )
+    return entries
+
+
+# ------------------------------------------------------------ lifecycle
+def void_open_charges_for_lease(lease: Lease, *, reason: str, created_by=None) -> dict:
+    """
+    Ending a lease (terminate/expire) must also end its open receivables —
+    otherwise the summary keeps counting dead leases' rent as "expected"
+    and their charges sit Overdue forever. Voids every non-voided charge on
+    the lease that has NO live settlements; anything with money already on
+    it is skipped (received money is historical fact — resolve those by
+    hand: void the payment first if the whole thing was a mistake).
+
+    Call this from the lease `terminate` action (and the expiry task):
+
+        from rentium.ledger.billing import void_open_charges_for_lease
+        void_open_charges_for_lease(
+            lease, reason=f"Lease {lease.lease_number} terminated",
+            created_by=request.user,
+        )
+
+    Idempotent — already-voided charges are excluded by the filter, so
+    calling it twice is harmless. The `void_lease_charges` management
+    command wraps this for cleaning up historical data.
+    """
+    from .models import CHARGE_TYPES
+
+    charges = (
+        LedgerEntry.objects.with_settlement()
+        .filter(lease=lease, entry_type__in=CHARGE_TYPES, reversed_by__isnull=True)
+    )
+    voided, skipped = 0, 0
+    for charge in charges:
+        if charge.settled_amount and charge.settled_amount > 0:
+            skipped += 1
+            continue
+        void_entry(charge, reason=reason, created_by=created_by)
+        voided += 1
+    return {"voided": voided, "skipped_with_payments": skipped}
+
+========================================
+FILE: ./models.py
+========================================
+
+"""
+The ledger: single source of truth for every dollar in Rentium.
+Rules (enforced in code, not convention):
+1. APPEND-ONLY. A posted entry's financial fields can never change and an
+   entry can never be deleted. Corrections are a REVERSAL entry (void)
+   plus, if needed, a fresh entry. The audit trail is therefore complete
+   by construction — for landlords, for the RTB, and for the AI later.
+2. STATUS IS COMPUTED, NEVER STORED. "Paid / partial / overdue" for a
+   charge is derived from (charge amount − non-voided settlements) and
+   the due date. There is no status column to drift out of sync.
+3. IDEMPOTENT WRITES. Every entry can carry a unique idempotency_key.
+   Generated charges use natural keys (rent:<lease>:<tenant>:<due_date>,
+   rent:<lease>:joint:<due_date> for household charges), API-recorded
+   payments use a client-generated key — so a double-click, a network
+   retry, or a re-run Celery task can never double-post.
+4. ONE LEDGER PER SCOPE. `property` is the partition key (NULL =
+   portfolio-wide, e.g. accountant fees). Money in (charges/payments)
+   and money out (expenses) live in the same stream, so the financial
+   summary, the mobile app, and the AI all read one table.
+
+JOINT (household) charges: a charge may carry tenant=NULL *with a lease
+set* — that is a joint-and-several household charge (roommate leases).
+Every tenant on the lease owes it, any tenant's PAYMENT (which carries
+tenant=<payer>) settles it for the whole household.
+"""
+
+import builtins
+import uuid
+from decimal import Decimal
+
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.db.models import Case
+from django.db.models import DecimalField
+from django.db.models import Exists
+from django.db.models import F
+from django.db.models import OuterRef
+from django.db.models import Q
+from django.db.models import Sum
+from django.db.models import Value
+from django.db.models import When
+from django.db.models.functions import Coalesce
+from django.utils.translation import gettext_lazy as _
+
+from rentium.leases.models import Lease
+from rentium.properties.models import Property
+from rentium.users.models import LandlordProfile
+from rentium.users.models import TenantProfile
+
+
+class EntryType(models.TextChoices):
+    # Charges — money the tenant owes (a receivable).
+    RENT_CHARGE = "RENT_CHARGE", _("Rent Charge")
+    UTILITY_CHARGE = "UTILITY_CHARGE", _("Utility Charge")
+    DEPOSIT_CHARGE = "DEPOSIT_CHARGE", _("Deposit Charge")
+    FEE_CHARGE = "FEE_CHARGE", _("Fee Charge")
+    OTHER_CHARGE = "OTHER_CHARGE", _("Other Charge")
+    # Settlements — reduce a charge's outstanding balance.
+    PAYMENT = "PAYMENT", _("Payment Received")
+    CREDIT = "CREDIT", _("Credit / Discount")
+    # Money out.
+    EXPENSE = "EXPENSE", _("Expense")
+    DEPOSIT_RETURN = "DEPOSIT_RETURN", _("Deposit Returned")
+    # Corrections.
+    REVERSAL = "REVERSAL", _("Reversal (void)")
+
+
+CHARGE_TYPES = {
+    EntryType.RENT_CHARGE,
+    EntryType.UTILITY_CHARGE,
+    EntryType.DEPOSIT_CHARGE,
+    EntryType.FEE_CHARGE,
+    EntryType.OTHER_CHARGE,
+}
+# Deposits are refundable liabilities, not income — excluded on purpose.
+INCOME_CHARGE_TYPES = CHARGE_TYPES - {EntryType.DEPOSIT_CHARGE}
+SETTLEMENT_TYPES = {EntryType.PAYMENT, EntryType.CREDIT}
+
+
+class PaymentMethod(models.TextChoices):
+    ETRANSFER = "ETRANSFER", _("e-Transfer")
+    CASH = "CASH", _("Cash")
+    CHEQUE = "CHEQUE", _("Cheque")
+    OTHER = "OTHER", _("Other")
+
+
+class ExpenseCategory(models.TextChoices):
+    MAINTENANCE = "MAINTENANCE", _("Maintenance / Repairs")
+    UTILITIES = "UTILITIES", _("Utilities (landlord-paid)")
+    INSURANCE = "INSURANCE", _("Insurance")
+    PROPERTY_TAX = "PROPERTY_TAX", _("Property Tax")
+    MORTGAGE = "MORTGAGE", _("Mortgage / Financing")
+    STRATA = "STRATA", _("Strata / HOA Fees")
+    MANAGEMENT = "MANAGEMENT", _("Management / Professional Fees")
+    SUPPLIES = "SUPPLIES", _("Supplies / Furnishings")
+    ADVERTISING = "ADVERTISING", _("Advertising / Listing")
+    OTHER = "OTHER", _("Other")
+
+
+class ChargeStatus:
+    """Computed, not stored (see rule 2)."""
+
+    VOIDED = "VOIDED"
+    PAID = "PAID"
+    PARTIALLY_PAID = "PARTIALLY_PAID"
+    OVERDUE = "OVERDUE"
+    DUE = "DUE"  # due today, unpaid
+    SCHEDULED = "SCHEDULED"  # due in the future
+
+
+class LedgerEntryQuerySet(models.QuerySet):
+    def not_voided(self):
+        return self.filter(reversed_by__isnull=True)
+
+    def charges(self):
+        return self.filter(entry_type__in=CHARGE_TYPES)
+
+    def income_charges(self):
+        return self.filter(entry_type__in=INCOME_CHARGE_TYPES)
+
+    def with_settlement(self):
+        """
+        Annotate charges with settled_amount / outstanding / is_voided in a
+        single query. Voided settlements do not count (rule 1 + 2 together:
+        void a payment and the charge reopens automatically).
+        """
+        active_settlements = Coalesce(
+            Sum(
+                "settlements__amount",
+                filter=Q(settlements__entry_type__in=SETTLEMENT_TYPES)
+                & Q(settlements__reversed_by__isnull=True),
+            ),
+            Value(Decimal("0.00")),
+            output_field=DecimalField(max_digits=12, decimal_places=2),
+        )
+        return self.annotate(
+            settled_amount=active_settlements,
+            outstanding=Case(
+                When(reversed_by__isnull=False, then=Value(Decimal("0.00"))),
+                default=F("amount") - F("settled_amount"),
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            ),
+            is_voided=Exists(LedgerEntry.objects.filter(reverses=OuterRef("pk"))),
+        )
+
+
+class LedgerEntry(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # ---- scope (the "which ledger" keys) --------------------------------
+    landlord = models.ForeignKey(
+        LandlordProfile, on_delete=models.PROTECT, related_name="ledger_entries"
+    )
+    property = models.ForeignKey(
+        Property,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="ledger_entries",
+        help_text=_(
+            "The ledger this entry belongs to. NULL = portfolio-wide (e.g. accountant fees)."
+        ),
+    )
+    lease = models.ForeignKey(
+        Lease,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="ledger_entries",
+    )
+    tenant = models.ForeignKey(
+        TenantProfile,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="ledger_entries",
+        help_text=_(
+            "Charges: who owes it — NULL with a lease set means the whole "
+            "household owes it jointly. Payments: who paid."
+        ),
+    )
+    # ---- the money -------------------------------------------------------
+    entry_type = models.CharField(
+        _("Type"), max_length=20, choices=EntryType.choices, db_index=True
+    )
+    amount = models.DecimalField(
+        _("Amount"),
+        max_digits=12,
+        decimal_places=2,
+        help_text=_("Always positive; the entry type carries the direction."),
+    )
+    due_date = models.DateField(
+        _("Due Date"),
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=_("Charges only."),
+    )
+    effective_date = models.DateField(
+        _("Effective Date"),
+        db_index=True,
+        help_text=_("Service period start / payment date / date incurred."),
+    )
+    description = models.CharField(_("Description"), max_length=255)
+    # ---- links -----------------------------------------------------------
+    settles = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="settlements",
+        help_text=_("For PAYMENT/CREDIT: the charge this settles."),
+    )
+    reverses = models.OneToOneField(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="reversed_by",
+        help_text=_(
+            "For REVERSAL: the entry this voids. OneToOne — an entry can be voided exactly once."
+        ),
+    )
+    work_order = models.ForeignKey(
+        "maintenance.WorkOrder",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="ledger_entries",
+        help_text=_("Expense/charge tied to a maintenance job, if any."),
+    )
+    # ---- type-specific detail (nullable by design; validated in clean) ----
+    payment_method = models.CharField(
+        _("Payment Method"),
+        max_length=12,
+        choices=PaymentMethod.choices,
+        blank=True,
+        default="",
+        help_text=_("PAYMENT / DEPOSIT_RETURN entries."),
+    )
+    reference_number = models.CharField(_("Reference #"), max_length=100, blank=True)
+    category = models.CharField(
+        _("Expense Category"),
+        max_length=20,
+        choices=ExpenseCategory.choices,
+        blank=True,
+        default="",
+    )
+    vendor = models.CharField(_("Vendor / Payee"), max_length=150, blank=True)
+    # ---- safety & audit ----------------------------------------------------
+    idempotency_key = models.CharField(
+        _("Idempotency Key"),
+        max_length=180,
+        null=True,
+        blank=True,
+        unique=True,
+        help_text=_(
+            "Natural key for generated entries; client-generated UUID for API writes. "
+            "Duplicate submissions are rejected by the database."
+        ),
+    )
+    metadata = models.JSONField(_("Metadata"), default=dict, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="ledger_entries_created",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    objects = LedgerEntryQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-effective_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["landlord", "entry_type", "effective_date"]),
+            models.Index(fields=["lease", "entry_type", "due_date"]),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=Q(amount__gt=0), name="ledger_amount_positive"
+            ),
+        ]
+        verbose_name = _("Ledger Entry")
+        verbose_name_plural = _("Ledger Entries")
+
+    def __str__(self):
+        return f"{self.get_entry_type_display()} ${self.amount} — {self.description}"
+
+    # ---- immutability (rule 1) --------------------------------------------
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError(
+                "Ledger entries are immutable. Void this entry (REVERSAL) and post a new one instead."
+            )
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(
+            "Ledger entries can never be deleted. Void with a REVERSAL entry."
+        )
+
+    def clean(self):
+        super().clean()
+        et = self.entry_type
+        if self.property and self.property.landlord_id != self.landlord_id:
+            raise ValidationError(
+                {"property": _("Property belongs to a different landlord.")}
+            )
+        if et in CHARGE_TYPES:
+            if not self.due_date:
+                raise ValidationError({"due_date": _("Charges require a due date.")})
+            # A charge names EITHER the tenant who owes it (split billing)
+            # OR just the lease (tenant=NULL = joint household charge).
+            if not self.tenant_id and not self.lease_id:
+                raise ValidationError(
+                    {
+                        "tenant": _(
+                            "Charges must name the tenant who owes them, or carry a "
+                            "lease for a joint household charge."
+                        )
+                    }
+                )
+        if et in SETTLEMENT_TYPES:
+            if not self.settles_id:
+                raise ValidationError(
+                    {
+                        "settles": _(
+                            "Payments/credits must reference the charge they settle."
+                        )
+                    }
+                )
+            if self.settles and self.settles.entry_type not in CHARGE_TYPES:
+                raise ValidationError({"settles": _("Can only settle a charge entry.")})
+        if et == EntryType.EXPENSE and not self.category:
+            raise ValidationError({"category": _("Expenses require a category.")})
+        if et == EntryType.REVERSAL:
+            if not self.reverses_id:
+                raise ValidationError(
+                    {"reverses": _("A reversal must reference the entry it voids.")}
+                )
+            if self.reverses and self.reverses.entry_type == EntryType.REVERSAL:
+                raise ValidationError({"reverses": _("Cannot void a reversal.")})
+            if self.reverses and self.amount != self.reverses.amount:
+                raise ValidationError(
+                    {
+                        "amount": _(
+                            "A reversal must be equal and opposite to its target."
+                        )
+                    }
+                )
+
+    # ---- computed status (rule 2) -------------------------------------------
+    # NOTE: this model has a field named `property`, which shadows the
+    # `property` builtin inside the class body — so decorate with the
+    # explicit builtin reference.
+    @builtins.property
+    def voided(self) -> bool:
+        return hasattr(self, "reversed_by") and self.reversed_by is not None
+
+    def charge_status(self, today=None) -> str:
+        """Prefer annotated querysets (with_settlement) in list views; this
+        per-object version is for detail views and services."""
+        from datetime import date as date_cls
+
+        if self.entry_type not in CHARGE_TYPES:
+            raise ValueError("charge_status() only applies to charge entries.")
+        if self.voided:
+            return ChargeStatus.VOIDED
+        settled = getattr(self, "settled_amount", None)
+        if settled is None:
+            settled = self.settlements.filter(
+                entry_type__in=SETTLEMENT_TYPES, reversed_by__isnull=True
+            ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        today = today or date_cls.today()
+        if settled >= self.amount:
+            return ChargeStatus.PAID
+        if settled > 0:
+            return ChargeStatus.PARTIALLY_PAID
+        if self.due_date and self.due_date < today:
+            return ChargeStatus.OVERDUE
+        if self.due_date and self.due_date == today:
+            return ChargeStatus.DUE
+        return ChargeStatus.SCHEDULED
+
+
+class LedgerAttachment(models.Model):
+    """Receipts / documents for an entry (kept off the ledger row itself)."""
+
+    entry = models.ForeignKey(
+        LedgerEntry, on_delete=models.CASCADE, related_name="attachments"
+    )
+    file = models.FileField(_("File"), upload_to="ledger_attachments/%Y/%m/")
+    label = models.CharField(_("Label"), max_length=150, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"Attachment for {self.entry_id}"
+
+
+========================================
+FILE: ./management/commands/rebill_joint.py
+========================================
+
+"""
+One-time (idempotent, re-runnable) converter: for every ACTIVE lease that
+bills JOINTLY (roommate agreements), void the old per-tenant generated
+charges and repost them as household charges (tenant=NULL).
+
+Only touches charges the billing engine itself generated (recognised by
+their natural idempotency keys: rent:/security_deposit:/pet_deposit:/
+cleaning_fee_lease:) — manual one-off charges are left alone. Charges that
+already have live payments/credits on them are SKIPPED and reported, since
+received money is historical fact; resolve those by hand (void the payment,
+re-run, re-record the payment against the new joint charge).
+
+Usage:
+    python manage.py rebill_joint --dry-run   # show what would happen
+    python manage.py rebill_joint             # do it
+"""
+from django.core.management.base import BaseCommand
+from django.db import transaction
+
+from rentium.leases.models import Lease
+
+from ...billing import generate_initial_charges, lease_is_joint
+from ...models import CHARGE_TYPES, LedgerEntry
+from ...services import LedgerError, void_entry
+
+GENERATED_KEY_PREFIXES = (
+    "rent:",
+    "security_deposit:",
+    "pet_deposit:",
+    "cleaning_fee_lease:",
+)
+
+
+class Command(BaseCommand):
+    help = "Void per-tenant generated charges on joint (roommate) leases and repost them as household charges."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
+        parser.add_argument("--lease", type=int, default=None, help="Limit to one lease id.")
+
+    def handle(self, *args, **options):
+        dry = options["dry_run"]
+        leases = Lease.objects.filter(status=Lease.LeaseStatus.ACTIVE)
+        if options["lease"]:
+            leases = leases.filter(pk=options["lease"])
+
+        joint_leases = [l for l in leases if lease_is_joint(l)]
+        if not joint_leases:
+            self.stdout.write("No active joint-billing leases found.")
+            return
+
+        total_voided = total_skipped = 0
+        for lease in joint_leases:
+            self.stdout.write(self.style.MIGRATE_HEADING(
+                f"\nLease {lease.pk} ({getattr(lease, 'lease_number', lease.pk)})"
+            ))
+            old = (
+                LedgerEntry.objects.with_settlement()
+                .filter(
+                    lease=lease,
+                    tenant__isnull=False,          # per-tenant = the old model
+                    entry_type__in=CHARGE_TYPES,
+                    reversed_by__isnull=True,      # not already voided
+                )
+            )
+            # Only the engine's own generated charges; manual ones stay.
+            old = [
+                c for c in old
+                if c.idempotency_key and c.idempotency_key.startswith(GENERATED_KEY_PREFIXES)
+            ]
+            if not old:
+                self.stdout.write("  no per-tenant generated charges to convert")
+            with transaction.atomic():
+                for charge in old:
+                    label = f"{charge.entry_type} ${charge.amount} due {charge.due_date} ({charge.tenant})"
+                    if charge.settled_amount and charge.settled_amount > 0:
+                        total_skipped += 1
+                        self.stdout.write(self.style.WARNING(
+                            f"  SKIP (has ${charge.settled_amount} in payments): {label}"
+                        ))
+                        continue
+                    if dry:
+                        self.stdout.write(f"  would void: {label}")
+                    else:
+                        try:
+                            void_entry(charge, reason="Converted to joint household billing")
+                            self.stdout.write(f"  voided: {label}")
+                        except LedgerError as exc:
+                            total_skipped += 1
+                            self.stdout.write(self.style.WARNING(f"  SKIP ({exc}): {label}"))
+                            continue
+                    total_voided += 1
+                if dry:
+                    self.stdout.write("  would repost household charges (deposit/fees/rent schedule)")
+                    transaction.set_rollback(True)
+                else:
+                    # Natural joint keys differ from the old per-tenant keys,
+                    # so this posts fresh household charges idempotently.
+                    generate_initial_charges(lease)
+                    self.stdout.write(self.style.SUCCESS("  reposted household charges"))
+
+        self.stdout.write(self.style.SUCCESS(
+            f"\nDone. {'Would void' if dry else 'Voided'} {total_voided} charge(s); "
+            f"{total_skipped} skipped (already paid — resolve by hand)."
+        ))
+
+
+========================================
+FILE: ./management/commands/run_daily_tasks.py
+========================================
+
+# rentium/ledger/daily.py
+"""
+Daily housekeeping for Rentium — the jobs that keep time-based state true.
+
+WHY THIS MODULE EXISTS: without it, the app silently rots. Rent charges are
+only generated 45 days ahead (GENERATION_HORIZON_DAYS) and only when a
+signal fires (a signature, an adjustment, a roommate change). On a quiet
+lease nothing re-triggers generation, so around month 2-3 new rent charges
+just stop appearing and "Expected This Month" drops to $0. Similarly,
+leases never flip to EXPIRED on their own, tenants never get "rent due
+soon" nudges, and maintenance SLA breaches are never detected.
+
+Each function below is IDEMPOTENT and safe to run any number of times per
+day:
+  - rent charges dedupe on their natural idempotency keys;
+  - lease expiry only touches ACTIVE leases whose end_date has passed;
+  - reminders and SLA breaches dedupe against the DomainEvent outbox, so a
+    re-run (or a twice-daily cron) never double-notifies.
+
+Run it two ways (both call the same functions):
+  1. Celery beat  -> rentium/ledger/tasks.py (preferred once Celery is up)
+  2. cron / manual -> python manage.py run_daily_tasks
+"""
+
+import logging
+from datetime import date, timedelta
+
+from django.utils import timezone
+
+logger = logging.getLogger(__name__)
+
+# How many days before a charge's due date the "due soon" reminder fires.
+# 0 is included so tenants also get a nudge on the due date itself.
+DUE_SOON_OFFSETS = (3, 0)
+
+
+# ------------------------------------------------------------ rent charges
+def generate_all_rent_charges() -> dict:
+    """
+    Roll the 45-day generation horizon forward for every ACTIVE lease.
+    Per-lease try/except so one bad lease can't starve the rest of the
+    portfolio of rent charges.
+    """
+    from rentium.leases.models import Lease
+    from rentium.ledger.billing import generate_rent_charges_for_lease
+
+    created_total, leases_touched, failures = 0, 0, 0
+    for lease in Lease.objects.filter(status=Lease.LeaseStatus.ACTIVE).iterator():
+        try:
+            created = generate_rent_charges_for_lease(lease)
+            created_total += created
+            leases_touched += 1
+        except Exception:
+            failures += 1
+            logger.exception("Rent generation failed for lease %s", lease.pk)
+    return {
+        "leases_processed": leases_touched,
+        "charges_created": created_total,
+        "failures": failures,
+    }
+
+
+# ------------------------------------------------------------ lease expiry
+def expire_ended_leases() -> dict:
+    """
+    ACTIVE fixed-term leases whose end_date has fully passed become EXPIRED.
+    (A lease ends ON its end_date, so we only expire when today is strictly
+    after it.) Month-to-month leases have no end_date and are never touched.
+    The existing close_occupancies_on_end signal fires off this save and
+    closes the occupancy log rows; we also publish lease.expired so both
+    parties get a notification (ROUTES already maps it to BOTH).
+    """
+    from rentium.events.registry import publish
+    from rentium.leases.models import Lease
+
+    today = date.today()
+    expired, failures = 0, 0
+    qs = Lease.objects.filter(
+        status=Lease.LeaseStatus.ACTIVE,
+        end_date__isnull=False,
+        end_date__lt=today,
+    )
+    for lease in qs.iterator():
+        try:
+            lease.status = Lease.LeaseStatus.EXPIRED
+            lease.save(update_fields=["status", "updated_at"])
+            publish(
+                "lease.expired",
+                {"lease_id": str(lease.pk), "end_date": lease.end_date.isoformat()},
+                property_id=lease.property_id,
+                lease_id=lease.pk,
+            )
+            expired += 1
+        except Exception:
+            failures += 1
+            logger.exception("Failed to expire lease %s", lease.pk)
+    return {"leases_expired": expired, "failures": failures}
+
+
+# ------------------------------------------------------- due-soon reminders
+def publish_charge_due_reminders(offsets=DUE_SOON_OFFSETS) -> dict:
+    """
+    For each offset N in `offsets`, find income charges due exactly N days
+    from today that still have an outstanding balance, and publish a
+    ledger.charge_due_soon event for each (fan-out turns it into tenant
+    notifications; ROUTES already maps this event type).
+
+    Dedup: each (charge, stage) pair is published at most once EVER,
+    enforced by checking the DomainEvent outbox — so re-running the task
+    the same day (or a Celery retry) can't double-notify. If the task
+    doesn't run at all on a given day, that day's reminders are skipped
+    rather than sent late; the due-date (offset 0) reminder is the
+    backstop.
+
+    NOTE: the TENANT audience notifies every linked tenant on the lease,
+    not just the tenant named on the charge — intentional, consistent with
+    the joint-and-several policy (everyone is on the hook for the full
+    rent, so everyone hears that money is due).
+    """
+    from rentium.events.models import DomainEvent
+    from rentium.events.registry import publish
+    from rentium.ledger.models import INCOME_CHARGE_TYPES, LedgerEntry
+
+    today = date.today()
+    published, skipped = 0, 0
+    for offset in offsets:
+        target = today + timedelta(days=offset)
+        stage = f"due_in_{offset}"
+        charges = (
+            LedgerEntry.objects.with_settlement()
+            .filter(
+                entry_type__in=INCOME_CHARGE_TYPES,
+                reversed_by__isnull=True,
+                due_date=target,
+                outstanding__gt=0,
+                tenant__isnull=False,
+                lease__isnull=False,
+            )
+            .select_related("lease")
+        )
+        for charge in charges.iterator():
+            already = DomainEvent.objects.filter(
+                event_type="ledger.charge_due_soon",
+                payload__charge_id=str(charge.pk),
+                payload__stage=stage,
+            ).exists()
+            if already:
+                skipped += 1
+                continue
+            try:
+                publish(
+                    "ledger.charge_due_soon",
+                    {
+                        "charge_id": str(charge.pk),
+                        "stage": stage,
+                        "amount_outstanding": str(charge.outstanding),
+                        "due_date": charge.due_date.isoformat(),
+                        "description": charge.description,
+                    },
+                    property_id=charge.property_id,
+                    lease_id=charge.lease_id,
+                )
+                published += 1
+            except Exception:
+                logger.exception("charge_due_soon publish failed for charge %s", charge.pk)
+    return {"reminders_published": published, "already_sent": skipped}
+
+
+# ---------------------------------------------------------- SLA breaches
+def flag_sla_breaches() -> dict:
+    """
+    Any open work order past its sla_due_at gets a maintenance.sla_breached
+    event (routed to the LANDLORD via the property fallback in notify.py).
+    Dedup against the DomainEvent outbox: one breach event per work order,
+    ever — the breach doesn't un-happen, so there's nothing to re-announce.
+
+    If your WorkOrder model stores a concrete `sla_breached` boolean, it's
+    flipped too (best-effort; skipped harmlessly if it's a computed
+    property instead).
+    """
+    from rentium.events.models import DomainEvent
+    from rentium.events.registry import publish
+    from rentium.maintenance.models import WorkOrder
+
+    now = timezone.now()
+    terminal = [WorkOrder.Status.COMPLETED, WorkOrder.Status.CANCELLED]
+    overdue = WorkOrder.objects.filter(
+        sla_due_at__isnull=False, sla_due_at__lt=now
+    ).exclude(status__in=terminal)
+
+    published, skipped = 0, 0
+    for wo in overdue.iterator():
+        already = DomainEvent.objects.filter(
+            event_type="maintenance.sla_breached",
+            payload__work_order_id=str(wo.pk),
+        ).exists()
+        if already:
+            skipped += 1
+            continue
+        try:
+            publish(
+                "maintenance.sla_breached",
+                {
+                    "work_order_id": str(wo.pk),
+                    "title": wo.title,
+                    "sla_due_at": wo.sla_due_at.isoformat(),
+                    "rta_emergency": bool(getattr(wo, "is_rta_emergency", False)),
+                },
+                property_id=wo.property_id,
+            )
+            published += 1
+            # Best-effort: persist the flag if it's a real column.
+            try:
+                type(wo).objects.filter(pk=wo.pk).update(sla_breached=True)
+            except Exception:
+                pass  # computed property / no such column — event is enough
+        except Exception:
+            logger.exception("sla_breached publish failed for work order %s", wo.pk)
+    return {"breaches_published": published, "already_flagged": skipped}
+
+
+# ------------------------------------------- inspection delivery deadlines
+INSPECTION_DELIVERY_WARN_DAYS = 2
+
+
+def publish_inspection_delivery_reminders() -> dict:
+    """
+    BC compliance clocks: a signed move-in report must reach the tenant
+    within 7 days of the inspection date; a signed move-out report within
+    15 days. Missing these deadlines extinguishes the landlord's deposit
+    claims — so warn at T-2 days and once more when overdue. Dedup per
+    (inspection, pass, stage) via the DomainEvent outbox, so re-runs never
+    double-notify. mark_delivered on the inspection stops the clock.
+    """
+    from datetime import timedelta as _td
+
+    from rentium.events.models import DomainEvent
+    from rentium.events.registry import publish
+    from rentium.leases.inspections import ConditionInspection
+
+    today = date.today()
+    published = 0
+
+    def _check(insp, pass_name, signed_date, window_days, delivered_at):
+        nonlocal published
+        if not signed_date or delivered_at:
+            return
+        deadline = signed_date + _td(days=window_days)
+        days_left = (deadline - today).days
+        if days_left > INSPECTION_DELIVERY_WARN_DAYS:
+            return
+        stage = "overdue" if days_left < 0 else "due_soon"
+        already = DomainEvent.objects.filter(
+            event_type="inspection.delivery_due",
+            payload__inspection_id=str(insp.pk),
+            payload__pass=pass_name,
+            payload__stage=stage,
+        ).exists()
+        if already:
+            return
+        try:
+            publish(
+                "inspection.delivery_due",
+                {
+                    "inspection_id": str(insp.pk),
+                    "pass": pass_name,
+                    "stage": stage,
+                    "deadline": deadline.isoformat(),
+                    "lease_number": insp.lease.lease_number,
+                },
+                property_id=insp.lease.property_id,
+                lease_id=insp.lease_id,
+            )
+            published += 1
+        except Exception:
+            logger.exception(
+                "Delivery reminder publish failed for inspection %s", insp.pk
+            )
+
+    qs = ConditionInspection.objects.select_related("lease").exclude(
+        status=ConditionInspection.Status.MOVE_IN_IN_PROGRESS
+    )
+    for insp in qs.iterator():
+        _check(
+            insp, "MOVE_IN", insp.move_in_inspection_date, 7,
+            insp.move_in_report_delivered_at,
+        )
+        if insp.status == ConditionInspection.Status.COMPLETED:
+            _check(
+                insp, "MOVE_OUT", insp.move_out_inspection_date, 15,
+                insp.move_out_report_delivered_at,
+            )
+    return {"delivery_reminders_published": published}
+
+
+# ------------------------------------------------------------------ runner
+def run_all() -> dict:
+    """Run every daily job in dependency-sensible order and return a report.
+
+    Order matters slightly: expire leases FIRST so generate_all_rent_charges
+    doesn't roll the horizon forward for a lease that ended yesterday
+    (generation is gated on ACTIVE, and _rent_due_dates respects end_date
+    anyway — this ordering just makes the invariant obvious)."""
+    report = {}
+    report["expire_ended_leases"] = expire_ended_leases()
+    report["generate_all_rent_charges"] = generate_all_rent_charges()
+    report["publish_charge_due_reminders"] = publish_charge_due_reminders()
+    report["publish_inspection_delivery_reminders"] = (
+        publish_inspection_delivery_reminders()
+    )
+    report["flag_sla_breaches"] = flag_sla_breaches()
+    logger.info("Daily housekeeping report: %s", report)
+    return report
+
+
+========================================
+FILE: ./__init__.py
+========================================
+
+
+
+========================================
+FILE: ./apps.py
+========================================
+
+from django.apps import AppConfig
+
+
+class LedgerConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "rentium.ledger"
+
+
+========================================
+FILE: ./admin.py
+========================================
+
+from django.contrib import admin
+
+from .models import LedgerAttachment, LedgerEntry
+
+
+class LedgerAttachmentInline(admin.TabularInline):
+    model = LedgerAttachment
+    extra = 0
+
+
+@admin.register(LedgerEntry)
+class LedgerEntryAdmin(admin.ModelAdmin):
+    """Read-only in admin too — the ledger has no back door."""
+
+    list_display = ("entry_type", "amount", "description", "property", "tenant",
+                    "due_date", "effective_date", "created_at")
+    list_filter = ("entry_type", "category", "payment_method")
+    search_fields = ("description", "vendor", "reference_number", "idempotency_key")
+    inlines = [LedgerAttachmentInline]
+    readonly_fields = [f.name for f in LedgerEntry._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+========================================
+FILE: ./api/__init__.py
+========================================
+
+
+
+========================================
+FILE: ./api/urls.py
+========================================
+
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+
+from .views import LedgerEntryViewSet, summary_view, utility_bill_view
+
+app_name = "ledger_api"
+
+router = DefaultRouter()
+router.register("entries", LedgerEntryViewSet, basename="ledger-entry")
+
+urlpatterns = [
+    path("summary/", summary_view, name="summary"),
+    path("utility-bills/", utility_bill_view, name="utility-bills"),
+    path("", include(router.urls)),
+]
+
+
+========================================
+FILE: ./api/views.py
+========================================
+
+# views.py
+
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+
+from django.db.models import Count, Q, Sum
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters, serializers, status, viewsets
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+
+from rentium.leases.models import Lease
+
+from .. import services
+from ..billing import lease_is_joint, split_utility_bill
+from ..models import (
+    CHARGE_TYPES,
+    ChargeStatus,
+    EntryType,
+    INCOME_CHARGE_TYPES,
+    LedgerAttachment,
+    LedgerEntry,
+)
+
+
+# --------------------------------------------------------------- serializers
+class LedgerAttachmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LedgerAttachment
+        fields = ["id", "file", "label", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class LedgerEntrySerializer(serializers.ModelSerializer):
+    entry_type_display = serializers.CharField(source="get_entry_type_display", read_only=True)
+    category_display = serializers.CharField(source="get_category_display", read_only=True)
+    property_name = serializers.CharField(source="property.name", read_only=True, allow_null=True)
+    # Context for the Financial UI's expandable rows: which lease a charge
+    # belongs to (human-readable number) and what kind of space it's for
+    # ("ROOM" vs "COMPLETE_UNIT") without a second fetch per row.
+    lease_number = serializers.CharField(source="lease.lease_number", read_only=True, allow_null=True)
+    property_category = serializers.CharField(source="property.property_category", read_only=True, allow_null=True)
+    tenant_name = serializers.SerializerMethodField()
+    # True for household charges on joint (roommate) leases — everyone on
+    # the lease owes it together, and any tenant's payment settles it.
+    is_joint = serializers.SerializerMethodField()
+    # From with_settlement() annotations (charges only; null otherwise).
+    settled_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True, required=False)
+    outstanding = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True, required=False)
+    charge_status = serializers.SerializerMethodField()
+    voided = serializers.SerializerMethodField()
+    attachments = LedgerAttachmentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = LedgerEntry
+        fields = [
+            "id", "entry_type", "entry_type_display", "amount",
+            "due_date", "effective_date", "description",
+            "property", "property_name", "property_category",
+            "lease", "lease_number", "tenant", "tenant_name", "is_joint",
+            "settles", "reverses", "work_order",
+            "payment_method", "reference_number", "category", "category_display", "vendor",
+            "settled_amount", "outstanding", "charge_status", "voided",
+            "metadata", "attachments", "created_at",
+        ]
+        read_only_fields = fields  # writes go through service-backed actions only
+
+    def get_tenant_name(self, obj):
+        try:
+            return obj.tenant.user.name if obj.tenant else None
+        except AttributeError:
+            return str(obj.tenant) if obj.tenant else None
+
+    def get_is_joint(self, obj):
+        return obj.entry_type in CHARGE_TYPES and obj.tenant_id is None and obj.lease_id is not None
+
+    def get_voided(self, obj):
+        annotated = getattr(obj, "is_voided", None)
+        return annotated if annotated is not None else obj.voided
+
+    def get_charge_status(self, obj):
+        if obj.entry_type not in CHARGE_TYPES:
+            return None
+        if self.get_voided(obj):
+            return ChargeStatus.VOIDED
+        settled = getattr(obj, "settled_amount", None)
+        if settled is not None:
+            today = date.today()
+            if settled >= obj.amount:
+                return ChargeStatus.PAID
+            if settled > 0:
+                return ChargeStatus.PARTIALLY_PAID
+            if obj.due_date and obj.due_date < today:
+                return ChargeStatus.OVERDUE
+            if obj.due_date == today:
+                return ChargeStatus.DUE
+            return ChargeStatus.SCHEDULED
+        return obj.charge_status()
+
+
+# ------------------------------------------------------------------ helpers
+def _landlord(request):
+    if not hasattr(request.user, "landlord_profile"):
+        raise PermissionDenied("Landlords only.")
+    return request.user.landlord_profile
+
+
+def _decimal(value, field):
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        raise ValidationError({field: "A valid amount is required."})
+    if d <= 0:
+        raise ValidationError({field: "Amount must be positive."})
+    return d
+
+
+def _date(value, field, required=True):
+    if value in (None, ""):
+        if required:
+            raise ValidationError({field: "A date (YYYY-MM-DD) is required."})
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except ValueError:
+        raise ValidationError({field: "Use YYYY-MM-DD."})
+
+
+def _payer_from_request(request, charge):
+    """
+    Optional `tenant` in a record_payment body = who actually paid.
+    Required semantics for joint charges (anyone in the household can pay,
+    and we keep who-paid-what on the record); for split charges it defaults
+    to the charge's own tenant. Validated against the charge's lease.
+    """
+    tenant_id = request.data.get("tenant")
+    if not tenant_id:
+        return None  # services.record_payment falls back to charge.tenant
+    if not charge.lease_id:
+        raise ValidationError({"tenant": "This charge has no lease to match a payer against."})
+    lt = charge.lease.lease_tenants.filter(tenant__pk=tenant_id).first()
+    if not lt or not lt.tenant:
+        raise ValidationError({"tenant": "That tenant is not on this charge's lease."})
+    return lt.tenant
+
+
+# ------------------------------------------------------------------ viewset
+class LedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    /api/ledger/entries/  — the property ledger.
+    Read-only by design: entries are immutable, so there is no PUT/PATCH/
+    DELETE. All writes are explicit business actions below, each routed
+    through the service layer (idempotency + events in one place).
+    """
+    serializer_class = LedgerEntrySerializer
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = {
+        "property": ["exact"],
+        "lease": ["exact"],
+        "tenant": ["exact"],
+        "entry_type": ["exact", "in"],
+        "category": ["exact"],
+        "due_date": ["gte", "lte"],
+        "effective_date": ["gte", "lte"],
+    }
+    search_fields = ["description", "vendor", "reference_number"]
+    ordering_fields = ["effective_date", "due_date", "amount", "created_at"]
+    ordering = ["-effective_date", "-created_at"]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = (
+            LedgerEntry.objects.select_related("property", "tenant", "lease")
+            .prefetch_related("attachments")
+            .with_settlement()
+        )
+        if hasattr(user, "landlord_profile"):
+            return qs.filter(landlord=user.landlord_profile)
+        if hasattr(user, "tenant_profile"):
+            tp = user.tenant_profile
+            # A tenant sees:
+            #  1. entries in their own name (their split charges, their payments),
+            #  2. JOINT household entries (tenant=NULL) on any lease they're on —
+            #     the whole household owes those together,
+            #  3. settlements OF those joint charges regardless of which
+            #     roommate paid — so when a roommate's $400 lands, everyone
+            #     sees the household balance clear.
+            # `lease__in=<queryset>` (a subquery) is used instead of joining
+            # lease__lease_tenants directly: a join would multiply rows on
+            # multi-tenant leases and corrupt the Sum() in with_settlement().
+            my_leases = Lease.objects.filter(lease_tenants__tenant=tp)
+            return qs.filter(
+                Q(tenant=tp)
+                | (Q(tenant__isnull=True) & Q(lease__in=my_leases))
+                | (Q(settles__tenant__isnull=True) & Q(settles__lease__in=my_leases))
+            )
+        return LedgerEntry.objects.none()
+
+    @action(detail=False, methods=["get"])
+    def charges(self, request):
+        """Charges only, with computed status; ?status=OVERDUE filter."""
+        qs = self.filter_queryset(self.get_queryset()).charges()
+        wanted = request.query_params.get("status")
+        page = self.paginate_queryset(qs)
+        items = page if page is not None else qs
+        data = self.get_serializer(items, many=True).data
+        if wanted:
+            data = [d for d in data if d["charge_status"] == wanted]
+        if page is not None and not wanted:
+            return self.get_paginated_response(data)
+        return Response(data)
+
+    # ----------------------------------------------------------- writes
+    @action(detail=True, methods=["post"])
+    def record_payment(self, request, pk=None):
+        """
+        Landlord confirms an e-transfer/cash arrived for this charge.
+        Body: {amount, payment_method, payment_date?, reference_number?,
+               notes?, tenant?, idempotency_key}
+        `tenant` = who paid — pass it on JOINT household charges so the
+        record shows which roommate's money it was (two $400 e-transfers
+        from different roommates are two payments settling the same $800
+        charge). Send a client-generated UUID as the idempotency_key; a
+        retry returns the original entry, never a double-post.
+        """
+        _landlord(request)
+        charge = self.get_object()
+        try:
+            entry, created = services.record_payment(
+                charge=charge,
+                amount=_decimal(request.data.get("amount"), "amount"),
+                payment_method=request.data.get("payment_method", "ETRANSFER"),
+                payment_date=_date(request.data.get("payment_date"), "payment_date", required=False),
+                reference_number=request.data.get("reference_number", ""),
+                notes=request.data.get("notes", ""),
+                paid_by=_payer_from_request(request, charge),
+                idempotency_key=request.data.get("idempotency_key") or None,
+                created_by=request.user,
+            )
+        except services.LedgerError as exc:
+            raise ValidationError({"detail": str(exc)})
+        return Response(
+            LedgerEntrySerializer(entry).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"])
+    def credit(self, request, pk=None):
+        """One-off discount/goodwill credit against this charge."""
+        _landlord(request)
+        charge = self.get_object()
+        try:
+            entry, created = services.post_credit(
+                charge=charge,
+                amount=_decimal(request.data.get("amount"), "amount"),
+                reason=request.data.get("reason", "Credit"),
+                idempotency_key=request.data.get("idempotency_key") or None,
+                created_by=request.user,
+            )
+        except services.LedgerError as exc:
+            raise ValidationError({"detail": str(exc)})
+        return Response(LedgerEntrySerializer(entry).data,
+                        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])
+    def void(self, request, pk=None):
+        """Void this entry with a reversal. Body: {reason}."""
+        _landlord(request)
+        entry = self.get_object()
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            raise ValidationError({"reason": "A reason is required — it goes on the audit trail."})
+        try:
+            reversal = services.void_entry(entry, reason=reason, created_by=request.user)
+        except services.LedgerError as exc:
+            raise ValidationError({"detail": str(exc)})
+        return Response(LedgerEntrySerializer(reversal).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def correct(self, request, pk=None):
+        """
+        The 'edit' button: void + repost with changed fields in one
+        transaction. Body: any of {amount, description, due_date,
+        effective_date, category, vendor, reference_number, reason}.
+        """
+        _landlord(request)
+        entry = self.get_object()
+        changes = {}
+        if "amount" in request.data:
+            changes["amount"] = _decimal(request.data["amount"], "amount")
+        for f in ("description", "category", "vendor", "reference_number"):
+            if f in request.data:
+                changes[f] = request.data[f]
+        if "due_date" in request.data:
+            changes["due_date"] = _date(request.data["due_date"], "due_date", required=False)
+        if "effective_date" in request.data:
+            changes["effective_date"] = _date(request.data["effective_date"], "effective_date")
+        if not changes:
+            raise ValidationError({"detail": "Nothing to change."})
+        try:
+            replacement = services.correct_entry(
+                entry, created_by=request.user,
+                reason=request.data.get("reason", "Correction"), **changes,
+            )
+        except services.LedgerError as exc:
+            raise ValidationError({"detail": str(exc)})
+        return Response(LedgerEntrySerializer(replacement).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"])
+    def expense(self, request):
+        """
+        Record money out. Body: {amount, category, description,
+        incurred_date?, property?, vendor?, work_order?, idempotency_key}.
+        """
+        landlord = _landlord(request)
+        prop = None
+        if request.data.get("property"):
+            from rentium.properties.models import Property
+            prop = Property.objects.filter(pk=request.data["property"], landlord=landlord).first()
+            if not prop:
+                raise ValidationError({"property": "Not your property."})
+        entry, created = services.post_expense(
+            landlord=landlord,
+            property=prop,
+            amount=_decimal(request.data.get("amount"), "amount"),
+            category=request.data.get("category", "OTHER"),
+            description=request.data.get("description", "").strip() or "Expense",
+            incurred_date=_date(request.data.get("incurred_date"), "incurred_date", required=False),
+            vendor=request.data.get("vendor", ""),
+            idempotency_key=request.data.get("idempotency_key") or None,
+            created_by=request.user,
+        )
+        return Response(LedgerEntrySerializer(entry).data,
+                        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"])
+    def charge(self, request):
+        """
+        Manual one-off charge (e.g. damage, late fee). Body: {lease,
+        amount, due_date, description, entry_type?, tenant?}.
+        `tenant` is optional on JOINT (roommate) leases — omit it to bill
+        the whole household jointly; required on split-billing leases.
+        """
+        landlord = _landlord(request)
+        lease = Lease.objects.filter(pk=request.data.get("lease"), landlord=landlord).first()
+        if not lease:
+            raise ValidationError({"lease": "Not your lease."})
+        tenant = None
+        tenant_id = request.data.get("tenant")
+        if tenant_id:
+            lt = lease.lease_tenants.filter(tenant__pk=tenant_id).first()
+            if not lt or not lt.tenant:
+                raise ValidationError({"tenant": "That tenant is not on this lease."})
+            tenant = lt.tenant
+        elif not lease_is_joint(lease):
+            raise ValidationError(
+                {"tenant": "A tenant is required on this lease (it bills per-tenant)."}
+            )
+        etype = request.data.get("entry_type", EntryType.OTHER_CHARGE)
+        if etype not in CHARGE_TYPES:
+            raise ValidationError({"entry_type": "Must be a charge type."})
+        entry, created = services.post_charge(
+            landlord=landlord,
+            tenant=tenant,
+            lease=lease,
+            amount=_decimal(request.data.get("amount"), "amount"),
+            due_date=_date(request.data.get("due_date"), "due_date"),
+            entry_type=etype,
+            description=request.data.get("description", "").strip() or "Charge",
+            idempotency_key=request.data.get("idempotency_key") or None,
+            created_by=request.user,
+        )
+        return Response(LedgerEntrySerializer(entry).data,
+                        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser])
+    def add_attachment(self, request, pk=None):
+        _landlord(request)
+        entry = self.get_object()
+        file = request.FILES.get("file")
+        if not file:
+            raise ValidationError({"file": "A file is required."})
+        att = LedgerAttachment.objects.create(
+            entry=entry, file=file, label=request.data.get("label", ""), uploaded_by=request.user
+        )
+        return Response(LedgerAttachmentSerializer(att).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"])
+    def receipt(self, request, pk=None):
+        """
+        GET /api/ledger/entries/<id>/receipt/ -> printable PDF receipt.
+        Only PAYMENT entries have receipts. Visibility rides on the
+        viewset's own queryset scoping — the landlord and every tenant on
+        the lease can pull it (roommates share one household ledger, and a
+        receipt for "who paid what" is exactly the record they need).
+        """
+        entry = self.get_object()
+        if entry.entry_type != EntryType.PAYMENT:
+            raise ValidationError({"detail": "Receipts are only available for payments."})
+
+        from io import BytesIO
+
+        from django.http import HttpResponse
+        from reportlab.lib.pagesizes import LETTER
+        from reportlab.lib.units import inch
+        from reportlab.pdfgen import canvas as pdfcanvas
+
+        charge = entry.settles
+        lease = entry.lease or (charge.lease if charge else None)
+        prop = entry.property or (charge.property if charge else None)
+        try:
+            payer = entry.tenant.user.name if entry.tenant else None
+        except AttributeError:
+            payer = str(entry.tenant) if entry.tenant else None
+        try:
+            landlord_name = entry.landlord.user.name
+        except AttributeError:
+            landlord_name = str(entry.landlord) if entry.landlord_id else ""
+
+        buf = BytesIO()
+        c = pdfcanvas.Canvas(buf, pagesize=LETTER)
+        width, height = LETTER
+        y = height - 1 * inch
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(1 * inch, y, "Payment Receipt")
+        c.setFont("Helvetica", 9)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawRightString(width - 1 * inch, y, f"Receipt {str(entry.pk)[:8].upper()}")
+        c.setFillColorRGB(0, 0, 0)
+        y -= 0.2 * inch
+        c.setStrokeColorRGB(0.85, 0.85, 0.85)
+        c.line(1 * inch, y, width - 1 * inch, y)
+        y -= 0.4 * inch
+
+        def row(label, value):
+            nonlocal y
+            if value in (None, ""):
+                return
+            c.setFont("Helvetica", 10)
+            c.setFillColorRGB(0.45, 0.45, 0.45)
+            c.drawString(1 * inch, y, label)
+            c.setFillColorRGB(0, 0, 0)
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(2.7 * inch, y, str(value)[:80])
+            y -= 0.28 * inch
+
+        row("Amount received", f"${entry.amount}")
+        row("Date received", entry.effective_date)
+        row("Paid by", payer or "Tenant")
+        row("Received by", landlord_name)
+        row("Method", entry.payment_method or "")
+        row("Reference", entry.reference_number or "")
+        if charge:
+            row("Applied to", charge.description)
+            row("Charge due date", charge.due_date)
+        if lease is not None:
+            row("Lease", getattr(lease, "lease_number", ""))
+        if prop is not None:
+            row("Property", getattr(prop, "name", ""))
+            row("Address", getattr(prop, "address", ""))
+        y -= 0.15 * inch
+        c.setStrokeColorRGB(0.85, 0.85, 0.85)
+        c.line(1 * inch, y, width - 1 * inch, y)
+        y -= 0.3 * inch
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(
+            1 * inch, y,
+            "Recorded in Rentium. This receipt confirms the payment above was "
+            "recorded on the lease ledger by the landlord.",
+        )
+        c.showPage()
+        c.save()
+        pdf = buf.getvalue()
+        buf.close()
+        response = HttpResponse(pdf, content_type="application/pdf")
+        response["Content-Disposition"] = (
+            f'attachment; filename="receipt_{str(entry.pk)[:8]}.pdf"'
+        )
+        return response
+
+
+# ------------------------------------------------------------- utility bill
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def utility_bill_view(request):
+    """
+    POST /api/ledger/utility-bills/
+    {lease, total_amount, period_start, period_end, description,
+     bill_key?, due_date?, record_landlord_expense?, vendor?}
+    `bill_key` names one of the lease's configured bills_included entries
+    (e.g. "electricity") — the tenants are then charged only their share
+    per the lease terms (included -> $0, percentage, fixed, full). Omitted
+    or unconfigured -> the full amount is billed (a one-off).
+    JOINT leases get ONE household charge for the tenant portion; split
+    leases fan the tenant portion into per-tenant UTILITY_CHARGE entries
+    weighted by days actually occupied in the period (occupancy log).
+    Optionally also books the landlord's own EXPENSE (always the FULL bill
+    — what the landlord actually paid the provider) in the same call.
+    """
+    landlord = _landlord(request)
+    lease = Lease.objects.filter(pk=request.data.get("lease"), landlord=landlord).first()
+    if not lease:
+        raise ValidationError({"lease": "Not your lease."})
+    bill_key = (request.data.get("bill_key") or "").strip() or None
+    if bill_key and bill_key not in (lease.bills_included or {}):
+        raise ValidationError({"bill_key": f"'{bill_key}' isn't configured on this lease."})
+    try:
+        entries = split_utility_bill(
+            lease=lease,
+            total_amount=_decimal(request.data.get("total_amount"), "total_amount"),
+            period_start=_date(request.data.get("period_start"), "period_start"),
+            period_end=_date(request.data.get("period_end"), "period_end"),
+            description=request.data.get("description", "").strip() or "Utility bill",
+            due_date=_date(request.data.get("due_date"), "due_date", required=False),
+            record_landlord_expense=bool(request.data.get("record_landlord_expense")),
+            expense_vendor=request.data.get("vendor", ""),
+            bill_key=bill_key,
+            created_by=request.user,
+        )
+    except ValueError as exc:
+        raise ValidationError({"detail": str(exc)})
+    return Response(LedgerEntrySerializer(entries, many=True).data, status=status.HTTP_201_CREATED)
+
+
+# ----------------------------------------------------------------- summary
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def summary_view(request):
+    """
+    GET /api/ledger/summary/?months=6[&property=<id>]
+    Per-month expected vs collected income, expenses, net; plus outstanding/
+    overdue and deposits held — all computed from the one ledger. Deposits
+    are excluded from income (refundable liabilities).
+    """
+    landlord = _landlord(request)
+    try:
+        months_back = min(max(int(request.query_params.get("months", 6)), 1), 24)
+    except ValueError:
+        months_back = 6
+    entries = LedgerEntry.objects.filter(landlord=landlord)
+    if request.query_params.get("property"):
+        entries = entries.filter(property_id=request.query_params["property"])
+    live = entries.not_voided()
+    today = date.today()
+
+    def month_starts(n):
+        y, m, out = today.year, today.month, []
+        for _ in range(n):
+            out.append(date(y, m, 1))
+            m -= 1
+            if m == 0:
+                m, y = 12, y - 1
+        return list(reversed(out))
+
+    def next_month(d):
+        return date(d.year + (d.month // 12), (d.month % 12) + 1, 1)
+
+    monthly = []
+    for start in month_starts(months_back):
+        end = next_month(start)
+        expected = live.filter(
+            entry_type__in=INCOME_CHARGE_TYPES, due_date__gte=start, due_date__lt=end
+        ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        collected = live.filter(
+            entry_type=EntryType.PAYMENT,
+            settles__entry_type__in=INCOME_CHARGE_TYPES,
+            effective_date__gte=start, effective_date__lt=end,
+        ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        spent = live.filter(
+            entry_type=EntryType.EXPENSE, effective_date__gte=start, effective_date__lt=end
+        ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        monthly.append({
+            "month": start.strftime("%Y-%m"),
+            "label": start.strftime("%b %Y"),
+            "expected_income": str(expected),
+            "collected_income": str(collected),
+            "expenses": str(spent),
+            "net": str(collected - spent),
+        })
+    open_charges = (
+        entries.with_settlement()
+        .filter(entry_type__in=INCOME_CHARGE_TYPES, reversed_by__isnull=True,
+                due_date__lte=today, outstanding__gt=0)
+    )
+    agg = open_charges.aggregate(total=Sum("outstanding"), count=Count("id"))
+    overdue_count = open_charges.filter(due_date__lt=today).count()
+    return Response({
+        "monthly": monthly,
+        "outstanding_total": str(agg["total"] or Decimal("0.00")),
+        "outstanding_count": agg["count"] or 0,
+        "overdue_count": overdue_count,
+        "deposits_held": str(services.deposits_held(landlord)),
+    })
+
+========================================
+FILE: ./daily.py
+========================================
+
+# rentium/ledger/daily.py
+"""
+Daily housekeeping for Rentium — the jobs that keep time-based state true.
+
+WHY THIS MODULE EXISTS: without it, the app silently rots. Rent charges are
+only generated 45 days ahead (GENERATION_HORIZON_DAYS) and only when a
+signal fires (a signature, an adjustment, a roommate change). On a quiet
+lease nothing re-triggers generation, so around month 2-3 new rent charges
+just stop appearing and "Expected This Month" drops to $0. Similarly,
+leases never flip to EXPIRED on their own, tenants never get "rent due
+soon" nudges, and maintenance SLA breaches are never detected.
+
+Each function below is IDEMPOTENT and safe to run any number of times per
+day:
+  - rent charges dedupe on their natural idempotency keys;
+  - lease expiry only touches ACTIVE leases whose end_date has passed;
+  - reminders and SLA breaches dedupe against the DomainEvent outbox, so a
+    re-run (or a twice-daily cron) never double-notifies.
+
+Run it two ways (both call the same functions):
+  1. Celery beat  -> rentium/ledger/tasks.py (preferred once Celery is up)
+  2. cron / manual -> python manage.py run_daily_tasks
+"""
+
+import logging
+from datetime import date, timedelta
+
+from django.utils import timezone
+
+logger = logging.getLogger(__name__)
+
+# How many days before a charge's due date the "due soon" reminder fires.
+# 0 is included so tenants also get a nudge on the due date itself.
+DUE_SOON_OFFSETS = (3, 0)
+
+
+# ------------------------------------------------------------ rent charges
+def generate_all_rent_charges() -> dict:
+    """
+    Roll the 45-day generation horizon forward for every ACTIVE lease.
+    Per-lease try/except so one bad lease can't starve the rest of the
+    portfolio of rent charges.
+    """
+    from rentium.leases.models import Lease
+    from rentium.ledger.billing import generate_rent_charges_for_lease
+
+    created_total, leases_touched, failures = 0, 0, 0
+    for lease in Lease.objects.filter(status=Lease.LeaseStatus.ACTIVE).iterator():
+        try:
+            created = generate_rent_charges_for_lease(lease)
+            created_total += created
+            leases_touched += 1
+        except Exception:
+            failures += 1
+            logger.exception("Rent generation failed for lease %s", lease.pk)
+    return {
+        "leases_processed": leases_touched,
+        "charges_created": created_total,
+        "failures": failures,
+    }
+
+
+# ------------------------------------------------------------ lease expiry
+def expire_ended_leases() -> dict:
+    """
+    ACTIVE fixed-term leases whose end_date has fully passed become EXPIRED.
+    (A lease ends ON its end_date, so we only expire when today is strictly
+    after it.) Month-to-month leases have no end_date and are never touched.
+    The existing close_occupancies_on_end signal fires off this save and
+    closes the occupancy log rows; we also publish lease.expired so both
+    parties get a notification (ROUTES already maps it to BOTH).
+    """
+    from rentium.events.registry import publish
+    from rentium.leases.models import Lease
+
+    today = date.today()
+    expired, failures = 0, 0
+    qs = Lease.objects.filter(
+        status=Lease.LeaseStatus.ACTIVE,
+        end_date__isnull=False,
+        end_date__lt=today,
+    )
+    for lease in qs.iterator():
+        try:
+            lease.status = Lease.LeaseStatus.EXPIRED
+            lease.save(update_fields=["status", "updated_at"])
+            publish(
+                "lease.expired",
+                {"lease_id": str(lease.pk), "end_date": lease.end_date.isoformat()},
+                property_id=lease.property_id,
+                lease_id=lease.pk,
+            )
+            expired += 1
+        except Exception:
+            failures += 1
+            logger.exception("Failed to expire lease %s", lease.pk)
+    return {"leases_expired": expired, "failures": failures}
+
+
+# ------------------------------------------------------- due-soon reminders
+def publish_charge_due_reminders(offsets=DUE_SOON_OFFSETS) -> dict:
+    """
+    For each offset N in `offsets`, find income charges due exactly N days
+    from today that still have an outstanding balance, and publish a
+    ledger.charge_due_soon event for each (fan-out turns it into tenant
+    notifications; ROUTES already maps this event type).
+
+    Dedup: each (charge, stage) pair is published at most once EVER,
+    enforced by checking the DomainEvent outbox — so re-running the task
+    the same day (or a Celery retry) can't double-notify. If the task
+    doesn't run at all on a given day, that day's reminders are skipped
+    rather than sent late; the due-date (offset 0) reminder is the
+    backstop.
+
+    NOTE: the TENANT audience notifies every linked tenant on the lease,
+    not just the tenant named on the charge — intentional, consistent with
+    the joint-and-several policy (everyone is on the hook for the full
+    rent, so everyone hears that money is due).
+    """
+    from rentium.events.models import DomainEvent
+    from rentium.events.registry import publish
+    from rentium.ledger.models import INCOME_CHARGE_TYPES, LedgerEntry
+
+    today = date.today()
+    published, skipped = 0, 0
+    for offset in offsets:
+        target = today + timedelta(days=offset)
+        stage = f"due_in_{offset}"
+        charges = (
+            LedgerEntry.objects.with_settlement()
+            .filter(
+                entry_type__in=INCOME_CHARGE_TYPES,
+                reversed_by__isnull=True,
+                due_date=target,
+                outstanding__gt=0,
+                tenant__isnull=False,
+                lease__isnull=False,
+            )
+            .select_related("lease")
+        )
+        for charge in charges.iterator():
+            already = DomainEvent.objects.filter(
+                event_type="ledger.charge_due_soon",
+                payload__charge_id=str(charge.pk),
+                payload__stage=stage,
+            ).exists()
+            if already:
+                skipped += 1
+                continue
+            try:
+                publish(
+                    "ledger.charge_due_soon",
+                    {
+                        "charge_id": str(charge.pk),
+                        "stage": stage,
+                        "amount_outstanding": str(charge.outstanding),
+                        "due_date": charge.due_date.isoformat(),
+                        "description": charge.description,
+                    },
+                    property_id=charge.property_id,
+                    lease_id=charge.lease_id,
+                )
+                published += 1
+            except Exception:
+                logger.exception("charge_due_soon publish failed for charge %s", charge.pk)
+    return {"reminders_published": published, "already_sent": skipped}
+
+
+# ---------------------------------------------------------- SLA breaches
+def flag_sla_breaches() -> dict:
+    """
+    Any open work order past its sla_due_at gets a maintenance.sla_breached
+    event (routed to the LANDLORD via the property fallback in notify.py).
+    Dedup against the DomainEvent outbox: one breach event per work order,
+    ever — the breach doesn't un-happen, so there's nothing to re-announce.
+
+    If your WorkOrder model stores a concrete `sla_breached` boolean, it's
+    flipped too (best-effort; skipped harmlessly if it's a computed
+    property instead).
+    """
+    from rentium.events.models import DomainEvent
+    from rentium.events.registry import publish
+    from rentium.maintenance.models import WorkOrder
+
+    now = timezone.now()
+    terminal = [WorkOrder.Status.COMPLETED, WorkOrder.Status.CANCELLED]
+    overdue = WorkOrder.objects.filter(
+        sla_due_at__isnull=False, sla_due_at__lt=now
+    ).exclude(status__in=terminal)
+
+    published, skipped = 0, 0
+    for wo in overdue.iterator():
+        already = DomainEvent.objects.filter(
+            event_type="maintenance.sla_breached",
+            payload__work_order_id=str(wo.pk),
+        ).exists()
+        if already:
+            skipped += 1
+            continue
+        try:
+            publish(
+                "maintenance.sla_breached",
+                {
+                    "work_order_id": str(wo.pk),
+                    "title": wo.title,
+                    "sla_due_at": wo.sla_due_at.isoformat(),
+                    "rta_emergency": bool(getattr(wo, "is_rta_emergency", False)),
+                },
+                property_id=wo.property_id,
+            )
+            published += 1
+            # Best-effort: persist the flag if it's a real column.
+            try:
+                type(wo).objects.filter(pk=wo.pk).update(sla_breached=True)
+            except Exception:
+                pass  # computed property / no such column — event is enough
+        except Exception:
+            logger.exception("sla_breached publish failed for work order %s", wo.pk)
+    return {"breaches_published": published, "already_flagged": skipped}
+
+
+# ------------------------------------------- inspection delivery deadlines
+INSPECTION_DELIVERY_WARN_DAYS = 2
+
+
+def publish_inspection_delivery_reminders() -> dict:
+    """
+    BC compliance clocks: a signed move-in report must reach the tenant
+    within 7 days of the inspection date; a signed move-out report within
+    15 days. Missing these deadlines extinguishes the landlord's deposit
+    claims — so warn at T-2 days and once more when overdue. Dedup per
+    (inspection, pass, stage) via the DomainEvent outbox, so re-runs never
+    double-notify. mark_delivered on the inspection stops the clock.
+    """
+    from datetime import timedelta as _td
+
+    from rentium.events.models import DomainEvent
+    from rentium.events.registry import publish
+    from rentium.leases.inspections import ConditionInspection
+
+    today = date.today()
+    published = 0
+
+    def _check(insp, pass_name, signed_date, window_days, delivered_at):
+        nonlocal published
+        if not signed_date or delivered_at:
+            return
+        deadline = signed_date + _td(days=window_days)
+        days_left = (deadline - today).days
+        if days_left > INSPECTION_DELIVERY_WARN_DAYS:
+            return
+        stage = "overdue" if days_left < 0 else "due_soon"
+        already = DomainEvent.objects.filter(
+            event_type="inspection.delivery_due",
+            payload__inspection_id=str(insp.pk),
+            payload__pass=pass_name,
+            payload__stage=stage,
+        ).exists()
+        if already:
+            return
+        try:
+            publish(
+                "inspection.delivery_due",
+                {
+                    "inspection_id": str(insp.pk),
+                    "pass": pass_name,
+                    "stage": stage,
+                    "deadline": deadline.isoformat(),
+                    "lease_number": insp.lease.lease_number,
+                },
+                property_id=insp.lease.property_id,
+                lease_id=insp.lease_id,
+            )
+            published += 1
+        except Exception:
+            logger.exception(
+                "Delivery reminder publish failed for inspection %s", insp.pk
+            )
+
+    qs = ConditionInspection.objects.select_related("lease").exclude(
+        status=ConditionInspection.Status.MOVE_IN_IN_PROGRESS
+    )
+    for insp in qs.iterator():
+        _check(
+            insp, "MOVE_IN", insp.move_in_inspection_date, 7,
+            insp.move_in_report_delivered_at,
+        )
+        if insp.status == ConditionInspection.Status.COMPLETED:
+            _check(
+                insp, "MOVE_OUT", insp.move_out_inspection_date, 15,
+                insp.move_out_report_delivered_at,
+            )
+    return {"delivery_reminders_published": published}
+
+
+# ------------------------------------------------------------------ runner
+def run_all() -> dict:
+    """Run every daily job in dependency-sensible order and return a report.
+
+    Order matters slightly: expire leases FIRST so generate_all_rent_charges
+    doesn't roll the horizon forward for a lease that ended yesterday
+    (generation is gated on ACTIVE, and _rent_due_dates respects end_date
+    anyway — this ordering just makes the invariant obvious)."""
+    report = {}
+    report["expire_ended_leases"] = expire_ended_leases()
+    report["generate_all_rent_charges"] = generate_all_rent_charges()
+    report["publish_charge_due_reminders"] = publish_charge_due_reminders()
+    report["publish_inspection_delivery_reminders"] = (
+        publish_inspection_delivery_reminders()
+    )
+    report["flag_sla_breaches"] = flag_sla_breaches()
+    logger.info("Daily housekeeping report: %s", report)
+    return report
+

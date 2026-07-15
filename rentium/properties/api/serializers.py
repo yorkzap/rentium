@@ -402,9 +402,15 @@ class PropertySerializer(serializers.ModelSerializer):
     group_name = serializers.CharField(
         source="group.name", read_only=True, allow_null=True
     )
-    assign_group_id = serializers.UUIDField(
-        write_only=True, required=False, allow_null=True, source="group"
+    assign_group_id = serializers.PrimaryKeyRelatedField(
+        queryset=PropertyGroup.objects.all(),  # narrowed per-landlord in __init__
+        source="group",
+        write_only=True,
+        required=False,
+        allow_null=True,
     )
+    publish_blockers = serializers.SerializerMethodField()
+    can_be_published = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Property
@@ -446,6 +452,17 @@ class PropertySerializer(serializers.ModelSerializer):
             # Timestamps
             "created_at",
             "updated_at",
+            "is_publicly_visible",
+            "public_slug",
+            "asking_rent",
+            "available_from",
+            "is_furnished",  # read-only: derived from inventory
+            "neighbourhood",
+            "building_amenities",
+            "latitude",
+            "longitude",
+            "publish_blockers",
+            "can_be_published",
         ]
         read_only_fields = [
             "id",
@@ -465,6 +482,12 @@ class PropertySerializer(serializers.ModelSerializer):
             "group_name",
             "created_at",
             "updated_at",
+            "public_slug",
+            "is_furnished",
+            "latitude",
+            "longitude",
+            "publish_blockers",
+            "can_be_published",
         ]
         extra_kwargs = {
             "bathrooms": {"coerce_to_string": False, "allow_null": True},
@@ -473,11 +496,6 @@ class PropertySerializer(serializers.ModelSerializer):
             "square_footage": {"allow_null": True},
             "unit_type": {"allow_null": True},
             "room_type": {"allow_null": True},
-            "assign_group_id": {
-                "queryset": PropertyGroup.objects.none(),  # Dynamically set
-                "allow_null": True,  # Allow unassigning
-                "required": False,  # Not required on every update
-            },
         }
 
     def __init__(self, *args, **kwargs):
@@ -492,17 +510,23 @@ class PropertySerializer(serializers.ModelSerializer):
                 landlord=request.user.landlord_profile
             )
 
+    def get_publish_blockers(self, obj):
+        return obj.publish_blockers()
+
     def validate_assign_group_id(self, value):
-        """Validate that the user owns the group being assigned."""
-        # 'value' here is the PropertyGroup instance fetched by DRF
-        # or None if null was passed
+        """`value` is a PropertyGroup instance (or None) resolved by DRF."""
+        if value is None:
+            return None
+
         request = self.context.get("request")
-        if value and request and hasattr(request.user, "landlord_profile"):
-            if value.landlord != request.user.landlord_profile:
-                raise serializers.ValidationError(
-                    _("You can only assign properties to your own groups.")
-                )
-        return value  # Return the group instance or None
+        landlord = getattr(getattr(request, "user", None), "landlord_profile", None)
+        if landlord is None:
+            raise serializers.ValidationError(
+                _("Only landlords can assign property groups.")
+            )
+        if value.landlord_id != landlord.id:
+            raise serializers.ValidationError(_("You don't own that property group."))
+        return value
 
     def validate(self, data):
         """Validate category-specific requirements and group assignment rules."""

@@ -1,7 +1,9 @@
 # rentium/properties/api/views.py
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import models  # Import models for Q objects
 from django.shortcuts import get_object_or_404
+from rest_framework import serializers
 from rest_framework import status
 from rest_framework import viewsets
 from rest_framework.decorators import action

@@ -35,14 +35,12 @@ class CustomObtainAuthToken(ObtainAuthToken):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data["user"]
-
         # Check if user's email is verified using EmailAddress model
         from allauth.account.models import EmailAddress
 
         email_verified = EmailAddress.objects.filter(
             user=user, primary=True, verified=True
         ).exists()
-
         if not email_verified:
             return Response(
                 {
@@ -50,7 +48,6 @@ class CustomObtainAuthToken(ObtainAuthToken):
                 },
                 status=status.HTTP_403_FORBIDDEN,
             )
-
         token, created = Token.objects.get_or_create(user=user)
         return Response({"token": token.key})
 
@@ -65,8 +62,29 @@ class UserViewSet(RetrieveModelMixin, ListModelMixin, UpdateModelMixin, GenericV
         assert isinstance(self.request.user.id, int)
         return self.queryset.filter(id=self.request.user.id)
 
-    @action(detail=False)
+    @action(detail=False, methods=["get", "patch"])
     def me(self, request):
+        """
+        GET returns the current user's profile. PATCH updates it — only
+        `name` and `phone` are actually writable (see UserSerializer's
+        read_only_fields for why email/user_type aren't editable here).
+
+        This was previously GET-only (no `methods=` on the @action decorator
+        defaults to GET), which is why phone-number edits from the frontend
+        were silently discarded — the request never reached this branch at
+        all, DRF rejected it with 405 before the view code ever ran.
+        """
+        if request.method == "PATCH":
+            serializer = UserSerializer(
+                request.user,
+                data=request.data,
+                partial=True,
+                context={"request": request},
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(status=status.HTTP_200_OK, data=serializer.data)
+
         serializer = UserSerializer(request.user, context={"request": request})
         return Response(status=status.HTTP_200_OK, data=serializer.data)
 
@@ -96,22 +114,18 @@ class UserRegistrationView(APIView):
 
     def post(self, request, *args, **kwargs):
         serializer = UserRegistrationSerializer(data=request.data)
-
         if serializer.is_valid():
             try:
                 # Create user from serializer
                 user = serializer.save()
-
                 # Create an email address instance for the user
                 email_address, created = EmailAddress.objects.get_or_create(
                     user=user,
                     email=user.email,
                     defaults={"primary": True, "verified": False},
                 )
-
                 # Send confirmation email
                 send_email_confirmation(request, user, signup=True)
-
                 return Response(
                     {
                         "message": "User registered successfully. Please check your email for verification instructions.",
@@ -131,7 +145,6 @@ class UserRegistrationView(APIView):
                     {"error": "Registration failed due to a database constraint."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -146,7 +159,6 @@ def verify_email_confirm(request):
         return Response(
             {"detail": "Missing verification key"}, status=status.HTTP_400_BAD_REQUEST
         )
-
     try:
         # First try with HMAC (more secure)
         confirmation = EmailConfirmationHMAC.from_key(key)
@@ -159,7 +171,6 @@ def verify_email_confirm(request):
                     {"detail": "Invalid verification key"},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-
         confirmation.confirm(request)
         return Response({"detail": "Email successfully verified"})
     except Exception as e:
@@ -177,20 +188,16 @@ def resend_verification_email(request):
         return Response(
             {"detail": "Email is required"}, status=status.HTTP_400_BAD_REQUEST
         )
-
     try:
         user = User.objects.get(email=email)
         email_address = EmailAddress.objects.filter(user=user, primary=True).first()
-
         # Check if email is already verified
         if email_address and email_address.verified:
             return Response(
                 {"message": "This email is already verified"}, status=status.HTTP_200_OK
             )
-
         # Send verification email using allauth
         send_email_confirmation(request, user, signup=False)
-
         return Response(
             {"message": "Verification email sent. Please check your inbox."},
             status=status.HTTP_200_OK,

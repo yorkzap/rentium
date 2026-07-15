@@ -1,0 +1,27 @@
+{% extends "emails/base_email.html" %}
+{% block content %}
+  <h1 style="margin:0 0 6px;font-size:19px;font-weight:600;">
+    {% if name %}{{ name }}, you've{% else %}You've{% endif %} been invited to sign a lease
+  </h1>
+  <p style="margin:0 0 20px;color:#6b6862;font-size:14px;">
+    {{ landlord_name }} has prepared a lease for <strong style="color:#1c1c1a;">{{ property_label }}</strong>.
+  </p>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;border:1px solid #eeece8;border-radius:8px;">
+    <tr><td style="padding:12px 14px;color:#8a8681;width:130px;">Monthly rent</td><td style="padding:12px 14px;font-weight:600;">${{ rent }}</td></tr>
+    <tr><td style="padding:12px 14px;color:#8a8681;border-top:1px solid #f4f2ef;">Starts</td><td style="padding:12px 14px;border-top:1px solid #f4f2ef;">{{ start_date }}</td></tr>
+  </table>
+
+  <p style="margin:20px 0 0;font-size:14px;line-height:1.6;">
+    Open the link below to set a password, read the full agreement, and sign it — or decline it,
+    if the terms don't work for you. You don't need an account yet; the link creates one.
+  </p>
+
+  <p style="margin:22px 0 0;">
+    <a href="{{ invite_url }}" style="display:inline-block;padding:12px 20px;background:#0f766e;color:#ffffff;text-decoration:none;border-radius:8px;font-size:14px;font-weight:600;">Review &amp; sign the lease</a>
+  </p>
+
+  <p style="margin:18px 0 0;font-size:12px;color:#8a8681;">
+    This link is personal to you — don't forward it. It stops working once you've used it to set your password.
+  </p>
+{% endblock %}

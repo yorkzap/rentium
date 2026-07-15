@@ -5,26 +5,35 @@ from rentium.users.models import LandlordProfile
 from rentium.users.models import TenantProfile
 from rentium.users.models import User
 
+
 # -----------------------------------------------------------------------------
 # USER SERIALIZERS
 # -----------------------------------------------------------------------------
-
-
 class UserSerializer(serializers.ModelSerializer):
     """
     Serializer for the User model.
 
     Used for:
     - GET /api/users/me/ - Returns the current authenticated user's details
+    - PATCH /api/users/me/ - Updates name/phone for the current user
     - GET /api/users/{id}/ - Returns a specific user's details
 
     Permissions:
     - IsAuthenticated: Only authenticated users can access user data
+
+    `email` and `user_type` are intentionally read-only here, even on PATCH:
+    - Changing email needs its own re-verification flow (it's also the
+      USERNAME_FIELD used to log in) — not something to allow as a side
+      effect of a general profile-update endpoint.
+    - Changing user_type after the account exists would orphan whichever of
+      LandlordProfile/TenantProfile no longer matches — that's a data
+      migration, not a profile edit.
     """
 
     class Meta:
         model = User
-        fields = ["id", "name", "email", "user_type"]
+        fields = ["id", "name", "email", "phone", "user_type"]
+        read_only_fields = ["id", "email", "user_type"]
 
 
 class LandlordProfileSerializer(serializers.ModelSerializer):
@@ -79,8 +88,6 @@ class TenantProfileSerializer(serializers.ModelSerializer):
 # -----------------------------------------------------------------------------
 # REGISTRATION SERIALIZER
 # -----------------------------------------------------------------------------
-
-
 class UserRegistrationSerializer(serializers.ModelSerializer):
     """
     Serializer for user registration.
@@ -166,9 +173,6 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         - Password complexity is enforced by Django's validators
         - Phone is required for all users
         """
-        # The serializer already handles the basic validation based on the field definitions
-        # This method can be extended if additional validation is needed in the future
-
         return data
 
     def create(self, validated_data):
@@ -183,14 +187,11 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 
         Note: This method is wrapped in a transaction to ensure data integrity
         """
-        # Extract profile data from validated data
         user_type = validated_data.pop("user_type")
         province = validated_data.pop("province", "")
         country = validated_data.pop("country", "")
 
-        # Use transaction to ensure database integrity
         with transaction.atomic():
-            # Create user with secure password hashing
             user = User.objects.create_user(
                 email=validated_data["email"],
                 password=validated_data["password"],
@@ -199,7 +200,6 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
                 user_type=user_type,
             )
 
-            # Create the appropriate profile based on user type
             if user_type == User.UserType.LANDLORD:
                 LandlordProfile.objects.create(
                     user=user, province=province, country=country
