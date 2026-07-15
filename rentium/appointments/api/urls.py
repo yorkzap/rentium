@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 
 from .public_views import public_property
 from .public_views import public_viewing_request
+from .public_views import public_viewing_status
 from .views import AppointmentViewSet
 
 app_name = "appointments"
@@ -26,4 +27,9 @@ urlpatterns = [
 public_urlpatterns = [
     path("properties/<str:property_id>/", public_property, name="public-property"),
     path("viewing-requests/", public_viewing_request, name="public-viewing-request"),
+    path(
+        "viewing-status/<uuid:token>/",
+        public_viewing_status,
+        name="public-viewing-status",
+    ),
 ]

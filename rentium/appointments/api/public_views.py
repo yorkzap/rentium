@@ -146,7 +146,49 @@ def public_viewing_request(request):
         {
             "ok": True,
             "reference": str(appt.pk)[:8].upper(),
+            # The requester's capability link — the SAME url the confirmation
+            # email carries, returned here too so the thank-you screen can
+            # offer "track your request" immediately.
+            "status_token": str(appt.public_token),
             "detail": "Request sent — the landlord will confirm or propose another time by email.",
         },
         status=201,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+@throttle_classes([ViewingRequestThrottle])
+def public_viewing_status(request, token):
+    """
+    GET /api/public/viewing-status/<token>/
+
+    The requester's status page. The token is a per-appointment capability:
+    whoever holds it can read THIS appointment's state and nothing else —
+    no account needed, no enumeration possible (uuid4), and the payload
+    stays as privacy-safe as the teaser (no street address, no landlord
+    contact details beyond what the confirmation email already carries).
+    """
+    try:
+        appt = Appointment.objects.select_related("property").get(
+            public_token=token, kind=Appointment.Kind.VIEWING
+        )
+    except (Appointment.DoesNotExist, ValueError, ValidationError):
+        raise NotFound("No viewing request found for this link.")
+
+    prop = appt.property
+    return Response(
+        {
+            "status": appt.status,
+            "status_display": appt.get_status_display(),
+            "starts_at": appt.starts_at.isoformat(),
+            "requested_by": appt.contact_name,
+            "property": {
+                "name": prop.name,
+                "location": prop.public_location,
+                "city": prop.city,
+                "province": prop.province_code,
+                "type_label": prop.public_type_label,
+            },
+        }
     )

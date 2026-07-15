@@ -40,13 +40,27 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                 lease_tenants__tenant=tenant,
                 status=Lease.LeaseStatus.ACTIVE,
             )
-            my_property_ids = list(
-                my_leases.exclude(property__isnull=True).values_list(
-                    "property_id", flat=True
+            # A tenant's view is exactly their ENTRY NOTICE — nothing more:
+            #   1. appointments explicitly attached to one of their leases
+            #      (incl. pre-move-in inspections dated before the lease
+            #      starts — those are about them);
+            #   2. property-wide appointments (lease unset, e.g. confirmed
+            #      public viewing requests) only from their lease's start
+            #      date onward. Anything the landlord scheduled on the same
+            #      property BEFORE this tenancy began — showings to other
+            #      prospects while the unit was listed — is landlord
+            #      business and must never leak to the incoming tenant.
+            visible = Q(lease__in=my_leases)
+            for lease in my_leases.exclude(property__isnull=True).only(
+                "property_id", "start_date"
+            ):
+                visible |= Q(
+                    lease__isnull=True,
+                    property_id=lease.property_id,
+                    starts_at__date__gte=lease.start_date,
                 )
-            )
             qs = (
-                qs.filter(Q(lease__in=my_leases) | Q(property_id__in=my_property_ids))
+                qs.filter(visible)
                 .exclude(
                     status__in=[
                         Appointment.Status.CANCELLED,

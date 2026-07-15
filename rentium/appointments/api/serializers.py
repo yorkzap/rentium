@@ -39,6 +39,17 @@ class AppointmentSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "status", "created_at", "updated_at"]
 
+    def to_representation(self, instance):
+        """Tenants see the appointment (their entry notice) but not the
+        visitor's private contact details — who is coming and when is their
+        business; how to reach that person is the landlord's."""
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        if request and not hasattr(request.user, "landlord_profile"):
+            data["contact_email"] = ""
+            data["contact_phone"] = ""
+        return data
+
     def validate(self, data):
         starts = data.get("starts_at") or getattr(self.instance, "starts_at", None)
         ends = data.get("ends_at") or getattr(self.instance, "ends_at", None)

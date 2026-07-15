@@ -79,6 +79,10 @@ class Appointment(models.Model):
     )
     contact_phone = PhoneField(_("Contact Phone"))
     notes = models.TextField(_("Notes"), blank=True)
+    # Capability token for the requester's status page (/viewing/status/<token>).
+    # A prospective tenant has no account; whoever holds this token may read
+    # this ONE appointment's status — nothing else. Never shown to tenants.
+    public_token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -93,7 +97,7 @@ class Appointment(models.Model):
     def publish_event(self, event_type: str):
         from rentium.events.registry import publish
 
-        publish(
+        return publish(
             event_type,
             {
                 "appointment_id": str(self.pk),
@@ -102,6 +106,7 @@ class Appointment(models.Model):
                 "starts_at": self.starts_at.isoformat(),
                 "contact_name": self.contact_name,
                 "contact_email": self.contact_email,
+                "public_token": str(self.public_token),
                 "work_order_id": str(self.work_order_id)
                 if self.work_order_id
                 else None,
