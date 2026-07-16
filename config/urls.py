@@ -73,6 +73,7 @@ urlpatterns += [
     ),
     path("api/ledger/", include("rentium.ledger.api.urls")),
     path("api/attention/", include("rentium.attention.urls")),
+    path("api/rama/", include("rentium.rama.urls")),
     path("api/maintenance/", include("rentium.maintenance.api.urls")),
     path("api/messaging/", include("rentium.messaging.api.urls")),
     path("api/agenda/", include("rentium.agenda.api.urls")),

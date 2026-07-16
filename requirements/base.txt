@@ -30,4 +30,5 @@ django-webpack-loader==3.1.1  # https://github.com/django-webpack/django-webpack
 drf-nested-routers==0.94.1
 reportlab==4.2.5
 requests==2.32.3
+anthropic==0.117.0  # RAMA default provider (rentium/rama/providers/anthropic.py)
 phonenumbers==8.13.48

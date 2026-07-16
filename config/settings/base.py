@@ -82,6 +82,10 @@ LOCAL_APPS = [
     # pages, inquiries. Deliberately its own app so its serializers can never
     # accidentally inherit an internal one and leak a street address.
     "rentium.showcase",
+    # RAMA: the reasoning layer over the service functions above. The model
+    # orchestrates, the app computes — see docs/rama-architecture.md in the
+    # frontend repo.
+    "rentium.rama",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -432,3 +436,16 @@ GEOAPIFY_KEY = env("GEOAPIFY_KEY", default="")
 # Email confirmation settings
 ACCOUNT_EMAIL_CONFIRMATION_AUTHENTICATED_REDIRECT_URL = f"{FRONTEND_URL}/dashboard"
 ACCOUNT_EMAIL_CONFIRMATION_ANONYMOUS_REDIRECT_URL = f"{FRONTEND_URL}/auth/login"
+
+# RAMA
+# ------------------------------------------------------------------------------
+# Provider and model are configuration, not code: any provider with function
+# calling slots in behind rentium/rama/providers/. The default is Anthropic
+# Haiku — cheap, fast, plenty for tool routing. Staff can override per
+# request; whatever ran is stamped on every RamaAudit row.
+RAMA_ENABLED = env.bool("RAMA_ENABLED", default=True)
+RAMA_PROVIDER = env("RAMA_PROVIDER", default="anthropic")
+RAMA_MODEL = env("RAMA_MODEL", default="claude-haiku-4-5")
+ANTHROPIC_API_KEY = env("ANTHROPIC_API_KEY", default="")
+OPENAI_API_KEY = env("OPENAI_API_KEY", default="")
+XAI_API_KEY = env("XAI_API_KEY", default="")
