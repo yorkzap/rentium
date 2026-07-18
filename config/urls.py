@@ -12,9 +12,11 @@ from drf_spectacular.views import SpectacularSwaggerView
 
 from rentium.appointments.api import urls as appointments_urls
 from rentium.showcase.api import urls as showcase_urls
-from rentium.users.api.views import verify_email_confirm
 from rentium.users.api.views import CustomObtainAuthToken
+from rentium.users.api.views import password_reset_confirm_view
+from rentium.users.api.views import password_reset_request_view
 from rentium.users.api.views import resend_verification_email
+from rentium.users.api.views import verify_email_confirm
 
 urlpatterns = [
     path("", TemplateView.as_view(template_name="pages/home.html"), name="home"),
@@ -38,6 +40,29 @@ if settings.DEBUG:
 # API URLS
 urlpatterns += [
     path("api/users/", include("rentium.users.api.urls")),
+    # Auth helpers under /api/users/<action>/ MUST be registered before the
+    # DefaultRouter users viewset below — otherwise DRF treats the action name
+    # as a user pk (e.g. password-reset → /api/users/<pk>/) and returns 403.
+    path(
+        "api/users/verify-email/confirm/",
+        verify_email_confirm,
+        name="verify-email-confirm",
+    ),
+    path(
+        "api/users/resend-verification/",
+        resend_verification_email,
+        name="resend-verification",
+    ),
+    path(
+        "api/users/password-reset/",
+        password_reset_request_view,
+        name="password-reset",
+    ),
+    path(
+        "api/users/password-reset/confirm/",
+        password_reset_confirm_view,
+        name="password-reset-confirm",
+    ),
     path("api/leases/", include("rentium.leases.api.urls", namespace="leases_api")),
     path(
         "api/properties/",
@@ -60,16 +85,6 @@ urlpatterns += [
         "api/docs/",
         SpectacularSwaggerView.as_view(url_name="api-schema"),
         name="api-docs",
-    ),
-    path(
-        "api/users/verify-email/confirm/",
-        verify_email_confirm,
-        name="verify-email-confirm",
-    ),
-    path(
-        "api/users/resend-verification/",
-        resend_verification_email,
-        name="resend-verification",
     ),
     path("api/ledger/", include("rentium.ledger.api.urls")),
     path("api/attention/", include("rentium.attention.urls")),

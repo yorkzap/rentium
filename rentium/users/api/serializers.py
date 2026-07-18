@@ -1,6 +1,7 @@
 from django.db import transaction
 from rest_framework import serializers
 
+from rentium.core.phone import to_e164
 from rentium.users.models import LandlordProfile
 from rentium.users.models import TenantProfile
 from rentium.users.models import User
@@ -164,15 +165,33 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
             "name": {"help_text": "Full name of the user"},
         }
 
-    def validate(self, data):
-        """
-        Custom validation method for additional checks if needed.
+    def validate_email(self, value):
+        email = (value or "").strip().lower()
+        if User.objects.filter(email__iexact=email).exists():
+            raise serializers.ValidationError(
+                "An account with this email already exists. Try logging in, "
+                "or use Forgot password if you need to reset it."
+            )
+        return email
 
-        Validation rules:
-        - Email must be in valid format (handled by EmailField)
-        - Password complexity is enforced by Django's validators
-        - Phone is required for all users
-        """
+    def validate_phone(self, value):
+        """Normalize to E.164 and reject numbers already on another account."""
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        try:
+            e164 = to_e164(value)
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if getattr(exc, "messages", None) else str(exc)
+            raise serializers.ValidationError(msg) from exc
+        if not e164:
+            raise serializers.ValidationError("Phone number is required.")
+        if User.objects.filter(phone=e164).exists():
+            raise serializers.ValidationError(
+                "This phone number is already used on another Rentium account."
+            )
+        return e164
+
+    def validate(self, data):
         return data
 
     def create(self, validated_data):

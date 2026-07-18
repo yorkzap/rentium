@@ -31,7 +31,7 @@ class AccountAdapter(DefaultAccountAdapter):
         """
         # Add custom context variables for email templates
         context["current_site"].name = "Rentium"
-        context["current_site"].domain = "rentium.com"
+        context["current_site"].domain = "rentium.ca"
 
         return super().render_mail(template_prefix, email, context)
 

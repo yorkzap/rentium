@@ -1,11 +1,18 @@
 from .anthropic import AnthropicProvider
 from .base import Provider, ProviderError, ToolCall, Turn
-from .openai_compat import OpenAIProvider, XAIProvider
+from .openai_compat import (
+    GeminiProvider,
+    MistralProvider,
+    OpenAIProvider,
+    XAIProvider,
+)
 
 PROVIDERS: dict[str, type[Provider]] = {
     AnthropicProvider.name: AnthropicProvider,
     OpenAIProvider.name: OpenAIProvider,
     XAIProvider.name: XAIProvider,
+    GeminiProvider.name: GeminiProvider,
+    MistralProvider.name: MistralProvider,
 }
 
 __all__ = [

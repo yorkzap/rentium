@@ -367,6 +367,8 @@ REST_FRAMEWORK = {
         # landlord typing an address fires maybe 8 requests. A bot could burn the
         # daily quota in ninety seconds, so this is a real limit, not a formality.
         "address_search": "60/min",
+        # Password-reset emails can be abused as a free spam vector; keep tight.
+        "password_reset": "5/hour",
     },
 }
 
@@ -394,10 +396,15 @@ WEBPACK_LOADER = {
 
 # Your stuff...
 # ------------------------------------------------------------------------------
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",  # Next.js development server
-    "http://localhost:8081",  # Ignite Mobile development server
-]
+CORS_ALLOWED_ORIGINS = env.list(
+    "CORS_ALLOWED_ORIGINS",
+    default=[
+        "http://localhost:3000",  # Next.js development server
+        "http://localhost:8081",  # Ignite Mobile development server
+        "https://rentium.ca",
+        "https://www.rentium.ca",
+    ],
+)
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
     "accept",
@@ -440,12 +447,17 @@ ACCOUNT_EMAIL_CONFIRMATION_ANONYMOUS_REDIRECT_URL = f"{FRONTEND_URL}/auth/login"
 # RAMA
 # ------------------------------------------------------------------------------
 # Provider and model are configuration, not code: any provider with function
-# calling slots in behind rentium/rama/providers/. The default is Anthropic
-# Haiku — cheap, fast, plenty for tool routing. Staff can override per
-# request; whatever ran is stamped on every RamaAudit row.
+# calling slots in behind rentium/rama/providers/. Defaults are xAI Grok
+# (switch to Anthropic/OpenAI in Django admin → RAMA configuration without
+# redeploying). Env vars are bootstrap/fallback; the admin singleton wins
+# when set (see rentium.rama.runtime.get_active_config). Staff can still
+# override provider/model per chat request; whatever ran is stamped on
+# every RamaAudit row.
 RAMA_ENABLED = env.bool("RAMA_ENABLED", default=True)
-RAMA_PROVIDER = env("RAMA_PROVIDER", default="anthropic")
-RAMA_MODEL = env("RAMA_MODEL", default="claude-haiku-4-5")
+RAMA_PROVIDER = env("RAMA_PROVIDER", default="xai")
+RAMA_MODEL = env("RAMA_MODEL", default="grok-4-1-fast-reasoning")
 ANTHROPIC_API_KEY = env("ANTHROPIC_API_KEY", default="")
 OPENAI_API_KEY = env("OPENAI_API_KEY", default="")
 XAI_API_KEY = env("XAI_API_KEY", default="")
+GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
+MISTRAL_API_KEY = env("MISTRAL_API_KEY", default="")

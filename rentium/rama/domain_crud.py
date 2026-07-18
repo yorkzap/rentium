@@ -1,0 +1,1921 @@
+"""
+Landlord CRUD for RAMA — properties, leases, maintenance, inventory.
+
+Rules (same as the dashboard / API):
+- Confirm gate: no confirm=yes → needs_confirm preview only.
+- Always scoped to authenticated landlord.
+- Prefer model.clean() / FSM / view-level rules over inventing new logic.
+- Never delete work orders (cancel via transition).
+- Only DRAFT leases may be deleted; non-draft → terminate.
+- ACTIVE/EXPIRED/TERMINATED/RENEWED leases are locked for field edits.
+- Property delete blocked if any lease still references it (PROTECT).
+- Rent shares live on LeaseTenant; total_rent is the unit rent.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.db.models.deletion import ProtectedError
+from django.utils import timezone
+
+
+def _confirmed(confirm: str) -> bool:
+    return str(confirm or "").strip().lower() in ("yes", "true", "1", "y", "confirm")
+
+
+def _preview(action: str, preview: dict, how: str) -> dict:
+    return {
+        "needs_confirm": True,
+        "action": action,
+        "preview": preview,
+        "instruction": (
+            f"Show this preview to the landlord. If they approve, call {action} "
+            f"again with the same arguments AND confirm=yes. {how}"
+        ),
+        "ui_rules": True,
+    }
+
+
+def _truthy(val: str) -> bool:
+    return str(val or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _money(value: str, default: str = "0"):
+    raw = str(value if value not in (None, "") else default)
+    raw = raw.replace("$", "").replace(",", "").strip()
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"Invalid money amount {value!r}") from exc
+
+
+def _parse_date(value: str, field: str = "date") -> date:
+    s = (value or "").strip()
+    if not s:
+        raise ValueError(f"{field} is required (YYYY-MM-DD).")
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"Invalid {field} {value!r}; use YYYY-MM-DD.") from exc
+
+
+def _resolve_property(landlord, property_query: str, pick: str = ""):
+    from .resolve import resolve_property
+
+    return resolve_property(landlord, property_query, pick=pick)
+
+
+def _prop_err(err):
+    """Return a tool error payload from resolve_property."""
+    if isinstance(err, dict):
+        return err if "error" in err else {"error": err}
+    return {"error": err}
+
+
+def _resolve_lease(
+    landlord, *, property_query: str = "", lease_number: str = "", pick: str = ""
+):
+    from rentium.leases.models import Lease
+
+    ln = (lease_number or "").strip()
+    if ln:
+        lease = (
+            Lease.objects.filter(landlord=landlord, lease_number__iexact=ln)
+            .select_related("property", "group")
+            .first()
+        )
+        if not lease:
+            return None, f"No lease with number {ln!r}."
+        return lease, None
+    pq = (property_query or "").strip()
+    if not pq:
+        return None, "Pass property_query or lease_number."
+    prop, err = _resolve_property(landlord, pq, pick=pick)
+    if err:
+        return None, err
+    lease = (
+        Lease.objects.filter(landlord=landlord, property=prop)
+        .exclude(
+            status__in=[
+                Lease.LeaseStatus.TERMINATED,
+                Lease.LeaseStatus.EXPIRED,
+            ]
+        )
+        .order_by("-created_at")
+        .select_related("property", "group")
+        .first()
+    )
+    if not lease:
+        return None, f"No open lease on {prop.name}."
+    return lease, None
+
+
+def _resolve_group(landlord, group_name: str):
+    from rentium.properties.models import PropertyGroup
+
+    q = (group_name or "").strip()
+    if not q:
+        return None, "group_name is required."
+    qs = PropertyGroup.objects.filter(landlord=landlord, name__icontains=q)
+    n = qs.count()
+    if n == 0:
+        return None, f"No property group matching {group_name!r}."
+    if n > 1:
+        names = list(qs.values_list("name", flat=True)[:8])
+        return None, f"Multiple groups match {group_name!r}: {names}."
+    return qs.first(), None
+
+
+def _default_lease_type(prop) -> str:
+    """Mirror leases/api/views.py lease_types_view for NEW leases."""
+    from rentium.leases.models import Lease
+    from rentium.properties.models import Property
+
+    if prop.property_category == Property.PropertyCategory.ROOM:
+        return Lease.LeaseType.GENERIC_ROOMMATE
+    prov = (prop.province or prop.province_code or "").lower()
+    if prov == "bc":
+        return Lease.LeaseType.BC_RESIDENTIAL_TENANCY
+    if prov == "sk":
+        return Lease.LeaseType.SK_RESIDENTIAL_TENANCY
+    return Lease.LeaseType.GENERIC_RESIDENTIAL
+
+
+def _validation_error_payload(exc: Exception) -> dict:
+    if isinstance(exc, ValidationError):
+        if hasattr(exc, "message_dict"):
+            return {"error": "Validation failed", "details": exc.message_dict}
+        if hasattr(exc, "messages"):
+            return {"error": "; ".join(str(m) for m in exc.messages)}
+        return {"error": str(exc)}
+    return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# Capabilities map (for the model + humans)
+# ---------------------------------------------------------------------------
+
+
+def crud_capabilities(landlord) -> dict:
+    """Read-only map of CRUD the agent can perform and hard UI restrictions."""
+    return {
+        "properties": {
+            "create": "create_property — name, address, city, ROOM|COMPLETE_UNIT",
+            "update": "update_property — name/status/description/address/city",
+            "delete": "delete_property — blocked if any lease exists (PROTECT)",
+            "group": "create_property_group, assign_property_to_group (rooms only)",
+        },
+        "leases": {
+            "create": "create_lease — always DRAFT; type from property category",
+            "update": "update_lease — only if NOT locked (not ACTIVE/EXPIRED/…)",
+            "delete": "delete_draft_lease — DRAFT only",
+            "terminate": "terminate_lease — voids open charges, closes occupancy",
+            "sign": "landlord_sign_lease — rent must be fully allocated",
+            "tenants": "invite/add_roommate/cancel/replace/rebalance (domain_actions)",
+        },
+        "maintenance": {
+            "create": "create_work_order",
+            "update_fields": "update_work_order (title/priority/contractor…)",
+            "status": "transition_work_order only (FSM)",
+            "complete": "complete_work_order — optional cost + post_expense",
+            "delete": "FORBIDDEN — cancel via transition instead",
+            "comment": "add_work_order_comment",
+        },
+        "inventory": {
+            "private": "create/update/delete_inventory_item on a listing",
+            "shared": "create/delete_shared_inventory_item on a property group",
+            "note": "is_furnished is derived from inventory (signals)",
+        },
+        "confirm_rule": "Every mutating tool: preview without confirm, then confirm=yes",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Properties
+# ---------------------------------------------------------------------------
+
+
+def _parse_item_names(inventory_items: str) -> list[str]:
+    """Comma-separated or JSON list of furniture names."""
+    raw = (inventory_items or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            import json
+
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(x).strip() for x in data if str(x).strip()]
+        except Exception:  # noqa: BLE001
+            pass
+    return [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+
+
+def create_property(
+    landlord,
+    *,
+    name: str,
+    address: str,
+    city: str,
+    property_category: str = "ROOM",
+    province: str = "bc",
+    status: str = "AVAILABLE",
+    unit_type: str = "",
+    room_type: str = "PRIVATE",
+    bedrooms: str = "",
+    bathrooms: str = "",
+    description: str = "",
+    group_name: str = "",
+    asking_rent: str = "",
+    inventory_items: str = "",
+    allow_duplicate_name: str = "0",
+    confirm: str = "",
+) -> dict:
+    """Create listing. If inventory_items is set (e.g. 'Single bed, Mattress'),
+    private inventory rows are created in the same confirm step so 'What's in it'
+    is not empty after the user mentioned furniture.
+    Rejects exact-name duplicates unless allow_duplicate_name=yes."""
+    from rentium.properties.models import InventoryItem, Property, Province
+
+    name = (name or "").strip()
+    address = (address or "").strip()
+    city = (city or "").strip()
+    if not name or not address or not city:
+        return {"error": "name, address, and city are required."}
+
+    # Prevent silent duplicate names (Room G × 2 broke lease/delete tools)
+    from .resolve import _candidate_row
+
+    dup_qs = Property.objects.filter(landlord=landlord, name__iexact=name).order_by(
+        "created_at"
+    )
+    if dup_qs.exists() and not _truthy(allow_duplicate_name):
+        return {
+            "error": (
+                f"You already have a listing named {name!r}. "
+                "Do not create another with the same name."
+            ),
+            "candidates": [_candidate_row(p) for p in dup_qs[:10]],
+            "hint": (
+                "Reuse property_query=<id>, rename the old one, or delete the "
+                "duplicate with delete_property property_query=<id> pick=…, "
+                "then continue lease/invite/inspection on the remaining listing."
+            ),
+        }
+
+    cat = (property_category or "ROOM").strip().upper()
+    if cat not in Property.PropertyCategory.values:
+        return {
+            "error": f"property_category must be one of {list(Property.PropertyCategory.values)}"
+        }
+
+    st = (status or "AVAILABLE").strip().upper()
+    if st not in Property.PropertyStatus.values:
+        st = Property.PropertyStatus.AVAILABLE
+
+    prov_raw = (province or "bc").strip().lower()
+    from rentium.properties.models import normalise_province
+
+    prov = normalise_province(prov_raw) or prov_raw[:2]
+    if prov not in Province.values:
+        return {
+            "error": f"Invalid province {province!r}. Use BC, ON, AB, … (two-letter)."
+        }
+
+    ut = (unit_type or "").strip().upper() or None
+    rt = (room_type or "PRIVATE").strip().upper() or None
+    if cat == Property.PropertyCategory.COMPLETE_UNIT:
+        ut = ut or Property.UnitType.OTHER
+        rt = None
+    else:
+        rt = rt or Property.RoomType.PRIVATE
+        ut = None
+
+    group = None
+    if group_name.strip():
+        if cat != Property.PropertyCategory.ROOM:
+            return {"error": "Only ROOM listings can join a property group."}
+        group, gerr = _resolve_group(landlord, group_name)
+        if gerr:
+            return {"error": gerr}
+
+    beds = int(bedrooms) if str(bedrooms).strip().isdigit() else None
+    baths = None
+    if str(bathrooms).strip():
+        try:
+            baths = Decimal(str(bathrooms))
+        except (InvalidOperation, ValueError):
+            return {"error": f"Invalid bathrooms {bathrooms!r}."}
+
+    ask = None
+    if str(asking_rent).strip():
+        try:
+            ask = _money(asking_rent)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+    inv_names = _parse_item_names(inventory_items)
+
+    preview = {
+        "name": name,
+        "address": address,
+        "city": city,
+        "province": prov,
+        "property_category": cat,
+        "unit_type": ut,
+        "room_type": rt,
+        "status": st,
+        "group": group.name if group else None,
+        "asking_rent": str(ask) if ask is not None else None,
+        "description": (description or "")[:200],
+        "inventory_items_to_create": inv_names,
+        "note": (
+            "Furniture listed here becomes private inventory (What's in it / "
+            "prints on roommate agreement + condition inspection)."
+            if inv_names
+            else "No inventory_items passed — 'What's in it' will stay empty until added."
+        ),
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "create_property",
+            preview,
+            "Creates a listing owned by this landlord (same rules as Properties UI). "
+            "Pass inventory_items when the landlord names furniture.",
+        )
+
+    prop = Property(
+        landlord=landlord,
+        name=name[:255],
+        address=address[:255],
+        city=city[:100],
+        province=prov,
+        status=st,
+        property_category=cat,
+        unit_type=ut,
+        room_type=rt,
+        bedrooms=beds,
+        bathrooms=baths,
+        description=(description or "")[:5000],
+        group=group,
+        asking_rent=ask,
+        country="Canada",
+    )
+    try:
+        prop.full_clean()
+        prop.save()
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+
+    created_items = []
+    for iname in inv_names:
+        item = InventoryItem.objects.create(
+            property=prop,
+            name=iname[:200],
+            quantity=1,
+            condition=InventoryItem.ItemCondition.GOOD,
+        )
+        created_items.append({"id": str(item.pk), "name": item.name})
+    prop.refresh_from_db()
+
+    return {
+        "created": True,
+        "property": {
+            "id": str(prop.pk),
+            "name": prop.name,
+            "category": prop.property_category,
+            "type_display": (
+                prop.get_room_type_display()
+                if prop.property_category == Property.PropertyCategory.ROOM
+                else prop.get_unit_type_display()
+            ),
+            "address": prop.address,
+            "city": prop.city,
+            "province": prop.province,
+            "status": prop.status,
+            "group": prop.group.name if prop.group_id else None,
+            "is_furnished": bool(prop.is_furnished),
+            "inventory_created": created_items,
+        },
+        "next_steps": [
+            "Add photos in the UI (required for public enquiries)",
+            "Create DRAFT lease with create_lease (security deposit defaults to half month if omitted)",
+            "Invite tenant, then create_condition_inspection for move-in day",
+        ],
+    }
+
+
+def update_property(
+    landlord,
+    *,
+    property_query: str,
+    name: str = "",
+    status: str = "",
+    description: str = "",
+    address: str = "",
+    city: str = "",
+    province: str = "",
+    asking_rent: str = "",
+    unit_type: str = "",
+    room_type: str = "",
+    is_publicly_visible: str = "",
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    from rentium.properties.models import Property, Province, normalise_province
+
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+
+    changes: dict = {}
+    if name.strip():
+        changes["name"] = name.strip()[:255]
+    if status.strip():
+        st = status.strip().upper()
+        if st not in Property.PropertyStatus.values:
+            return {
+                "error": f"Invalid status. Use {list(Property.PropertyStatus.values)}"
+            }
+        changes["status"] = st
+    if description != "":
+        changes["description"] = description[:5000]
+    if address.strip():
+        changes["address"] = address.strip()[:255]
+    if city.strip():
+        changes["city"] = city.strip()[:100]
+    if province.strip():
+        prov = normalise_province(province) or province.strip().lower()[:2]
+        if prov not in Province.values:
+            return {"error": f"Invalid province {province!r}."}
+        changes["province"] = prov
+    if unit_type.strip():
+        ut = unit_type.strip().upper()
+        if ut not in Property.UnitType.values:
+            return {"error": f"Invalid unit_type {unit_type!r}."}
+        if prop.property_category != Property.PropertyCategory.COMPLETE_UNIT:
+            return {"error": "unit_type only applies to COMPLETE_UNIT listings."}
+        changes["unit_type"] = ut
+    if room_type.strip():
+        rt = room_type.strip().upper()
+        if rt not in Property.RoomType.values:
+            return {"error": f"Invalid room_type {room_type!r}."}
+        if prop.property_category != Property.PropertyCategory.ROOM:
+            return {"error": "room_type only applies to ROOM listings."}
+        changes["room_type"] = rt
+    if asking_rent != "":
+        if asking_rent.strip() == "":
+            changes["asking_rent"] = None
+        else:
+            try:
+                changes["asking_rent"] = _money(asking_rent)
+            except ValueError as exc:
+                return {"error": str(exc)}
+    if is_publicly_visible != "":
+        changes["is_publicly_visible"] = _truthy(is_publicly_visible)
+
+    if not changes:
+        return {"error": "No fields to update. Pass name/status/description/…"}
+
+    preview = {
+        "property": prop.name,
+        "id": str(prop.pk),
+        "changes": {
+            k: (str(v) if isinstance(v, Decimal) else v) for k, v in changes.items()
+        },
+    }
+    if not _confirmed(confirm):
+        return _preview("update_property", preview, "Updates listing fields.")
+
+    for k, v in changes.items():
+        setattr(prop, k, v)
+    try:
+        prop.full_clean()
+        prop.save()
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+
+    return {
+        "updated": True,
+        "property": {
+            "id": str(prop.pk),
+            "name": prop.name,
+            "status": prop.status,
+            "address": prop.address,
+            "city": prop.city,
+        },
+        "applied": list(changes.keys()),
+    }
+
+
+def delete_property(
+    landlord, *, property_query: str, pick: str = "", confirm: str = ""
+) -> dict:
+    """Delete listing. Blocked if any lease still references it (Lease.property PROTECT).
+    On name collisions pass property_query=<id> or pick=first|no_group|with_group|2."""
+    from rentium.leases.models import Lease
+
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+
+    lease_qs = Lease.objects.filter(property=prop)
+    n_leases = lease_qs.count()
+    if n_leases:
+        sample = list(
+            lease_qs.values_list("lease_number", "status")[:5]
+        )
+        return {
+            "error": (
+                f"Cannot delete {prop.name}: {n_leases} lease(s) still reference it "
+                f"(DB PROTECT, same as UI). Terminate/delete draft leases first."
+            ),
+            "leases": [{"lease_number": ln, "status": st} for ln, st in sample],
+        }
+
+    open_wo = prop.work_orders.exclude(status__in=["COMPLETED", "CANCELLED"]).count()
+    preview = {
+        "property": prop.name,
+        "id": str(prop.pk),
+        "inventory_items": prop.inventory_items.count(),
+        "open_work_orders": open_wo,
+        "warning": "Deletes the listing and cascades private inventory/images.",
+    }
+    if not _confirmed(confirm):
+        return _preview("delete_property", preview, "Permanently deletes the listing.")
+
+    name = prop.name
+    try:
+        prop.delete()
+    except ProtectedError as exc:
+        return {"error": f"Delete blocked by related records: {exc}"}
+    return {"deleted": True, "property": name}
+
+
+def create_property_group(
+    landlord, *, name: str, description: str = "", confirm: str = ""
+) -> dict:
+    from rentium.properties.models import PropertyGroup
+
+    name = (name or "").strip()
+    if not name:
+        return {"error": "name is required."}
+    if PropertyGroup.objects.filter(landlord=landlord, name__iexact=name).exists():
+        return {"error": f"You already have a group named {name!r}."}
+
+    preview = {"name": name, "description": (description or "")[:300]}
+    if not _confirmed(confirm):
+        return _preview(
+            "create_property_group",
+            preview,
+            "Creates a property group for shared rooms (e.g. McKenzie Side Unit).",
+        )
+
+    g = PropertyGroup.objects.create(
+        landlord=landlord, name=name[:100], description=(description or "")[:2000]
+    )
+    return {"created": True, "group": {"id": str(g.pk), "name": g.name}}
+
+
+def assign_property_to_group(
+    landlord,
+    *,
+    property_query: str,
+    group_name: str = "",
+    clear: str = "",
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Attach a ROOM listing to a group, or clear group membership (clear=yes)."""
+    from rentium.properties.models import Property
+
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+    if prop.property_category != Property.PropertyCategory.ROOM:
+        return {
+            "error": "Only ROOM listings can belong to a property group "
+            "(complete units must stay standalone)."
+        }
+
+    if _truthy(clear) or not group_name.strip():
+        if not prop.group_id and not group_name.strip():
+            return {"error": "Pass group_name or clear=yes."}
+        preview = {
+            "property": prop.name,
+            "from_group": prop.group.name if prop.group_id else None,
+            "to_group": None,
+            "action": "clear_group",
+        }
+        if not _confirmed(confirm):
+            return _preview(
+                "assign_property_to_group",
+                preview,
+                "Removes listing from its property group.",
+            )
+        prop.group = None
+        try:
+            prop.full_clean()
+            prop.save(update_fields=["group", "updated_at"])
+        except ValidationError as exc:
+            return _validation_error_payload(exc)
+        return {"updated": True, "property": prop.name, "group": None}
+
+    group, gerr = _resolve_group(landlord, group_name)
+    if gerr:
+        return {"error": gerr}
+
+    preview = {
+        "property": prop.name,
+        "from_group": prop.group.name if prop.group_id else None,
+        "to_group": group.name,
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "assign_property_to_group",
+            preview,
+            "Puts a room into a shared household group.",
+        )
+
+    prop.group = group
+    try:
+        prop.full_clean()
+        prop.save(update_fields=["group", "updated_at"])
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+    return {
+        "updated": True,
+        "property": prop.name,
+        "group": group.name,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Leases
+# ---------------------------------------------------------------------------
+
+
+def _resolve_security_deposit(
+    *,
+    security_deposit: str,
+    total_rent: Decimal,
+    asking_rent: Decimal | None = None,
+) -> tuple[Decimal, str]:
+    """
+    Deposit defaults for landlord protection:
+    - Explicit number (incl. 0) → use it.
+    - Empty / omitted / 'default' / 'half' → half of monthly rent (capped
+      common room practice; matches "$800 rent → $400 deposit").
+    Pet deposit and cleaning fee stay 0 unless the landlord mentions them.
+    """
+    raw = str(security_deposit if security_deposit is not None else "").strip().lower()
+    if raw in ("", "default", "half", "half_month", "auto"):
+        base = total_rent if total_rent > 0 else (asking_rent or Decimal("0"))
+        if base > 0:
+            half = (base / Decimal("2")).quantize(Decimal("0.01"))
+            return half, f"defaulted_to_half_month_rent ({half} = half of {base})"
+        return Decimal("0"), "no_rent_basis_deposit_zero"
+    try:
+        return _money(raw), "explicit"
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def create_lease(
+    landlord,
+    *,
+    property_query: str,
+    start_date: str,
+    end_date: str = "",
+    total_rent: str = "0",
+    security_deposit: str = "",
+    pet_deposit: str = "0",
+    cleaning_fee: str = "0",
+    is_month_to_month: str = "0",
+    pets_allowed: str = "0",
+    smoking_allowed: str = "0",
+    special_terms: str = "",
+    etransfer_email: str = "",
+    bills_included: str = "",
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Create DRAFT lease. Defaults (landlord protection):
+    - smoking_allowed / pets_allowed = false unless truthy
+    - pet_deposit / cleaning_fee = 0 unless set
+    - security_deposit: if omitted → half of total_rent; pass "0" for zero
+    - etransfer_email: landlord service email fallback if blank
+    """
+    from rentium.leases.models import Lease
+
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+
+    try:
+        start = _parse_date(start_date, "start_date")
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    mtm = _truthy(is_month_to_month)
+    end = None
+    if not mtm:
+        if not (end_date or "").strip():
+            return {"error": "Fixed-term leases require end_date (YYYY-MM-DD)."}
+        try:
+            end = _parse_date(end_date, "end_date")
+        except ValueError as exc:
+            return {"error": str(exc)}
+        if end <= start:
+            return {"error": "end_date must be after start_date."}
+    elif (end_date or "").strip():
+        return {"error": "Month-to-month leases must not have end_date."}
+
+    try:
+        rent = _money(total_rent or "0")
+        if rent <= 0 and prop.asking_rent:
+            rent = Decimal(prop.asking_rent)
+        deposit, deposit_src = _resolve_security_deposit(
+            security_deposit=security_deposit,
+            total_rent=rent,
+            asking_rent=Decimal(prop.asking_rent or 0) if prop.asking_rent else None,
+        )
+        pet_dep = _money(pet_deposit or "0")
+        clean_fee = _money(cleaning_fee or "0")
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    # Defaults: no smoking / no pets unless landlord opts in (protection)
+    pets = _truthy(pets_allowed)
+    smoking = _truthy(smoking_allowed)
+
+    e_email = (etransfer_email or "").strip()[:254]
+    if not e_email:
+        # Match UI fallback: service/account email
+        e_email = (
+            getattr(landlord, "service_email", None)
+            or getattr(getattr(landlord, "user", None), "email", "")
+            or ""
+        )[:254]
+
+    bills = {}
+    raw_bills = (bills_included or "").strip()
+    if raw_bills:
+        if raw_bills.startswith("{"):
+            try:
+                import json
+
+                bills = json.loads(raw_bills)
+            except Exception:  # noqa: BLE001
+                return {"error": "bills_included must be JSON object if provided."}
+        else:
+            # comma list → included utilities
+            for part in raw_bills.replace(";", ",").split(","):
+                key = part.strip().lower().replace(" ", "_")
+                if key:
+                    bills[key] = {"included": True}
+
+    lease_type = _default_lease_type(prop)
+    preview = {
+        "property_id": str(prop.pk),
+        "property": prop.name,
+        "property_category": prop.property_category,
+        "lease_type": lease_type,
+        "lease_type_display": dict(Lease.LeaseType.choices).get(lease_type, lease_type),
+        "status": Lease.LeaseStatus.DRAFT,
+        "start_date": str(start),
+        "end_date": str(end) if end else None,
+        "is_month_to_month": mtm,
+        "total_rent": str(rent),
+        "security_deposit": str(deposit),
+        "security_deposit_source": deposit_src,
+        "pet_deposit": str(pet_dep),
+        "cleaning_fee": str(clean_fee),
+        "pets_allowed": pets,
+        "smoking_allowed": smoking,
+        "etransfer_email": e_email or None,
+        "bills_included": bills or None,
+        "special_terms": (special_terms or "")[:200] or None,
+        "inventory_on_property": prop.inventory_items.count(),
+        "warnings": (
+            []
+            if prop.inventory_items.exists()
+            else [
+                "Property has no inventory items — roommate agreement / "
+                "condition inspection will show empty furnishings. "
+                "Add via create_inventory_item or pass inventory_items on create_property."
+            ]
+        ),
+        "note": (
+            "Created as DRAFT. Invite tenants separately. "
+            "After invite: create_condition_inspection for move-in day "
+            "(NOT schedule_viewing — that is only for showings)."
+        ),
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "create_lease",
+            preview,
+            "Creates a DRAFT lease (UI: New Lease). Type auto-picked from listing. "
+            "Omit security_deposit to default to half monthly rent; pass 0 for none.",
+        )
+
+    lease = Lease(
+        landlord=landlord,
+        property=prop,
+        group=None,
+        lease_type=lease_type,
+        status=Lease.LeaseStatus.DRAFT,
+        start_date=start,
+        end_date=end,
+        is_month_to_month=mtm,
+        move_in_date=start,
+        total_rent=rent,
+        security_deposit=deposit,
+        pet_deposit=pet_dep,
+        cleaning_fee=clean_fee,
+        pets_allowed=pets,
+        smoking_allowed=smoking,
+        special_terms=(special_terms or "")[:5000],
+        etransfer_email=e_email,
+        bills_included=bills or {},
+    )
+    # Roommate + landlord-shared common areas clause (same as serializer.create)
+    if "ROOMMATE" in lease_type:
+        try:
+            from rentium.leases.tenancy_rules import landlord_shares_common_areas
+
+            if landlord_shares_common_areas(lease):
+                lease.common_space_shared_with = ["LANDLORD"]
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        lease.full_clean()
+        lease.save()
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+
+    return {
+        "created": True,
+        "lease": {
+            "id": str(lease.pk),
+            "lease_number": lease.lease_number,
+            "status": lease.status,
+            "lease_type": lease.lease_type,
+            "lease_type_display": lease.get_lease_type_display(),
+            "property": prop.name,
+            "start_date": str(lease.start_date),
+            "end_date": str(lease.end_date) if lease.end_date else None,
+            "total_rent": str(lease.total_rent),
+            "security_deposit": str(lease.security_deposit),
+            "security_deposit_source": deposit_src,
+            "pet_deposit": str(lease.pet_deposit),
+            "cleaning_fee": str(lease.cleaning_fee),
+            "pets_allowed": lease.pets_allowed,
+            "smoking_allowed": lease.smoking_allowed,
+            "etransfer_email": lease.etransfer_email or None,
+        },
+        "next_steps": [
+            "Invite tenants with add_roommate_to_lease or invite_tenant_to_lease",
+            "Landlord may landlord_sign_lease once rent is fully allocated",
+            "create_condition_inspection after at least one tenant is on the lease",
+            "Lease PDF is always downloadable via the UI /api/leases/<id>/pdf/ "
+            "(does not require a stored document_file)",
+        ],
+    }
+
+
+def update_lease(
+    landlord,
+    *,
+    property_query: str = "",
+    lease_number: str = "",
+    total_rent: str = "",
+    security_deposit: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    pets_allowed: str = "",
+    smoking_allowed: str = "",
+    special_terms: str = "",
+    etransfer_email: str = "",
+    is_month_to_month: str = "",
+    confirm: str = "",
+) -> dict:
+    from rentium.leases.models import Lease
+
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return _prop_err(err)
+
+    # Match LeaseNotLocked: ACTIVE+ cannot be edited via API
+    if lease.is_locked():
+        return {
+            "error": (
+                f"Lease {lease.lease_number} is locked (status={lease.status}). "
+                "ACTIVE/EXPIRED/TERMINATED/RENEWED leases cannot be field-edited "
+                "(same as UI LeaseNotLocked). Use terminate_lease or admin."
+            )
+        }
+
+    changes: dict = {}
+    try:
+        if total_rent != "":
+            changes["total_rent"] = _money(total_rent)
+        if security_deposit != "":
+            changes["security_deposit"] = _money(security_deposit)
+        if start_date.strip():
+            changes["start_date"] = _parse_date(start_date, "start_date")
+        if is_month_to_month != "":
+            mtm = _truthy(is_month_to_month)
+            changes["is_month_to_month"] = mtm
+            if mtm:
+                changes["end_date"] = None
+        if end_date != "" and not changes.get("is_month_to_month"):
+            if end_date.strip() == "" and _truthy(is_month_to_month):
+                changes["end_date"] = None
+            elif end_date.strip():
+                changes["end_date"] = _parse_date(end_date, "end_date")
+        if pets_allowed != "":
+            changes["pets_allowed"] = _truthy(pets_allowed)
+        if smoking_allowed != "":
+            changes["smoking_allowed"] = _truthy(smoking_allowed)
+        if special_terms != "":
+            changes["special_terms"] = special_terms[:5000]
+        if etransfer_email != "":
+            changes["etransfer_email"] = etransfer_email.strip()[:254]
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if not changes:
+        return {"error": "No lease fields to update."}
+
+    preview = {
+        "lease_number": lease.lease_number,
+        "property": lease.property.name if lease.property_id else "",
+        "status": lease.status,
+        "changes": {
+            k: (str(v) if isinstance(v, (Decimal, date)) else v)
+            for k, v in changes.items()
+        },
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "update_lease",
+            preview,
+            "Updates draft/pending lease fields only.",
+        )
+
+    for k, v in changes.items():
+        setattr(lease, k, v)
+    try:
+        lease.full_clean()
+        lease.save()
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+
+    # If total_rent changed, rebalance unsigned tenant shares (UI equal-split)
+    if "total_rent" in changes:
+        from rentium.rama.domain_actions import rebalance_lease_rent_shares
+
+        rebalance_lease_rent_shares(lease, force_equal_unsigned=True)
+
+    return {
+        "updated": True,
+        "lease_number": lease.lease_number,
+        "status": lease.status,
+        "total_rent": str(lease.total_rent),
+        "applied": list(changes.keys()),
+    }
+
+
+def delete_draft_lease(
+    landlord, *, property_query: str = "", lease_number: str = "", confirm: str = ""
+) -> dict:
+    from rentium.leases.models import Lease
+
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return _prop_err(err)
+
+    if lease.status != Lease.LeaseStatus.DRAFT:
+        return {
+            "error": (
+                f"Only DRAFT leases can be deleted (this is {lease.status}). "
+                'Use terminate_lease for pending/active — same as UI "Terminate".'
+            )
+        }
+
+    preview = {
+        "lease_number": lease.lease_number,
+        "property": lease.property.name if lease.property_id else "",
+        "status": lease.status,
+        "tenants": lease.lease_tenants.count(),
+    }
+    if not _confirmed(confirm):
+        return _preview("delete_draft_lease", preview, "Permanently deletes a DRAFT lease.")
+
+    ln = lease.lease_number
+    try:
+        lease.delete()
+    except ProtectedError:
+        return {
+            "error": (
+                "This draft can't be deleted because it already has payment "
+                "records attached (same as UI)."
+            )
+        }
+    return {"deleted": True, "lease_number": ln}
+
+
+def terminate_lease(
+    landlord,
+    *,
+    property_query: str = "",
+    lease_number: str = "",
+    termination_date: str = "",
+    move_out_date: str = "",
+    confirm: str = "",
+) -> dict:
+    """Mirror LeaseViewSet.terminate — status TERMINATED, void open charges."""
+    from rentium.leases.models import Lease
+    from rentium.leases.occupancy import close_lease_occupancies
+    from rentium.ledger.billing import void_open_charges_for_lease
+
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return _prop_err(err)
+
+    if lease.status in (
+        Lease.LeaseStatus.TERMINATED,
+        Lease.LeaseStatus.EXPIRED,
+        Lease.LeaseStatus.RENEWED,
+    ):
+        return {
+            "error": f"Lease is already final ({lease.status}).",
+        }
+    if lease.status == Lease.LeaseStatus.DRAFT:
+        return {
+            "error": "Draft leases should be deleted with delete_draft_lease, not terminated."
+        }
+
+    try:
+        term = (
+            _parse_date(termination_date, "termination_date")
+            if (termination_date or "").strip()
+            else timezone.now().date()
+        )
+        mout = (
+            _parse_date(move_out_date, "move_out_date")
+            if (move_out_date or "").strip()
+            else term
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    preview = {
+        "lease_number": lease.lease_number,
+        "property": lease.property.name if lease.property_id else "",
+        "from_status": lease.status,
+        "to_status": Lease.LeaseStatus.TERMINATED,
+        "termination_date": str(term),
+        "move_out_date": str(mout),
+        "side_effects": [
+            "void open (unpaid) charges",
+            "close occupancy records",
+            "preserve lease row for audit",
+        ],
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "terminate_lease",
+            preview,
+            "Terminates lease like the UI Terminate button.",
+        )
+
+    with transaction.atomic():
+        lease.status = Lease.LeaseStatus.TERMINATED
+        # move_out may be "today" even if term starts in the future — clamp
+        # so model.clean() (end >= start, move_out >= move_in) still holds.
+        if lease.start_date and mout < lease.start_date:
+            mout = lease.start_date
+        lease.move_out_date = mout
+        if not lease.end_date or lease.end_date > term:
+            end = term
+            if lease.start_date and end < lease.start_date:
+                end = lease.start_date
+            lease.end_date = end
+        try:
+            lease.full_clean()
+        except ValidationError as exc:
+            return _validation_error_payload(exc)
+        lease.save()
+        void_open_charges_for_lease(
+            lease,
+            reason=f"Lease {lease.lease_number} terminated {term}",
+            created_by=landlord.user,
+        )
+        close_lease_occupancies(lease, move_out=mout)
+
+    return {
+        "terminated": True,
+        "lease_number": lease.lease_number,
+        "status": str(lease.status),
+        "end_date": str(lease.end_date) if lease.end_date else None,
+        "move_out_date": str(lease.move_out_date) if lease.move_out_date else None,
+    }
+
+
+def landlord_sign_lease(
+    landlord,
+    *,
+    property_query: str = "",
+    lease_number: str = "",
+    confirm: str = "",
+) -> dict:
+    """Mirror LeaseViewSet.landlord_sign — requires full rent allocation."""
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return _prop_err(err)
+
+    if lease.is_locked():
+        return {"error": "This lease is already fully executed (locked)."}
+    if lease.landlord_signed:
+        return {"error": "You have already signed this lease."}
+    if not lease.rent_is_fully_allocated():
+        return {
+            "error": (
+                f"Rent isn't fully assigned — "
+                f"${lease.get_unallocated_rent()} of ${lease.total_rent} still "
+                f"unassigned. Adjust tenant shares (rebalance_lease_rents) first."
+            )
+        }
+
+    preview = {
+        "lease_number": lease.lease_number,
+        "property": lease.property.name if lease.property_id else "",
+        "status": lease.status,
+        "total_rent": str(lease.total_rent),
+        "unallocated_rent": str(lease.get_unallocated_rent()),
+        "note": "With any tenant signature, lease may activate (charges generated).",
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "landlord_sign_lease",
+            preview,
+            "Records landlord signature (may activate lease).",
+        )
+
+    lease.landlord_signed = True
+    lease.landlord_signed_date = timezone.now()
+    lease.save(
+        update_fields=["landlord_signed", "landlord_signed_date", "updated_at"]
+    )
+    activated = lease.check_and_activate()
+    return {
+        "signed": True,
+        "lease_number": lease.lease_number,
+        "status": lease.status,
+        "landlord_signed": True,
+        "activated": bool(activated),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Maintenance
+# ---------------------------------------------------------------------------
+
+
+def _resolve_work_order(landlord, *, work_order_id: str = "", title_query: str = ""):
+    from rentium.maintenance.models import WorkOrder
+
+    if work_order_id:
+        try:
+            wo = WorkOrder.objects.select_related("property").get(
+                pk=work_order_id, property__landlord=landlord
+            )
+            return wo, None
+        except (WorkOrder.DoesNotExist, ValueError):
+            return None, f"No work order {work_order_id!r}."
+    if title_query:
+        qs = WorkOrder.objects.filter(
+            property__landlord=landlord, title__icontains=title_query.strip()
+        )
+        if qs.count() != 1:
+            return None, (
+                f"Need exactly one WO matching {title_query!r} "
+                f"(found {qs.count()}). Pass work_order_id."
+            )
+        return qs.select_related("property").first(), None
+    return None, "Pass work_order_id or title_query."
+
+
+def update_work_order(
+    landlord,
+    *,
+    work_order_id: str = "",
+    title_query: str = "",
+    title: str = "",
+    description: str = "",
+    priority: str = "",
+    category: str = "",
+    contractor_name: str = "",
+    contractor_phone: str = "",
+    scheduled_date: str = "",
+    confirm: str = "",
+) -> dict:
+    """Update fields only — status goes through transition_work_order / complete."""
+    from rentium.maintenance.models import WorkOrder
+
+    wo, err = _resolve_work_order(
+        landlord, work_order_id=work_order_id, title_query=title_query
+    )
+    if err:
+        return _prop_err(err)
+
+    if wo.status in (WorkOrder.Status.COMPLETED, WorkOrder.Status.CANCELLED):
+        return {
+            "error": f"Cannot edit a {wo.status} work order (terminal status)."
+        }
+
+    changes: dict = {}
+    if title.strip():
+        changes["title"] = title.strip()[:200]
+    if description != "":
+        changes["description"] = description[:5000]
+    if priority.strip():
+        pr = priority.strip().upper()
+        if pr not in WorkOrder.Priority.values:
+            return {"error": f"Invalid priority. Use {list(WorkOrder.Priority.values)}"}
+        changes["priority"] = pr
+    if category.strip():
+        cat = category.strip().upper()
+        if cat not in WorkOrder.Category.values:
+            return {"error": f"Invalid category. Use {list(WorkOrder.Category.values)}"}
+        changes["category"] = cat
+    if contractor_name != "":
+        changes["contractor_name"] = contractor_name.strip()[:150]
+    if contractor_phone != "":
+        changes["contractor_phone"] = contractor_phone.strip()[:30]
+    if scheduled_date.strip():
+        try:
+            changes["scheduled_date"] = _parse_date(scheduled_date, "scheduled_date")
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+    if not changes:
+        return {
+            "error": "No fields to update. For status use transition_work_order."
+        }
+
+    preview = {
+        "id": str(wo.pk),
+        "title": wo.title,
+        "property": wo.property.name,
+        "status": wo.status,
+        "changes": {
+            k: (str(v) if isinstance(v, date) else v) for k, v in changes.items()
+        },
+        "note": "Status is NOT changed here — use transition_work_order / complete_work_order.",
+    }
+    if not _confirmed(confirm):
+        return _preview("update_work_order", preview, "Updates WO metadata fields.")
+
+    for k, v in changes.items():
+        setattr(wo, k, v)
+    try:
+        wo.full_clean()
+        wo.save()
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+
+    return {
+        "updated": True,
+        "work_order": {
+            "id": str(wo.pk),
+            "title": wo.title,
+            "status": wo.status,
+            "priority": wo.priority,
+            "contractor_name": wo.contractor_name,
+        },
+        "applied": list(changes.keys()),
+    }
+
+
+def complete_work_order(
+    landlord,
+    *,
+    work_order_id: str = "",
+    title_query: str = "",
+    cost: str = "",
+    post_expense: str = "0",
+    vendor: str = "",
+    confirm: str = "",
+) -> dict:
+    """Mirror WorkOrderViewSet.complete — FSM to COMPLETED + optional expense."""
+    from rentium.maintenance.models import WorkOrder
+
+    wo, err = _resolve_work_order(
+        landlord, work_order_id=work_order_id, title_query=title_query
+    )
+    if err:
+        return _prop_err(err)
+
+    cost_dec = None
+    if str(cost).strip():
+        try:
+            cost_dec = _money(cost)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+    will_expense = bool(cost_dec is not None and _truthy(post_expense))
+    preview = {
+        "id": str(wo.pk),
+        "title": wo.title,
+        "property": wo.property.name,
+        "from_status": wo.status,
+        "to_status": WorkOrder.Status.COMPLETED,
+        "cost": str(cost_dec) if cost_dec is not None else None,
+        "post_expense": will_expense,
+        "vendor": (vendor or wo.contractor_name or "")[:150],
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "complete_work_order",
+            preview,
+            "Completes the job; optionally posts a MAINTENANCE expense.",
+        )
+
+    if cost_dec is not None:
+        wo.cost = cost_dec
+        wo.save(update_fields=["cost", "updated_at"])
+
+    try:
+        wo.transition_to(WorkOrder.Status.COMPLETED, by=landlord.user)
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Transition failed: {exc}"}
+
+    expense_id = None
+    if will_expense and cost_dec is not None:
+        from rentium.ledger.services import post_expense
+
+        entry, _created = post_expense(
+            landlord=landlord,
+            property=wo.property,
+            amount=cost_dec,
+            category="MAINTENANCE",
+            description=f"Work order: {wo.title}",
+            vendor=vendor or wo.contractor_name,
+            work_order=wo,
+            idempotency_key=f"woexp:{wo.pk}",
+            created_by=landlord.user,
+        )
+        expense_id = str(getattr(entry, "pk", "") or "")
+
+    return {
+        "completed": True,
+        "work_order": {
+            "id": str(wo.pk),
+            "title": wo.title,
+            "status": wo.status,
+            "cost": str(wo.cost) if wo.cost is not None else None,
+        },
+        "expense_posted": will_expense,
+        "expense_id": expense_id or None,
+    }
+
+
+def add_work_order_comment(
+    landlord,
+    *,
+    body: str,
+    work_order_id: str = "",
+    title_query: str = "",
+    confirm: str = "",
+) -> dict:
+    from rentium.maintenance.models import WorkOrderComment
+
+    wo, err = _resolve_work_order(
+        landlord, work_order_id=work_order_id, title_query=title_query
+    )
+    if err:
+        return _prop_err(err)
+    body = (body or "").strip()
+    if not body:
+        return {"error": "body is required."}
+
+    preview = {
+        "work_order": wo.title,
+        "property": wo.property.name,
+        "body": body[:500],
+    }
+    if not _confirmed(confirm):
+        return _preview("add_work_order_comment", preview, "Adds a landlord comment.")
+
+    c = WorkOrderComment.objects.create(
+        work_order=wo, author=landlord.user, body=body[:5000]
+    )
+    return {
+        "created": True,
+        "comment_id": str(c.pk),
+        "work_order_id": str(wo.pk),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Inventory
+# ---------------------------------------------------------------------------
+
+
+def create_inventory_item(
+    landlord,
+    *,
+    property_query: str,
+    name: str,
+    quantity: str = "1",
+    condition: str = "GOOD",
+    location: str = "",
+    description: str = "",
+    confirm: str = "",
+) -> dict:
+    from rentium.properties.models import InventoryItem
+
+    prop, err = _resolve_property(landlord, property_query)
+    if err:
+        return _prop_err(err)
+    name = (name or "").strip()
+    if not name:
+        return {"error": "name is required."}
+    try:
+        qty = max(1, int(str(quantity or "1").strip() or "1"))
+    except ValueError:
+        return {"error": f"Invalid quantity {quantity!r}."}
+    cond = (condition or "GOOD").strip().upper()
+    if cond and cond not in InventoryItem.ItemCondition.values:
+        return {
+            "error": f"Invalid condition. Use {list(InventoryItem.ItemCondition.values)}"
+        }
+
+    preview = {
+        "property": prop.name,
+        "name": name,
+        "quantity": qty,
+        "condition": cond or None,
+        "location": (location or "")[:255],
+        "scope": "private",
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "create_inventory_item",
+            preview,
+            "Adds private inventory; may flip is_furnished via signals.",
+        )
+
+    item = InventoryItem.objects.create(
+        property=prop,
+        name=name[:200],
+        quantity=qty,
+        condition=cond or None,
+        location_description=(location or "")[:255],
+        description=(description or "")[:2000],
+    )
+    prop.refresh_from_db()
+    return {
+        "created": True,
+        "item": {
+            "id": str(item.pk),
+            "name": item.name,
+            "quantity": item.quantity,
+            "condition": item.condition,
+            "property": prop.name,
+        },
+        "property_is_furnished": bool(prop.is_furnished),
+    }
+
+
+def update_inventory_item(
+    landlord,
+    *,
+    property_query: str,
+    item_name: str,
+    name: str = "",
+    quantity: str = "",
+    condition: str = "",
+    location: str = "",
+    description: str = "",
+    confirm: str = "",
+) -> dict:
+    from rentium.properties.models import InventoryItem
+
+    prop, err = _resolve_property(landlord, property_query)
+    if err:
+        return _prop_err(err)
+    q = (item_name or "").strip()
+    if not q:
+        return {"error": "item_name is required."}
+    qs = prop.inventory_items.filter(name__icontains=q)
+    if qs.count() != 1:
+        return {
+            "error": f"Need exactly one inventory item matching {item_name!r} "
+            f"on {prop.name} (found {qs.count()}).",
+            "candidates": list(qs.values_list("name", flat=True)[:8]),
+        }
+    item = qs.first()
+
+    changes: dict = {}
+    if name.strip():
+        changes["name"] = name.strip()[:200]
+    if quantity != "":
+        try:
+            changes["quantity"] = max(1, int(str(quantity).strip()))
+        except ValueError:
+            return {"error": f"Invalid quantity {quantity!r}."}
+    if condition.strip():
+        cond = condition.strip().upper()
+        if cond not in InventoryItem.ItemCondition.values:
+            return {"error": f"Invalid condition {condition!r}."}
+        changes["condition"] = cond
+    if location != "":
+        changes["location_description"] = location[:255]
+    if description != "":
+        changes["description"] = description[:2000]
+    if not changes:
+        return {"error": "No inventory fields to update."}
+
+    preview = {
+        "property": prop.name,
+        "item": item.name,
+        "changes": changes,
+    }
+    if not _confirmed(confirm):
+        return _preview("update_inventory_item", preview, "Updates private inventory.")
+
+    for k, v in changes.items():
+        setattr(item, k, v)
+    item.save()
+    return {
+        "updated": True,
+        "item": {
+            "id": str(item.pk),
+            "name": item.name,
+            "quantity": item.quantity,
+            "condition": item.condition,
+        },
+    }
+
+
+def delete_inventory_item(
+    landlord, *, property_query: str, item_name: str, confirm: str = ""
+) -> dict:
+    prop, err = _resolve_property(landlord, property_query)
+    if err:
+        return _prop_err(err)
+    q = (item_name or "").strip()
+    qs = prop.inventory_items.filter(name__icontains=q)
+    if qs.count() != 1:
+        return {
+            "error": f"Need exactly one item matching {item_name!r} "
+            f"(found {qs.count()}).",
+            "candidates": list(qs.values_list("name", flat=True)[:8]),
+        }
+    item = qs.first()
+    preview = {"property": prop.name, "item": item.name, "id": str(item.pk)}
+    if not _confirmed(confirm):
+        return _preview("delete_inventory_item", preview, "Deletes private inventory item.")
+    nm = item.name
+    item.delete()
+    prop.refresh_from_db()
+    return {
+        "deleted": True,
+        "item": nm,
+        "property": prop.name,
+        "property_is_furnished": bool(prop.is_furnished),
+    }
+
+
+def create_shared_inventory_item(
+    landlord,
+    *,
+    group_name: str,
+    name: str,
+    quantity: str = "1",
+    condition: str = "GOOD",
+    location: str = "",
+    description: str = "",
+    confirm: str = "",
+) -> dict:
+    from rentium.properties.models import SharedInventoryItem
+
+    group, err = _resolve_group(landlord, group_name)
+    if err:
+        return _prop_err(err)
+    name = (name or "").strip()
+    if not name:
+        return {"error": "name is required."}
+    try:
+        qty = max(1, int(str(quantity or "1").strip() or "1"))
+    except ValueError:
+        return {"error": f"Invalid quantity {quantity!r}."}
+    cond = (condition or "GOOD").strip().upper()
+    if cond and cond not in SharedInventoryItem.ItemCondition.values:
+        return {
+            "error": f"Invalid condition. Use {list(SharedInventoryItem.ItemCondition.values)}"
+        }
+
+    preview = {
+        "group": group.name,
+        "name": name,
+        "quantity": qty,
+        "condition": cond,
+        "location": (location or "")[:255],
+        "scope": "shared",
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "create_shared_inventory_item",
+            preview,
+            "Adds shared inventory on a property group (kitchen etc.).",
+        )
+
+    item = SharedInventoryItem.objects.create(
+        group=group,
+        name=name[:200],
+        quantity=qty,
+        condition=cond or None,
+        location_description=(location or "")[:255],
+        description=(description or "")[:2000],
+    )
+    return {
+        "created": True,
+        "item": {
+            "id": str(item.pk),
+            "name": item.name,
+            "group": group.name,
+            "quantity": item.quantity,
+        },
+    }
+
+
+def delete_shared_inventory_item(
+    landlord, *, group_name: str, item_name: str, confirm: str = ""
+) -> dict:
+    group, err = _resolve_group(landlord, group_name)
+    if err:
+        return _prop_err(err)
+    q = (item_name or "").strip()
+    qs = group.group_shared_inventory.filter(name__icontains=q)
+    if qs.count() != 1:
+        return {
+            "error": f"Need exactly one shared item matching {item_name!r} "
+            f"(found {qs.count()}).",
+            "candidates": list(qs.values_list("name", flat=True)[:8]),
+        }
+    item = qs.first()
+    preview = {"group": group.name, "item": item.name}
+    if not _confirmed(confirm):
+        return _preview(
+            "delete_shared_inventory_item", preview, "Deletes shared inventory item."
+        )
+    nm = item.name
+    item.delete()
+    return {"deleted": True, "item": nm, "group": group.name}
+
+
+# ---------------------------------------------------------------------------
+# Full room → lease → invite → inspection workflow (one confirm)
+# ---------------------------------------------------------------------------
+
+
+def setup_room_tenancy(
+    landlord,
+    *,
+    room_name: str,
+    address: str,
+    city: str,
+    group_name: str = "",
+    province: str = "bc",
+    asking_rent: str = "",
+    inventory_items: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    total_rent: str = "",
+    security_deposit: str = "",
+    pet_deposit: str = "0",
+    cleaning_fee: str = "0",
+    special_terms: str = "",
+    tenant_name: str = "",
+    tenant_email: str = "",
+    smoking_allowed: str = "0",
+    pets_allowed: str = "0",
+    create_inspection: str = "1",
+    use_existing_if_name_matches: str = "1",
+    confirm: str = "",
+) -> dict:
+    """
+    One-shot landlord workflow (UI-equivalent package):
+      1) Create room (or reuse existing same name if use_existing…)
+      2) Ensure inventory items
+      3) Create DRAFT lease (deposit defaults half rent if omitted)
+      4) Invite tenant if email given
+      5) create_condition_inspection if create_inspection and tenant exists
+
+    Prefer this over many separate tools for “add Room G + lease + invite + inspection”.
+    """
+    from rentium.properties.models import Property
+    from rentium.rama import domain_actions as actions
+
+    room_name = (room_name or "").strip()
+    if not room_name:
+        return {"error": "room_name is required."}
+
+    rent_s = (total_rent or asking_rent or "").strip() or "0"
+    inv = (inventory_items or "").strip()
+    start = (start_date or "").strip()
+    end = (end_date or "").strip()
+    email = (tenant_email or "").strip()
+    tname = (tenant_name or "").strip() or email.split("@")[0]
+
+    existing = list(
+        Property.objects.filter(landlord=landlord, name__iexact=room_name).order_by(
+            "created_at"
+        )
+    )
+    from .resolve import _candidate_row
+
+    plan = {
+        "workflow": "setup_room_tenancy",
+        "room_name": room_name,
+        "address": address,
+        "city": city,
+        "group_name": group_name or None,
+        "inventory_items": _parse_item_names(inv),
+        "lease": {
+            "start_date": start or None,
+            "end_date": end or None,
+            "total_rent": rent_s,
+            "security_deposit": security_deposit or "half month if omitted",
+            "pet_deposit": pet_deposit or "0",
+            "cleaning_fee": cleaning_fee or "0",
+            "smoking_allowed": _truthy(smoking_allowed),
+            "pets_allowed": _truthy(pets_allowed),
+            "special_terms": (special_terms or "")[:200] or None,
+            "type_hint": "Standard Roommate Agreement for ROOM listings",
+        },
+        "tenant": {"name": tname, "email": email} if email else None,
+        "create_inspection": _truthy(create_inspection) and bool(email),
+        "existing_same_name": [_candidate_row(p) for p in existing],
+        "will_reuse_existing": bool(existing) and _truthy(use_existing_if_name_matches),
+        "steps": [
+            "create_or_reuse_property",
+            "ensure_inventory",
+            "create_lease" if start else "skip_lease_no_start_date",
+            "invite_tenant" if email else "skip_invite",
+            "create_condition_inspection"
+            if (_truthy(create_inspection) and email)
+            else "skip_inspection",
+        ],
+    }
+    if not start:
+        plan["warnings"] = [
+            "start_date missing — will create room (+ inventory) only; pass start_date for lease."
+        ]
+    if not _confirmed(confirm):
+        return _preview(
+            "setup_room_tenancy",
+            plan,
+            "Runs full room setup in one confirm. Prefer this for multi-step room requests.",
+        )
+
+    results: dict = {"workflow": "setup_room_tenancy", "steps_done": []}
+    prop = None
+
+    if existing and _truthy(use_existing_if_name_matches):
+        # Prefer grouped if group_name set
+        if group_name.strip():
+            gmatch = [p for p in existing if p.group and group_name.lower() in p.group.name.lower()]
+            prop = gmatch[0] if gmatch else existing[-1]
+        else:
+            prop = existing[-1]
+        results["steps_done"].append(
+            {"reuse_property": True, "property_id": str(prop.pk), "name": prop.name}
+        )
+        if group_name.strip() and not prop.group_id:
+            assign_property_to_group(
+                landlord,
+                property_query=str(prop.pk),
+                group_name=group_name,
+                confirm="yes",
+            )
+            prop.refresh_from_db()
+            results["steps_done"].append({"assigned_group": group_name})
+    else:
+        created = create_property(
+            landlord,
+            name=room_name,
+            address=address,
+            city=city,
+            province=province,
+            property_category="ROOM",
+            room_type="PRIVATE",
+            group_name=group_name,
+            asking_rent=asking_rent or rent_s,
+            inventory_items=inv,
+            description="",
+            confirm="yes",
+        )
+        if created.get("error") or created.get("needs_confirm"):
+            return created
+        results["steps_done"].append({"create_property": created})
+        prop, err = _resolve_property(landlord, created["property"]["id"])
+        if err:
+            return _prop_err(err)
+
+    # Inventory if still missing
+    if inv:
+        have = {n.lower() for n in prop.inventory_items.values_list("name", flat=True)}
+        missing = [n for n in _parse_item_names(inv) if n.lower() not in have]
+        if missing:
+            inv_r = actions.bulk_add_inventory(
+                landlord,
+                property_query=str(prop.pk),
+                items=", ".join(missing),
+                confirm="yes",
+            )
+            results["steps_done"].append({"inventory": inv_r})
+
+    if not start:
+        results["property_id"] = str(prop.pk)
+        results["done"] = True
+        results["note"] = "Room ready; pass start_date to also create lease."
+        return results
+
+    lease_r = create_lease(
+        landlord,
+        property_query=str(prop.pk),
+        start_date=start,
+        end_date=end,
+        total_rent=rent_s,
+        security_deposit=security_deposit,
+        pet_deposit=pet_deposit,
+        cleaning_fee=cleaning_fee,
+        smoking_allowed=smoking_allowed,
+        pets_allowed=pets_allowed,
+        special_terms=special_terms,
+        confirm="yes",
+    )
+    results["steps_done"].append({"create_lease": lease_r})
+    if lease_r.get("error"):
+        results["partial"] = True
+        return results
+
+    lease_number = lease_r.get("lease", {}).get("lease_number", "")
+    if email:
+        inv_t = actions.invite_tenant_to_lease(
+            landlord,
+            property_query=str(prop.pk),
+            lease_number=lease_number,
+            name=tname,
+            email=email,
+            confirm="yes",
+        )
+        results["steps_done"].append({"invite_tenant": inv_t})
+        if inv_t.get("error") or inv_t.get("needs_confirm"):
+            results["partial"] = True
+            results["invite_error"] = inv_t
+            return results
+
+        if _truthy(create_inspection):
+            insp = actions.create_condition_inspection(
+                landlord,
+                property_query=str(prop.pk),
+                lease_number=lease_number,
+                tenant_email=email,
+                confirm="yes",
+            )
+            results["steps_done"].append({"create_condition_inspection": insp})
+
+    results["done"] = True
+    results["property_id"] = str(prop.pk)
+    results["property_name"] = prop.name
+    results["lease_number"] = lease_number
+    results["next_ui"] = [
+        "Add photos on the property page",
+        "Download lease PDF from lease page after signatures",
+        "Landlord sign when ready",
+    ]
+    return results

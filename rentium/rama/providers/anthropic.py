@@ -1,6 +1,4 @@
-"""Anthropic Messages API adapter (the default provider), via the official SDK."""
-
-from django.conf import settings
+"""Anthropic Messages API adapter, via the official SDK."""
 
 from .base import Provider, ProviderError, ToolCall, Turn
 
@@ -11,16 +9,18 @@ class AnthropicProvider(Provider):
     name = "anthropic"
     api_key_setting = "ANTHROPIC_API_KEY"
 
-    def complete(self, *, model, system, messages, tools):
-        api_key = getattr(settings, self.api_key_setting, "")
-        if not api_key:
+    def complete(self, *, model, system, messages, tools, api_key: str = ""):
+        from rentium.rama.runtime import platform_api_key
+
+        key = (api_key or "").strip() or platform_api_key(self.name)
+        if not key:
             raise ProviderError(
-                "ANTHROPIC_API_KEY is not configured — set it in the backend "
-                "environment to enable RAMA."
+                "No Anthropic API key. Add your key under Account → RAMA, "
+                "or set ANTHROPIC_API_KEY on the server."
             )
         import anthropic
 
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(api_key=key)
         try:
             response = client.messages.create(
                 model=model,

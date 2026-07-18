@@ -24,12 +24,21 @@ from dataclasses import dataclass, field
 class ProviderError(Exception):
     """A provider couldn't complete a turn — bad config or upstream failure."""
 
+    def __init__(self, message: str, *, status_hint: int = 502):
+        super().__init__(message)
+        # Suggested HTTP status for the chat endpoint (429 rate limit, 400 bad
+        # request, 502 upstream, etc.).
+        self.status_hint = status_hint
+
 
 @dataclass
 class ToolCall:
     id: str
     name: str
     arguments: dict
+    # Gemini (and possibly others) attach opaque extra_content that MUST be
+    # echoed on the next turn (thought_signature). Opaque to us; pass-through.
+    extra: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -42,7 +51,7 @@ class Turn:
 
 class Provider:
     name = "base"
-    api_key_setting = ""  # Django settings attribute holding this provider's key
+    api_key_setting = ""  # Django settings attribute holding platform fallback key
 
     def complete(
         self,
@@ -51,5 +60,6 @@ class Provider:
         system: str,
         messages: list[dict],
         tools: list[dict],
+        api_key: str = "",
     ) -> Turn:
         raise NotImplementedError

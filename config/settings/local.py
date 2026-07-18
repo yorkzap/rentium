@@ -15,7 +15,28 @@ SECRET_KEY = env(
     default="OWuJRWohl2JLI7qDeidRBcaHuSuVSZhvLERlnCqa16Ya6FvrCKt8gN8fEbXL7pY5",
 )
 # https://docs.djangoproject.com/en/dev/ref/settings/#allowed-hosts
-ALLOWED_HOSTS = ["localhost", "0.0.0.0", "127.0.0.1", "host.docker.internal"]  # noqa: S104
+# Include api.rentium.ca when serving local Django behind a Cloudflare Tunnel.
+ALLOWED_HOSTS = env.list(
+    "DJANGO_ALLOWED_HOSTS",
+    default=[
+        "localhost",
+        "0.0.0.0",  # noqa: S104
+        "127.0.0.1",
+        "host.docker.internal",
+        "api.rentium.ca",
+    ],
+)
+
+# Required for cross-origin POSTs from the Vercel frontend (Django 4+).
+CSRF_TRUSTED_ORIGINS = env.list(
+    "CSRF_TRUSTED_ORIGINS",
+    default=[
+        "https://rentium.ca",
+        "https://www.rentium.ca",
+        "https://api.rentium.ca",
+        "http://localhost:3000",
+    ],
+)
 
 # CACHES
 # ------------------------------------------------------------------------------
@@ -29,10 +50,30 @@ CACHES = {
 
 # EMAIL
 # ------------------------------------------------------------------------------
-# https://docs.djangoproject.com/en/dev/ref/settings/#email-host
-EMAIL_HOST = env("EMAIL_HOST", default="mailpit")
-# https://docs.djangoproject.com/en/dev/ref/settings/#email-port
-EMAIL_PORT = 1025
+# Default: Mailpit (http://localhost:8025) — zero config, no real outbound mail.
+# When SENDGRID_API_KEY is set in .envs/.local/.django, switch to Anymail so
+# signup / password-reset / invite emails actually reach inboxes while the API
+# is tunnelled at api.rentium.ca. Never put the SendGrid key in the frontend.
+_sendgrid_api_key = env("SENDGRID_API_KEY", default="")
+if _sendgrid_api_key:
+    INSTALLED_APPS = ["anymail", *INSTALLED_APPS]
+    EMAIL_BACKEND = "anymail.backends.sendgrid.EmailBackend"
+    ANYMAIL = {
+        "SENDGRID_API_KEY": _sendgrid_api_key,
+        "SENDGRID_API_URL": env(
+            "SENDGRID_API_URL", default="https://api.sendgrid.com/v3/"
+        ),
+    }
+    DEFAULT_FROM_EMAIL = env(
+        "DJANGO_DEFAULT_FROM_EMAIL",
+        default="Rentium <noreply@rentium.ca>",
+    )
+    SERVER_EMAIL = env("DJANGO_SERVER_EMAIL", default=DEFAULT_FROM_EMAIL)
+else:
+    # https://docs.djangoproject.com/en/dev/ref/settings/#email-host
+    EMAIL_HOST = env("EMAIL_HOST", default="mailpit")
+    # https://docs.djangoproject.com/en/dev/ref/settings/#email-port
+    EMAIL_PORT = env.int("EMAIL_PORT", default=1025)
 
 # WhiteNoise
 # ------------------------------------------------------------------------------

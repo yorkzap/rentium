@@ -499,6 +499,7 @@ def next_upcoming_charge(landlord, property_id=None) -> dict | None:
         "due_date": charge.due_date.isoformat(),
         "amount": str(charge.amount),
         "entry_type": charge.entry_type,
-        "lease_id": charge.lease_id,
+        # Stringify: RAMA audit / JSONField cannot store raw UUID objects.
+        "lease_id": str(charge.lease_id) if charge.lease_id else None,
         "property_name": charge.property.name if charge.property else "",
     }
