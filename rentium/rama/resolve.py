@@ -14,6 +14,41 @@ import uuid
 from typing import Any
 
 
+# Natural-language → canonical pick token. Lets the landlord say "the old one"
+# and have the deterministic resolver pick it, instead of leaning on the weak
+# model to translate. "matches" is ordered oldest→newest (created_at, pk), so
+# oldest == first, newest == last.
+_PICK_ALIASES = {
+    "old": "oldest", "older": "oldest", "oldest": "oldest",
+    "earliest": "oldest", "earlier": "oldest", "original": "oldest",
+    "first": "first", "1st": "first",
+    "new": "newest", "newer": "newest", "newest": "newest",
+    "latest": "newest", "recent": "newest", "most_recent": "newest",
+    "last": "last", "2nd": "last", "second": "last",
+    # "operate on every duplicate" escape hatch for destructive bulk ops.
+    "all": "all", "both": "all", "every": "all", "each": "all",
+}
+
+
+def _normalize_pick(pick: str) -> str:
+    """Map free-text ('the old one', 'newer', 'second') to a canonical pick."""
+    p = (pick or "").strip().lower()
+    if not p:
+        return ""
+    # Strip common filler so "the old one" / "old room" reduce to a keyword.
+    for filler in ("the ", " one", " one.", " room", " listing", " unit"):
+        p = p.replace(filler, "")
+    p = p.strip()
+    if p in _PICK_ALIASES:
+        return _PICK_ALIASES[p]
+    # Bare word inside a longer phrase, e.g. "old" survives above; also catch
+    # any remaining alias token embedded in the phrase.
+    for word in p.split():
+        if word in _PICK_ALIASES:
+            return _PICK_ALIASES[word]
+    return p
+
+
 def _candidate_row(prop) -> dict[str, Any]:
     from rentium.leases.models import Lease
 
@@ -84,7 +119,7 @@ def resolve_property(
         return matches[0], None
 
     candidates = [_candidate_row(p) for p in matches]
-    pick_s = (pick or "").strip().lower()
+    pick_s = _normalize_pick(pick)
 
     if pick_s in ("first", "1", "oldest"):
         return matches[0], None
@@ -163,12 +198,16 @@ def resolve_property(
     return None, {
         "error": (
             f"Multiple listings match {property_query!r} ({n}). "
-            "Pass property_query=<id> from candidates, or pick=first|last|with_group|no_group|1|2."
+            "Pass property_query=<id> from candidates, or "
+            "pick=oldest|newest|first|last|with_group|no_group|1|2 "
+            "('the old one'→oldest, 'the new one'→newest)."
         ),
         "candidates": candidates,
         "hint": (
-            "To delete a duplicate: delete_property property_query=<id> confirm=yes. "
-            "Do not rename in a loop."
+            "These are duplicate-named listings, NOT blocked items — pick one and "
+            "the operation proceeds. 'the old one'→pick=oldest, 'the new one'→"
+            "pick=newest. To rename one instead: update_property name=<new name> "
+            "pick=oldest|newest."
         ),
     }
 

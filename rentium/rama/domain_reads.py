@@ -1349,3 +1349,247 @@ def domain_digest(landlord) -> dict:
             "Zero means none — do not invent."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Finders — deterministic set-scoping. When the landlord scopes a request
+# over a set ("all listings without images except X"), Python enumerates and
+# filters; the model only relays. Every finder returns the COMPLETE matching
+# set plus an `excluded` echo and a `match_rule` sentence so nothing can be
+# silently dropped.
+# ---------------------------------------------------------------------------
+
+
+def _tri(value: str) -> bool | None:
+    """Parse a yes/no/'' filter: '' (or 'any') = no filter."""
+    s = str(value or "").strip().lower()
+    if not s or s == "any":
+        return None
+    return s in ("1", "true", "yes", "y", "on")
+
+
+def _exclude_tokens(exclude: str) -> list[str]:
+    return [t.strip().lower() for t in (exclude or "").split(",") if t.strip()]
+
+
+def _is_excluded(name: str, pk, tokens: list[str]) -> str | None:
+    """The matching token if this row is excluded, else None."""
+    low = (name or "").lower()
+    for tok in tokens:
+        if tok == str(pk).lower() or tok == low or tok in low:
+            return tok
+    return None
+
+
+def find_listings(
+    landlord,
+    *,
+    has_images: str = "",
+    vacant_today: str = "",
+    has_lease: str = "",
+    listing_status: str = "",
+    group: str = "",
+    name_contains: str = "",
+    exclude: str = "",
+) -> dict:
+    """Find listings matching filters. Returns the COMPLETE matching set —
+    relay every row; never enumerate or filter listings yourself.
+    Filters (all optional; '' = any): has_images yes/no, vacant_today yes/no,
+    has_lease yes/no (ANY lease incl. drafts/ended — these block deletion),
+    listing_status AVAILABLE|OCCUPIED|MAINTENANCE|NOT_AVAILABLE,
+    group <name>, name_contains <text>,
+    exclude 'name or id, name or id' (kept OUT of the result, echoed back)."""
+    from datetime import date as _date
+
+    from rentium.properties.models import Property
+
+    from .union import _active_leases_by_property, _serialize_lease_brief
+
+    today = _date.today()
+    qs = list(
+        Property.objects.filter(landlord=landlord)
+        .select_related("group")
+        .annotate(
+            _gallery_count=Count("property_images", distinct=True),
+            _lease_count=Count("leases", distinct=True),
+            _open_wo=Count(
+                "work_orders",
+                filter=~Q(work_orders__status__in=["COMPLETED", "CANCELLED"]),
+                distinct=True,
+            ),
+        )
+        .order_by("name")
+    )
+    total = len(qs)
+    lease_map = _active_leases_by_property(landlord, [p.pk for p in qs], today)
+
+    want_images = _tri(has_images)
+    want_vacant = _tri(vacant_today)
+    want_lease = _tri(has_lease)
+    status_f = (listing_status or "").strip().upper()
+    group_f = (group or "").strip().lower()
+    name_f = (name_contains or "").strip().lower()
+    tokens = _exclude_tokens(exclude)
+
+    filters_used: list[str] = []
+    if want_images is not None:
+        filters_used.append(f"has_images={'yes' if want_images else 'no'}")
+    if want_vacant is not None:
+        filters_used.append(f"vacant_today={'yes' if want_vacant else 'no'}")
+    if want_lease is not None:
+        filters_used.append(f"has_lease={'yes' if want_lease else 'no'}")
+    if status_f:
+        filters_used.append(f"listing_status={status_f}")
+    if group_f:
+        filters_used.append(f"group~{group_f}")
+    if name_f:
+        filters_used.append(f"name~{name_f}")
+
+    rows: list[dict] = []
+    excluded_rows: list[dict] = []
+    for prop in qs:
+        image_count = prop.image_count  # honours the _gallery_count annotation
+        lease = lease_map.get(prop.pk)
+        brief = (
+            _serialize_lease_brief(lease, today, place_name=prop.name)
+            if lease
+            else None
+        )
+        is_vacant = brief["vacant_today"] if brief else True
+
+        tok = _is_excluded(prop.name, prop.pk, tokens)
+        row = {
+            "id": str(prop.pk),
+            "name": prop.name,
+            "group": prop.group.name if prop.group_id else None,
+            "listing_status": prop.status,
+            "image_count": image_count,
+            "has_images": image_count > 0,
+            # ALL leases incl. drafts and ended — this is the number that
+            # blocks deletion (DB PROTECT), not just active occupancy.
+            "lease_count": int(getattr(prop, "_lease_count", 0)),
+            "current_lease": (
+                {
+                    "lease_number": brief.get("lease_number"),
+                    "status": brief.get("status"),
+                    "start_date": brief.get("start_date"),
+                    "end_date": brief.get("end_date"),
+                }
+                if brief
+                else None
+            ),
+            "open_work_orders": int(getattr(prop, "_open_wo", 0)),
+            "vacant_today": is_vacant,
+        }
+        if tok is not None:
+            excluded_rows.append({**row, "excluded_by": tok})
+            continue
+
+        if want_images is not None and row["has_images"] is not want_images:
+            continue
+        if want_vacant is not None and is_vacant is not want_vacant:
+            continue
+        if want_lease is not None and (row["lease_count"] > 0) is not want_lease:
+            continue
+        if status_f and prop.status != status_f:
+            continue
+        if group_f and group_f not in (row["group"] or "").lower():
+            continue
+        if name_f and name_f not in prop.name.lower():
+            continue
+        rows.append(row)
+
+    return {
+        "listings": rows,
+        "count": len(rows),
+        "total_listings": total,
+        "excluded": excluded_rows,
+        "match_rule": (
+            f"Matched {len(rows)} of {total} listings"
+            + (f" (filters: {', '.join(filters_used)})" if filters_used else "")
+            + (
+                f"; excluded by request: {', '.join(r['name'] for r in excluded_rows)}"
+                if excluded_rows
+                else ""
+            )
+            + "."
+        ),
+        "instruction": (
+            "This is the COMPLETE matching set. Present every listing; do not "
+            "drop, add, or re-filter items yourself."
+        ),
+    }
+
+
+def find_leases(
+    landlord,
+    *,
+    status: str = "",
+    property_query: str = "",
+    ending_before: str = "",
+    include_ended: str = "",
+) -> dict:
+    """Find leases matching filters. Returns the COMPLETE matching set.
+    Filters (optional): status DRAFT|PENDING_SIGNATURES|SIGNED|ACTIVE|
+    TERMINATED|EXPIRED|RENEWED, property_query <listing name or id>,
+    ending_before YYYY-MM-DD, include_ended yes to include final leases."""
+    from datetime import datetime as _dt
+
+    from rentium.leases.models import Lease
+
+    qs = Lease.objects.filter(landlord=landlord).select_related("property")
+    status_f = (status or "").strip().upper()
+    if status_f:
+        qs = qs.filter(status=status_f)
+    elif _tri(include_ended) is not True:
+        qs = qs.exclude(
+            status__in=[Lease.LeaseStatus.TERMINATED, Lease.LeaseStatus.EXPIRED]
+        )
+    pq = (property_query or "").strip().lower()
+    end_cut = None
+    raw_cut = (ending_before or "").strip()
+    if raw_cut:
+        try:
+            end_cut = _dt.strptime(raw_cut[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return {"error": f"Invalid ending_before {ending_before!r}; use YYYY-MM-DD."}
+        qs = qs.filter(end_date__isnull=False, end_date__lt=end_cut)
+
+    rows = []
+    for lease in qs.order_by("property__name", "-created_at"):
+        prop_name = lease.property.name if lease.property_id else ""
+        if pq and pq not in prop_name.lower() and pq != str(lease.property_id):
+            continue
+        rows.append(
+            {
+                "lease_number": lease.lease_number,
+                "property": prop_name,
+                "status": lease.status,
+                "start_date": str(lease.start_date) if lease.start_date else None,
+                "end_date": str(lease.end_date) if lease.end_date else None,
+                "total_rent": str(lease.total_rent),
+                "tenants": lease.lease_tenants.count(),
+            }
+        )
+    filters = [
+        f
+        for f in (
+            f"status={status_f}" if status_f else "",
+            f"property~{pq}" if pq else "",
+            f"ending_before={end_cut}" if end_cut else "",
+        )
+        if f
+    ]
+    return {
+        "leases": rows,
+        "count": len(rows),
+        "match_rule": (
+            f"Matched {len(rows)} lease(s)"
+            + (f" (filters: {', '.join(filters)})" if filters else "")
+            + "."
+        ),
+        "instruction": (
+            "This is the COMPLETE matching set. Present every lease; do not "
+            "drop or re-filter items yourself."
+        ),
+    }

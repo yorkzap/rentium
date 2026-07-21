@@ -1,8 +1,16 @@
 """Anthropic Messages API adapter, via the official SDK."""
 
+from django.conf import settings
+
 from .base import Provider, ProviderError, ToolCall, Turn
 
-MAX_TOKENS = 1024  # answers are short prose over tool results, not essays
+# Plan previews and full set listings routinely exceed 1024 tokens; a cap that
+# truncates mid-plan reads as the model "going quiet". Overridable via settings.
+DEFAULT_MAX_TOKENS = 4096
+
+
+def _max_tokens() -> int:
+    return int(getattr(settings, "RAMA_MAX_TOKENS", DEFAULT_MAX_TOKENS))
 
 
 class AnthropicProvider(Provider):
@@ -24,7 +32,7 @@ class AnthropicProvider(Provider):
         try:
             response = client.messages.create(
                 model=model,
-                max_tokens=MAX_TOKENS,
+                max_tokens=_max_tokens(),
                 system=system,
                 tools=[
                     {

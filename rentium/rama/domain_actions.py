@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
@@ -42,6 +43,26 @@ def _prop_err(err):
     if isinstance(err, dict):
         return err if "error" in err else {"error": err}
     return _prop_err(err)
+
+
+def _parse_when(when: str):
+    """Parse 'YYYY-MM-DD HH:MM' (or ISO) into a tz-aware datetime in the launch
+    market's timezone. Returns None if unparseable. Mirrors schedule_viewing."""
+    from zoneinfo import ZoneInfo
+
+    when_s = (when or "").strip()
+    if not when_s:
+        return None
+    tz = ZoneInfo("America/Vancouver")
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            naive = datetime.strptime(when_s.replace("Z", "")[:19], fmt)
+            if fmt == "%Y-%m-%d":
+                naive = datetime.combine(naive.date(), time(14, 0))
+            return naive.replace(tzinfo=tz)
+        except ValueError:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -454,20 +475,41 @@ def schedule_viewing(
     if not _confirmed(confirm):
         return _preview("schedule_viewing", preview, "Creates a SCHEDULED viewing.")
 
+    from rentium.appointments.services import (
+        current_active_lease,
+        notification_receipt,
+    )
+
     try:
+        active_lease = current_active_lease(prop)
         appt = Appointment.objects.create(
             landlord=landlord,
             property=prop,
+            lease=active_lease,
             kind=Appointment.Kind.VIEWING,
             status=Appointment.Status.SCHEDULED,
             starts_at=starts,
             contact_name=(contact_name or "")[:200],
             contact_email=(contact_email or "")[:150],
             notes=(notes or "")[:2000],
+            tenant_consent=(
+                Appointment.TenantConsent.PENDING
+                if active_lease
+                else Appointment.TenantConsent.NOT_APPLICABLE
+            ),
         )
+        appt.stamp_time_class()
+        appt.save(update_fields=["time_class"])
+        appt.record_proposal(by="LANDLORD", starts_at=starts, message=notes or "")
+        # Directly scheduling emails the viewer + notices current tenants; if the
+        # unit is occupied the tenant is also asked for consent (advisory).
+        appt.publish_event("appointment.scheduled")
+        if active_lease:
+            appt.publish_event("appointment.tenant_review")
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Could not create viewing: {exc}"}
 
+    receipt = notification_receipt(appt)
     return {
         "created": True,
         "appointment": {
@@ -476,7 +518,260 @@ def schedule_viewing(
             "starts_at": starts.isoformat(),
             "status": appt.status,
             "kind": appt.kind,
+            "time_class": appt.time_class,
         },
+        # Grounded delivery facts so RAMA can truthfully answer "how were they
+        # notified?" — the exact gap that made it feel not-alive.
+        "notified": receipt,
+    }
+
+
+_PENDING_VIEWING = ("REQUESTED", "AWAITING_REQUESTER")
+
+
+def list_viewing_requests(landlord, scope: str = "pending") -> dict:
+    """List viewing requests with negotiation state. scope=pending (default) is
+    what's awaiting action; scope=all includes scheduled/cancelled."""
+    from rentium.appointments.models import Appointment
+
+    qs = Appointment.objects.filter(
+        landlord=landlord, kind=Appointment.Kind.VIEWING
+    ).select_related("property")
+    if scope != "all":
+        qs = qs.filter(status__in=_PENDING_VIEWING)
+    rows = []
+    for a in qs.order_by("starts_at")[:50]:
+        local = timezone.localtime(a.starts_at)
+        rows.append(
+            {
+                "ref": str(a.pk)[:8].upper(),
+                "id": str(a.pk),
+                "property": a.property.name,
+                "who": a.contact_name or "someone",
+                "contact_email": a.contact_email or "",
+                "when": local.strftime("%Y-%m-%d %H:%M"),
+                "weekday": local.strftime("%A"),
+                "status": a.status,
+                "time_class": a.time_class,
+                "tenant_consent": a.tenant_consent,
+                "awaiting": (
+                    "the requester"
+                    if a.status == "AWAITING_REQUESTER"
+                    else "you"
+                    if a.status == "REQUESTED"
+                    else "—"
+                ),
+            }
+        )
+    return {"count": len(rows), "requests": rows}
+
+
+def _find_viewing(landlord, request_ref: str):
+    import uuid as _uuid
+
+    from rentium.appointments.models import Appointment
+
+    ref = (request_ref or "").strip()
+    if not ref:
+        return None
+    qs = Appointment.objects.filter(
+        landlord=landlord, kind=Appointment.Kind.VIEWING
+    )
+    # Full UUID → direct hit; anything else is treated as the short ref.
+    try:
+        return qs.filter(pk=_uuid.UUID(ref)).first() or _match_short_ref(qs, ref)
+    except (ValueError, AttributeError):
+        return _match_short_ref(qs, ref)
+
+
+def _match_short_ref(qs, ref: str):
+    """Match the 8-char reference shown in list_viewing_requests."""
+    for a in qs.filter(status__in=_PENDING_VIEWING):
+        if str(a.pk)[:8].upper() == ref.upper():
+            return a
+    return None
+
+
+def respond_to_viewing_request(
+    landlord,
+    request_ref: str,
+    action: str,
+    when: str = "",
+    confirm: str = "",
+) -> dict:
+    """Act on a pending viewing request. action = confirm | counter | decline.
+    counter needs when ('YYYY-MM-DD HH:MM'). Preview first; confirm=yes to run.
+    Get request_ref from list_viewing_requests."""
+    from rentium.appointments.models import Appointment, AppointmentProposal
+    from rentium.appointments.services import notification_receipt
+
+    appt = _find_viewing(landlord, request_ref)
+    if appt is None:
+        return {"error": f"No viewing request matches ref={request_ref!r}."}
+    if appt.status not in _PENDING_VIEWING:
+        return {"error": f"That viewing is {appt.status}, nothing to act on."}
+
+    act = (action or "").strip().lower()
+    if act not in ("confirm", "counter", "decline"):
+        return {"error": "action must be confirm, counter, or decline."}
+
+    new_start = None
+    if act == "counter":
+        new_start = _parse_when(when)
+        if new_start is None:
+            return {"error": "counter needs when, e.g. 2026-08-05 14:00."}
+
+    preview = {
+        "ref": str(appt.pk)[:8].upper(),
+        "property": appt.property.name,
+        "action": act,
+        "current_time": timezone.localtime(appt.starts_at).strftime("%Y-%m-%d %H:%M"),
+    }
+    if new_start:
+        preview["new_time"] = timezone.localtime(new_start).strftime("%Y-%m-%d %H:%M")
+    if not _confirmed(confirm):
+        verb = {"confirm": "Confirms", "counter": "Proposes a new time for", "decline": "Declines"}[act]
+        return _preview("respond_to_viewing_request", preview, f"{verb} this viewing.")
+
+    if act == "confirm":
+        appt.transition_to(Appointment.Status.SCHEDULED)
+        appt.publish_event("appointment.scheduled")
+    elif act == "decline":
+        appt.transition_to(Appointment.Status.CANCELLED)
+        appt.publish_event("appointment.cancelled", cancelled_by="LANDLORD")
+    else:  # counter
+        appt.starts_at = new_start
+        appt.stamp_time_class()
+        appt.transition_to(Appointment.Status.AWAITING_REQUESTER)
+        appt.save(update_fields=["starts_at", "time_class"])
+        appt.record_proposal(by=AppointmentProposal.By.LANDLORD, starts_at=new_start)
+        appt.publish_event("appointment.countered", proposed_by="LANDLORD")
+
+    return {
+        "done": True,
+        "ref": str(appt.pk)[:8].upper(),
+        "status": appt.status,
+        "notified": notification_receipt(appt),
+    }
+
+
+def get_viewing_availability(landlord, property_query: str = "") -> dict:
+    """The landlord's preferred viewing hours (their default, or a property's
+    override if property_query is given)."""
+    from rentium.appointments.services import preferred_windows
+
+    prop = None
+    if property_query:
+        prop, err = _resolve_property(landlord, property_query)
+        if err:
+            return _prop_err(err)
+    windows = preferred_windows(landlord, prop)
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    return {
+        "scope": prop.name if prop else "default (all properties)",
+        "timezone": getattr(landlord, "timezone", "America/Vancouver"),
+        "windows": [
+            {
+                "day": days[w.weekday],
+                "from": w.start_time.strftime("%H:%M"),
+                "to": w.end_time.strftime("%H:%M"),
+            }
+            for w in windows
+        ],
+    }
+
+
+_WEEKDAYS = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+
+def set_viewing_availability(
+    landlord,
+    weekday: str,
+    start: str,
+    end: str,
+    property_query: str = "",
+    confirm: str = "",
+) -> dict:
+    """Add a preferred viewing window. weekday = a day name (e.g. Tuesday).
+    start/end = 'HH:MM' 24h. Optionally property_query for a per-property
+    override. Preview first; confirm=yes to save."""
+    from datetime import time as _time
+
+    from rentium.appointments.models import AvailabilityWindow
+
+    wd = _WEEKDAYS.get((weekday or "").strip().lower())
+    if wd is None:
+        return {"error": "weekday must be a day name like Tuesday."}
+
+    def _parse_hhmm(s):
+        try:
+            h, m = str(s).strip().split(":")
+            return _time(int(h), int(m))
+        except (ValueError, AttributeError):
+            return None
+
+    start_t, end_t = _parse_hhmm(start), _parse_hhmm(end)
+    if start_t is None or end_t is None:
+        return {"error": "start and end must be HH:MM, e.g. 17:00."}
+    if end_t <= start_t:
+        return {"error": "end must be after start."}
+
+    prop = None
+    if property_query:
+        prop, err = _resolve_property(landlord, property_query)
+        if err:
+            return _prop_err(err)
+
+    preview = {
+        "day": (weekday or "").strip().title(),
+        "from": start_t.strftime("%H:%M"),
+        "to": end_t.strftime("%H:%M"),
+        "scope": prop.name if prop else "default (all properties)",
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "set_viewing_availability", preview, "Adds a preferred viewing window."
+        )
+
+    AvailabilityWindow.objects.create(
+        landlord=landlord, property=prop, weekday=wd,
+        start_time=start_t, end_time=end_t,
+    )
+    return {"created": True, "window": preview}
+
+
+def get_notification_channels(landlord) -> dict:
+    """How this landlord is reachable outside the app — which channels are
+    linked and verified (Telegram today, WhatsApp later), plus the always-on
+    in-app + email. Answers "am I on Telegram?" / "how will you reach me?"."""
+    linked = []
+    try:
+        from rentium.comms.models import ChannelAccount
+
+        for c in ChannelAccount.objects.filter(landlord=landlord):
+            linked.append(
+                {
+                    "channel": c.channel_type,
+                    "verified": c.verified,
+                    "active": c.is_active,
+                    "name": c.display_name or "",
+                }
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    verified = [c for c in linked if c["verified"] and c["active"]]
+    return {
+        "always_on": ["in-app dashboard", "email"],
+        "external_channels": linked,
+        "reachable_on": ["dashboard", "email"]
+        + [c["channel"].lower() for c in verified],
+        "telegram_linked": any(
+            c["channel"] == "TELEGRAM" and c["verified"] for c in linked
+        ),
     }
 
 
@@ -536,6 +831,40 @@ def _place(lease) -> str:
     if lease.group_id:
         return lease.group.name
     return ""
+
+
+def _resolve_existing_tenant(landlord, email: str):
+    """Given an invite email, return the existing TenantProfile to LINK, or None
+    to create a fresh invited-email slot, or a friendly {"error": ...} dict when
+    the email can't be a tenant (the landlord's own account, or a non-tenant
+    account). Mirrors leases/api/serializers.py:LeaseTenantSerializer.create so
+    RAMA links an existing account instead of erroring on a duplicate/invalid
+    invited-email slot. `hasattr(user, "tenant_profile")` works because Django's
+    reverse-OneToOne missing accessor raises an AttributeError subclass."""
+    from rentium.users.models import User
+
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    landlord_email = (getattr(getattr(landlord, "user", None), "email", "") or "").lower()
+    if email == landlord_email:
+        return {
+            "error": (
+                "That's your own account email — invite the TENANT's email "
+                "address, not your own."
+            )
+        }
+    user = User.objects.filter(email__iexact=email).first()
+    if user is None:
+        return None  # brand-new person → normal invited-email slot
+    if hasattr(user, "tenant_profile"):
+        return user.tenant_profile  # link the existing tenant account
+    return {
+        "error": (
+            f"{email} already belongs to a non-tenant account (e.g. a landlord), "
+            "so it can't be invited as a tenant. Use the tenant's own email."
+        )
+    }
 
 
 def _active_tenant_slots(lease):
@@ -815,6 +1144,15 @@ def invite_tenant_to_lease(
     if hasattr(lease, "is_locked") and lease.is_locked():
         return {"error": "This lease is fully executed and locked — cannot invite."}
 
+    # Existing-account detection (the fix for "sent it to a pre-existing email
+    # and errored"). Mirrors leases/api/serializers.py: if the email already
+    # belongs to an account, we LINK it instead of blindly creating a pending
+    # invited-email slot — and we refuse cleanly for the landlord's own email or
+    # a non-tenant (e.g. another landlord) account rather than throwing.
+    linked_tenant = _resolve_existing_tenant(landlord, email)
+    if isinstance(linked_tenant, dict):  # a friendly error, not a profile
+        return linked_tenant
+
     mode = (mode or "add").strip().lower()
     # Only enter replace when explicitly requested — NEVER because someone
     # already lives on the lease (that was the bug that deleted roommates).
@@ -943,6 +1281,9 @@ def invite_tenant_to_lease(
             lt.rent_amount = rent
             lt.is_primary_tenant = want_primary
             lt.declined = False
+            if linked_tenant is not None and not lt.tenant_id:
+                lt.tenant = linked_tenant
+                lt.invite_accepted_at = timezone.now()
             lt.save()
         else:
             room = None
@@ -960,10 +1301,23 @@ def invite_tenant_to_lease(
                 rent_amount=rent,
                 is_primary_tenant=want_primary,
             )
+            # Link an existing tenant account rather than leaving a pending
+            # invited-email slot (which is what previously errored).
+            if linked_tenant is not None:
+                lt.tenant = linked_tenant
+                lt.invite_accepted_at = timezone.now()
             if room is not None:
                 lt.room = room
-            lt.full_clean()
-            lt.save()
+            try:
+                lt.full_clean()
+                lt.save()
+            except ValidationError as exc:
+                # Roll back the whole invite and return a clean message instead
+                # of the bare "ValidationError: …" the dispatcher would surface
+                # as a "system error".
+                transaction.set_rollback(True)
+                msgs = "; ".join(exc.messages) if hasattr(exc, "messages") else str(exc)
+                return {"error": f"Couldn't add this tenant: {msgs}"}
 
         if lease.status == Lease.LeaseStatus.DRAFT:
             lease.status = Lease.LeaseStatus.PENDING_SIGNATURES
@@ -987,8 +1341,21 @@ def invite_tenant_to_lease(
         email_error = str(exc)
 
     roster = [_slot_label(a) for a in _active_tenant_slots(lease)]
+    linked = bool(getattr(lt, "tenant_id", None))
+    if linked:
+        note = (
+            "Linked their existing Rentium account — no invite email needed; "
+            "they can sign in and sign the lease directly. Rent rebalanced "
+            "across unsigned active tenants."
+        )
+    else:
+        note = (
+            ("Email sent. " if email_sent else "Invite saved; email may have failed — use invite_url. ")
+            + "Rent rebalanced across unsigned active tenants."
+        )
     return {
         "invited": True,
+        "linked_existing_account": linked,
         "mode": mode,
         "cancelled_prior": cancelled_label,
         "email_sent": email_sent,
@@ -1009,10 +1376,7 @@ def invite_tenant_to_lease(
             sum((__import__("decimal").Decimal(a["rent_amount"]) for a in roster),
                 __import__("decimal").Decimal("0"))
         ),
-        "note": (
-            ("Email sent. " if email_sent else "Invite saved; email may have failed — use invite_url. ")
-            + "Rent rebalanced across unsigned active tenants."
-        ),
+        "note": note,
     }
 
 

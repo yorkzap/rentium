@@ -13,18 +13,22 @@ from dataclasses import dataclass
 from django.conf import settings
 
 DEFAULT_MODELS = {
-    "xai": "grok-4-1-fast-reasoning",
+    "xai": "grok-4.3",
     "gemini": "gemini-flash-latest",
     "mistral": "mistral-small-latest",
     "anthropic": "claude-haiku-4-5",
-    "openai": "gpt-4o-mini",
+    "openai": "gpt-5.6-luna",
 }
 
+# Curated per vendor: one fast/cheap option (the recommended default — RAMA is
+# designed to work on weak models) and the vendor's bigger tiers for landlords
+# who want them. BYOK landlords can type any uncataloged id (resolve_model
+# passes it through). Verified against vendor docs 2026-07.
 MODEL_CATALOG: dict[str, list[dict[str, str]]] = {
+    # grok-4-1-fast-* were retired 2026-05-15 (requests redirect to grok-4.3).
     "xai": [
-        {"id": "grok-4-1-fast-reasoning", "label": "Grok 4.1 Fast (reasoning)"},
-        {"id": "grok-4-1-fast-non-reasoning", "label": "Grok 4.1 Fast"},
-        {"id": "grok-4.5", "label": "Grok 4.5 (flagship)"},
+        {"id": "grok-4.3", "label": "Grok 4.3 (fast, recommended)"},
+        {"id": "grok-4.5", "label": "Grok 4.5 (flagship — not available in EU)"},
     ],
     # Model ids that work for new Google AI Studio keys (some 2.5 names are
     # closed to new users; free tier quotas also vary by model).
@@ -42,12 +46,15 @@ MODEL_CATALOG: dict[str, list[dict[str, str]]] = {
         {"id": "ministral-8b-latest", "label": "Ministral 8B"},
     ],
     "anthropic": [
-        {"id": "claude-haiku-4-5", "label": "Claude Haiku 4.5"},
-        {"id": "claude-sonnet-4-5", "label": "Claude Sonnet 4.5"},
+        {"id": "claude-haiku-4-5", "label": "Claude Haiku 4.5 (fast, recommended)"},
+        {"id": "claude-sonnet-5", "label": "Claude Sonnet 5"},
+        {"id": "claude-opus-4-8", "label": "Claude Opus 4.8"},
+        {"id": "claude-fable-5", "label": "Claude Fable 5 (most capable, premium)"},
     ],
     "openai": [
-        {"id": "gpt-4o-mini", "label": "GPT-4o mini"},
-        {"id": "gpt-4o", "label": "GPT-4o"},
+        {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna (fast, recommended)"},
+        {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra (balanced)"},
+        {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol (frontier)"},
     ],
 }
 
@@ -83,7 +90,7 @@ def resolve_model(provider: str, model: str | None) -> str:
     if chosen:
         return chosen
     return DEFAULT_MODELS.get(
-        provider, getattr(settings, "RAMA_MODEL", "grok-4-1-fast-reasoning")
+        provider, getattr(settings, "RAMA_MODEL", "grok-4.3")
     )
 
 
@@ -107,5 +114,61 @@ def get_landlord_config(landlord) -> LandlordRamaConfig:
         provider=provider,
         model=resolve_model(provider, prefs.model),
         api_key=own or platform,
+        has_own_key=bool(own),
+    )
+
+
+# Role-default models when the landlord hasn't picked one: the General gets
+# the provider's strong tier (it reasons over policy and makes decisions), the
+# FSA a mid tier (bounded analyses over prepared fact packs). Corporals keep
+# the landlord's cheap chat model — that's the cost pyramid.
+GENERAL_DEFAULT_MODELS = {
+    "mistral": "mistral-large-latest",
+    "anthropic": "claude-sonnet-5",
+    "xai": "grok-4.5",
+    "openai": "gpt-5.6-terra",
+    "gemini": "gemini-flash-latest",
+}
+FSA_DEFAULT_MODELS = {
+    "mistral": "mistral-medium-latest",
+    "anthropic": "claude-haiku-4-5",
+    "xai": "grok-4.3",
+    "openai": "gpt-5.6-luna",
+    "gemini": "gemini-flash-latest",
+}
+_ROLE_DEFAULTS = {"general": GENERAL_DEFAULT_MODELS, "fsa": FSA_DEFAULT_MODELS}
+
+
+def get_role_config(landlord, role: str) -> LandlordRamaConfig:
+    """Provider/model for one agent role (corporal | general | fsa).
+
+    Resolution: landlord's per-role prefs → platform RAMA_<ROLE>_* settings →
+    the landlord's chat provider with the role's default model tier. BYOK:
+    the landlord's key applies when the role's provider matches their chat
+    provider; otherwise the platform key for that provider is used.
+    """
+    from .models import RamaPreferences
+
+    chat = get_landlord_config(landlord)
+    if role == "corporal" or role not in _ROLE_DEFAULTS:
+        return chat
+
+    prefs = RamaPreferences.for_landlord(landlord)
+    provider = (
+        (getattr(prefs, f"{role}_provider", "") or "").strip().lower()
+        or (getattr(settings, f"RAMA_{role.upper()}_PROVIDER", "") or "").strip().lower()
+        or chat.provider
+    )
+    model = (
+        (getattr(prefs, f"{role}_model", "") or "").strip()
+        or (getattr(settings, f"RAMA_{role.upper()}_MODEL", "") or "").strip()
+        or _ROLE_DEFAULTS[role].get(provider, "")
+    )
+    own = (prefs.api_key or "").strip() if provider == chat.provider else ""
+    return LandlordRamaConfig(
+        enabled=chat.enabled,
+        provider=provider,
+        model=resolve_model(provider, model),
+        api_key=own or platform_api_key(provider),
         has_own_key=bool(own),
     )

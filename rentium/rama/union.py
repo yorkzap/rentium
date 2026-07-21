@@ -675,6 +675,8 @@ def live_context(landlord) -> dict:
                 "group": row.get("group"),
                 "category": row.get("category"),
                 "listing_status": row.get("listing_status") or row.get("status"),
+                "has_images": row.get("has_images"),
+                "image_count": row.get("image_count"),
                 "vacant_today": occ.get("vacant_today"),
                 "occupied_today": occ.get("occupied_today"),
                 "phase": occ.get("phase"),
@@ -757,6 +759,8 @@ def live_context(landlord) -> dict:
         "instructions": (
             "These figures are live from the database for THIS landlord. "
             "They override any earlier message in the chat that disagrees. "
+            "has_images / image_count are authoritative — never guess or infer "
+            "whether a listing has photos from anything else. "
             "Room E with a lease_number is an active commitment even if vacant_today. "
             "Expense lines must be quoted by description+amount from this_month_expenses only. "
             "draft_leases / draft_lease_count: DRAFT paperwork only — not rented; "
@@ -927,6 +931,9 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
     qs = list(
         Property.objects.filter(landlord=landlord)
         .select_related("group")
+        # Grounds has_images/image_count without an N+1; Property helpers
+        # (gallery_image_count etc.) honour this annotation.
+        .annotate(_gallery_count=Count("property_images", distinct=True))
         .order_by("name")[: max(1, min(limit, 200))]
     )
     prop_ids = [p.pk for p in qs]
@@ -1033,6 +1040,11 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             "city": prop.city,
             "group": prop.group.name if prop.group_id else None,
             "occupancy": occupancy,
+            # Photos — computed in Python, never for the model to infer.
+            "has_primary_image": bool(prop.primary_image),
+            "image_count": prop.image_count,
+            "has_images": prop.image_count > 0,
+            "publish_blockers": prop.publish_blockers(),
             **type_payload,
         }
         if prop.property_category == Property.PropertyCategory.ROOM:

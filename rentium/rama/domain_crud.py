@@ -40,6 +40,27 @@ def _preview(action: str, preview: dict, how: str) -> dict:
     }
 
 
+def _ask_for(question: str, recall_hint: str) -> dict:
+    """Deterministic 'ask the landlord for a missing ESSENTIAL value' payload.
+
+    Reuses the same shape as playbooks._disambiguation_payload: it sets
+    question_for_user + relay_instruction but NOT needs_confirm, so the persona
+    (roles.py: "if a result has question_for_user, ask it VERBATIM then STOP")
+    asks the question, waits for a free-form answer, and re-calls the tool with
+    the value supplied — the same machinery that collects pick=oldest|newest.
+    This is how RAMA follows up for essential info (rent, start date) instead of
+    silently creating a broken record.
+    """
+    return {
+        "needs_input": True,
+        "question_for_user": question,
+        "relay_instruction": (
+            "Ask the landlord question_for_user VERBATIM, then STOP and wait. "
+            "Do NOT create or preview anything yet. " + recall_hint
+        ),
+    }
+
+
 def _truthy(val: str) -> bool:
     return str(val or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
@@ -67,6 +88,136 @@ def _resolve_property(landlord, property_query: str, pick: str = ""):
     from .resolve import resolve_property
 
     return resolve_property(landlord, property_query, pick=pick)
+
+
+# ---------------------------------------------------------------------------
+# Blockers — the ONE source of truth for "why can't this run", shared by the
+# single tools below and by plan partitioning (tool_meta / playbooks). Each
+# returns [] when the action can proceed, else a list of dicts with a machine
+# `reason`, a human `detail`, and optional context.
+# ---------------------------------------------------------------------------
+
+
+def lease_protect_blockers(prop) -> list[dict]:
+    """Why this property cannot be deleted: Lease.property is DB PROTECT."""
+    from rentium.leases.models import Lease
+
+    lease_qs = Lease.objects.filter(property=prop)
+    n_leases = lease_qs.count()
+    if not n_leases:
+        return []
+    sample = list(lease_qs.values_list("lease_number", "status")[:5])
+    return [
+        {
+            "reason": "leases_protect",
+            "detail": (
+                f"{n_leases} lease(s) still reference it (DB PROTECT, same as "
+                "UI). Terminate/delete draft leases first."
+            ),
+            "leases": [{"lease_number": ln, "status": st} for ln, st in sample],
+        }
+    ]
+
+
+def work_order_protect_blockers(prop) -> list[dict]:
+    """Why this property cannot be deleted: WorkOrder.property is DB PROTECT
+    and work orders are never deleted (only cancelled) — so ANY work order,
+    even a completed one, keeps the listing undeletable."""
+    n_wos = prop.work_orders.count()
+    if not n_wos:
+        return []
+    open_n = prop.work_orders.exclude(status__in=["COMPLETED", "CANCELLED"]).count()
+    return [
+        {
+            "reason": "work_orders_protect",
+            "detail": (
+                f"{n_wos} work order(s) reference it ({open_n} open). Work "
+                "orders are permanent records (DB PROTECT, never deleted), so "
+                "this listing cannot be deleted — only hidden or marked "
+                "NOT_AVAILABLE."
+            ),
+            "open_work_orders": open_n,
+        }
+    ]
+
+
+def property_delete_blockers(prop) -> list[dict]:
+    """Everything preventing a hard delete of this listing."""
+    return lease_protect_blockers(prop) + work_order_protect_blockers(prop)
+
+
+def delete_property_blockers(
+    landlord, *, property_query: str = "", pick: str = "", **_
+) -> list[dict]:
+    """Blockers for delete_property, keyed by the same args the tool takes."""
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return [{"reason": "unresolved", "detail": str(err)}]
+    return property_delete_blockers(prop)
+
+
+def lease_terminate_blockers(lease) -> list[dict]:
+    """Why this lease cannot be terminated (already final, or draft)."""
+    from rentium.leases.models import Lease
+
+    if lease.status in (
+        Lease.LeaseStatus.TERMINATED,
+        Lease.LeaseStatus.EXPIRED,
+        Lease.LeaseStatus.RENEWED,
+    ):
+        return [
+            {
+                "reason": "already_final",
+                "detail": f"Lease is already final ({lease.status}).",
+            }
+        ]
+    if lease.status == Lease.LeaseStatus.DRAFT:
+        return [
+            {
+                "reason": "draft",
+                "detail": (
+                    "Draft leases should be deleted with delete_draft_lease, "
+                    "not terminated."
+                ),
+            }
+        ]
+    return []
+
+
+def terminate_lease_blockers(
+    landlord, *, property_query: str = "", lease_number: str = "", **_
+) -> list[dict]:
+    """Blockers for terminate_lease, keyed by the same args the tool takes."""
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return [{"reason": "unresolved", "detail": str(err)}]
+    return lease_terminate_blockers(lease)
+
+
+def delete_draft_lease_blockers(
+    landlord, *, property_query: str = "", lease_number: str = "", **_
+) -> list[dict]:
+    """Blockers for delete_draft_lease: only DRAFT leases are deletable."""
+    from rentium.leases.models import Lease
+
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return [{"reason": "unresolved", "detail": str(err)}]
+    if lease.status != Lease.LeaseStatus.DRAFT:
+        return [
+            {
+                "reason": "not_draft",
+                "detail": (
+                    f"Only DRAFT leases can be deleted (this is {lease.status}). "
+                    "Use terminate_lease instead."
+                ),
+            }
+        ]
+    return []
 
 
 def _prop_err(err):
@@ -130,6 +281,22 @@ def _resolve_group(landlord, group_name: str):
     return qs.first(), None
 
 
+def _resolve_holding(landlord, holding_name: str):
+    from rentium.properties.models import PropertyHolding
+
+    q = (holding_name or "").strip()
+    if not q:
+        return None, "holding_name is required."
+    qs = PropertyHolding.objects.filter(landlord=landlord, name__icontains=q)
+    n = qs.count()
+    if n == 0:
+        return None, f"No holding matching {holding_name!r}."
+    if n > 1:
+        names = list(qs.values_list("name", flat=True)[:8])
+        return None, f"Multiple holdings match {holding_name!r}: {names}."
+    return qs.first(), None
+
+
 def _default_lease_type(prop) -> str:
     """Mirror leases/api/views.py lease_types_view for NEW leases."""
     from rentium.leases.models import Lease
@@ -168,6 +335,8 @@ def crud_capabilities(landlord) -> dict:
             "update": "update_property — name/status/description/address/city",
             "delete": "delete_property — blocked if any lease exists (PROTECT)",
             "group": "create_property_group, assign_property_to_group (rooms only)",
+            "holding": "create_holding, assign_property_to_holding (any category — "
+            "the house/building a bank-balance policy attaches to)",
         },
         "leases": {
             "create": "create_lease — always DRAFT; type from property category",
@@ -189,6 +358,15 @@ def crud_capabilities(landlord) -> dict:
             "private": "create/update/delete_inventory_item on a listing",
             "shared": "create/delete_shared_inventory_item on a property group",
             "note": "is_furnished is derived from inventory (signals)",
+        },
+        "sets_and_chains": {
+            "find": "find_listings / find_leases — deterministic set scoping; "
+            "returns the COMPLETE matching set (never enumerate yourself)",
+            "plan": "plan_operation — bulk/multi-step plans over listings "
+            "(delete_listings, terminate_and_delete, update_status)",
+            "move": "plan_move_tenant — end current lease, re-lease another room",
+            "confirm": "one 'yes' runs a whole plan; lease terminations always "
+            "pause for their own confirmation (server-side policy)",
         },
         "confirm_rule": "Every mutating tool: preview without confirm, then confirm=yes",
     }
@@ -518,32 +696,23 @@ def delete_property(
 ) -> dict:
     """Delete listing. Blocked if any lease still references it (Lease.property PROTECT).
     On name collisions pass property_query=<id> or pick=first|no_group|with_group|2."""
-    from rentium.leases.models import Lease
-
     prop, err = _resolve_property(landlord, property_query, pick=pick)
     if err:
         return _prop_err(err)
 
-    lease_qs = Lease.objects.filter(property=prop)
-    n_leases = lease_qs.count()
-    if n_leases:
-        sample = list(
-            lease_qs.values_list("lease_number", "status")[:5]
-        )
+    blockers = property_delete_blockers(prop)
+    if blockers:
+        b = blockers[0]
         return {
-            "error": (
-                f"Cannot delete {prop.name}: {n_leases} lease(s) still reference it "
-                f"(DB PROTECT, same as UI). Terminate/delete draft leases first."
-            ),
-            "leases": [{"lease_number": ln, "status": st} for ln, st in sample],
+            "error": f"Cannot delete {prop.name}: {b['detail']}",
+            "leases": b.get("leases", []),
+            "blockers": blockers,
         }
 
-    open_wo = prop.work_orders.exclude(status__in=["COMPLETED", "CANCELLED"]).count()
     preview = {
         "property": prop.name,
         "id": str(prop.pk),
         "inventory_items": prop.inventory_items.count(),
-        "open_work_orders": open_wo,
         "warning": "Deletes the listing and cascades private inventory/images.",
     }
     if not _confirmed(confirm):
@@ -655,6 +824,118 @@ def assign_property_to_group(
     }
 
 
+def create_holding(
+    landlord, *, name: str, kind: str = "HOUSE", address: str = "", city: str = "",
+    confirm: str = "",
+) -> dict:
+    """Create a holding: the physical/financial container for one address —
+    one bank account, any mix of rooms and complete units (e.g. a garden
+    suite + basement suite + upstairs rooms all under one house). kind:
+    HOUSE|BUILDING|OTHER."""
+    from rentium.properties.models import PropertyHolding
+
+    name = (name or "").strip()
+    if not name:
+        return {"error": "name is required."}
+    if PropertyHolding.objects.filter(landlord=landlord, name__iexact=name).exists():
+        return {"error": f"You already have a holding named {name!r}."}
+    kind_u = (kind or "HOUSE").strip().upper()
+    if kind_u not in {c for c, _ in PropertyHolding.Kind.choices}:
+        kind_u = PropertyHolding.Kind.HOUSE
+
+    preview = {"name": name, "kind": kind_u, "address": address, "city": city}
+    if not _confirmed(confirm):
+        return _preview(
+            "create_holding",
+            preview,
+            "Creates a holding (house/building) that listings can join.",
+        )
+
+    h = PropertyHolding.objects.create(
+        landlord=landlord, name=name[:100], kind=kind_u,
+        address=(address or "")[:255], city=(city or "")[:100],
+    )
+    return {"created": True, "holding": {"id": str(h.pk), "name": h.name, "kind": h.kind}}
+
+
+def assign_property_to_holding(
+    landlord, *, property_query: str, holding_name: str = "", clear: str = "",
+    pick: str = "", confirm: str = "",
+) -> dict:
+    """Put a listing (ANY category — room or complete unit) into a holding,
+    or clear=yes to remove it. Unlike property groups, holdings accept any
+    listing type — this is what a bank-balance policy attaches to."""
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+
+    if _truthy(clear) or not holding_name.strip():
+        if not prop.holding_id and not holding_name.strip():
+            return {"error": "Pass holding_name or clear=yes."}
+        preview = {
+            "property": prop.name,
+            "from_holding": prop.holding.name if prop.holding_id else None,
+            "to_holding": None,
+            "action": "clear_holding",
+        }
+        if not _confirmed(confirm):
+            return _preview(
+                "assign_property_to_holding", preview, "Removes listing from its holding."
+            )
+        prop.holding = None
+        try:
+            prop.full_clean()
+            prop.save(update_fields=["holding", "updated_at"])
+        except ValidationError as exc:
+            return _validation_error_payload(exc)
+        return {"updated": True, "property": prop.name, "holding": None}
+
+    holding, herr = _resolve_holding(landlord, holding_name)
+    if herr:
+        return {"error": herr}
+
+    preview = {
+        "property": prop.name,
+        "from_holding": prop.holding.name if prop.holding_id else None,
+        "to_holding": holding.name,
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "assign_property_to_holding", preview, "Puts a listing into a holding."
+        )
+
+    prop.holding = holding
+    try:
+        prop.full_clean()
+        prop.save(update_fields=["holding", "updated_at"])
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+    return {"updated": True, "property": prop.name, "holding": holding.name}
+
+
+def list_holdings(landlord) -> dict:
+    """List holdings (houses/buildings) and which listings belong to each."""
+    from rentium.properties.models import PropertyHolding
+
+    out = []
+    for h in (
+        PropertyHolding.objects.filter(landlord=landlord)
+        .prefetch_related("listings")
+        .order_by("name")
+    ):
+        out.append(
+            {
+                "id": str(h.pk),
+                "name": h.name,
+                "kind": h.kind,
+                "address": h.address,
+                "city": h.city,
+                "listings": [p.name for p in h.listings.all()],
+            }
+        )
+    return {"holdings": out, "count": len(out)}
+
+
 # ---------------------------------------------------------------------------
 # Leases
 # ---------------------------------------------------------------------------
@@ -692,7 +973,7 @@ def create_lease(
     property_query: str,
     start_date: str,
     end_date: str = "",
-    total_rent: str = "0",
+    total_rent: str = "",
     security_deposit: str = "",
     pet_deposit: str = "0",
     cleaning_fee: str = "0",
@@ -749,6 +1030,17 @@ def create_lease(
         clean_fee = _money(cleaning_fee or "0")
     except ValueError as exc:
         return {"error": str(exc)}
+
+    # Essential-field gate: RENT. If the landlord never gave a rent and the
+    # listing has no asking_rent to fall back on, do NOT silently create a $0
+    # lease — stop and ask. An explicit total_rent="0" is respected (a genuinely
+    # free room), mirroring the deposit "pass 0 for none" convention.
+    if rent <= 0 and not (total_rent or "").strip():
+        return _ask_for(
+            f"What's the monthly rent for {prop.name}?",
+            "When they answer, call create_lease again with the same details "
+            "plus total_rent=<the amount>.",
+        )
 
     # Defaults: no smoking / no pets unless landlord opts in (protection)
     pets = _truthy(pets_allowed)
@@ -1008,12 +1300,10 @@ def delete_draft_lease(
         return _prop_err(err)
 
     if lease.status != Lease.LeaseStatus.DRAFT:
-        return {
-            "error": (
-                f"Only DRAFT leases can be deleted (this is {lease.status}). "
-                'Use terminate_lease for pending/active — same as UI "Terminate".'
-            )
-        }
+        blocker = delete_draft_lease_blockers(
+            landlord, lease_number=lease.lease_number
+        )[0]
+        return {"error": blocker["detail"]}
 
     preview = {
         "lease_number": lease.lease_number,
@@ -1057,18 +1347,9 @@ def terminate_lease(
     if err:
         return _prop_err(err)
 
-    if lease.status in (
-        Lease.LeaseStatus.TERMINATED,
-        Lease.LeaseStatus.EXPIRED,
-        Lease.LeaseStatus.RENEWED,
-    ):
-        return {
-            "error": f"Lease is already final ({lease.status}).",
-        }
-    if lease.status == Lease.LeaseStatus.DRAFT:
-        return {
-            "error": "Draft leases should be deleted with delete_draft_lease, not terminated."
-        }
+    blockers = lease_terminate_blockers(lease)
+    if blockers:
+        return {"error": blockers[0]["detail"]}
 
     try:
         term = (
@@ -1767,6 +2048,8 @@ def setup_room_tenancy(
         "lease": {
             "start_date": start or None,
             "end_date": end or None,
+            # No end date = month-to-month, which is how landlords mean it.
+            "month_to_month": not end,
             "total_rent": rent_s,
             "security_deposit": security_deposit or "half month if omitted",
             "pet_deposit": pet_deposit or "0",
@@ -1794,6 +2077,25 @@ def setup_room_tenancy(
         plan["warnings"] = [
             "start_date missing — will create room (+ inventory) only; pass start_date for lease."
         ]
+
+    # Smart gating (before preview): don't silently produce a half-done setup
+    # when the landlord clearly intended a tenancy.
+    #  - a tenant was named but no start date → ask for the start date
+    #  - a lease will be created but no rent was given anywhere → ask for rent
+    # An explicit total_rent="0" is respected (free room).
+    if email and not start:
+        return _ask_for(
+            f"What date should the tenancy for {room_name} start? (YYYY-MM-DD)",
+            "When they answer, call setup_room_tenancy again with the same "
+            "details plus start_date=<the date>.",
+        )
+    if start and not (total_rent or asking_rent or "").strip():
+        return _ask_for(
+            f"What's the monthly rent for {room_name}?",
+            "When they answer, call setup_room_tenancy again with the same "
+            "details plus total_rent=<the amount>.",
+        )
+
     if not _confirmed(confirm):
         return _preview(
             "setup_room_tenancy",
@@ -1869,6 +2171,8 @@ def setup_room_tenancy(
         property_query=str(prop.pk),
         start_date=start,
         end_date=end,
+        # No end date given = month-to-month (never a doomed fixed-term).
+        is_month_to_month="0" if end else "1",
         total_rent=rent_s,
         security_deposit=security_deposit,
         pet_deposit=pet_deposit,

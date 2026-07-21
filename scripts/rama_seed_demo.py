@@ -5,7 +5,14 @@ Docker:
   docker compose -f docker-compose.local.yml exec -T django \\
     python /app/scripts/rama_seed_demo.py
 
+Reset (delete [RAMA-DEMO] entities + this landlord's RAMA chat memory —
+DEV ONLY, refuses outside DEBUG):
+  docker compose -f docker-compose.local.yml exec -T django \\
+    python /app/scripts/rama_seed_demo.py --reset
+
 Idempotent-ish: skips creating WO/inquiry if a demo marker already exists.
+Image fixtures: seeds listings in every photo state (primary-only,
+gallery-only, none±lease) so "listings without images" answers are testable.
 """
 
 from __future__ import annotations
@@ -37,13 +44,147 @@ from rentium.users.models import User
 EMAIL = os.environ.get("RAMA_EMAIL", "rajgurshersingh@gmail.com")
 MARKER = "[RAMA-DEMO]"
 
+# Smallest valid GIF — enough for ImageField fixtures.
+TINY_GIF = (
+    b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04"
+    b"\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+)
 
-def main() -> int:
+
+def _demo_landlord():
     user = User.objects.filter(email=EMAIL).first()
     if not user or not getattr(user, "landlord_profile", None):
         print(f"No landlord for {EMAIL}")
+        return None, None
+    return user, user.landlord_profile
+
+
+def reset() -> int:
+    """Delete every [RAMA-DEMO]-marked record plus this landlord's RAMA chat
+    memory. Test-fixture hygiene ONLY — the append-only audit principle holds
+    for real landlords, so this refuses to run outside DEBUG."""
+    from django.conf import settings
+
+    if not settings.DEBUG:
+        print("Refusing: --reset is dev-only (settings.DEBUG is off).")
         return 1
-    landlord = user.landlord_profile
+    user, landlord = _demo_landlord()
+    if not landlord:
+        return 1
+
+    from rentium.leases.models import Lease, LeaseDocument
+    from rentium.maintenance.models import WorkOrder
+    from rentium.messaging.models import Conversation, Message
+    from rentium.properties.models import Property
+    from rentium.rama.models import RamaAudit, RamaPendingPlan
+    from rentium.showcase.models import Inquiry
+
+    n, _ = Message.objects.filter(
+        conversation__landlord=landlord, body__contains=MARKER
+    ).delete()
+    print("messages deleted:", n)
+    n, _ = Conversation.objects.filter(
+        landlord=landlord, subject__contains=MARKER
+    ).delete()
+    print("conversations deleted:", n)
+    n, _ = WorkOrder.objects.filter(
+        property__landlord=landlord, title__contains=MARKER
+    ).delete()
+    print("work orders deleted:", n)
+    n, _ = Inquiry.objects.filter(landlord=landlord, message__contains=MARKER).delete()
+    print("inquiries deleted:", n)
+    n, _ = LeaseDocument.objects.filter(
+        lease__landlord=landlord, title__contains=MARKER
+    ).delete()
+    print("lease documents deleted:", n)
+
+    # Demo listings: their leases first (drafts and demo leases delete
+    # cleanly; anything with payment records raises PROTECT and is kept).
+    demo_props = Property.objects.filter(landlord=landlord, name__contains=MARKER)
+    for lease in Lease.objects.filter(property__in=demo_props):
+        try:
+            lease.delete()
+        except Exception as exc:  # noqa: BLE001 — keep going, report at end
+            print("lease kept (protected):", lease.lease_number, exc)
+    deleted = 0
+    for prop in list(demo_props):
+        try:
+            prop.delete()
+            deleted += 1
+        except Exception as exc:  # noqa: BLE001
+            print("listing kept (protected):", prop.name, exc)
+    print("demo listings deleted:", deleted)
+
+    # RAMA conversation memory for the demo landlord (dev-only wipe).
+    n, _ = RamaPendingPlan.objects.filter(landlord=landlord).delete()
+    print("pending plans deleted:", n)
+    n, _ = RamaAudit.objects.filter(landlord=landlord).delete()
+    print("rama audit rows deleted:", n)
+    print("Done reset.")
+    return 0
+
+
+def seed_image_fixtures(landlord) -> None:
+    """Listings in every photo state, so set questions have known answers:
+
+    - "Room PrimaryPix"  — hero image only
+    - "Room GalleryPix"  — gallery image only (must still count as has_images)
+    - "Room NoPix Free"  — no images, no lease  → trivially deletable
+    - "Room NoPix Leased"— no images, ACTIVE lease → delete blocked (PROTECT)
+    """
+    from rentium.leases.models import Lease
+    from rentium.properties.models import Property, PropertyImage
+
+    def room(name, **extra):
+        prop, created = Property.objects.get_or_create(
+            landlord=landlord,
+            name=f"{MARKER} {name}",
+            defaults={
+                "address": "950 Demo Ave",
+                "city": "Victoria",
+                "province": "bc",
+                "property_category": Property.PropertyCategory.ROOM,
+                "room_type": Property.RoomType.PRIVATE,
+                "asking_rent": "900.00",
+                **extra,
+            },
+        )
+        print("listing", "created" if created else "exists", prop.name)
+        return prop, created
+
+    p1, created = room("Room PrimaryPix")
+    if created or not p1.primary_image:
+        p1.primary_image.save("demo_primary.gif", ContentFile(TINY_GIF), save=True)
+
+    p2, _ = room("Room GalleryPix")
+    if not p2.property_images.exists():
+        PropertyImage.objects.create(
+            property=p2,
+            image=ContentFile(TINY_GIF, name="demo_gallery.gif"),
+            caption=f"{MARKER} gallery only",
+        )
+
+    room("Room NoPix Free")
+
+    p4, _ = room("Room NoPix Leased")
+    if not Lease.objects.filter(property=p4).exists():
+        Lease.objects.create(
+            landlord=landlord,
+            property=p4,
+            lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+            status=Lease.LeaseStatus.ACTIVE,
+            start_date=date.today() - timedelta(days=30),
+            is_month_to_month=True,
+            total_rent="900.00",
+        )
+        print("lease created on", p4.name)
+
+
+def main() -> int:
+    user, landlord = _demo_landlord()
+    if not landlord:
+        return 1
+    seed_image_fixtures(landlord)
     from rentium.properties.models import Property
     from rentium.leases.models import Lease, LeaseDocument, LeaseTenant
     from rentium.maintenance.models import WorkOrder
@@ -206,4 +347,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(reset() if "--reset" in sys.argv[1:] else main())

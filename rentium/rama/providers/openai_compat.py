@@ -7,10 +7,13 @@ two-line subclass — that's the point of the neutral contract.
 import json
 
 import requests
+from django.conf import settings
 
 from .base import Provider, ProviderError, ToolCall, Turn
 
 TIMEOUT_SECONDS = 60
+DEFAULT_MAX_TOKENS = 4096
+DEFAULT_TEMPERATURE = 0.0  # RAMA routes and phrases; determinism beats flair
 
 
 class OpenAIProvider(Provider):
@@ -30,6 +33,12 @@ class OpenAIProvider(Provider):
         api_key = key
         payload = {
             "model": model,
+            "temperature": float(
+                getattr(settings, "RAMA_TEMPERATURE", DEFAULT_TEMPERATURE)
+            ),
+            "max_tokens": int(
+                getattr(settings, "RAMA_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+            ),
             "messages": [
                 {"role": "system", "content": system},
                 *[self._to_wire(m) for m in messages],

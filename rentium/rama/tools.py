@@ -19,6 +19,22 @@ from __future__ import annotations
 from datetime import date
 
 
+def _params(**docs: str):
+    """Attach per-parameter descriptions to a tool function.
+
+    The registry's schema builder reads ``fn.param_docs`` and emits a
+    ``description`` alongside each argument's ``type``. Use this on the tools
+    where a weak model needs to be told what an argument DOES (not just its
+    name) — most importantly that a value SETS/renames rather than looks up.
+    """
+
+    def deco(fn):
+        fn.param_docs = docs
+        return fn
+
+    return deco
+
+
 def _month_bounds(month: str):
     """Parse 'YYYY-MM' (empty = current month) into [start, end)."""
     from .union import _month_bounds as bounds
@@ -666,6 +682,81 @@ def schedule_viewing(
     )
 
 
+def list_viewing_requests(landlord, scope: str = "pending") -> dict:
+    """List viewing REQUESTS and their negotiation state — who asked, when,
+    whether it's in or out of your preferred hours, the current tenant's
+    consent, and whose reply it's waiting on. scope=pending (default) shows
+    what needs action; scope=all includes scheduled/cancelled. Use before
+    respond_to_viewing_request to get each request's ref."""
+    from .domain_actions import list_viewing_requests as _fn
+
+    return _fn(landlord, scope=(scope or "pending").strip())
+
+
+def respond_to_viewing_request(
+    landlord,
+    request_ref: str,
+    action: str,
+    when: str = "",
+    confirm: str = "",
+) -> dict:
+    """Confirm, counter (propose a new time), or decline a pending viewing
+    request. action = confirm | counter | decline. For counter, pass when like
+    '2026-08-05 14:00'. Get request_ref from list_viewing_requests. Preview
+    first; confirm=yes to run. The result's `notified` says exactly who was
+    told and how."""
+    from .domain_actions import respond_to_viewing_request as _fn
+
+    return _fn(
+        landlord,
+        request_ref=request_ref,
+        action=action,
+        when=when,
+        confirm=confirm,
+    )
+
+
+def get_viewing_availability(landlord, property_query: str = "") -> dict:
+    """Show the landlord's preferred viewing hours (their weekly default, or a
+    specific property's override when property_query is given)."""
+    from .domain_actions import get_viewing_availability as _fn
+
+    return _fn(landlord, property_query=property_query)
+
+
+def set_viewing_availability(
+    landlord,
+    weekday: str,
+    start: str,
+    end: str,
+    property_query: str = "",
+    confirm: str = "",
+) -> dict:
+    """Add a preferred viewing window. weekday = a day name (e.g. Tuesday);
+    start/end = 'HH:MM' 24-hour. property_query sets a per-property override.
+    Preview first; confirm=yes to save."""
+    from .domain_actions import set_viewing_availability as _fn
+
+    return _fn(
+        landlord,
+        weekday=weekday,
+        start=start,
+        end=end,
+        property_query=property_query,
+        confirm=confirm,
+    )
+
+
+def get_notification_channels(landlord) -> dict:
+    """How this landlord is reachable outside the app: which external channels
+    (Telegram now, WhatsApp later) they've linked and verified, plus the
+    always-on in-app dashboard and email. Use to answer "how will you reach
+    me?", "am I on Telegram?", or "how were people notified?" grounding."""
+    from .domain_actions import get_notification_channels as _fn
+
+    return _fn(landlord)
+
+
 def create_condition_inspection(
     landlord,
     property_query: str = "",
@@ -994,6 +1085,26 @@ def setup_room_tenancy(
     )
 
 
+@_params(
+    property_query="Which listing to change: its exact name or id (this is the "
+    "LOOKUP key — it is never modified).",
+    name="RENAME the listing to this new name. This is how you rename a listing "
+    "— pass the new name here. Works on any listing, draft or leased (the name "
+    "is just the listing's label; the lease document only ever says 'the Room').",
+    status="New status: AVAILABLE | OCCUPIED | MAINTENANCE | NOT_AVAILABLE.",
+    description="New public description text.",
+    address="New street address.",
+    city="New city.",
+    province="New province code (e.g. BC).",
+    asking_rent="New asking rent, e.g. '850.00'.",
+    unit_type="COMPLETE_UNIT listings only: new unit_type.",
+    room_type="ROOM listings only: new room_type.",
+    is_publicly_visible="yes/no — whether the listing shows publicly.",
+    pick="If property_query matches MORE THAN ONE listing, choose which: "
+    "oldest|first|1 (the older/earlier one) | newest|last|2 (the newer one). "
+    "Use this for 'the old one' / 'the new one' / 'the first/second one'.",
+    confirm="Leave empty to PREVIEW; pass 'yes' to apply.",
+)
 def update_property(
     landlord,
     property_query: str,
@@ -1007,25 +1118,39 @@ def update_property(
     unit_type: str = "",
     room_type: str = "",
     is_publicly_visible: str = "",
+    pick: str = "",
     confirm: str = "",
 ) -> dict:
-    """Update listing fields. status: AVAILABLE|OCCUPIED|MAINTENANCE|NOT_AVAILABLE.
-    Preview; confirm=yes."""
+    """Update (edit) an existing listing's fields — this includes RENAMING it:
+    to rename a listing, call update_property with name=<the new name>. Also
+    sets status/description/address/city/province/asking_rent/visibility.
+    Renaming works even if the listing has a signed lease (the name is just a
+    label; nothing about the tenancy changes). If the name/id matches two
+    listings (duplicates), add pick=oldest|newest|1|2. Preview first, then
+    confirm=yes."""
     from .domain_crud import update_property as _fn
     return _fn(
         landlord, property_query=property_query, name=name, status=status,
         description=description, address=address, city=city, province=province,
         asking_rent=asking_rent, unit_type=unit_type, room_type=room_type,
-        is_publicly_visible=is_publicly_visible, confirm=confirm,
+        is_publicly_visible=is_publicly_visible, pick=pick, confirm=confirm,
     )
 
 
+@_params(
+    property_query="Which listing to delete: its exact name or id.",
+    pick="If the name/id matches MORE THAN ONE listing, choose which to delete: "
+    "oldest|first|1 (the older one) | newest|last|2 (the newer one). Use this "
+    "for 'delete the old one' / 'the duplicate I just made'.",
+    confirm="Leave empty to PREVIEW; pass 'yes' to delete.",
+)
 def delete_property(
     landlord, property_query: str, pick: str = "", confirm: str = ""
 ) -> dict:
     """Delete a listing. Blocked if ANY lease still references it (PROTECT).
-    On duplicate names pass property_query=<id> or pick=first|no_group|with_group|2.
-    Preview; confirm=yes."""
+    On duplicate names pass pick=oldest|newest|1|2 (or property_query=<id>) to
+    pick which one — e.g. 'delete the old one' → pick=oldest. Preview;
+    confirm=yes."""
     from .domain_crud import delete_property as _fn
     return _fn(landlord, property_query=property_query, pick=pick, confirm=confirm)
 
@@ -1054,12 +1179,75 @@ def assign_property_to_group(
     )
 
 
+def create_holding(
+    landlord, name: str, kind: str = "HOUSE", address: str = "", city: str = "",
+    confirm: str = "",
+) -> dict:
+    """Create a holding — the physical/financial container for one address:
+    one bank account, any mix of rooms AND complete units (e.g. a garden
+    suite + basement suite + upstairs rooms, all one house). kind:
+    HOUSE|BUILDING|OTHER. This is what bank-balance policy attaches to —
+    unlike property groups (rooms only, layout). Preview; confirm=yes."""
+    from .domain_crud import create_holding as _fn
+    return _fn(landlord, name=name, kind=kind, address=address, city=city, confirm=confirm)
+
+
+def assign_property_to_holding(
+    landlord, property_query: str, holding_name: str = "", clear: str = "",
+    confirm: str = "",
+) -> dict:
+    """Put ANY listing (room or complete unit) into a holding, or clear=yes to
+    remove it. Preview; confirm=yes."""
+    from .domain_crud import assign_property_to_holding as _fn
+    return _fn(
+        landlord, property_query=property_query, holding_name=holding_name,
+        clear=clear, confirm=confirm,
+    )
+
+
+def list_holdings(landlord) -> dict:
+    """List holdings (houses/buildings) and their listings. Use to answer
+    'which listings share a bank account/address' and before setting a
+    min-balance policy."""
+    from .domain_crud import list_holdings as _fn
+    return _fn(landlord)
+
+
+def update_bank_balance(
+    landlord, holding_name: str = "", label: str = "Operating", balance: str = "",
+    as_of: str = "", confirm: str = "",
+) -> dict:
+    """Record the landlord's reported bank balance for one holding
+    (holding_name) or the whole portfolio (blank). balance e.g. '5230.00';
+    as_of YYYY-MM-DD (default today). ALWAYS preview and get the landlord's
+    explicit confirmation — never write a balance without it."""
+    from .finance import update_bank_balance as _fn
+    return _fn(
+        landlord, holding_name=holding_name, label=label, balance=balance,
+        as_of=as_of, confirm=confirm,
+    )
+
+
+def list_bank_balances(landlord) -> dict:
+    """Landlord-reported bank balances per holding, with staleness and
+    estimated ledger drift since last reported. Use for balance/cash
+    questions and before any min-balance analysis."""
+    from .finance import list_bank_balances as _fn
+    return _fn(landlord)
+
+
+@_params(
+    total_rent="Monthly rent for the listing. Rent is ESSENTIAL — if the "
+    "landlord hasn't said it and the listing has no asking rent, LEAVE THIS "
+    "BLANK and the tool will ask them; do not guess. Pass '0' only if the "
+    "landlord explicitly wants a free/zero-rent arrangement.",
+)
 def create_lease(
     landlord,
     property_query: str,
     start_date: str,
     end_date: str = "",
-    total_rent: str = "0",
+    total_rent: str = "",
     security_deposit: str = "",
     pet_deposit: str = "0",
     cleaning_fee: str = "0",
@@ -1076,6 +1264,9 @@ def create_lease(
     BC complete unit→RTB-1. Fixed-term needs end_date.
     property_query can be listing id or name; pick=first|with_group|… if duplicates.
     Defaults for protection: no smoking/pets; pet_deposit & cleaning_fee 0 unless set.
+    RENT is essential: if the landlord didn't give it (and the listing has no
+    asking rent), leave total_rent blank — the tool will ASK rather than make a
+    $0 lease. Pass '0' only for a genuinely free room.
     security_deposit: omit for half monthly rent; pass '0' only if landlord wants zero.
     Then invite tenants; use create_condition_inspection (not schedule_viewing) for move-in.
     Preview; confirm=yes."""
@@ -1295,3 +1486,212 @@ def crud_capabilities(landlord) -> dict:
     Call when unsure which write tool to use or what is forbidden."""
     from .domain_crud import crud_capabilities as _fn
     return _fn(landlord)
+
+
+# ---------------------------------------------------------------------------
+# Finders + plans: deterministic set-scoping and multi-step chains
+# ---------------------------------------------------------------------------
+
+
+def find_listings(
+    landlord,
+    has_images: str = "",
+    vacant_today: str = "",
+    has_lease: str = "",
+    listing_status: str = "",
+    group: str = "",
+    name_contains: str = "",
+    exclude: str = "",
+) -> dict:
+    """Find listings matching filters — USE THIS whenever the landlord scopes a
+    request over a set ('all/every listing that/without …'). Never enumerate or
+    filter listings yourself; this returns the COMPLETE set, grounded
+    (image_count, lease_count, work orders, vacancy). Filters ('' = any):
+    has_images yes/no, vacant_today yes/no, has_lease yes/no (any lease incl.
+    drafts — blocks deletion), listing_status, group, name_contains,
+    exclude='name or id, …' (kept out, echoed back)."""
+    from .domain_reads import find_listings as _fn
+    return _fn(
+        landlord, has_images=has_images, vacant_today=vacant_today,
+        has_lease=has_lease, listing_status=listing_status, group=group,
+        name_contains=name_contains, exclude=exclude,
+    )
+
+
+def find_leases(
+    landlord,
+    status: str = "",
+    property_query: str = "",
+    ending_before: str = "",
+    include_ended: str = "",
+) -> dict:
+    """Find leases matching filters — use for set questions over leases
+    ('all draft leases', 'leases ending before …'). Returns the COMPLETE set.
+    Filters: status DRAFT|PENDING_SIGNATURES|SIGNED|ACTIVE|TERMINATED|EXPIRED|
+    RENEWED, property_query, ending_before YYYY-MM-DD, include_ended yes."""
+    from .domain_reads import find_leases as _fn
+    return _fn(
+        landlord, status=status, property_query=property_query,
+        ending_before=ending_before, include_ended=include_ended,
+    )
+
+
+@_params(
+    operation="delete_listings | terminate_and_delete | update_status.",
+    include="Operate on ONLY these named listings, comma-separated (do not "
+    "combine with filters). An id here targets exactly one listing.",
+    pick="If an include name matches two listings (duplicates), which one: "
+    "oldest|newest|1|2. 'the old one'→oldest, 'the new one'→newest.",
+    exclude="Names the landlord wants to KEEP ('except X' → exclude='X').",
+    has_images="Filter: yes|no.",
+    vacant_today="Filter: yes|no.",
+    has_lease="Filter: yes|no.",
+    listing_status="Filter by status, e.g. AVAILABLE.",
+    group="Filter to one property group.",
+    name_contains="Filter to listings whose name contains this text.",
+    new_status="Required for update_status: the target status.",
+    confirm="Leave empty — the system handles confirmation of the returned plan.",
+)
+def plan_operation(
+    landlord,
+    operation: str,
+    include: str = "",
+    pick: str = "",
+    exclude: str = "",
+    has_images: str = "",
+    vacant_today: str = "",
+    has_lease: str = "",
+    listing_status: str = "",
+    group: str = "",
+    name_contains: str = "",
+    new_status: str = "",
+    confirm: str = "",
+) -> dict:
+    """Build a multi-step PLAN over a set of listings — ALWAYS use this (never a
+    hand-rolled tool sequence) for bulk or multi-step asks like 'delete all X'.
+    operation: delete_listings | terminate_and_delete (end leases first, then
+    delete — use when landlord says delete listings that still have leases) |
+    update_status (needs new_status).
+    Scoping: filters (has_images/vacant_today/has_lease/listing_status/group/
+    name_contains) select the set; exclude='name' = the items the landlord
+    wants to KEEP ('except X / keep X' → exclude='X', NOTHING else changes);
+    include='name, name' = operate on ONLY those named listings (do not
+    combine with filters).
+    EXAMPLE: 'delete all listings that have no images except Garden Suite' →
+    operation=delete_listings, has_images=no, exclude='Garden Suite'.
+    DUPLICATES: if an include name matches two listings the result comes back
+    with needs_disambiguation (NOT blocked) — ask which, then re-call with
+    pick=oldest|newest ('the old one'→oldest). Returns the full plan + blocked
+    items with reasons; the SYSTEM confirms and executes it — show the whole
+    plan, ask question_for_user if present, then STOP."""
+    from .playbooks import plan_operation as _fn
+    return _fn(
+        landlord, operation=operation, include=include, pick=pick, exclude=exclude,
+        has_images=has_images, vacant_today=vacant_today, has_lease=has_lease,
+        listing_status=listing_status, group=group, name_contains=name_contains,
+        new_status=new_status, confirm=confirm,
+    )
+
+
+def plan_move_tenant(
+    landlord,
+    tenant: str,
+    from_property: str,
+    to_property: str,
+    start_date: str = "",
+    total_rent: str = "",
+    confirm: str = "",
+) -> dict:
+    """Build a PLAN that moves a tenant to another room: end the current lease
+    (own confirmation), then new lease + signing invite + move-in inspection on
+    the target room. tenant: name or email. total_rent defaults to the old
+    lease's rent; start_date YYYY-MM-DD (default today). Show the plan, then
+    STOP — the system confirms and executes."""
+    from .playbooks import plan_move_tenant as _fn
+    return _fn(
+        landlord, tenant=tenant, from_property=from_property,
+        to_property=to_property, start_date=start_date, total_rent=total_rent,
+        confirm=confirm,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Constitution: the landlord's written policy (read + guarded amendment)
+# ---------------------------------------------------------------------------
+
+
+def read_constitution(landlord) -> dict:
+    """Read the landlord's Constitution: policy sections (markdown) and the
+    structured rules sentinels enforce (MIN_BALANCE, GRACE_PERIOD, LATE_FEE,
+    VENDOR_PREFERENCE, AUTO_RECORD_PAYMENT). Treat it as authoritative."""
+    from .constitution import section_payload
+    return section_payload(landlord)
+
+
+def amend_constitution(
+    landlord,
+    key: str,
+    title: str = "",
+    new_body_md: str = "",
+    rule_changes: str = "",
+    confirm: str = "",
+) -> dict:
+    """Amend one Constitution section (creates a NEW version — append-only;
+    never edits in place). key: balances|vendors|tenant-policies|workflows or
+    a new slug. new_body_md: full replacement markdown ('' keeps current).
+    rule_changes: JSON list, e.g.
+    [{"action":"add","rule_type":"MIN_BALANCE","params":{"property_id":null,
+    "amount":"5000.00"}}, {"action":"remove","rule_id":3}].
+    ALWAYS preview first (no confirm) and show the landlord exactly what will
+    change; confirm=yes applies. Never amend silently."""
+    from .constitution import amend, parse_rule_changes
+    from .domain_crud import _confirmed, _preview
+    from .models import RamaConstitutionSection
+
+    key_s = (key or "").strip().lower()
+    if not key_s:
+        return {"error": "key is required (e.g. balances, vendors)."}
+    changes, err = parse_rule_changes(rule_changes)
+    if err:
+        return {"error": err}
+
+    preview = {
+        "section": key_s,
+        "title": title or "(unchanged)",
+        "new_body_md": (new_body_md or "(unchanged)")[:1500],
+        "rule_changes": changes or "(none)",
+        "note": "Creates a new version; the old version stays in history.",
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "amend_constitution", preview, "Amends the landlord's Constitution."
+        )
+    return amend(
+        landlord,
+        key=key_s,
+        title=title,
+        body_md=new_body_md,
+        rule_changes=changes,
+        origin=RamaConstitutionSection.Origin.GENERAL_PROPOSAL,
+    )
+
+
+def list_vendors(landlord) -> dict:
+    """Preferred vendors/contractors from the Constitution's
+    VENDOR_PREFERENCE rules (trade, name, phone, priority). Use when picking
+    who to contact for maintenance."""
+    from .constitution import active_rules
+
+    vendors = [
+        {"id": r.pk, **(r.params or {})}
+        for r in active_rules(landlord, "VENDOR_PREFERENCE")
+    ]
+    vendors.sort(key=lambda v: v.get("priority", 99))
+    return {
+        "vendors": vendors,
+        "count": len(vendors),
+        "instruction": (
+            "These are the landlord's preferred vendors, in priority order. "
+            "If empty, ask the landlord who they use."
+        ),
+    }

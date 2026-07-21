@@ -46,13 +46,30 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.list_tenants,
     tool_functions.tenant_history,
     tool_functions.list_documents,
+    tool_functions.find_listings,
+    tool_functions.find_leases,
+    tool_functions.read_constitution,
+    tool_functions.list_vendors,
+    tool_functions.list_holdings,
+    tool_functions.list_bank_balances,
+    tool_functions.list_viewing_requests,
+    tool_functions.get_viewing_availability,
+    tool_functions.get_notification_channels,
     # write actions (confirm=yes)
+    tool_functions.plan_operation,
+    tool_functions.plan_move_tenant,
+    tool_functions.amend_constitution,
+    tool_functions.create_holding,
+    tool_functions.assign_property_to_holding,
+    tool_functions.update_bank_balance,
     tool_functions.create_work_order,
     tool_functions.transition_work_order,
     tool_functions.mark_inquiry_replied,
     tool_functions.send_tenant_message,
     tool_functions.mark_messages_read,
     tool_functions.schedule_viewing,
+    tool_functions.respond_to_viewing_request,
+    tool_functions.set_viewing_availability,
     tool_functions.create_condition_inspection,
     tool_functions.lease_pdf_info,
     tool_functions.bulk_add_inventory,
@@ -98,13 +115,22 @@ class Tool:
 def _schema_for(fn: Callable) -> dict:
     """JSON schema for a tool's arguments, from its signature and hints."""
     hints = typing.get_type_hints(fn)
+    # Optional per-parameter descriptions, attached via tools._params(...). Weak
+    # models get almost nothing from a bare {"type": "string"} — a one-line hint
+    # per argument is the single highest-leverage nudge (e.g. telling the model
+    # that update_property's `name=` RENAMES the listing).
+    param_docs: dict[str, str] = getattr(fn, "param_docs", {}) or {}
     properties: dict[str, dict] = {}
     required: list[str] = []
     for name, param in inspect.signature(fn).parameters.items():
         if name == "landlord":
             continue  # injected server-side, never exposed to the model
         json_type = _JSON_TYPES.get(hints.get(name, str), "string")
-        properties[name] = {"type": json_type}
+        prop: dict[str, Any] = {"type": json_type}
+        doc = param_docs.get(name)
+        if doc:
+            prop["description"] = doc
+        properties[name] = prop
         if param.default is inspect.Parameter.empty:
             required.append(name)
     schema: dict = {"type": "object", "properties": properties}
