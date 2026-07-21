@@ -26,11 +26,20 @@ someone wrote "Britsh Columbia".
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import requests
 from django.conf import settings
 from django.core.cache import cache
+
+
+def _geo_cache_key(kind: str, query: str) -> str:
+    """Stable, memcached-safe cache key. The raw address has spaces/commas that
+    are illegal in memcached keys (they were logged as CacheKeyWarning), so hash
+    the query instead of interpolating it."""
+    digest = hashlib.sha1(query.lower().strip().encode("utf-8")).hexdigest()
+    return f"geo:{kind}:{digest}"
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +121,7 @@ def autocomplete(query: str, limit: int = 6) -> list[dict]:
     if len(query) < 3:
         return []
 
-    cache_key = f"geo:ac:{query.lower()}"
+    cache_key = _geo_cache_key("ac", query)
     hit = cache.get(cache_key)
     if hit is not None:
         return hit
@@ -161,7 +170,7 @@ def geocode(address: str, city: str = "", province: str = "") -> dict | None:
     if not query.strip():
         return None
 
-    cache_key = f"geo:gc:{query.lower()}"
+    cache_key = _geo_cache_key("gc", query)
     hit = cache.get(cache_key)
     if hit is not None:
         return hit
