@@ -1262,6 +1262,69 @@ def test_attach_photo_to_listing(landlord):
     assert upload.used_at is not None  # single-use, consumed
 
 
+def test_attach_multiple_photos_bulk(landlord):
+    """Bulk: attaching several staged uploads at once — first primary, rest gallery."""
+    from django.core.files.base import ContentFile
+
+    from rentium.rama.models import RamaUpload
+
+    room = _room(landlord, "Bulk Room")
+    for n in range(3):
+        RamaUpload.objects.create(
+            landlord=landlord, image=ContentFile(_TINY_GIF, name=f"b{n}.gif")
+        )
+    res = registry.execute(
+        "attach_photo_to_listing",
+        {"property_query": "Bulk Room", "upload_id": "all", "set_primary": "yes", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("attached") is True and res["photos_added"] == 3
+    room.refresh_from_db()
+    assert bool(room.primary_image) and room.property_images.count() == 2  # 1 primary + 2 gallery
+    assert RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True).count() == 0
+
+
+def test_add_co_host_to_lease(landlord):
+    """Co-landlord/co-host recorded on the lease + shown on the agreement."""
+    from rentium.leases.documents import render_lease
+
+    lease = _draft_lease(landlord, name="CoHostRoom")
+    res = registry.execute(
+        "add_co_host_to_lease",
+        {"lease_number": lease.lease_number, "name": "Sam Partner", "email": "sam@example.com", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("updated") is True and "Sam Partner" in res["co_hosts"]
+    lease.refresh_from_db()
+    assert lease.co_hosts[0]["name"] == "Sam Partner"
+    # It appears on the rendered agreement.
+    doc = render_lease(lease)
+    parties = next(s for s in doc.sections if s.id == "parties")
+    assert any("Sam Partner" in r.value for r in parties.rows)
+
+    # Remove it.
+    registry.execute(
+        "add_co_host_to_lease",
+        {"lease_number": lease.lease_number, "name": "Sam Partner", "remove": "yes", "confirm": "yes"},
+        landlord=landlord,
+    )
+    lease.refresh_from_db()
+    assert lease.co_hosts == []
+
+
+def test_update_lease_sets_house_rules(landlord):
+    """Custom clauses: house_rules is editable via update_lease."""
+    lease = _draft_lease(landlord, name="RulesRoom")
+    res = registry.execute(
+        "update_lease",
+        {"lease_number": lease.lease_number, "house_rules": "Quiet hours after 10pm. No parties.", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert "error" not in res
+    lease.refresh_from_db()
+    assert "Quiet hours" in (lease.house_rules or "")
+
+
 def test_attach_photo_cannot_use_another_landlords_upload(landlord):
     """Security: an upload is landlord-scoped — RAMA can't attach one it doesn't own."""
     from django.core.files.base import ContentFile

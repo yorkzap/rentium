@@ -1093,9 +1093,11 @@ def list_capability_gaps(landlord, status: str = "", limit: str = "20") -> dict:
 
 @_params(
     property_query="The listing to add the photo to: its exact name or id.",
-    upload_id="The staged photo id from the chat note '[The landlord attached a "
-    "photo, upload_id=…]'. Omit to use their most recent attachment.",
-    set_primary="yes to make it the listing's MAIN photo; omit for a gallery photo.",
+    upload_id="Staged photo id(s) from the chat note(s) '[The landlord attached a "
+    "photo, upload_id=…]'. One id, a comma-separated list for MULTIPLE photos, "
+    "'all', or blank = every photo they just attached.",
+    set_primary="yes to make the FIRST photo the listing's MAIN photo (rest go to "
+    "the gallery); omit for all gallery.",
     pick="If the name matches two listings: oldest|newest|1|2.",
     confirm="Leave empty to preview; 'yes' to attach.",
 )
@@ -1381,20 +1383,56 @@ def update_lease(
     pets_allowed: str = "",
     smoking_allowed: str = "",
     special_terms: str = "",
+    house_rules: str = "",
     etransfer_email: str = "",
     is_month_to_month: str = "",
     confirm: str = "",
 ) -> dict:
     """Update draft/pending lease fields. Blocked if ACTIVE/locked (LeaseNotLocked).
-    Changing total_rent rebalances unsigned shares. Preview; confirm=yes."""
+    special_terms = extra clauses/terms added to the agreement; house_rules =
+    roommate-agreement house rules the landlord wants to add (both are how you
+    'customise the lease' / add clauses per lease). Changing total_rent rebalances
+    unsigned shares. Preview; confirm=yes."""
     from .domain_crud import update_lease as _fn
     return _fn(
         landlord, property_query=property_query, lease_number=lease_number,
         total_rent=total_rent, security_deposit=security_deposit,
         start_date=start_date, end_date=end_date, pets_allowed=pets_allowed,
         smoking_allowed=smoking_allowed, special_terms=special_terms,
-        etransfer_email=etransfer_email, is_month_to_month=is_month_to_month,
-        confirm=confirm,
+        house_rules=house_rules, etransfer_email=etransfer_email,
+        is_month_to_month=is_month_to_month, confirm=confirm,
+    )
+
+
+@_params(
+    name="The co-host / co-landlord's name (required).",
+    email="Their email (optional, for the agreement + notice).",
+    phone="Their phone (optional).",
+    property_query="The listing whose lease to edit (name or id), OR use lease_number.",
+    lease_number="The lease to edit (alternative to property_query).",
+    remove="yes to REMOVE this co-host instead of adding.",
+    confirm="Leave empty to preview; 'yes' to apply.",
+)
+def add_co_host_to_lease(
+    landlord,
+    name: str,
+    email: str = "",
+    phone: str = "",
+    property_query: str = "",
+    lease_number: str = "",
+    remove: str = "",
+    confirm: str = "",
+) -> dict:
+    """Add (or remove) a CO-HOST / CO-LANDLORD on a lease — a second landlord
+    party (partner, co-owner, manager) recorded on the agreement and reachable
+    for notice. Use for 'add a co-host/co-landlord to this lease'. This records
+    them on the document; it does NOT create an app login for them. Preview;
+    confirm=yes."""
+    from .domain_actions import add_co_host_to_lease as _fn
+    return _fn(
+        landlord, name=name, email=email, phone=phone,
+        property_query=property_query, lease_number=lease_number,
+        remove=remove, confirm=confirm,
     )
 
 

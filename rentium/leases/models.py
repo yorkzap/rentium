@@ -80,6 +80,11 @@ class Lease(AgreementTerms):
     landlord = models.ForeignKey(
         LandlordProfile, on_delete=models.PROTECT, related_name="landlord_leases"
     )
+    # Co-hosts / co-landlords recorded ON THIS AGREEMENT — additional landlord
+    # parties (a partner, a co-owner, a property manager) shown on the document
+    # and reachable for notice. A list of {"name", "email", "phone"} dicts. This
+    # is a RECORD on the lease, not an app login/permission grant.
+    co_hosts = models.JSONField(_("Co-hosts"), default=list, blank=True)
     # Common lease fields
     lease_number = models.CharField(
         _("Lease Number"), max_length=20, unique=True, blank=True, editable=False

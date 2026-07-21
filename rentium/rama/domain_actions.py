@@ -867,6 +867,66 @@ def _resolve_existing_tenant(landlord, email: str):
     }
 
 
+def add_co_host_to_lease(
+    landlord,
+    *,
+    name: str,
+    email: str = "",
+    phone: str = "",
+    property_query: str = "",
+    lease_number: str = "",
+    remove: str = "",
+    confirm: str = "",
+) -> dict:
+    """Add (or remove) a co-host / co-landlord recorded on a lease agreement — a
+    second landlord party (partner, co-owner, manager) shown on the document and
+    reachable for notice. This is a RECORD on the lease, NOT an app login. Use
+    when the landlord says 'add a co-host/co-landlord to this lease'. Preview;
+    confirm=yes."""
+    name = (name or "").strip()
+    email = (email or "").strip().lower()
+    if not name:
+        return {"error": "A co-host name is required."}
+
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return _prop_err(err)
+
+    hosts = list(lease.co_hosts or [])
+    removing = str(remove or "").strip().lower() in ("1", "true", "yes", "y")
+    if removing:
+        after = [h for h in hosts if (h.get("name", "").lower() != name.lower() and (not email or h.get("email", "").lower() != email))]
+        action = f"remove co-host {name}"
+    else:
+        if any(h.get("name", "").lower() == name.lower() for h in hosts):
+            return {"error": f"{name} is already a co-host on this lease."}
+        after = hosts + [{"name": name[:150], "email": email[:254], "phone": (phone or "").strip()[:32]}]
+        action = f"add co-host {name}"
+
+    if not _confirmed(confirm):
+        return _preview(
+            "add_co_host_to_lease",
+            {
+                "lease_number": lease.lease_number,
+                "property": lease.property.name if lease.property_id else "",
+                "action": action,
+                "co_hosts_after": [h.get("name") for h in after],
+            },
+            "Records a co-host on the agreement (not an app login). confirm=yes.",
+        )
+
+    lease.co_hosts = after
+    lease.save(update_fields=["co_hosts", "updated_at"])
+    return {
+        "updated": True,
+        "lease_number": lease.lease_number,
+        "co_hosts": [h.get("name") for h in after],
+        "note": f"Co-hosts on {lease.lease_number}: {', '.join(h.get('name') for h in after) or 'none'}.",
+    }
+
+
 def log_capability_gap(landlord, *, request: str, detail: str = "", learn_now: str = "") -> dict:
     """Record something RAMA couldn't do as a STRUCTURED gap (never code). The
     safe first half of self-evolving: instead of failing silently, RAMA logs

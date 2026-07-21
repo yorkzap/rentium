@@ -99,6 +99,7 @@ TOOL_META: dict[str, ToolMeta] = {
     "cancel_lease_invite": ToolMeta(risk="medium"),
     "replace_lease_invite": ToolMeta(risk="medium"),
     "add_roommate_to_lease": ToolMeta(risk="medium"),
+    "add_co_host_to_lease": ToolMeta(risk="low"),
     "rebalance_lease_rents": ToolMeta(risk="medium"),
     # ------------------------------------------------------ inspections
     "create_condition_inspection": ToolMeta(risk="low"),

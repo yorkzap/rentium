@@ -82,6 +82,7 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.replace_lease_invite,
     tool_functions.list_lease_roster,
     tool_functions.add_roommate_to_lease,
+    tool_functions.add_co_host_to_lease,
     tool_functions.rebalance_lease_rents,
     tool_functions.create_property,
     tool_functions.duplicate_listing,

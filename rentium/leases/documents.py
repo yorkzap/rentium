@@ -152,6 +152,19 @@ def tenant_rows(lease) -> list[Row]:
     return rows
 
 
+def co_host_rows(lease) -> list[Row]:
+    """Co-hosts / co-landlords recorded on the lease — additional landlord
+    parties shown on the agreement."""
+    rows = []
+    for h in lease.co_hosts or []:
+        name = (h.get("name") or "").strip()
+        if not name:
+            continue
+        contact = " · ".join(p for p in [h.get("email", ""), h.get("phone", "")] if p)
+        rows.append(Row("Co-host", f"{name}{f' — {contact}' if contact else ''}"))
+    return rows
+
+
 def signature_rows(lease) -> list[Row]:
     rows = [
         Row(
@@ -265,6 +278,7 @@ class BCResidentialFormat(LeaseFormat):
                 title="1. Parties to this Agreement",
                 rows=[
                     Row("Landlord", lease.landlord.user.name),
+                    *co_host_rows(lease),
                     Row("Address for service", contact["address"] or "—"),
                     Row("Daytime phone", contact["daytime_phone"] or "—"),
                     Row("Email for service", contact["email"] or "—"),
@@ -582,6 +596,7 @@ class RoommateFormat(LeaseFormat):
                 title="1. Who this Agreement is Between",
                 rows=[
                     Row("Landlord", lease.landlord.user.name),
+                    *co_host_rows(lease),
                     Row("Contact", contact["daytime_phone"] or contact["email"] or "—"),
                     *tenant_rows(lease),
                 ],

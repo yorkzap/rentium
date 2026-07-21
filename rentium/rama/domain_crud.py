@@ -742,11 +742,12 @@ def attach_photo_to_listing(
     pick: str = "",
     confirm: str = "",
 ) -> dict:
-    """Attach a photo the landlord uploaded in the chat to a listing. `upload_id`
-    is the staged RamaUpload id the chat provided ('[The landlord attached a
-    photo, upload_id=…]'); if omitted, uses their most recent unused upload.
-    set_primary=yes makes it the listing's main photo. Landlord-scoped — an
-    upload can only be attached by the landlord who made it. Preview; confirm=yes."""
+    """Attach photo(s) the landlord uploaded in the chat to a listing. Handles
+    ONE OR MANY: `upload_id` may be a single id, a comma-separated list, 'all',
+    or blank (= every photo they've attached and not yet used). The chat provides
+    ids as '[The landlord attached a photo, upload_id=…]'. set_primary=yes makes
+    the FIRST one the main photo (the rest go to the gallery). Landlord-scoped.
+    Preview; confirm=yes."""
     import os
 
     from django.core.files.base import ContentFile
@@ -759,25 +760,21 @@ def attach_photo_to_listing(
         return _prop_err(err)
 
     uid = (upload_id or "").strip()
-    qs = RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True)
-    if uid:
-        upload = qs.filter(pk=uid).first()
-        if upload is None:
-            return {
-                "error": (
-                    "That attached photo wasn't found (it may have already been "
-                    "used). Ask the landlord to attach it again."
-                )
-            }
+    qs = RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True).order_by(
+        "created_at"
+    )
+    if uid and uid.lower() != "all":
+        ids = [x.strip() for x in uid.replace(";", ",").split(",") if x.strip()]
+        uploads = list(qs.filter(pk__in=ids))
     else:
-        upload = qs.order_by("-created_at").first()
-        if upload is None:
-            return {
-                "error": (
-                    "No attached photo to add. The landlord needs to attach a "
-                    "photo in the chat first (the paperclip)."
-                )
-            }
+        uploads = list(qs)  # 'all' or blank → every pending photo
+    if not uploads:
+        return {
+            "error": (
+                "No attached photo to add. The landlord needs to attach a photo "
+                "in the chat first (the paperclip, or send it to the Telegram bot)."
+            )
+        }
 
     make_primary = _truthy(set_primary)
     if not _confirmed(confirm):
@@ -786,35 +783,36 @@ def attach_photo_to_listing(
             {
                 "listing": prop.name,
                 "listing_id": str(prop.pk),
-                "as": "primary photo" if make_primary else "gallery photo",
-                "upload_id": str(upload.pk),
+                "photos": len(uploads),
+                "first_as": "primary photo" if make_primary else "gallery photo",
+                "rest_as": "gallery photos" if len(uploads) > 1 else None,
             },
-            "Adds the attached photo to the listing. confirm=yes to apply.",
+            f"Adds {len(uploads)} photo(s) to the listing. confirm=yes to apply.",
         )
 
-    try:
-        upload.image.open("rb")
-        data = upload.image.read()
-        upload.image.close()
-        basename = os.path.basename(upload.image.name)
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"Couldn't read the uploaded photo: {exc}"}
-
-    if make_primary:
-        prop.primary_image.save(basename, ContentFile(data), save=True)
-    else:
-        img = PropertyImage(property=prop)
-        img.image.save(basename, ContentFile(data), save=True)
-
-    upload.used_at = timezone.now()
-    upload.save(update_fields=["used_at"])
+    added = 0
+    for i, upload in enumerate(uploads):
+        try:
+            upload.image.open("rb")
+            data = upload.image.read()
+            upload.image.close()
+            basename = os.path.basename(upload.image.name)
+        except Exception:  # noqa: BLE001 — skip a broken upload, keep the rest
+            continue
+        if make_primary and i == 0:
+            prop.primary_image.save(basename, ContentFile(data), save=True)
+        else:
+            PropertyImage(property=prop).image.save(basename, ContentFile(data), save=True)
+        upload.used_at = timezone.now()
+        upload.save(update_fields=["used_at"])
+        added += 1
 
     return {
         "attached": True,
         "listing": prop.name,
-        "as": "primary photo" if make_primary else "gallery photo",
+        "photos_added": added,
         "image_count": prop.image_count,
-        "note": f"Added the photo to {prop.name}.",
+        "note": f"Added {added} photo(s) to {prop.name}.",
     }
 
 
@@ -1425,6 +1423,7 @@ def update_lease(
     pets_allowed: str = "",
     smoking_allowed: str = "",
     special_terms: str = "",
+    house_rules: str = "",
     etransfer_email: str = "",
     is_month_to_month: str = "",
     confirm: str = "",
@@ -1471,6 +1470,9 @@ def update_lease(
             changes["smoking_allowed"] = _truthy(smoking_allowed)
         if special_terms != "":
             changes["special_terms"] = special_terms[:5000]
+        if house_rules != "":
+            # Roommate-agreement house rules (extra clauses the landlord adds).
+            changes["house_rules"] = house_rules[:5000]
         if etransfer_email != "":
             changes["etransfer_email"] = etransfer_email.strip()[:254]
     except ValueError as exc:
