@@ -1,130 +1,163 @@
 # Rentium — Go-Live Checklist
 
-Steps to take Rentium from the test environment into real production use. Items
-are grouped: **must-do before launch**, **recommended**, and **operational**.
+Take Rentium from testing into real use. Your setup today: the **backend runs in
+Docker** and is exposed at **api.rentium.ca via a Cloudflare Tunnel**; the
+**frontend is on Vercel** (rentium.ca / www). So "production env vars" means the
+Docker env file, and "redeploy the frontend" means push → Vercel builds.
 
 ---
 
 ## 1. Wipe the test data (keep your account)
 
-You've been testing with fake leases/tenants/ledger entries. Clear them WITHOUT
-losing your login, showcase page, channel links, or RAMA settings:
+Clear fake listings/leases/ledger WITHOUT losing your login/showcase/channels:
 
 ```bash
-# Dry run first — prints exactly what will be deleted, changes nothing:
-python manage.py wipe_landlord_data --email you@example.com
+# dry run — prints what it will delete, changes nothing:
+docker compose -f docker-compose.local.yml exec django \
+  python manage.py wipe_landlord_data --email you@example.com
 
-# When the counts look right, actually delete:
-python manage.py wipe_landlord_data --email you@example.com --confirm
+# do it:
+docker compose -f docker-compose.local.yml exec django \
+  python manage.py wipe_landlord_data --email you@example.com --confirm
 ```
 
-- Preserves: your `User` + `LandlordProfile`, `Showcase` (+ slug), Telegram/
-  WhatsApp `ChannelAccount`s, `RamaPreferences` (provider/model/BYOK key).
-- Deletes: leases, properties, ledger, payments, inspections, work orders,
-  occupancy, inquiries, conversations, appointments, agenda, RAMA memory, and the
-  test tenant logins (a tenant shared with another landlord is left alone).
-- Flags: `--keep-tenants` (leave tenant logins), `--include-events` (also clear
-  DomainEvent/Notification history). Runs in one transaction — a PROTECT surprise
-  rolls the whole thing back.
-
-Not DEBUG-gated, so it runs in production. It's the one destructive command that's
-safe to point at a single landlord.
+Deletes listings, leases, ledger (incl. reversals/settlements), payments,
+inspections, work orders, occupancy, inquiries, conversations, appointments,
+agenda, RAMA memory, and test tenant logins. Keeps your `User` + landlord
+profile, showcase + slug, channel links, RAMA settings. One transaction. Flags:
+`--keep-tenants`, `--include-events`. Not DEBUG-gated.
 
 ---
 
-## 2. Required environment variables (must-do)
+## 2. Where env vars go (the thing that bit you)
 
-Production reads these from the environment (`config/settings/production.py`,
-`base.py`). Missing ones either break the app or silently no-op a feature.
+Exporting vars in an interactive shell (`export FOO=bar`) is **temporary** — it
+only affects that shell, not the running gunicorn/Django process, and it's gone
+on restart. Put them in the env file and **restart the containers**:
 
-| Env var | Why it matters if unset |
+- Local Docker: edit **`.envs/.local/.django`** (one `KEY=value` per line, no
+  `export`, no quotes needed).
+- Then reload so every process (web + workers) picks them up:
+
+```bash
+docker compose -f docker-compose.local.yml up -d   # recreates with new env
+# or: docker compose -f docker-compose.local.yml restart django celeryworker celerybeat
+```
+
+Verify a var is actually loaded by the server (not just your shell):
+
+```bash
+docker compose -f docker-compose.local.yml exec django \
+  python -c "from django.conf import settings; print(bool(settings.TELEGRAM_BOT_TOKEN))"
+```
+
+### Required keys
+
+| Env var | Why |
 |---|---|
-| `DJANGO_SECRET_KEY` | Prod refuses to start without it (no default). |
-| `DJANGO_ALLOWED_HOSTS` | Must include `api.rentium.ca` (and the apex) or every request 400s with `DisallowedHost`. |
-| `FRONTEND_URL` | Invite / password-reset / "continue the conversation" links point at `localhost` otherwise. |
-| `PUBLIC_SITE_URL` | Used to build the `<slug>.rentium.ca` subdomain URLs and email links. |
-| `SENDGRID_API_KEY` | No key → no outbound email (invites, inquiries, viewing confirmations). |
-| `GEOAPIFY_KEY` | Address autocomplete + geocoding silently return empty. |
-| RAMA provider key (`XAI_API_KEY` by default, or the provider you set) | RAMA can't answer/act. |
-| `TELEGRAM_WEBHOOK_SECRET` | The Telegram webhook's ONLY auth — unset means broken/unauthenticated. |
-| `WHATSAPP_APP_SECRET` | **Before enabling WhatsApp:** the inbound webhook skips HMAC signature verification when this is blank, so a spoofed POST could drive a landlord's RAMA turn. Set it whenever you wire WhatsApp (it's a no-op seam until then). |
-| `CORS_ALLOWED_ORIGINS` | Optional override; the default is now safe (localhost only in DEBUG). |
-
-After setting hosts, run `python manage.py check --deploy` and resolve findings.
+| `DJANGO_SECRET_KEY` | Required in production. |
+| `DJANGO_ALLOWED_HOSTS` | Must include `api.rentium.ca`. |
+| `FRONTEND_URL`, `PUBLIC_SITE_URL` | Emailed links (invites, chat, reset) use these — else they point at localhost. |
+| `SENDGRID_API_KEY` | Outbound email. |
+| `GEOAPIFY_KEY` | Address autocomplete + geocoding. |
+| RAMA provider key(s) | Landlords BYOK in Settings; platform keys are the fallback. |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_BOT_USERNAME` / `TELEGRAM_WEBHOOK_SECRET` | Telegram (see §4). |
 
 ---
 
-## 3. DNS & email deliverability (must-do)
+## 3. The subdomain `raj.rentium.ca` (Cloudflare + Vercel)
 
-### Landlord vanity subdomains (`raj.rentium.ca`) — the `ERR_NAME_NOT_RESOLVED` fix
+DNS is only half of it. You've already added the wildcard DNS record
+(`*.rentium.ca` CNAME, proxied) — good. The missing piece is **Vercel must be
+told to accept the wildcard host**:
 
-The middleware already rewrites `<slug>.rentium.ca` → the showcase, but the
-subdomain has to actually resolve in DNS first. **No Cloudflare Worker is
-needed — just a wildcard DNS record:**
+1. **Vercel → your project → Settings → Domains → Add** `*.rentium.ca`. Vercel
+   issues the cert and starts accepting `<anything>.rentium.ca`. Without this,
+   the subdomain resolves but Vercel returns a 404/misdirected-request.
+2. Set **`NEXT_PUBLIC_ROOT_DOMAIN=rentium.ca`** in Vercel → Environment
+   Variables, then redeploy, so the middleware and the settings screen use the
+   right root domain.
+3. Keep the apex/`www` records as they are (Vercel DNS).
 
-1. Cloudflare → your `rentium.ca` zone → DNS → Add record:
-   - Type `CNAME`, Name `*`, Target = the same host your apex/`www` points at
-     (your frontend/Vercel host), Proxy status **Proxied** (orange cloud).
-   - (If the frontend is on an IP, use an `A` record with Name `*` instead.)
-2. TLS: Cloudflare Universal SSL covers the first label (`*.rentium.ca`) — for
-   Vercel/Netlify, also add `*.rentium.ca` as a domain in the project so it
-   issues a cert and accepts the Host.
-3. Set `NEXT_PUBLIC_ROOT_DOMAIN=rentium.ca` on the frontend so the editor shows
-   `<slug>.rentium.ca` and it matches the backend `subdomain_url`.
+After that, `raj.rentium.ca` loads the showcase.
 
-After this, `raj.rentium.ca` resolves and serves the showcase.
-
-### Email
-
-- **SPF + DKIM** DNS records for `rentium.ca` (per your SendGrid domain auth), or
-  invites and notifications land in spam.
-
-## 3a. Connecting Telegram (the "no such bot" fix)
-
-The Channels screen shows `Message @the Rentium bot: /link ABC123`, but
-`@the Rentium bot` is a **placeholder** — it means no bot is configured yet.
-There is no Rentium bot on Telegram until you create one:
-
-1. In Telegram, message **@BotFather** → `/newbot` → pick a name and a username
-   (e.g. `RentiumOpsBot`). BotFather gives you a **token**.
-2. Set env on the backend: `TELEGRAM_BOT_TOKEN=<token>`,
-   `TELEGRAM_BOT_USERNAME=RentiumOpsBot` (no `@`), and a random
-   `TELEGRAM_WEBHOOK_SECRET`.
-3. Register the webhook: `python manage.py set_telegram_webhook`.
-4. Now the Channels screen shows your real bot username; `/link <code>` to it
-   verifies the channel and RAMA replies.
+### Email deliverability
+Your DKIM (`cf2024-1._domainkey`) and SPF TXT records are already present — good.
+Make sure SendGrid domain auth matches them.
 
 ---
 
-## 4. Recommended hardening
+## 4. Telegram — the exact fix for "the bot does nothing"
 
-- **HSTS:** `config/settings/production.py` sets `SECURE_HSTS_SECONDS = 60` with a
-  TODO. Once you've confirmed HTTPS everywhere works, raise it (e.g. `31536000`)
-  and keep `SECURE_HSTS_INCLUDE_SUBDOMAINS`.
-- **Registration:** `ACCOUNT_ALLOW_REGISTRATION` defaults `True` — anyone can
-  self-register a landlord account. Decide whether launch should be open or
-  invite-only, and set it accordingly.
+Two separate things must be true, and the second is what bit you:
+
+**A) A real bot exists and the webhook is registered.**
+1. Telegram → **@BotFather** → `/newbot` → name + username (yours:
+   `Rentium_CA_Bot`) → copy the **token**.
+2. Put in `.envs/.local/.django`:
+   ```
+   TELEGRAM_BOT_TOKEN=8700021820:AA...        # from BotFather
+   TELEGRAM_BOT_USERNAME=Rentium_CA_Bot        # no @
+   TELEGRAM_WEBHOOK_SECRET=<any long random string>
+   ```
+3. **Restart the containers** (§2) so the web process has them.
+4. Register the webhook (the path is added for you now — just give the host):
+   ```bash
+   docker compose -f docker-compose.local.yml exec django \
+     python manage.py set_telegram_webhook --url https://api.rentium.ca
+   ```
+   Check it: `... set_telegram_webhook --info`.
+
+**B) The SERVER process (not your shell) has the token + secret.**
+This is why your `/link 4904F1` did nothing: you'd `export`ed the vars in one
+interactive shell, but the gunicorn process answering `api.rentium.ca` didn't
+have them — so it couldn't verify Telegram's secret header or call the bot back.
+Fixing §2 (env file + restart) fixes this. Confirm with the verify command in §2.
+
+Then in the app: Settings → Channels → **Link Telegram** → message
+`/link <code>` to **@Rentium_CA_Bot** → it verifies and RAMA replies.
 
 ---
 
-## 5. Operational — background jobs must be running
+## 5. Background jobs (Celery) — how to verify
 
-`CELERY_BEAT_SCHEDULE` (`base.py`) drives rent-charge generation, lease expiry,
-SLA-breach checks, event replay (the dropped-notification safety net), geocoding,
-and RAMA briefings. These only fire if BOTH are deployed and running:
+Rent charges, lease expiry, SLA checks, event replay, and RAMA briefings run on
+Celery. Two processes must be up: a **worker** and **beat**. Check:
 
-- a Celery **worker**, and
-- Celery **beat**.
+```bash
+docker compose -f docker-compose.local.yml ps
+# expect celeryworker AND celerybeat = "Up"
+```
 
-If beat isn't running, rent charges silently stop being generated and leases
-never expire. Verify both processes are up after deploy.
+If either is missing/exited: `docker compose -f docker-compose.local.yml up -d
+celeryworker celerybeat`. If beat isn't running, rent charges silently stop
+generating.
 
 ---
 
-## Quick post-deploy smoke test
+## 6. HSTS (optional — skip unless you care)
 
-1. Load `https://<slug>.rentium.ca/` → your showcase; a listing card → apex listing.
-2. Submit a public inquiry → it appears in your inbox and as a lead thread.
-3. Ask RAMA to set up a room without a rent → it should ASK for the rent.
-4. Link Telegram from Settings → Channels → send `/link <code>` → RAMA replies.
-5. `python manage.py check --deploy` is clean.
+HSTS is a browser security header that says "only ever use HTTPS for this
+domain." It's **hardening, not required to function** — everything works without
+touching it. If you want it later: in `config/settings/production.py` raise
+`SECURE_HSTS_SECONDS` from `60` to `31536000` (1 year) once you're sure HTTPS
+works everywhere. That's the whole task. Cloudflare already serves HTTPS, so
+you can safely ignore this for now.
+
+---
+
+## 7. Deploy the latest frontend (for the layered-AI picker etc.)
+
+Your Vercel deploy is on an older commit. New UI — the **decision-layer model
+picker**, the RAMA setup prompt, the clearer Telegram state — only appears after
+the frontend redeploys. **Push `main`** (or Vercel → Deployments → Redeploy the
+latest commit). Vercel auto-builds on push.
+
+---
+
+## Post-deploy smoke test
+1. `docker compose ... exec django python -c "from django.conf import settings; print(bool(settings.TELEGRAM_BOT_TOKEN))"` → `True`.
+2. `raj.rentium.ca` → your showcase.
+3. Settings → Account & RAMA shows the "smarter model for the General" toggle.
+4. `/link <code>` to your bot → RAMA replies.
+5. `docker compose ... ps` → celeryworker + celerybeat up.

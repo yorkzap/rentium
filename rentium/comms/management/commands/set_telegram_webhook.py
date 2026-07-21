@@ -55,9 +55,18 @@ class Command(BaseCommand):
             self._show(requests.post(f"{base}/deleteWebhook", timeout=15))
             return
 
-        url = opts.get("url")
+        webhook_path = "/api/public/comms/telegram/webhook/"
+        url = (opts.get("url") or getattr(settings, "TELEGRAM_WEBHOOK_URL", "") or "").strip()
         if not url:
-            raise CommandError("Pass --url <public webhook URL>, or --info / --delete.")
+            raise CommandError(
+                "Pass --url <your API base, e.g. https://api.rentium.ca> "
+                "(the /api/public/comms/telegram/webhook/ path is added for you), "
+                "or --info / --delete."
+            )
+        # Be forgiving: accept a bare host and append the correct path so nobody
+        # has to guess it (that was a repeated 404).
+        if "comms/telegram/webhook" not in url:
+            url = url.rstrip("/") + webhook_path
         secret = (getattr(settings, "TELEGRAM_WEBHOOK_SECRET", "") or "").strip()
         if not secret:
             raise CommandError(
@@ -70,6 +79,16 @@ class Command(BaseCommand):
             "allowed_updates": ["message"],
         }
         self._show(requests.post(f"{base}/setWebhook", json=payload, timeout=15))
+        self.stdout.write(
+            self.style.WARNING(
+                f"Webhook set to {url}\n"
+                "IMPORTANT: the SERVER process that answers that URL (gunicorn/"
+                "the django container) must ALSO have TELEGRAM_BOT_TOKEN and "
+                "TELEGRAM_WEBHOOK_SECRET in its environment — not just this shell. "
+                "Put them in your env file and RESTART the container, or /link "
+                "will silently do nothing."
+            )
+        )
 
     def _show(self, response):
         try:

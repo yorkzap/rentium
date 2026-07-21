@@ -75,11 +75,22 @@ RAMA always **previews risky actions and asks before running them.**
 
 ## 4. Notifications & your public page (operational, one-time)
 
-- **Telegram:** the in-app "Link Telegram" only works once a bot exists. Create
-  one with **@BotFather**, set `TELEGRAM_BOT_TOKEN` / `TELEGRAM_BOT_USERNAME` /
-  `TELEGRAM_WEBHOOK_SECRET`, run `python manage.py set_telegram_webhook`. Until
-  then the screen now says "Telegram isn't set up on this server yet" instead of
-  pointing at a bot that doesn't exist. (Full steps: `GO_LIVE.md` §3a.)
-- **Your `slug.rentium.ca` page:** add a **wildcard DNS record** `*.rentium.ca`
-  (proxied) and set `NEXT_PUBLIC_ROOT_DOMAIN=rentium.ca`. No Cloudflare Worker
-  needed. (Full steps: `GO_LIVE.md` §3.)
+Two gotchas that will waste your time if you miss them:
+
+- **Env vars must live in the env file + a restart — not a shell `export`.**
+  Put keys in `.envs/.local/.django`, then
+  `docker compose -f docker-compose.local.yml up -d`. A shell `export` only
+  affects that shell and is why `/link` "did nothing" before. (GO_LIVE.md §2.)
+- **Telegram:** create a bot with **@BotFather**, set the 3 env vars, restart,
+  then `set_telegram_webhook --url https://api.rentium.ca` (the path is appended
+  for you). Then Settings → Channels → Link Telegram → `/link <code>` to your
+  bot. (GO_LIVE.md §4.)
+- **Your `slug.rentium.ca` page:** wildcard DNS `*.rentium.ca` (done) **plus add
+  `*.rentium.ca` in Vercel → Domains** and set `NEXT_PUBLIC_ROOT_DOMAIN=rentium.ca`.
+  (GO_LIVE.md §3.)
+
+## 5. Seeing new features
+
+The dashboard picks up new UI only after the frontend redeploys. If the
+**"smarter model for the General" picker** or other new controls aren't showing,
+**push `main`** so Vercel rebuilds (or Redeploy the latest commit in Vercel).
