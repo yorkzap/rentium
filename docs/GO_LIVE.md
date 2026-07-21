@@ -47,6 +47,7 @@ Production reads these from the environment (`config/settings/production.py`,
 | `GEOAPIFY_KEY` | Address autocomplete + geocoding silently return empty. |
 | RAMA provider key (`XAI_API_KEY` by default, or the provider you set) | RAMA can't answer/act. |
 | `TELEGRAM_WEBHOOK_SECRET` | The Telegram webhook's ONLY auth — unset means broken/unauthenticated. |
+| `WHATSAPP_APP_SECRET` | **Before enabling WhatsApp:** the inbound webhook skips HMAC signature verification when this is blank, so a spoofed POST could drive a landlord's RAMA turn. Set it whenever you wire WhatsApp (it's a no-op seam until then). |
 | `CORS_ALLOWED_ORIGINS` | Optional override; the default is now safe (localhost only in DEBUG). |
 
 After setting hosts, run `python manage.py check --deploy` and resolve findings.
