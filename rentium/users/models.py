@@ -57,6 +57,15 @@ class LandlordProfile(models.Model):
     user = OneToOneField(User, on_delete=CASCADE, related_name="landlord_profile")
     province = CharField(_("Province"), max_length=100)
     country = CharField(_("Country"), max_length=100)
+    # The landlord's local timezone. Every "5pm" they type — preferred viewing
+    # hours, scheduled times — is interpreted here, and every time we show them
+    # is rendered here. Default matches the launch market (BC). An IANA name.
+    timezone = CharField(
+        _("Timezone"),
+        max_length=64,
+        default="America/Vancouver",
+        help_text=_("IANA timezone name, e.g. America/Vancouver."),
+    )
 
     def __str__(self):
         return f"Landlord: {self.user.name}"

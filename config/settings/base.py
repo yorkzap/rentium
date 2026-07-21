@@ -86,6 +86,9 @@ LOCAL_APPS = [
     # orchestrates, the app computes — see docs/rama-architecture.md in the
     # frontend repo.
     "rentium.rama",
+    # Communication channels (Telegram now; email/WhatsApp behind the same
+    # abstraction later) — where RAMA reaches the landlord outside the app.
+    "rentium.comms",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -328,6 +331,26 @@ CELERY_BEAT_SCHEDULE = {
         "task": "rentium.showcase.tasks.geocode_pending",
         "schedule": crontab(minute=25),  # hourly at :25
     },
+    # Sergeants ($0-LLM watchers): min balances, deposit-return deadlines,
+    # late-payment patterns, expense anomalies, cash surplus. After daily
+    # housekeeping so the ledger/lease state it reads is already current.
+    "rama-sergeants-daily": {
+        "task": "rentium.rama.tasks.run_sergeants",
+        "schedule": crontab(hour=6, minute=45),
+    },
+    # Morning briefing: deterministic digest to every channel that opted in
+    # (ChannelAccount.prefs.briefing). After Sergeants so it can include
+    # today's fresh insights.
+    "rama-morning-briefing": {
+        "task": "rentium.comms.tasks.send_morning_briefings",
+        "schedule": crontab(hour=7, minute=0),
+    },
+    # Let stale viewing negotiations die so they stop nagging the landlord and
+    # free the per-property open-request cap. Overnight, off-peak.
+    "appointments-expire-stale-viewings": {
+        "task": "rentium.appointments.tasks.expire_stale_viewing_requests",
+        "schedule": crontab(hour=3, minute=30),
+    },
 }
 
 # django-allauth
@@ -363,10 +386,18 @@ REST_FRAMEWORK = {
         "public_read": "120/min",  # city / property / showcase page reads
         "inquiry": "5/hour",  # contact form: generous for a human, brutal for a bot
         "viewing_request": "5/hour",
+        # Prospect replying in their tokenized chat thread — human-paced, but a
+        # leaked token shouldn't let a bot flood the landlord's inbox.
+        "public_chat_read": "120/min",
+        "public_chat_send": "20/hour",
         # Address autocomplete proxies a METERED api (Geoapify, 3k/day free). One
         # landlord typing an address fires maybe 8 requests. A bot could burn the
         # daily quota in ninety seconds, so this is a real limit, not a formality.
         "address_search": "60/min",
+        # Telegram's own retry/backoff means this only needs to absorb bursts,
+        # not sustained traffic — one bot, one landlord base.
+        "telegram_webhook": "60/min",
+        "whatsapp_webhook": "60/min",
         # Password-reset emails can be abused as a free spam vector; keep tight.
         "password_reset": "5/hour",
     },
@@ -396,14 +427,24 @@ WEBPACK_LOADER = {
 
 # Your stuff...
 # ------------------------------------------------------------------------------
-CORS_ALLOWED_ORIGINS = env.list(
-    "CORS_ALLOWED_ORIGINS",
-    default=[
+# Localhost origins are dev-only — gate them behind DEBUG so the DEFAULT never
+# leaks a permissive CORS policy into production. (An explicit
+# CORS_ALLOWED_ORIGINS env var still overrides this entirely.)
+_cors_origin_defaults = ["https://rentium.ca", "https://www.rentium.ca"]
+_cors_regex_defaults = [r"^https://[a-z0-9-]+\.rentium\.ca$"]
+if DEBUG:
+    _cors_origin_defaults += [
         "http://localhost:3000",  # Next.js development server
         "http://localhost:8081",  # Ignite Mobile development server
-        "https://rentium.ca",
-        "https://www.rentium.ca",
-    ],
+    ]
+    _cors_regex_defaults += [r"^http://[a-z0-9-]+\.localhost:3000$"]
+
+CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=_cors_origin_defaults)
+# Landlord vanity subdomains (raj.rentium.ca) are a wildcard — a fixed list
+# can't enumerate them. Any browser call from a showcase page (e.g. a contact
+# form) is same-scheme https on a *.rentium.ca host.
+CORS_ALLOWED_ORIGIN_REGEXES = env.list(
+    "CORS_ALLOWED_ORIGIN_REGEXES", default=_cors_regex_defaults
 )
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
@@ -455,9 +496,42 @@ ACCOUNT_EMAIL_CONFIRMATION_ANONYMOUS_REDIRECT_URL = f"{FRONTEND_URL}/auth/login"
 # every RamaAudit row.
 RAMA_ENABLED = env.bool("RAMA_ENABLED", default=True)
 RAMA_PROVIDER = env("RAMA_PROVIDER", default="xai")
-RAMA_MODEL = env("RAMA_MODEL", default="grok-4-1-fast-reasoning")
+# grok-4-1-fast-* were retired by xAI on 2026-05-15; grok-4.3 is the current
+# fast/cheap tier with strong tool calling.
+RAMA_MODEL = env("RAMA_MODEL", default="grok-4.3")
+# Sampling/limits for all providers. RAMA routes and phrases over tool
+# results — temperature 0 for determinism; 4096 tokens so plan previews and
+# full set listings never truncate mid-answer.
+RAMA_TEMPERATURE = env.float("RAMA_TEMPERATURE", default=0.0)
+RAMA_MAX_TOKENS = env.int("RAMA_MAX_TOKENS", default=4096)
+# Per-role platform defaults for the agent hierarchy (General decides, FSA
+# analyzes, Corporals execute on the landlord's cheap chat model). Empty =
+# fall back to the landlord's chat provider with the role's default tier
+# (see rama.runtime.get_role_config).
+RAMA_GENERAL_PROVIDER = env("RAMA_GENERAL_PROVIDER", default="")
+RAMA_GENERAL_MODEL = env("RAMA_GENERAL_MODEL", default="")
+RAMA_FSA_PROVIDER = env("RAMA_FSA_PROVIDER", default="")
+RAMA_FSA_MODEL = env("RAMA_FSA_MODEL", default="")
 ANTHROPIC_API_KEY = env("ANTHROPIC_API_KEY", default="")
 OPENAI_API_KEY = env("OPENAI_API_KEY", default="")
 XAI_API_KEY = env("XAI_API_KEY", default="")
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
 MISTRAL_API_KEY = env("MISTRAL_API_KEY", default="")
+
+# ------------------------------------------------------------------------------
+# Comms: Telegram bot config. TELEGRAM_WEBHOOK_SECRET is set on the bot via
+# setWebhook(secret_token=...) and must match what comms/api/views.py checks —
+# it is the ONLY authentication on that public endpoint.
+TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", default="")
+TELEGRAM_WEBHOOK_SECRET = env("TELEGRAM_WEBHOOK_SECRET", default="")
+TELEGRAM_BOT_USERNAME = env("TELEGRAM_BOT_USERNAME", default="")
+
+# Comms: WhatsApp (Meta Cloud API by default — pluggable in comms/whatsapp.py).
+# All blank until a provider is wired, which keeps the transport a safe no-op
+# and the webhook a 403. WHATSAPP_VERIFY_TOKEN is echoed on Meta's GET
+# handshake; WHATSAPP_APP_SECRET (optional) verifies the POST HMAC signature.
+WHATSAPP_TOKEN = env("WHATSAPP_TOKEN", default="")
+WHATSAPP_PHONE_NUMBER_ID = env("WHATSAPP_PHONE_NUMBER_ID", default="")
+WHATSAPP_VERIFY_TOKEN = env("WHATSAPP_VERIFY_TOKEN", default="")
+WHATSAPP_APP_SECRET = env("WHATSAPP_APP_SECRET", default="")
+WHATSAPP_API_VERSION = env("WHATSAPP_API_VERSION", default="v21.0")

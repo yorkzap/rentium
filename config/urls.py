@@ -11,6 +11,8 @@ from drf_spectacular.views import SpectacularAPIView
 from drf_spectacular.views import SpectacularSwaggerView
 
 from rentium.appointments.api import urls as appointments_urls
+from rentium.comms.api import urls as comms_urls
+from rentium.messaging.api import urls as messaging_urls
 from rentium.showcase.api import urls as showcase_urls
 from rentium.users.api.views import CustomObtainAuthToken
 from rentium.users.api.views import password_reset_confirm_view
@@ -89,6 +91,10 @@ urlpatterns += [
     path("api/ledger/", include("rentium.ledger.api.urls")),
     path("api/attention/", include("rentium.attention.urls")),
     path("api/rama/", include("rentium.rama.urls")),
+    path(
+        "api/comms/",
+        include((comms_urls.urlpatterns, "comms"), namespace="comms_api"),
+    ),
     path("api/maintenance/", include("rentium.maintenance.api.urls")),
     path("api/messaging/", include("rentium.messaging.api.urls")),
     path("api/agenda/", include("rentium.agenda.api.urls")),
@@ -129,6 +135,25 @@ urlpatterns += [
         include(
             (showcase_urls.public_urlpatterns, "showcase_public"),
             namespace="showcase_public",
+        ),
+    ),
+    # Telegram's inbound webhook: auth is a secret header (checked in the
+    # view), never a session — see comms/api/views.py:telegram_webhook.
+    path(
+        "api/public/",
+        include(
+            (comms_urls.public_urlpatterns, "comms_public"),
+            namespace="comms_public",
+        ),
+    ),
+    # The prospect's tokenized chat thread: auth is the per-conversation
+    # access_token in the URL, PII-minimized payload — see
+    # messaging/api/public_views.py.
+    path(
+        "api/public/",
+        include(
+            (messaging_urls.public_urlpatterns, "messaging_public"),
+            namespace="messaging_public",
         ),
     ),
     # Landlord-authenticated showcase surface: the opt-in settings page, the
