@@ -154,13 +154,18 @@ def get_role_config(landlord, role: str) -> LandlordRamaConfig:
         return chat
 
     prefs = RamaPreferences.for_landlord(landlord)
+    role_provider = (getattr(prefs, f"{role}_provider", "") or "").strip().lower()
     provider = (
-        (getattr(prefs, f"{role}_provider", "") or "").strip().lower()
+        role_provider
         or (getattr(settings, f"RAMA_{role.upper()}_PROVIDER", "") or "").strip().lower()
         or chat.provider
     )
+    # A per-role MODEL only applies alongside its per-role PROVIDER — otherwise a
+    # leftover model name (e.g. "claude-sonnet-5") would be sent to whatever
+    # provider we fell back to (e.g. Mistral) and rejected as an invalid model.
+    role_model = (getattr(prefs, f"{role}_model", "") or "").strip() if role_provider else ""
     model = (
-        (getattr(prefs, f"{role}_model", "") or "").strip()
+        role_model
         or (getattr(settings, f"RAMA_{role.upper()}_MODEL", "") or "").strip()
         or _ROLE_DEFAULTS[role].get(provider, "")
     )
