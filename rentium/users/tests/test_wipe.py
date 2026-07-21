@@ -21,7 +21,39 @@ def seeded(landlord, bc_property, bc_lease):
 
     tenant_user = UserFactory(email="wipe.tenant@example.com")
     tenant = TenantProfile.objects.create(user=tenant_user)
-    bc_lease.lease_tenants.create(tenant=tenant, rent_amount="850.00")
+    lt = bc_lease.lease_tenants.create(tenant=tenant, rent_amount="850.00")
+
+    # Reproduce the PROTECT traps the wipe must survive (bulk_create skips model
+    # validation so we can seed the raw shapes cheaply):
+    from datetime import date as _date
+
+    from rentium.ledger.models import LedgerEntry
+    from rentium.leases.models import RentAdjustment
+    from rentium.leases.occupancy import Occupancy
+
+    def _entry(**kw):
+        return LedgerEntry(
+            landlord=landlord, property=bc_property, lease=bc_lease, tenant=tenant,
+            amount="800.00", due_date=_date.today(), effective_date=_date.today(),
+            **kw,
+        )
+
+    # (a) ledger self-references (settles/reverses are PROTECT self-FKs)
+    charge = _entry(entry_type="RENT_CHARGE", description="Rent")
+    LedgerEntry.objects.bulk_create([charge])
+    LedgerEntry.objects.bulk_create(
+        [_entry(entry_type="REVERSAL", description="Void", reverses=charge)]
+    )
+    # (b) an Occupancy (PROTECTs its lease/room/tenant)
+    Occupancy.objects.bulk_create(
+        [Occupancy(room=bc_property, tenant=tenant, lease=bc_lease, move_in=_date.today())]
+    )
+    # (c) a RentAdjustment (hangs off LeaseTenant, not Lease)
+    RentAdjustment.objects.bulk_create(
+        [RentAdjustment(lease_tenant=lt, adjustment_type="DISCOUNT", amount="50.00",
+                        effective_date=_date.today(), reason="test",
+                        created_by=landlord)]
+    )
 
     Inquiry.objects.create(
         property=bc_property, landlord=landlord, name="Lead", email="lead@example.com",

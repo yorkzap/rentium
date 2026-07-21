@@ -98,6 +98,19 @@ class Command(BaseCommand):
 
         # --- delete, atomically ---
         with transaction.atomic():
+            # The ledger's self-references (settles/reverses) are PROTECT, so a
+            # plain delete of the landlord's entries fails even though every
+            # referencing row is in the set. Null those FKs first (they're
+            # nullable), then the delete proceeds.
+            try:
+                from rentium.ledger.models import LedgerEntry
+
+                LedgerEntry.objects.filter(landlord=landlord).update(
+                    settles=None, reverses=None
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.stdout.write(f"  (ledger self-ref clear skipped: {exc})")
+
             for label, qs_fn in steps:
                 try:
                     deleted, _ = qs_fn().delete()
@@ -134,10 +147,12 @@ class Command(BaseCommand):
         steps = [
             ("ledger entries", lambda: LedgerEntry.objects.filter(landlord=L)),
             ("payments", lambda: Payment.objects.filter(lease__landlord=L)),
-            ("rent adjustments", lambda: RentAdjustment.objects.filter(lease__landlord=L)),
+            # RentAdjustment hangs off LeaseTenant, not Lease directly.
+            ("rent adjustments", lambda: RentAdjustment.objects.filter(lease_tenant__lease__landlord=L)),
             ("condition inspections", lambda: ConditionInspection.objects.filter(lease__landlord=L)),
             ("work orders", lambda: WorkOrder.objects.filter(property__landlord=L)),
-            ("occupancy records", lambda: Occupancy.objects.filter(property__landlord=L)),
+            # Occupancy is scoped by its lease (it has no `property` field).
+            ("occupancy records", lambda: Occupancy.objects.filter(lease__landlord=L)),
             ("leases", lambda: Lease.objects.filter(landlord=L)),
             ("property groups", lambda: PropertyGroup.objects.filter(landlord=L)),
             ("property holdings", lambda: PropertyHolding.objects.filter(landlord=L)),
