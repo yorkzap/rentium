@@ -23,6 +23,34 @@ def _token() -> str:
     return (getattr(settings, "TELEGRAM_BOT_TOKEN", "") or "").strip()
 
 
+def get_file_bytes(file_id: str) -> tuple[bytes, str] | None:
+    """Download a Telegram file (e.g. a photo the landlord sent) → (bytes, name).
+    Two calls: getFile → file_path, then download from the file endpoint. Returns
+    None on any failure (never raises — a bad download must not break the turn)."""
+    token = _token()
+    if not token or not file_id:
+        return None
+    try:
+        meta = requests.get(
+            f"https://api.telegram.org/bot{token}/getFile",
+            params={"file_id": file_id},
+            timeout=TIMEOUT_SECONDS,
+        ).json()
+        path = ((meta or {}).get("result") or {}).get("file_path")
+        if not path:
+            return None
+        blob = requests.get(
+            f"https://api.telegram.org/file/bot{token}/{path}", timeout=TIMEOUT_SECONDS
+        )
+        if blob.status_code >= 400 or not blob.content:
+            return None
+        name = path.rsplit("/", 1)[-1] or "telegram.jpg"
+        return blob.content, name
+    except requests.RequestException:
+        logger.exception("telegram getFile/download failed")
+        return None
+
+
 def send_message(chat_id: str, text: str) -> bool:
     """Send `text` to a Telegram chat. Returns True on success."""
     token = _token()

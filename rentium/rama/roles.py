@@ -288,6 +288,9 @@ GENERAL_TOOLS = READ_TOOLS + (
     "plan_move_tenant",
     "amend_constitution",
     "log_capability_gap",
+    # So a photo sent to the Telegram bot can be attached without a delegation
+    # round-trip (low-risk, previews before it writes).
+    "attach_photo_to_listing",
 )
 
 # The FSA reasons over facts; its proposal surface arrives in Phase 4.

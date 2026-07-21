@@ -139,7 +139,14 @@ def telegram_webhook(request):
     chat = message.get("chat") or {}
     chat_id = str(chat.get("id") or "").strip()
     text = str(message.get("text") or "").strip()
-    if not chat_id or not text:
+    # A photo message has no `text` — it has a `photo` array (sizes, largest
+    # last) and an optional `caption`. Capture the biggest size's file_id so the
+    # landlord can "send RAMA a photo" from Telegram, mirroring the web paperclip.
+    photos = message.get("photo") or []
+    photo_file_id = str(photos[-1].get("file_id")) if photos else ""
+    if not text and message.get("caption"):
+        text = str(message.get("caption") or "").strip()
+    if not chat_id or (not text and not photo_file_id):
         return Response({"ok": True})  # nothing actionable; ack anyway
 
     from .. import telegram as transport
@@ -188,7 +195,9 @@ def telegram_webhook(request):
 
     from ..tasks import handle_telegram_message
 
-    handle_telegram_message.delay(str(account.landlord_id), chat_id, text)
+    handle_telegram_message.delay(
+        str(account.landlord_id), chat_id, text, photo_file_id=photo_file_id
+    )
     return Response({"ok": True})
 
 

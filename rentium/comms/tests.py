@@ -121,7 +121,60 @@ def test_webhook_linked_chat_enqueues_turn(landlord, settings):
     with mock.patch("rentium.comms.tasks.handle_telegram_message.delay") as delay:
         res = _webhook(client, {"message": {"chat": {"id": 777}, "text": "how's rent?"}})
     assert res.status_code == 200
-    delay.assert_called_once_with(str(landlord.pk), "777", "how's rent?")
+    delay.assert_called_once_with(str(landlord.pk), "777", "how's rent?", photo_file_id="")
+
+
+def test_webhook_photo_message_passes_biggest_file_id(landlord, settings):
+    settings.TELEGRAM_WEBHOOK_SECRET = "test-secret"
+    ChannelAccount.objects.create(
+        landlord=landlord,
+        channel_type=ChannelAccount.ChannelType.TELEGRAM,
+        address="777",
+        verified=True,
+    )
+    client = APIClient()
+    msg = {
+        "message": {
+            "chat": {"id": 777},
+            "caption": "add this to Room C",
+            "photo": [{"file_id": "small"}, {"file_id": "BIG"}],  # largest is last
+        }
+    }
+    with mock.patch("rentium.comms.tasks.handle_telegram_message.delay") as delay:
+        res = _webhook(client, msg)
+    assert res.status_code == 200
+    delay.assert_called_once_with(
+        str(landlord.pk), "777", "add this to Room C", photo_file_id="BIG"
+    )
+
+
+def test_handle_telegram_photo_stages_upload(landlord, settings):
+    from rentium.rama.models import RamaPreferences, RamaUpload
+    from rentium.rama.providers import Turn
+    from rentium.rama.tests import ScriptedProvider
+
+    prefs = RamaPreferences.for_landlord(landlord)
+    prefs.enabled = True
+    prefs.provider = "xai"
+    prefs.api_key = "xai-test"
+    prefs.save()
+
+    from rentium.comms.tasks import handle_telegram_message
+
+    gif = (
+        b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04"
+        b"\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+    )
+    provider = ScriptedProvider([Turn(text="Which listing should it go on?")])
+    with mock.patch(
+        "rentium.comms.telegram.get_file_bytes", return_value=(gif, "photo.jpg")
+    ):
+        with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+            with mock.patch("rentium.comms.telegram.send_message"):
+                handle_telegram_message(
+                    str(landlord.pk), "42", "add to Room C", photo_file_id="BIG"
+                )
+    assert RamaUpload.objects.filter(landlord=landlord).count() == 1
 
 
 def test_telegram_conversation_id_is_stable_per_chat():
