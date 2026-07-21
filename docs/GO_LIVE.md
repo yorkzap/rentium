@@ -56,12 +56,43 @@ After setting hosts, run `python manage.py check --deploy` and resolve findings.
 
 ## 3. DNS & email deliverability (must-do)
 
+### Landlord vanity subdomains (`raj.rentium.ca`) — the `ERR_NAME_NOT_RESOLVED` fix
+
+The middleware already rewrites `<slug>.rentium.ca` → the showcase, but the
+subdomain has to actually resolve in DNS first. **No Cloudflare Worker is
+needed — just a wildcard DNS record:**
+
+1. Cloudflare → your `rentium.ca` zone → DNS → Add record:
+   - Type `CNAME`, Name `*`, Target = the same host your apex/`www` points at
+     (your frontend/Vercel host), Proxy status **Proxied** (orange cloud).
+   - (If the frontend is on an IP, use an `A` record with Name `*` instead.)
+2. TLS: Cloudflare Universal SSL covers the first label (`*.rentium.ca`) — for
+   Vercel/Netlify, also add `*.rentium.ca` as a domain in the project so it
+   issues a cert and accepts the Host.
+3. Set `NEXT_PUBLIC_ROOT_DOMAIN=rentium.ca` on the frontend so the editor shows
+   `<slug>.rentium.ca` and it matches the backend `subdomain_url`.
+
+After this, `raj.rentium.ca` resolves and serves the showcase.
+
+### Email
+
 - **SPF + DKIM** DNS records for `rentium.ca` (per your SendGrid domain auth), or
   invites and notifications land in spam.
-- **Cloudflare wildcard** `*.rentium.ca` (proxied) so landlord vanity subdomains
-  (`raj-rentals.rentium.ca`) resolve; Universal SSL covers the first label.
-- Set `NEXT_PUBLIC_ROOT_DOMAIN=rentium.ca` on the frontend so the public-page
-  editor shows `<slug>.rentium.ca` and it matches the backend `subdomain_url`.
+
+## 3a. Connecting Telegram (the "no such bot" fix)
+
+The Channels screen shows `Message @the Rentium bot: /link ABC123`, but
+`@the Rentium bot` is a **placeholder** — it means no bot is configured yet.
+There is no Rentium bot on Telegram until you create one:
+
+1. In Telegram, message **@BotFather** → `/newbot` → pick a name and a username
+   (e.g. `RentiumOpsBot`). BotFather gives you a **token**.
+2. Set env on the backend: `TELEGRAM_BOT_TOKEN=<token>`,
+   `TELEGRAM_BOT_USERNAME=RentiumOpsBot` (no `@`), and a random
+   `TELEGRAM_WEBHOOK_SECRET`.
+3. Register the webhook: `python manage.py set_telegram_webhook`.
+4. Now the Channels screen shows your real bot username; `/link <code>` to it
+   verifies the channel and RAMA replies.
 
 ---
 

@@ -588,6 +588,151 @@ def create_property(
     }
 
 
+def _copy_image_field(src_field, dst_saver) -> bool:
+    """Read a source ImageField's bytes and save an independent copy via
+    dst_saver(basename, ContentFile). Returns True on success."""
+    import os
+
+    from django.core.files.base import ContentFile
+
+    if not src_field:
+        return False
+    try:
+        src_field.open("rb")
+        data = src_field.read()
+        src_field.close()
+        dst_saver(os.path.basename(src_field.name), ContentFile(data))
+        return True
+    except Exception:  # noqa: BLE001 — a broken source file shouldn't abort the copy
+        return False
+
+
+def duplicate_listing(
+    landlord,
+    *,
+    property_query: str,
+    new_name: str = "",
+    copy_images: str = "1",
+    copy_inventory: str = "1",
+    group_name: str = "",
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Duplicate an existing listing — a real copy, WITH its photos and inventory
+    (this is what a landlord means by 'duplicate this listing', not a blank new
+    one). Copies the source's address, city, category, room/unit type, beds,
+    description, asking rent, status, and — unless turned off — its primary photo
+    + gallery images and its private inventory rows. new_name defaults to the
+    same name (it's a deliberate duplicate). Leases are NOT copied. Preview;
+    confirm=yes."""
+    from rentium.properties.models import InventoryItem, Property, PropertyImage
+
+    src, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+
+    name = (new_name or "").strip() or src.name
+    do_images = _truthy(copy_images)
+    do_inventory = _truthy(copy_inventory)
+    n_gallery = src.property_images.count()
+    n_images = n_gallery + (1 if src.primary_image else 0)
+    n_inventory = src.inventory_items.count()
+
+    group = None
+    if group_name.strip():
+        group, gerr = _resolve_group(landlord, group_name)
+        if gerr:
+            return {"error": gerr}
+    elif src.group_id:
+        group = src.group
+
+    preview = {
+        "source": src.name,
+        "source_id": str(src.pk),
+        "new_name": name,
+        "will_copy": {
+            "images": n_images if do_images else 0,
+            "inventory_items": n_inventory if do_inventory else 0,
+            "address_city": f"{src.address}, {src.city}",
+            "category": src.property_category,
+            "asking_rent": str(src.asking_rent) if src.asking_rent else None,
+            "group": group.name if group else None,
+        },
+        "note": "Leases are never copied — the duplicate starts with no tenancy.",
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "duplicate_listing",
+            preview,
+            "Copies the listing WITH its photos and inventory. confirm=yes to run.",
+        )
+
+    dup = Property(
+        landlord=landlord,
+        name=name[:255],
+        address=src.address,
+        city=src.city,
+        province=src.province,
+        property_category=src.property_category,
+        room_type=src.room_type,
+        unit_type=src.unit_type,
+        bedrooms=src.bedrooms,
+        bathrooms=src.bathrooms,
+        description=src.description,
+        asking_rent=src.asking_rent,
+        status=src.status,
+        group=group,
+        is_publicly_visible=src.is_publicly_visible,
+    )
+    try:
+        dup.save()  # duplicate names are allowed here on purpose (it's a copy)
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+
+    copied_images = 0
+    if do_images:
+        if src.primary_image and _copy_image_field(
+            src.primary_image, lambda n, c: dup.primary_image.save(n, c, save=True)
+        ):
+            copied_images += 1
+        for img in src.property_images.all().order_by("order", "created_at"):
+            new_img = PropertyImage(property=dup, caption=img.caption, order=img.order)
+            if _copy_image_field(
+                img.image, lambda n, c: new_img.image.save(n, c, save=True)
+            ):
+                copied_images += 1
+
+    copied_inventory = 0
+    if do_inventory:
+        for it in src.inventory_items.all():
+            InventoryItem.objects.create(
+                property=dup,
+                name=it.name,
+                description=it.description,
+                quantity=it.quantity,
+                condition=it.condition,
+                location_description=it.location_description,
+            )
+            copied_inventory += 1
+
+    return {
+        "created": True,
+        "duplicated_from": src.name,
+        "listing": {
+            "id": str(dup.pk),
+            "name": dup.name,
+            "status": dup.status,
+            "group": group.name if group else None,
+        },
+        "copied_images": copied_images,
+        "copied_inventory": copied_inventory,
+        "note": (
+            f"Duplicated {src.name} → {dup.name} with {copied_images} photo(s) and "
+            f"{copied_inventory} inventory item(s). No lease was copied."
+        ),
+    }
+
+
 def update_property(
     landlord,
     *,

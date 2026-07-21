@@ -1168,6 +1168,58 @@ def test_setup_room_tenancy_asks_for_start_date_when_tenant_given(landlord):
     assert "start" in res.get("question_for_user", "").lower()
 
 
+_TINY_GIF = (
+    b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04"
+    b"\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+)
+
+
+def test_duplicate_listing_copies_images_and_inventory(landlord):
+    """The 'dumb duplicate' fix: duplicating a listing must carry its photos and
+    inventory, not produce an empty copy."""
+    from django.core.files.base import ContentFile
+
+    from rentium.properties.models import InventoryItem, PropertyImage
+
+    src = _room(landlord, "Room With Stuff")
+    src.primary_image.save("hero.gif", ContentFile(_TINY_GIF), save=True)
+    PropertyImage.objects.create(property=src, image=ContentFile(_TINY_GIF, name="g1.gif"))
+    PropertyImage.objects.create(property=src, image=ContentFile(_TINY_GIF, name="g2.gif"))
+    InventoryItem.objects.create(property=src, name="Double bed")
+    InventoryItem.objects.create(property=src, name="Mattress")
+
+    res = registry.execute(
+        "duplicate_listing",
+        {"property_query": "Room With Stuff", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("created") is True
+    assert res["copied_inventory"] == 2
+    assert res["copied_images"] == 3  # primary + 2 gallery
+
+    from rentium.properties.models import Property
+
+    dup = Property.objects.get(pk=res["listing"]["id"])
+    assert dup.pk != src.pk
+    assert dup.name == "Room With Stuff"  # same name by default (a real duplicate)
+    assert dup.inventory_items.count() == 2
+    assert dup.property_images.count() == 2
+    assert bool(dup.primary_image)
+    # Independent copies — the duplicate's images are its own rows/files.
+    assert set(dup.property_images.values_list("pk", flat=True)).isdisjoint(
+        src.property_images.values_list("pk", flat=True)
+    )
+
+
+def test_duplicate_listing_previews_before_creating(landlord):
+    _room(landlord, "Preview Me")
+    res = registry.execute(
+        "duplicate_listing", {"property_query": "Preview Me"}, landlord=landlord
+    )
+    assert res.get("needs_confirm") is True
+    assert "created" not in res
+
+
 # ---------------------------------------------- R2: existing-account linking
 def _draft_lease(landlord, name="InviteRoom"):
     from rentium.leases.models import Lease

@@ -1030,6 +1030,41 @@ def create_property(
     )
 
 
+@_params(
+    property_query="The listing to duplicate: its exact name or id.",
+    new_name="Name for the copy. Default is the SAME name (it's a deliberate "
+    "duplicate) — pass a new name only if the landlord wants one.",
+    copy_images="yes/no — copy the source's photos (default yes).",
+    copy_inventory="yes/no — copy the source's inventory (default yes).",
+    group_name="Optional: put the copy in this property group (defaults to the "
+    "source's group).",
+    pick="If the name matches two listings: oldest|newest|1|2.",
+    confirm="Leave empty to preview; 'yes' to create the copy.",
+)
+def duplicate_listing(
+    landlord,
+    property_query: str,
+    new_name: str = "",
+    copy_images: str = "1",
+    copy_inventory: str = "1",
+    group_name: str = "",
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Duplicate an existing listing — a REAL copy WITH its photos and inventory.
+    Use this whenever the landlord says 'duplicate/copy/clone this listing';
+    never hand-roll it with create_property (that makes an EMPTY listing with no
+    photos or inventory, which is not what they mean). Copies address, category,
+    type, beds, description, asking rent, status, primary + gallery photos, and
+    private inventory. Leases are never copied. Preview; confirm=yes."""
+    from .domain_crud import duplicate_listing as _fn
+    return _fn(
+        landlord, property_query=property_query, new_name=new_name,
+        copy_images=copy_images, copy_inventory=copy_inventory,
+        group_name=group_name, pick=pick, confirm=confirm,
+    )
+
+
 def setup_room_tenancy(
     landlord,
     room_name: str,

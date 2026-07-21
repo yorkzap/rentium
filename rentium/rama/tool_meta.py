@@ -64,6 +64,7 @@ TOOL_META: dict[str, ToolMeta] = {
     "delete_shared_inventory_item": ToolMeta(risk="low"),
     # ------------------------------------------------------- properties
     "create_property": ToolMeta(risk="low"),
+    "duplicate_listing": ToolMeta(risk="low"),
     "update_property": ToolMeta(risk="low"),
     "delete_property": ToolMeta(
         risk="high", blockers=delete_property_blockers
