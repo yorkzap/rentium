@@ -867,6 +867,74 @@ def _resolve_existing_tenant(landlord, email: str):
     }
 
 
+def log_capability_gap(landlord, *, request: str, detail: str = "", learn_now: str = "") -> dict:
+    """Record something RAMA couldn't do as a STRUCTURED gap (never code). The
+    safe first half of self-evolving: instead of failing silently, RAMA logs
+    what was missing so it becomes a reviewable backlog the team builds from.
+    learn_now=yes = the landlord explicitly asked us to build it → prioritise."""
+    from rentium.rama.models import RamaCapabilityGap
+
+    req = (request or "").strip()
+    if not req:
+        return {"error": "request is required — what did the landlord want?"}
+    prioritised = str(learn_now or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+    existing = RamaCapabilityGap.objects.filter(
+        landlord=landlord,
+        request__iexact=req,
+        status=RamaCapabilityGap.Status.NEW,
+    ).first()
+    if existing is not None:
+        gap = existing
+        if prioritised and not gap.prioritised:
+            gap.prioritised = True
+            gap.save(update_fields=["prioritised", "updated_at"])
+    else:
+        gap = RamaCapabilityGap.objects.create(
+            landlord=landlord,
+            request=req[:2000],
+            detail=(detail or "").strip()[:2000],
+            prioritised=prioritised,
+        )
+    return {
+        "logged": True,
+        "gap_id": str(gap.pk),
+        "prioritised": gap.prioritised,
+        "note": (
+            "Flagged to build (learn now) — it'll be reviewed, built, and tested "
+            "before it's switched on."
+            if gap.prioritised
+            else "Noted so the team can build it. Say 'learn now' to prioritise it."
+        ),
+    }
+
+
+def list_capability_gaps(landlord, *, status: str = "", limit: str = "20") -> dict:
+    """The capability gaps RAMA has logged for this landlord (what it couldn't do
+    yet). Answers 'what have you flagged to learn / build?'."""
+    from rentium.rama.models import RamaCapabilityGap
+
+    qs = RamaCapabilityGap.objects.filter(landlord=landlord)
+    st = (status or "").strip().upper()
+    if st:
+        qs = qs.filter(status=st)
+    try:
+        n = max(1, min(int(limit or "20"), 100))
+    except ValueError:
+        n = 20
+    rows = [
+        {
+            "id": str(g.pk),
+            "request": g.request,
+            "status": g.status,
+            "prioritised": g.prioritised,
+            "logged": g.created_at.date().isoformat(),
+        }
+        for g in qs[:n]
+    ]
+    return {"count": qs.count(), "gaps": rows}
+
+
 def _active_tenant_slots(lease):
     """Non-declined tenant slots (site treats declined as out of the roster)."""
     return list(

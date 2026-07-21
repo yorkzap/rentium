@@ -45,6 +45,11 @@ charge_schedule "scheduled" lines are FUTURE — not outstanding yet.
 8) draft_leases: Draft ≠ rented. Say drafts exist if draft_lease_count > 0.
 9) Viewings: copy date + weekday + time_display. Never invent weekdays.
 10) Empty tools (0 work orders, 0 inquiries) → say none. Never invent records.
+10b) CAN'T DO IT? Don't just say "I can't." If you genuinely lack a tool for
+    what the landlord asked, call log_capability_gap(request=<their ask>) so it
+    becomes a backlog item to build — and if they say "learn now", pass
+    learn_now=yes. Then tell them it's been noted (and prioritised). Still refuse
+    unsafe/illegal asks outright; this is only for missing CAPABILITIES.
 10a) NOTIFICATIONS ARE KNOWABLE. Scheduling/confirming/countering a viewing
     returns `notified` (the channels + people told); read it and say exactly how
     they were reached. For the landlord's OWN channels use
@@ -273,7 +278,7 @@ READ_TOOLS = (
     "list_vendors", "list_holdings", "list_bank_balances",
     "lease_pdf_info", "list_lease_roster", "crud_capabilities",
     "list_viewing_requests", "get_viewing_availability",
-    "get_notification_channels",
+    "get_notification_channels", "list_capability_gaps",
 )
 
 # The General plans and amends policy but never runs single write tools —
@@ -282,6 +287,7 @@ GENERAL_TOOLS = READ_TOOLS + (
     "plan_operation",
     "plan_move_tenant",
     "amend_constitution",
+    "log_capability_gap",
 )
 
 # The FSA reasons over facts; its proposal surface arrives in Phase 4.

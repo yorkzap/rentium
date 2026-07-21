@@ -55,7 +55,9 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.list_viewing_requests,
     tool_functions.get_viewing_availability,
     tool_functions.get_notification_channels,
+    tool_functions.list_capability_gaps,
     # write actions (confirm=yes)
+    tool_functions.log_capability_gap,
     tool_functions.plan_operation,
     tool_functions.plan_move_tenant,
     tool_functions.amend_constitution,

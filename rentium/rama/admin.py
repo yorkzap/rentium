@@ -1,6 +1,19 @@
 from django.contrib import admin
 
-from .models import RamaAudit, RamaPreferences
+from .models import RamaAudit, RamaCapabilityGap, RamaPreferences
+
+
+@admin.register(RamaCapabilityGap)
+class RamaCapabilityGapAdmin(admin.ModelAdmin):
+    """The 'learn now' backlog — what RAMA couldn't do yet. Review here, build the
+    capability (a tool or a playbook composition of existing tools), then set
+    status=BUILT. Nothing here runs code."""
+
+    list_display = ("created_at", "landlord", "status", "prioritised", "request")
+    list_filter = ("status", "prioritised")
+    search_fields = ("request", "detail", "landlord__user__email")
+    list_editable = ("status",)
+    ordering = ("-prioritised", "-created_at")
 
 
 @admin.register(RamaPreferences)

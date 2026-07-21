@@ -342,6 +342,46 @@ class RamaInsight(models.Model):
         return f"{self.kind} ({self.severity}/{self.status}) for {self.landlord_id}"
 
 
+class RamaCapabilityGap(models.Model):
+    """Something a landlord asked for that RAMA couldn't do — captured as a
+    STRUCTURED gap (not code). This is the safe first half of "self-evolving":
+    RAMA logs what was missing instead of failing silently, turning real usage
+    into a reviewable backlog. A human (or, later, an LLM-drafted playbook under
+    human review) builds the actual capability — nothing here ever runs code.
+    """
+
+    class Status(models.TextChoices):
+        NEW = "NEW", "New"
+        REVIEWED = "REVIEWED", "Reviewed"
+        BUILT = "BUILT", "Built"
+        DISMISSED = "DISMISSED", "Dismissed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_capability_gaps",
+    )
+    request = models.TextField(help_text="What the landlord wanted, in their words.")
+    detail = models.TextField(
+        blank=True, default="", help_text="Why it was blocked / what was missing."
+    )
+    # 'learn now' = the landlord explicitly asked us to build this → prioritise.
+    prioritised = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.NEW, db_index=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-prioritised", "-created_at"]
+        indexes = [models.Index(fields=["landlord", "status", "-created_at"])]
+
+    def __str__(self):
+        return f"Gap [{self.status}] {self.request[:60]}"
+
+
 class RamaUpload(models.Model):
     """A photo the landlord attached in a RAMA chat, STAGED until a tool (e.g.
     attach_photo_to_listing) consumes it. Landlord-scoped — a tool may only

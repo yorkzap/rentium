@@ -66,6 +66,10 @@ TOOL_META: dict[str, ToolMeta] = {
     "create_property": ToolMeta(risk="low"),
     "duplicate_listing": ToolMeta(risk="low"),
     "attach_photo_to_listing": ToolMeta(risk="low"),
+    # Logging a capability gap is frictionless (no confirm) — we WANT RAMA to
+    # record what it can't do rather than fail silently.
+    "log_capability_gap": ToolMeta(risk="low"),
+    "list_capability_gaps": ToolMeta(risk="low"),
     "update_property": ToolMeta(risk="low"),
     "delete_property": ToolMeta(
         risk="high", blockers=delete_property_blockers

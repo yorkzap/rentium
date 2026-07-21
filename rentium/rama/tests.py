@@ -1211,6 +1211,33 @@ def test_duplicate_listing_copies_images_and_inventory(landlord):
     )
 
 
+def test_log_capability_gap_records_and_prioritises(landlord):
+    """The 'learn now' backlog: RAMA logs what it can't do (no code), and
+    'learn now' prioritises it. De-dupes identical NEW gaps."""
+    from rentium.rama.models import RamaCapabilityGap
+
+    r1 = registry.execute(
+        "log_capability_gap",
+        {"request": "Bulk-export all my leases to PDF"},
+        landlord=landlord,
+    )
+    assert r1.get("logged") is True and r1["prioritised"] is False
+    gap = RamaCapabilityGap.objects.get(landlord=landlord)
+    assert gap.status == RamaCapabilityGap.Status.NEW
+
+    # 'learn now' on the same ask prioritises the existing gap, no duplicate.
+    r2 = registry.execute(
+        "log_capability_gap",
+        {"request": "Bulk-export all my leases to PDF", "learn_now": "yes"},
+        landlord=landlord,
+    )
+    assert r2["prioritised"] is True
+    assert RamaCapabilityGap.objects.filter(landlord=landlord).count() == 1
+
+    listed = registry.execute("list_capability_gaps", {}, landlord=landlord)
+    assert listed["count"] == 1 and listed["gaps"][0]["prioritised"] is True
+
+
 def test_attach_photo_to_listing(landlord):
     """The in-chat photo attach: a staged RamaUpload becomes a listing photo."""
     from django.core.files.base import ContentFile

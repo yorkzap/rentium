@@ -1066,6 +1066,32 @@ def duplicate_listing(
 
 
 @_params(
+    request="What the landlord wanted, in their own words (one sentence).",
+    detail="Optional: why it was blocked / what tool or field was missing.",
+    learn_now="yes if the landlord said 'learn now' or otherwise asked us to "
+    "build this — prioritises it.",
+)
+def log_capability_gap(
+    landlord, request: str, detail: str = "", learn_now: str = ""
+) -> dict:
+    """Log something you genuinely CANNOT do yet as a structured gap for the team
+    to build — instead of just saying 'I can't'. Call this whenever you hit a
+    real capability limit, and especially when the landlord says 'learn now'.
+    Then tell them it's been noted (and prioritised if learn_now). This never
+    writes code; it records the need for a human to build safely."""
+    from .domain_actions import log_capability_gap as _fn
+    return _fn(landlord, request=request, detail=detail, learn_now=learn_now)
+
+
+def list_capability_gaps(landlord, status: str = "", limit: str = "20") -> dict:
+    """List the capability gaps RAMA has logged for this landlord — what it
+    couldn't do yet and what's been flagged to build. status: NEW|REVIEWED|
+    BUILT|DISMISSED (blank = all)."""
+    from .domain_actions import list_capability_gaps as _fn
+    return _fn(landlord, status=status, limit=limit)
+
+
+@_params(
     property_query="The listing to add the photo to: its exact name or id.",
     upload_id="The staged photo id from the chat note '[The landlord attached a "
     "photo, upload_id=…]'. Omit to use their most recent attachment.",
