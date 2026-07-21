@@ -219,6 +219,22 @@ class Lease(AgreementTerms):
         related_name="renewal_leases",
         help_text=_("Link to the lease this one renewed/replaced"),
     )
+    # --- Signed-document snapshot (immutability) ---
+    # Captured once, at activation, by documents.capture_signed_document. It
+    # freezes the rendered agreement TERMS so that later edits to clauses.py can
+    # never retroactively change what a tenant signed; the SHA-256 is stored for
+    # tamper-evidence. Not editable via API/admin — a signed record is immutable,
+    # the same principle as the append-only ledger.
+    signed_document = models.JSONField(
+        _("Signed Document Snapshot"), null=True, blank=True, editable=False
+    )
+    signed_document_sha256 = models.CharField(
+        _("Signed Document Checksum"),
+        max_length=64,
+        blank=True,
+        default="",
+        editable=False,
+    )
     # --- Signature / execution tracking ---
     landlord_signed = models.BooleanField(_("Landlord Signed"), default=False)
     landlord_signed_date = models.DateTimeField(
@@ -290,8 +306,20 @@ class Lease(AgreementTerms):
                     "The landlord must own the property group associated with this lease."
                 )
             )
-        # End date validation
-        if self.is_month_to_month and self.end_date:
+        # End date validation. A month-to-month lease has no end date while it
+        # runs — but terminating one legitimately SETS an end date (the UI's
+        # terminate endpoint has always done this), so the rule only applies
+        # to non-final statuses.
+        final_statuses = (
+            self.LeaseStatus.TERMINATED,
+            self.LeaseStatus.EXPIRED,
+            self.LeaseStatus.RENEWED,
+        )
+        if (
+            self.is_month_to_month
+            and self.end_date
+            and self.status not in final_statuses
+        ):
             raise ValidationError(
                 _("Month-to-month leases should not have an end date.")
             )
@@ -496,9 +524,13 @@ class Lease(AgreementTerms):
             # Runs exactly once: the guard at the top of this method returns
             # early unless status was PENDING, and generation is idempotent.
             from rentium.events.registry import publish
+            from rentium.leases.documents import capture_signed_document
             from rentium.leases.occupancy import open_occupancy
             from rentium.ledger.billing import generate_initial_charges
 
+            # Freeze the agreement as signed, before anything else reads it, so
+            # later clause edits can never change this executed lease's document.
+            capture_signed_document(self)
             generate_initial_charges(self)  # deposits, fees, prorated rent schedule
             for lt in self.lease_tenants.filter(tenant__isnull=False, declined=False):
                 open_occupancy(lt)  # start the "who lived where when" log

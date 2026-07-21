@@ -24,6 +24,8 @@ a pure function of a Lease.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
@@ -63,6 +65,28 @@ class Document:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Document":
+        """Rebuild a Document from a stored snapshot (see capture_signed_document)."""
+        sections = [
+            Section(
+                id=s["id"],
+                title=s["title"],
+                rows=[Row(**r) for r in s.get("rows", [])],
+                clauses=list(s.get("clauses", [])),
+                note=s.get("note", ""),
+            )
+            for s in data.get("sections", [])
+        ]
+        return cls(
+            format_id=data["format_id"],
+            name=data["name"],
+            subtitle=data.get("subtitle", ""),
+            legal_note=data.get("legal_note", ""),
+            official_text_loaded=data.get("official_text_loaded", False),
+            sections=sections,
+        )
 
 
 # ----------------------------------------------------------------- helpers
@@ -400,13 +424,29 @@ class BCResidentialFormat(LeaseFormat):
                 block=True,
             ),
         ]
-        out.append(Section(id="conduct", title="7. Pets and Smoking", rows=conduct))
+        out.append(
+            Section(
+                id="conduct",
+                title="7. Pets and Smoking",
+                rows=conduct,
+                clauses=self.clauses(lease, "pets"),
+            )
+        )
 
-        # 8. Standard terms
+        # 8. Occupants and guests
+        out.append(
+            Section(
+                id="occupants_guests",
+                title="8. Occupants and Guests",
+                clauses=self.clauses(lease, "occupants_guests"),
+            )
+        )
+
+        # 9. Standard terms
         out.append(
             Section(
                 id="standard_terms",
-                title="8. Standard Terms of Every Tenancy",
+                title="9. Standard Terms of Every Tenancy",
                 note=(
                     "These terms apply to every residential tenancy in BC and cannot "
                     "be changed by agreement."
@@ -415,21 +455,30 @@ class BCResidentialFormat(LeaseFormat):
             )
         )
 
-        # 9. Ending the tenancy
+        # 10. Ending the tenancy
         out.append(
             Section(
                 id="ending",
-                title="9. Ending the Tenancy",
+                title="10. Ending the Tenancy",
                 clauses=self.clauses(lease, "ending"),
             )
         )
 
-        # 10. Additional terms
+        # 11. Service of documents
+        out.append(
+            Section(
+                id="service_of_documents",
+                title="11. Service of Documents",
+                clauses=self.clauses(lease, "service_of_documents"),
+            )
+        )
+
+        # 12. Additional terms
         if lease.special_terms:
             out.append(
                 Section(
                     id="additional_terms",
-                    title="10. Additional Terms",
+                    title="12. Additional Terms",
                     rows=[
                         Row(
                             "Agreed between the parties",
@@ -441,20 +490,20 @@ class BCResidentialFormat(LeaseFormat):
                 )
             )
 
-        # 11. The Act prevails
+        # 13. Application of the Residential Tenancy Act
         out.append(
             Section(
                 id="act_prevails",
-                title="11. The Act Prevails",
+                title="13. Application of the Residential Tenancy Act",
                 clauses=self.clauses(lease, "act_prevails"),
             )
         )
 
-        # 12. Signatures
+        # 14. Signatures
         out.append(
             Section(
                 id="signatures",
-                title="12. Signatures",
+                title="14. Signatures",
                 note="By signing, the landlord and each tenant are bound by the terms above.",
                 rows=signature_rows(lease),
             )
@@ -665,7 +714,18 @@ class RoommateFormat(LeaseFormat):
         if lease.get_bills_summary():
             money_rows.append(Row("Utilities", lease.get_bills_summary(), block=True))
 
-        out.append(Section(id="money", title="5. Rent and Money", rows=money_rows))
+        out.append(
+            Section(
+                id="money",
+                title="5. Rent and Money",
+                rows=money_rows,
+                clauses=(
+                    self.clauses(lease, "deposit_terms")
+                    if Decimal(str(lease.security_deposit or 0)) > 0
+                    else []
+                ),
+            )
+        )
 
         # 6. Looking after the place
         out.append(
@@ -698,7 +758,14 @@ class RoommateFormat(LeaseFormat):
                 block=True,
             )
         )
-        out.append(Section(id="house_rules", title="7. House Rules", rows=rules_rows))
+        out.append(
+            Section(
+                id="house_rules",
+                title="7. House Rules",
+                rows=rules_rows,
+                clauses=self.clauses(lease, "house_rules"),
+            )
+        )
 
         # 8. Ending it — read straight out of tenancy_rules, so this section can
         #    never disagree with what the move-out screen actually enforces.
@@ -725,6 +792,7 @@ class RoommateFormat(LeaseFormat):
                         block=True,
                     ),
                 ],
+                clauses=self.clauses(lease, "ending_terms"),
             )
         )
 
@@ -766,6 +834,49 @@ def get_format(lease) -> LeaseFormat:
     return REGISTRY.get(lease.lease_type, FALLBACK)
 
 
+def _canonical_json(data: dict) -> str:
+    """Stable serialization for checksumming — key order can't change the hash."""
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def document_sha256(data: dict) -> str:
+    return hashlib.sha256(_canonical_json(data).encode("utf-8")).hexdigest()
+
+
 def render_lease(lease) -> Document:
-    """The one entry point. Screen, PDF, and API all call this."""
+    """The one entry point. Screen, PDF, and API all call this.
+
+    Once a lease is signed and activated, its TERMS are frozen: we return the
+    document captured at activation (see capture_signed_document) so that later
+    edits to clauses.py can never retroactively change what a tenant signed.
+    Only the signatures section is re-rendered live, because who has signed is
+    current status, not a term of the agreement (late joint-and-several signers
+    must still appear). Drafts render live.
+    """
+    snapshot = getattr(lease, "signed_document", None)
+    if snapshot:
+        doc = Document.from_dict(snapshot)
+        live_signatures = signature_rows(lease)
+        for section in doc.sections:
+            if section.id == "signatures":
+                section.rows = live_signatures
+        return doc
     return get_format(lease).render(lease)
+
+
+def capture_signed_document(lease) -> bool:
+    """Freeze the rendered agreement on the Lease at activation.
+
+    Idempotent: only captures the first time (a signed document is immutable —
+    re-capturing would defeat the point). Returns True if it captured now.
+    Stores the full rendered Document plus a SHA-256 of it for tamper-evidence.
+    """
+    if getattr(lease, "signed_document", None):
+        return False
+    data = get_format(lease).render(lease).as_dict()
+    lease.signed_document = data
+    lease.signed_document_sha256 = document_sha256(data)
+    lease.save(
+        update_fields=["signed_document", "signed_document_sha256", "updated_at"]
+    )
+    return True
