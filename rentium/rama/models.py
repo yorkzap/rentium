@@ -63,10 +63,15 @@ class RamaPreferences(models.Model):
         max_length=40, blank=True, default="", choices=Provider.choices
     )
     general_model = models.CharField(max_length=100, blank=True, default="")
+    # Per-role BYOK key — lets the General/FSA run a DIFFERENT provider than the
+    # corporal (model-agnostic). Blank → fall back to the main key (if same
+    # provider) or the platform key. Never returned in full by the API.
+    general_api_key = models.CharField(max_length=512, blank=True, default="")
     fsa_provider = models.CharField(
         max_length=40, blank=True, default="", choices=Provider.choices
     )
     fsa_model = models.CharField(max_length=100, blank=True, default="")
+    fsa_api_key = models.CharField(max_length=512, blank=True, default="")
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

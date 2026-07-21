@@ -72,7 +72,44 @@ def _settings_payload(landlord, prefs: RamaPreferences | None = None) -> dict:
         },
         # All providers available when landlord can paste a key.
         "byok": True,
+        # The decision-layer (General) + analysis (FSA) roles. Blank provider =
+        # "use my main model". Keys are never returned — only has_*_key.
+        "general": {
+            "provider": prefs.general_provider,
+            "model": prefs.general_model,
+            "has_key": bool((prefs.general_api_key or "").strip()),
+        },
+        "fsa": {
+            "provider": prefs.fsa_provider,
+            "model": prefs.fsa_model,
+            "has_key": bool((prefs.fsa_api_key or "").strip()),
+        },
     }
+
+
+def _apply_role_prefs(prefs, data, role: str):
+    """Write general_*/fsa_* provider/model/api_key from a PATCH. Provider ''
+    clears the override (role falls back to the main model)."""
+    block = data.get(role)
+    if not isinstance(block, dict):
+        return None
+    if "provider" in block:
+        prov = str(block.get("provider") or "").strip().lower()
+        if prov and prov not in PROVIDERS:
+            return f"Unknown {role} provider {prov!r}."
+        setattr(prefs, f"{role}_provider", prov)
+    if "model" in block:
+        setattr(prefs, f"{role}_model", str(block.get("model") or "").strip())
+    if "api_key" in block:
+        raw = block.get("api_key")
+        if raw is None:
+            setattr(prefs, f"{role}_api_key", "")
+        elif str(raw).strip():
+            setattr(prefs, f"{role}_api_key", str(raw).strip())
+        # empty string → keep existing
+    if block.get("clear_api_key"):
+        setattr(prefs, f"{role}_api_key", "")
+    return None
 
 
 @api_view(["GET"])
@@ -146,6 +183,14 @@ def settings_view(request):
 
     if "clear_api_key" in data and data.get("clear_api_key"):
         prefs.api_key = ""
+
+    # Optional per-role (decision-layer / analysis) model config.
+    for role in ("general", "fsa"):
+        role_err = _apply_role_prefs(prefs, data, role)
+        if role_err:
+            return Response(
+                {"detail": role_err}, status=http_status.HTTP_400_BAD_REQUEST
+            )
 
     prefs.save()
     return Response(_settings_payload(landlord, prefs))

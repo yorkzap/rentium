@@ -164,7 +164,12 @@ def get_role_config(landlord, role: str) -> LandlordRamaConfig:
         or (getattr(settings, f"RAMA_{role.upper()}_MODEL", "") or "").strip()
         or _ROLE_DEFAULTS[role].get(provider, "")
     )
-    own = (prefs.api_key or "").strip() if provider == chat.provider else ""
+    # Key priority: this role's own BYOK key → the main key (only if the role
+    # uses the same provider as the corporal) → the platform key. This is what
+    # lets the General/FSA run a different provider than the corporal.
+    own = (getattr(prefs, f"{role}_api_key", "") or "").strip()
+    if not own and provider == chat.provider:
+        own = (prefs.api_key or "").strip()
     return LandlordRamaConfig(
         enabled=chat.enabled,
         provider=provider,
