@@ -25,9 +25,30 @@ from rest_framework.throttling import AnonRateThrottle
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.throttling import UserRateThrottle
 
+from django.conf import settings
+
 from rentium.core.geo import GeoError
 from rentium.core.geo import autocomplete
 from rentium.properties.models import Property
+
+
+def _subdomain_url(slug):
+    """The landlord's vanity showcase URL, e.g. https://raj.rentium.ca. Derived
+    from PUBLIC_SITE_URL's host so it follows the deployment without a second
+    config knob. Returns None until they've chosen a slug."""
+    if not slug:
+        return None
+    from urllib.parse import urlsplit
+
+    base = getattr(settings, "PUBLIC_SITE_URL", "") or getattr(
+        settings, "FRONTEND_URL", ""
+    )
+    parts = urlsplit(base or "https://rentium.ca")
+    host = parts.hostname or "rentium.ca"
+    host = host[4:] if host.startswith("www.") else host
+    scheme = parts.scheme or "https"
+    port = f":{parts.port}" if parts.port else ""
+    return f"{scheme}://{slug}.{host}{port}"
 
 from .. import services
 from ..models import Inquiry
@@ -193,6 +214,20 @@ def public_inquiry(request):
         user_agent=request.META.get("HTTP_USER_AGENT", "")[:300],
         **payload.validated_data,
     )
+
+    # Merge the inquiry into a continuing prospect thread and post the message
+    # into it, so the landlord replies in one place and the prospect can keep
+    # the conversation going from their tokenized chat link.
+    from rentium.messaging.services import get_or_create_lead_thread, post_prospect_message
+
+    conversation = get_or_create_lead_thread(inquiry)
+    inquiry.conversation = conversation
+    inquiry.save(update_fields=["conversation"])
+    if inquiry.message:
+        # Seed the thread silently — inquiry.created (below) already tells the
+        # landlord, so we don't want a second "new message" row for one lead.
+        post_prospect_message(conversation, inquiry.message, notify=False)
+
     inquiry.publish_event()  # -> in-app notification + email to the landlord
 
     return Response(
@@ -325,7 +360,10 @@ class ShowcaseSettingsViewSet(viewsets.ViewSet):
             else None,
             "contact_email": showcase.contact_email,
             "effective_contact_email": showcase.inquiry_email,
+            # Canonical path form (the SEO anchor); the vanity subdomain is a
+            # mirror the frontend can show a landlord as their shareable link.
             "public_url": f"/l/{showcase.slug}" if showcase.slug else None,
+            "subdomain_url": _subdomain_url(showcase.slug),
             "public_property_count": showcase.public_properties().count()
             if showcase.is_public
             else 0,

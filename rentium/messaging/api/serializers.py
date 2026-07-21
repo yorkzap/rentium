@@ -24,10 +24,15 @@ class ConversationSerializer(serializers.ModelSerializer):
     other_party = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
+    is_lead = serializers.SerializerMethodField()
+    listing = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
-        fields = ["id", "subject", "lease", "other_party", "last_message", "unread_count", "updated_at"]
+        fields = [
+            "id", "subject", "lease", "other_party", "last_message",
+            "unread_count", "is_lead", "listing", "updated_at",
+        ]
         read_only_fields = fields
 
     def _is_landlord(self):
@@ -36,10 +41,19 @@ class ConversationSerializer(serializers.ModelSerializer):
 
     def get_other_party(self, obj):
         if self._is_landlord():
+            # Prospect (lead) threads have no tenant account — show the lead.
+            if obj.tenant_id is None:
+                return obj.other_display_name()
             u = getattr(obj.tenant, "user", None)
         else:
             u = getattr(obj.landlord, "user", None)
         return (getattr(u, "name", None) or getattr(u, "email", "—")) if u else "—"
+
+    def get_is_lead(self, obj):
+        return obj.tenant_id is None
+
+    def get_listing(self, obj):
+        return obj.property.name if obj.property_id else ""
 
     def get_last_message(self, obj):
         m = obj.messages.last()

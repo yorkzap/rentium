@@ -264,6 +264,15 @@ class Inquiry(models.Model):
         blank=True,
         related_name="inquiries",
     )
+    # An inquiry now continues as a message thread instead of dead-ending in the
+    # landlord's inbox — the prospect and landlord keep talking in one place.
+    conversation = models.ForeignKey(
+        "messaging.Conversation",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="inquiries",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 

@@ -38,6 +38,9 @@ ROUTES = {
         "CUSTOM",
         Notification.Category.MESSAGE,
     ),  # recipients in payload
+    # RAMA: a Sergeant's finding, analyzed by the FSA — see rama/handlers.py.
+    # Portfolio/holding-scoped (landlord_id in payload; see _landlord_user).
+    "rama.insight.created": ("LANDLORD", Notification.Category.SYSTEM),
 }
 
 
@@ -71,6 +74,19 @@ def _landlord_user(event):
     prop = _property(event)
     if prop and prop.landlord and getattr(prop.landlord, "user_id", None):
         return prop.landlord.user
+    # Portfolio/holding-scoped events (no natural property or lease anchor —
+    # e.g. RAMA's Sergeant findings) carry landlord_id directly in payload.
+    landlord_id = (event.payload or {}).get("landlord_id")
+    if landlord_id:
+        from rentium.users.models import LandlordProfile
+
+        landlord = (
+            LandlordProfile.objects.filter(pk=landlord_id)
+            .select_related("user")
+            .first()
+        )
+        if landlord and landlord.user_id:
+            return landlord.user
     return None
 
 
@@ -220,6 +236,13 @@ def _render(event):
             p.get("title", "New message"),
             p.get("preview", ""),
             "/dashboard/messages",
+        )
+    if t == "rama.insight.created":
+        icon = {"URGENT": "🔴", "WARN": "🟡", "INFO": "🔵"}.get(p.get("severity"), "")
+        return (
+            f"{icon} {p.get('title', 'RAMA insight')}".strip(),
+            p.get("analysis", "")[:280],
+            "/dashboard/insights",
         )
     if t == "inquiry.created":
         return (

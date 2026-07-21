@@ -73,10 +73,13 @@ class PublicPropertyCardSerializer(serializers.ModelSerializer):
 
     def get_image(self, obj):
         request = self.context.get("request")
-        if not obj.primary_image:
+        # Primary image, else first gallery image — gallery-only listings
+        # must not render as grey boxes.
+        image = obj.display_image
+        if not image:
             return None
         try:
-            url = obj.primary_image.url
+            url = image.url
             return request.build_absolute_uri(url) if request else url
         except Exception:
             return None
@@ -296,6 +299,7 @@ class InquirySerializer(serializers.ModelSerializer):
             "landlord_notes",
             "responded_at",
             "appointment",
+            "conversation",
             "created_at",
         ]
         # source_ip and user_agent are deliberately absent. They exist for abuse
