@@ -31,7 +31,8 @@ from rest_framework.throttling import ScopedRateThrottle
 
 from rentium.properties.models import Property
 
-from ..models import Appointment
+from ..models import Appointment, AppointmentProposal
+from ..services import current_active_lease, suggest_slots
 
 MAX_OPEN_REQUESTS_PER_PROPERTY = 25  # crude spam guard
 
@@ -91,6 +92,24 @@ def public_property(request, property_id):
     )
 
 
+@api_view(["GET"])
+@permission_classes([AllowAny])
+@throttle_classes([ViewingRequestThrottle])
+def public_viewing_slots(request, property_id):
+    """Suggested viewing times inside the landlord's preferred hours, to steer
+    the requester's picker toward slots that are likely to be accepted. Empty
+    ``slots`` (hours_set false) means the landlord hasn't set hours — the picker
+    then just offers a free time input. Never blocks any time."""
+    prop = _public_property_or_404(property_id)
+    slots = suggest_slots(prop.landlord, prop, limit=12)
+    return Response(
+        {
+            "hours_set": bool(slots),
+            "slots": [s.isoformat() for s in slots],
+        }
+    )
+
+
 @api_view(["POST"])
 @permission_classes([AllowAny])
 @throttle_classes([ViewingRequestThrottle])
@@ -129,18 +148,37 @@ def public_viewing_request(request):
             {"detail": "This property isn't accepting more viewing requests right now."}
         )
 
+    # If someone lives there now, the showing is their entry notice: link the
+    # lease and route the request to them for consent (advisory — the landlord
+    # can still confirm). A vacant unit has no one to ask.
+    active_lease = current_active_lease(prop)
+    message = (data.get("message") or "").strip()
+
     appt = Appointment.objects.create(
         landlord=prop.landlord,
         property=prop,
+        lease=active_lease,
         kind=Appointment.Kind.VIEWING,
         status=Appointment.Status.REQUESTED,
         starts_at=when,
         contact_name=name,
         contact_email=email,
         contact_phone=(data.get("phone") or "").strip(),
-        notes=(data.get("message") or "").strip(),
+        notes=message,
+        tenant_consent=(
+            Appointment.TenantConsent.PENDING
+            if active_lease
+            else Appointment.TenantConsent.NOT_APPLICABLE
+        ),
+    )
+    appt.stamp_time_class()
+    appt.save(update_fields=["time_class"])
+    appt.record_proposal(
+        by=AppointmentProposal.By.REQUESTER, starts_at=when, message=message
     )
     appt.publish_event("appointment.requested")
+    if active_lease:
+        appt.publish_event("appointment.tenant_review")
 
     return Response(
         {
@@ -154,6 +192,74 @@ def public_viewing_request(request):
         },
         status=201,
     )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+@throttle_classes([ViewingRequestThrottle])
+def public_viewing_respond(request, token):
+    """
+    POST /api/public/viewing-respond/<token>/
+        {action: "accept" | "counter" | "withdraw", requested_time?, message?}
+
+    The requester's half of the negotiation — no account, capability token only.
+    - accept:   the landlord proposed a time; take it → SCHEDULED.
+    - counter:  suggest a different time → back to the landlord (REQUESTED).
+    - withdraw: drop the request → CANCELLED.
+    """
+    try:
+        appt = Appointment.objects.select_related("property", "landlord").get(
+            public_token=token, kind=Appointment.Kind.VIEWING
+        )
+    except (Appointment.DoesNotExist, ValueError, ValidationError):
+        raise NotFound("No viewing request found for this link.")
+
+    action = str(request.data.get("action") or "").strip().lower()
+
+    if action == "withdraw":
+        if appt.status in (Appointment.Status.CANCELLED, Appointment.Status.COMPLETED):
+            raise ValidationError({"detail": "This request is already closed."})
+        appt.transition_to(Appointment.Status.CANCELLED)
+        appt.publish_event("appointment.cancelled", cancelled_by="REQUESTER")
+        return Response({"ok": True, "status": appt.status})
+
+    if appt.status != Appointment.Status.AWAITING_REQUESTER:
+        raise ValidationError(
+            {"detail": "There's nothing awaiting your reply on this request right now."}
+        )
+
+    if action == "accept":
+        appt.transition_to(Appointment.Status.SCHEDULED)
+        appt.publish_event("appointment.scheduled")
+        return Response({"ok": True, "status": appt.status})
+
+    if action == "counter":
+        when = parse_datetime(str(request.data.get("requested_time") or ""))
+        if not when:
+            raise ValidationError({"requested_time": "Pick a date and time."})
+        if timezone.is_naive(when):
+            when = timezone.make_aware(when)
+        if when <= timezone.now():
+            raise ValidationError({"requested_time": "Pick a time in the future."})
+
+        appt.starts_at = when
+        appt.stamp_time_class()
+        # A new time means the current tenant (if any) must be re-asked.
+        if appt.lease_id:
+            appt.tenant_consent = Appointment.TenantConsent.PENDING
+        appt.transition_to(Appointment.Status.REQUESTED, by=None)
+        appt.save(update_fields=["starts_at", "time_class", "tenant_consent"])
+        appt.record_proposal(
+            by=AppointmentProposal.By.REQUESTER,
+            starts_at=when,
+            message=(request.data.get("message") or "").strip(),
+        )
+        appt.publish_event("appointment.countered", proposed_by="REQUESTER")
+        if appt.lease_id:
+            appt.publish_event("appointment.tenant_review")
+        return Response({"ok": True, "status": appt.status})
+
+    raise ValidationError({"action": "Use accept, counter, or withdraw."})
 
 
 @api_view(["GET"])
