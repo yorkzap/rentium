@@ -1211,6 +1211,51 @@ def test_duplicate_listing_copies_images_and_inventory(landlord):
     )
 
 
+def test_attach_photo_to_listing(landlord):
+    """The in-chat photo attach: a staged RamaUpload becomes a listing photo."""
+    from django.core.files.base import ContentFile
+
+    from rentium.rama.models import RamaUpload
+
+    room = _room(landlord, "Photo Room")
+    upload = RamaUpload.objects.create(
+        landlord=landlord, image=ContentFile(_TINY_GIF, name="attach.gif")
+    )
+    assert room.image_count == 0
+
+    res = registry.execute(
+        "attach_photo_to_listing",
+        {"property_query": "Photo Room", "upload_id": str(upload.pk), "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("attached") is True
+    room.refresh_from_db()
+    assert room.image_count == 1
+    upload.refresh_from_db()
+    assert upload.used_at is not None  # single-use, consumed
+
+
+def test_attach_photo_cannot_use_another_landlords_upload(landlord):
+    """Security: an upload is landlord-scoped — RAMA can't attach one it doesn't own."""
+    from django.core.files.base import ContentFile
+
+    from rentium.rama.models import RamaUpload
+    from rentium.users.models import LandlordProfile
+
+    other = LandlordProfile.objects.create(user=UserFactory())
+    other_upload = RamaUpload.objects.create(
+        landlord=other, image=ContentFile(_TINY_GIF, name="other.gif")
+    )
+    _room(landlord, "My Room")
+
+    res = registry.execute(
+        "attach_photo_to_listing",
+        {"property_query": "My Room", "upload_id": str(other_upload.pk), "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert "error" in res and "attached" not in res
+
+
 def test_duplicate_listing_previews_before_creating(landlord):
     _room(landlord, "Preview Me")
     res = registry.execute(

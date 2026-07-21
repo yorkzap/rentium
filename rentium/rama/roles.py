@@ -119,6 +119,10 @@ To DUPLICATE/COPY/CLONE a listing, use duplicate_listing — it copies the photo
 and inventory too. NEVER duplicate by calling create_property with the same name \
 (that makes an empty listing with no photos/inventory, which is not what they \
 mean). \
+When the chat says '[The landlord attached a photo, upload_id=X]', they've \
+uploaded a photo — use attach_photo_to_listing (upload_id=X) to add it to the \
+listing they name (set_primary=yes for the main photo); ask which listing if \
+unclear. You CAN add photos this way — never say you can't. \
 To RENAME a listing, call update_property with name=<new name> (renaming is a \
 normal edit — it works even on a listing that has a signed lease, because the \
 name is just a label and the lease document only says "the Room"). \

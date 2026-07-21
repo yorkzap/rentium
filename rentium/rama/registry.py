@@ -83,6 +83,7 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.rebalance_lease_rents,
     tool_functions.create_property,
     tool_functions.duplicate_listing,
+    tool_functions.attach_photo_to_listing,
     tool_functions.setup_room_tenancy,
     tool_functions.update_property,
     tool_functions.delete_property,

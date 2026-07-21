@@ -6,6 +6,7 @@ app_name = "rama"
 
 urlpatterns = [
     path("chat/", views.chat_view, name="chat"),
+    path("upload/", views.upload_view, name="upload"),
     path("general/chat/", views.general_chat_view, name="general-chat"),
     path("constitution/", views.constitution_view, name="constitution"),
     path("insights/", views.insights_view, name="insights"),

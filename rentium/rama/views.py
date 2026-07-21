@@ -29,6 +29,7 @@ from .union import state_of_the_union
 
 __all__ = [
     "chat_view",
+    "upload_view",
     "general_chat_view",
     "constitution_view",
     "insights_view",
@@ -202,8 +203,74 @@ def _chat_response(result) -> Response:
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
+def upload_view(request):
+    """POST /api/rama/upload/ (multipart 'image') — stage a photo the landlord
+    attached in chat. Returns upload_id to pass back on the next chat message so
+    RAMA can attach_photo_to_listing it. Landlord-scoped."""
+    from django.core.exceptions import ValidationError
+
+    from .models import RamaUpload
+
+    landlord = _landlord(request)
+    f = request.FILES.get("image")
+    if not f:
+        return Response(
+            {"detail": "An image file is required."},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    if f.size > 15 * 1024 * 1024:
+        return Response(
+            {"detail": "Image too large (max 15MB)."},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    upload = RamaUpload(landlord=landlord, image=f)
+    try:
+        upload.full_clean()  # ImageField validation rejects non-images
+        upload.save()
+    except ValidationError:
+        return Response(
+            {"detail": "That file isn't a valid image."},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(
+        {"upload_id": str(upload.pk)}, status=http_status.HTTP_201_CREATED
+    )
+
+
+def _attachment_note(request, landlord) -> str:
+    """If the chat request references staged uploads (this landlord's, unused),
+    return a note that tells the weak model the photo(s) are attached and how to
+    use them. Empty string when there are none."""
+    from .models import RamaUpload
+
+    raw = request.data.get("upload_ids")
+    if raw is None:
+        raw = request.data.get("upload_id") or ""
+    if isinstance(raw, (list, tuple)):
+        ids = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        ids = [x.strip() for x in str(raw).split(",") if x.strip()]
+    if not ids:
+        return ""
+    valid = [
+        str(pk)
+        for pk in RamaUpload.objects.filter(
+            landlord=landlord, used_at__isnull=True, pk__in=ids
+        ).values_list("pk", flat=True)
+    ]
+    if not valid:
+        return ""
+    tags = " ".join(f"[The landlord attached a photo, upload_id={u}]" for u in valid)
+    return (
+        f"\n\n{tags}\nUse attach_photo_to_listing with the upload_id to add the "
+        "photo to a listing (ask which listing if they didn't say)."
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
 def chat_view(request):
-    """POST /api/rama/chat/ {message, conversation_id?} — the Corporal."""
+    """POST /api/rama/chat/ {message, conversation_id?, upload_ids?} — the Corporal."""
     landlord = _landlord(request)
     cfg = get_landlord_config(landlord)
 
@@ -229,6 +296,10 @@ def chat_view(request):
     message, conversation_id, err = _validated_chat_input(request)
     if err is not None:
         return err
+
+    # If the landlord attached photo(s) in the chat, tell the model so it can
+    # attach_photo_to_listing them (the image itself is staged server-side).
+    message = f"{message}{_attachment_note(request, landlord)}"
 
     result = run_turn(
         landlord, message, conversation_id, role="corporal", channel="web"

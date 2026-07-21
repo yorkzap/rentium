@@ -733,6 +733,91 @@ def duplicate_listing(
     }
 
 
+def attach_photo_to_listing(
+    landlord,
+    *,
+    property_query: str,
+    upload_id: str = "",
+    set_primary: str = "",
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Attach a photo the landlord uploaded in the chat to a listing. `upload_id`
+    is the staged RamaUpload id the chat provided ('[The landlord attached a
+    photo, upload_id=…]'); if omitted, uses their most recent unused upload.
+    set_primary=yes makes it the listing's main photo. Landlord-scoped — an
+    upload can only be attached by the landlord who made it. Preview; confirm=yes."""
+    import os
+
+    from django.core.files.base import ContentFile
+
+    from rentium.properties.models import PropertyImage
+    from rentium.rama.models import RamaUpload
+
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+
+    uid = (upload_id or "").strip()
+    qs = RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True)
+    if uid:
+        upload = qs.filter(pk=uid).first()
+        if upload is None:
+            return {
+                "error": (
+                    "That attached photo wasn't found (it may have already been "
+                    "used). Ask the landlord to attach it again."
+                )
+            }
+    else:
+        upload = qs.order_by("-created_at").first()
+        if upload is None:
+            return {
+                "error": (
+                    "No attached photo to add. The landlord needs to attach a "
+                    "photo in the chat first (the paperclip)."
+                )
+            }
+
+    make_primary = _truthy(set_primary)
+    if not _confirmed(confirm):
+        return _preview(
+            "attach_photo_to_listing",
+            {
+                "listing": prop.name,
+                "listing_id": str(prop.pk),
+                "as": "primary photo" if make_primary else "gallery photo",
+                "upload_id": str(upload.pk),
+            },
+            "Adds the attached photo to the listing. confirm=yes to apply.",
+        )
+
+    try:
+        upload.image.open("rb")
+        data = upload.image.read()
+        upload.image.close()
+        basename = os.path.basename(upload.image.name)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Couldn't read the uploaded photo: {exc}"}
+
+    if make_primary:
+        prop.primary_image.save(basename, ContentFile(data), save=True)
+    else:
+        img = PropertyImage(property=prop)
+        img.image.save(basename, ContentFile(data), save=True)
+
+    upload.used_at = timezone.now()
+    upload.save(update_fields=["used_at"])
+
+    return {
+        "attached": True,
+        "listing": prop.name,
+        "as": "primary photo" if make_primary else "gallery photo",
+        "image_count": prop.image_count,
+        "note": f"Added the photo to {prop.name}.",
+    }
+
+
 def update_property(
     landlord,
     *,

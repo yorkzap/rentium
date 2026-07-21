@@ -340,3 +340,27 @@ class RamaInsight(models.Model):
 
     def __str__(self):
         return f"{self.kind} ({self.severity}/{self.status}) for {self.landlord_id}"
+
+
+class RamaUpload(models.Model):
+    """A photo the landlord attached in a RAMA chat, STAGED until a tool (e.g.
+    attach_photo_to_listing) consumes it. Landlord-scoped — a tool may only
+    resolve an upload belonging to the same landlord, so an attached image can
+    never cross accounts. `used_at` marks it consumed (single use)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_uploads",
+    )
+    image = models.ImageField(upload_to="rama_uploads/%Y/%m/")
+    used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["landlord", "-created_at"])]
+
+    def __str__(self):
+        return f"RamaUpload {self.pk} for {self.landlord_id}"

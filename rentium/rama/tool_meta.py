@@ -65,6 +65,7 @@ TOOL_META: dict[str, ToolMeta] = {
     # ------------------------------------------------------- properties
     "create_property": ToolMeta(risk="low"),
     "duplicate_listing": ToolMeta(risk="low"),
+    "attach_photo_to_listing": ToolMeta(risk="low"),
     "update_property": ToolMeta(risk="low"),
     "delete_property": ToolMeta(
         risk="high", blockers=delete_property_blockers

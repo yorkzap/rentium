@@ -1065,6 +1065,33 @@ def duplicate_listing(
     )
 
 
+@_params(
+    property_query="The listing to add the photo to: its exact name or id.",
+    upload_id="The staged photo id from the chat note '[The landlord attached a "
+    "photo, upload_id=…]'. Omit to use their most recent attachment.",
+    set_primary="yes to make it the listing's MAIN photo; omit for a gallery photo.",
+    pick="If the name matches two listings: oldest|newest|1|2.",
+    confirm="Leave empty to preview; 'yes' to attach.",
+)
+def attach_photo_to_listing(
+    landlord,
+    property_query: str,
+    upload_id: str = "",
+    set_primary: str = "",
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Attach a photo the landlord uploaded IN THE CHAT to a listing. When the
+    conversation contains '[The landlord attached a photo, upload_id=X]', use
+    this with that upload_id (or omit it to use their latest attachment).
+    set_primary=yes makes it the main photo. Preview; confirm=yes."""
+    from .domain_crud import attach_photo_to_listing as _fn
+    return _fn(
+        landlord, property_query=property_query, upload_id=upload_id,
+        set_primary=set_primary, pick=pick, confirm=confirm,
+    )
+
+
 def setup_room_tenancy(
     landlord,
     room_name: str,
