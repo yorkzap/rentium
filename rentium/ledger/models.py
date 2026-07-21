@@ -484,3 +484,162 @@ class LedgerAttachment(models.Model):
 
     def __str__(self):
         return f"Attachment for {self.entry_id}"
+
+
+class PropertyBankBalance(models.Model):
+    """Landlord-reported bank balance for one holding (house/building) — or
+    the whole portfolio when `holding` is null.
+
+    NOT a bank feed: this is what the landlord tells RAMA their account
+    holds, as of a date. The min-balance Sergeant compares this figure
+    against the landlord's Constitution rules and separately tracks ledger
+    movement since `as_of` (drift) so a stale report reads as "stale," not
+    as a false balance breach. Real bank integration (Flinks/Plaid CA) is a
+    later phase that would swap the SOURCE of these rows, not this shape.
+    """
+
+    class Source(models.TextChoices):
+        UI = "UI", _("Entered in the app")
+        CHAT = "CHAT", _("Entered via RAMA")
+
+    landlord = models.ForeignKey(
+        LandlordProfile, on_delete=models.CASCADE, related_name="bank_balances"
+    )
+    holding = models.ForeignKey(
+        "properties.PropertyHolding",
+        on_delete=models.CASCADE,
+        related_name="bank_balances",
+        null=True,
+        blank=True,
+        help_text=_("Null = portfolio-wide balance (no per-house breakdown yet)."),
+    )
+    label = models.CharField(max_length=100, blank=True, default="Operating")
+    balance = models.DecimalField(max_digits=12, decimal_places=2)
+    as_of = models.DateField()
+    updated_via = models.CharField(
+        max_length=10, choices=Source.choices, default=Source.UI
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = _("Bank Balance")
+        verbose_name_plural = _("Bank Balances")
+        ordering = ["landlord", "holding__name"]
+        constraints = [
+            # One current balance row per (landlord, holding) — corrections
+            # overwrite it (this is a reported snapshot, not an append-only
+            # ledger; the ledger itself remains append-only as always). Two
+            # constraints because Postgres treats NULL as distinct from NULL,
+            # so a plain unique on (landlord, holding) would let unlimited
+            # portfolio-wide (holding=null) rows through.
+            models.UniqueConstraint(
+                fields=["landlord", "holding"],
+                condition=models.Q(holding__isnull=False),
+                name="ledger_bank_balance_one_per_holding",
+            ),
+            models.UniqueConstraint(
+                fields=["landlord"],
+                condition=models.Q(holding__isnull=True),
+                name="ledger_bank_balance_one_portfolio_wide",
+            ),
+        ]
+
+    def __str__(self):
+        where = self.holding.name if self.holding_id else "portfolio"
+        return f"{where}: ${self.balance} as of {self.as_of}"
+
+
+class ImportBatch(models.Model):
+    """One historical-data upload — a batch of StagedLedgerEntry rows the
+    landlord can freely edit before anything becomes permanent. Nothing in
+    a batch touches the real (append-only) ledger until commit_batch()
+    posts each clean row through the normal ledger/services writers inside
+    one atomic transaction. This is the ONLY place ledger rows are created
+    in bulk from outside the app's own workflows — everything else about
+    the ledger's append-only, audited nature is unchanged.
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = "DRAFT", _("Draft — still editable")
+        COMMITTED = "COMMITTED", _("Committed")
+        DISCARDED = "DISCARDED", _("Discarded")
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        LandlordProfile, on_delete=models.CASCADE, related_name="import_batches"
+    )
+    label = models.CharField(max_length=200, blank=True, default="")
+    source_file = models.FileField(
+        upload_to="ledger_imports/%Y/%m/", blank=True, null=True
+    )
+    source_filename = models.CharField(max_length=255, blank=True, default="")
+    column_map = models.JSONField(default=dict, blank=True)
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.DRAFT
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    committed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("Import Batch")
+        verbose_name_plural = _("Import Batches")
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.label or self.source_filename or self.pk} ({self.status})"
+
+
+class StagedLedgerEntry(models.Model):
+    """One row of a historical import, fully mutable while its batch is
+    DRAFT. `issues` is recomputed by staging_services.validate_row() on
+    every edit — a row with any issue cannot be committed, so "why won't
+    this commit" is always visible right on the row, not a mystery."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    batch = models.ForeignKey(
+        ImportBatch, on_delete=models.CASCADE, related_name="rows"
+    )
+    row_number = models.PositiveIntegerField(default=0)
+    entry_type = models.CharField(
+        max_length=20, choices=EntryType.choices, blank=True, default=""
+    )
+    amount = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+    due_date = models.DateField(null=True, blank=True)
+    effective_date = models.DateField(null=True, blank=True)
+    paid_on = models.DateField(null=True, blank=True)
+    property = models.ForeignKey(
+        Property, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    lease = models.ForeignKey(Lease, on_delete=models.SET_NULL, null=True, blank=True)
+    tenant = models.ForeignKey(
+        "users.TenantProfile", on_delete=models.SET_NULL, null=True, blank=True
+    )
+    category = models.CharField(max_length=30, blank=True, default="")
+    vendor = models.CharField(max_length=150, blank=True, default="")
+    description = models.CharField(max_length=255, blank=True, default="")
+    payment_method = models.CharField(max_length=20, blank=True, default="")
+    # For PAYMENT/CREDIT rows: which charge row in THIS batch it settles.
+    settles_row = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    raw = models.JSONField(default=dict, blank=True)  # original spreadsheet row
+    issues = models.JSONField(default=list, blank=True)
+    committed_entry = models.ForeignKey(
+        LedgerEntry, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = _("Staged Ledger Entry")
+        verbose_name_plural = _("Staged Ledger Entries")
+        ordering = ["batch", "row_number"]
+
+    def __str__(self):
+        return f"row {self.row_number} of {self.batch_id}: {self.entry_type} {self.amount}"
