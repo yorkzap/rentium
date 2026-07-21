@@ -111,6 +111,49 @@ def normalise_province(raw: str | None) -> str:
 
 
 # --- PropertyGroup Model ---
+class PropertyHolding(models.Model):
+    """One physical address, one bank account, any mix of listings.
+
+    Orthogonal to PropertyGroup (which stays room-only layout grouping, e.g.
+    "McKenzie Side Unit"). A Holding is the financial/physical container a
+    landlord's Constitution and bank-balance policy attach to — a house with
+    a garden suite, a basement suite, and three rooms upstairs is ONE
+    Holding containing a mix of ROOM and COMPLETE_UNIT listings (and may
+    contain several PropertyGroups for room-level layout inside it).
+
+    `kind` makes this the same concept at any scale: a multi-unit building is
+    just a Holding with more listings — no separate hierarchy level needed
+    unless a real distinction emerges later.
+    """
+
+    class Kind(models.TextChoices):
+        HOUSE = "HOUSE", _("House")
+        BUILDING = "BUILDING", _("Building")
+        OTHER = "OTHER", _("Other")
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        LandlordProfile, on_delete=models.CASCADE, related_name="property_holdings"
+    )
+    name = models.CharField(
+        _("Holding Name"), max_length=100, help_text=_("e.g., McKenzie House")
+    )
+    kind = models.CharField(max_length=20, choices=Kind.choices, default=Kind.HOUSE)
+    address = models.CharField(_("Address"), max_length=255, blank=True)
+    city = models.CharField(_("City"), max_length=100, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = _("Property Holding")
+        verbose_name_plural = _("Property Holdings")
+        ordering = ["landlord", "name"]
+        unique_together = ("landlord", "name")
+
+    def __str__(self):
+        return f"{self.name} (Landlord: {self.landlord.user.name})"
+
+
 class PropertyGroup(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     landlord = models.ForeignKey(
@@ -334,7 +377,7 @@ class Property(models.Model):
         _("Room Type"), max_length=20, choices=RoomType.choices, null=True, blank=True
     )
 
-    # Relationship to Group (For Room Organization)
+    # Relationship to Group (For Room Organization — layout only, rooms only)
     group = models.ForeignKey(
         PropertyGroup,
         on_delete=models.SET_NULL,
@@ -343,6 +386,17 @@ class Property(models.Model):
         blank=True,
         verbose_name=_("Property Group"),
         help_text=_("Group this room belongs to (if sharing common areas)"),
+    )
+    # The physical/financial container (any listing category) — see
+    # PropertyHolding. Nullable: existing/ungrouped properties keep working.
+    holding = models.ForeignKey(
+        PropertyHolding,
+        on_delete=models.SET_NULL,
+        related_name="listings",
+        null=True,
+        blank=True,
+        verbose_name=_("Holding"),
+        help_text=_("The house/building this listing belongs to (one bank account)."),
     )
 
     # ---------------------------------------------------------------- public
@@ -579,7 +633,7 @@ class Property(models.Model):
             blockers.append(
                 "Set an asking rent — a listing without a price gets ignored."
             )
-        if not self.primary_image:
+        if not self.primary_image and not self.has_gallery_images:
             blockers.append("Add at least one photo. Nobody enquires about a grey box.")
         if self.latitude is None:
             blockers.append(
@@ -591,6 +645,38 @@ class Property(models.Model):
     @property
     def can_be_published(self) -> bool:
         return not self.publish_blockers()
+
+    # ------------------------------------------------------------ images
+    @property
+    def gallery_image_count(self) -> int:
+        """Gallery (PropertyImage) count. Honours a `_gallery_count` queryset
+        annotation when present so list views don't pay an N+1."""
+        annotated = getattr(self, "_gallery_count", None)
+        if annotated is not None:
+            return int(annotated)
+        # .all() uses the prefetch cache when property_images was prefetched.
+        return len(self.property_images.all())
+
+    @property
+    def has_gallery_images(self) -> bool:
+        return self.gallery_image_count > 0
+
+    @property
+    def image_count(self) -> int:
+        """Total photos: primary (if set) + gallery."""
+        return self.gallery_image_count + (1 if self.primary_image else 0)
+
+    @property
+    def display_image(self):
+        """What a card should show: primary image, else first gallery image.
+
+        A listing whose landlord uploaded gallery photos but never set a hero
+        image must not render as a grey box — nor be told it has "no photos".
+        """
+        if self.primary_image:
+            return self.primary_image
+        first = list(self.property_images.all()[:1])
+        return first[0].image if first else None
 
     @property
     def public_type_label(self) -> str:
