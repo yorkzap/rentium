@@ -14,11 +14,11 @@ Clear fake listings/leases/ledger WITHOUT losing your login/showcase/channels:
 ```bash
 # dry run — prints what it will delete, changes nothing:
 docker compose -f docker-compose.local.yml exec django \
-  python manage.py wipe_landlord_data --email you@example.com
+  python manage.py wipe_landlord_data --email rajgurshersingh@gmail.com
 
 # do it:
 docker compose -f docker-compose.local.yml exec django \
-  python manage.py wipe_landlord_data --email you@example.com --confirm
+  python manage.py wipe_landlord_data --email rajgurshersingh@gmail.com --confirm
 ```
 
 Deletes listings, leases, ledger (incl. reversals/settlements), payments,
@@ -37,11 +37,13 @@ on restart. Put them in the env file and **restart the containers**:
 
 - Local Docker: edit **`.envs/.local/.django`** (one `KEY=value` per line, no
   `export`, no quotes needed).
-- Then reload so every process (web + workers) picks them up:
+- Then reload. **`restart` is NOT enough** — it reuses the old env; and plain
+  `up -d` often says "up to date" because editing an env-file's *contents*
+  doesn't change the compose config. Use `--force-recreate`:
 
 ```bash
-docker compose -f docker-compose.local.yml up -d   # recreates with new env
-# or: docker compose -f docker-compose.local.yml restart django celeryworker celerybeat
+docker compose -f docker-compose.local.yml up -d --force-recreate \
+  django celeryworker celerybeat
 ```
 
 Verify a var is actually loaded by the server (not just your shell):
