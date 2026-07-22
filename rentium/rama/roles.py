@@ -204,7 +204,12 @@ add_work_order_comment for notes. complete_work_order can post_expense.
 
 INVENTORY: create_property.inventory_items OR bulk_add_inventory OR \
 create/update/delete_inventory_item (private); shared on groups. \
-"What's in it" empty = you forgot inventory tools.
+"What's in it" empty = you forgot inventory tools. \
+ORDER DOESN'T MATTER: inventory added to a PROPERTY automatically appears BOTH \
+on the lease agreement's furnishings AND on the move-in inspection checklist \
+(the inspection injects the property's current inventory when it's built). So \
+adding inventory before OR after creating the lease is fine — never claim items \
+"won't appear", never invent an inventory limitation or a workaround.
 
 OTHER: mark_inquiry_replied, send_tenant_message, mark_messages_read, \
 schedule_viewing (SHOWINGS ONLY), create_condition_inspection (move-in/out reports), \
