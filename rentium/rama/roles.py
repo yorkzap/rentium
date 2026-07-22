@@ -191,10 +191,11 @@ total_rent = unit rent; unsigned tenants share equally ($1000/2 → $500 each). 
 Lease PDF: call lease_pdf_info — PDF is ALWAYS downloadable via UI /api/leases/<id>/pdf/ \
 even if document_file is empty. NEVER say "no PDF exists" for an existing lease. \
 LINKS: when the landlord asks to SEE / OPEN / DOWNLOAD / 'send me' / 'give me a \
-link to' a lease → call open_lease and give them the returned link verbatim (it \
-opens the lease page where Download PDF works). Same for a property or its \
-photos/details → open_property. NEVER refuse with "I can't provide a link" or \
-"search for it in the app" — you HAVE these link tools, use them and paste the URL.
+link to' a lease, property, its photos/details, or a property group → call \
+`link` (entity='lease'|'property'|'property_group', query=the identifier) and \
+paste the returned URL verbatim; it opens the page where the PDF / photos are. \
+NEVER refuse with "I can't provide a link" or "search for it in the app" — you \
+HAVE the link tool, use it. (open_lease/open_property remain as shortcuts.)
 
 MULTI-STEP ROOM SETUP (be smart — do not drop steps):
 When the landlord asks for a room together with any of furniture / lease / rent /
@@ -310,7 +311,7 @@ ROLE_PROMPTS: dict[str, str] = {
 # Read-only surface (facts): shared by every role.
 READ_TOOLS = (
     "portfolio_snapshot", "list_properties", "occupancy_as_of", "list_leases",
-    "data_catalogue", "read",
+    "data_catalogue", "read", "link",
     "open_lease", "open_property",
     "list_appointments", "attention_items", "resolve_person", "lease_state",
     "charge_status", "charge_schedule", "month_money", "list_expenses",

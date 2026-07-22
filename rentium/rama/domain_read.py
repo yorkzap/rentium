@@ -144,3 +144,60 @@ def read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
         "fields": [fs.name for fs in wanted],
         "rows": rows,
     }
+
+
+def link(landlord, *, entity: str = "", query: str = "") -> dict:
+    """Resolve ONE instance of a catalogued entity within the landlord's scope and
+    return a clickable in-app deep link (+ what can be downloaded there). Generic
+    Phase-2 replacement for per-entity open_* tools — driven by the manifest's
+    LinkSpec. Same scope guarantee as read: only the landlord's own rows resolve."""
+    from django.conf import settings
+    from django.db.models import Q
+
+    spec = MANIFEST.get((entity or "").strip().lower())
+    if spec is None:
+        linkable = [k for k, s in MANIFEST.items() if s.links]
+        return {"error": f"Unknown entity {entity!r}.", "linkable": linkable}
+    if spec.links is None:
+        linkable = [k for k, s in MANIFEST.items() if s.links]
+        return {"error": f"{spec.key} has no page to link to.", "linkable": linkable}
+
+    from django.apps import apps
+
+    Model = apps.get_model(*spec.model.split("."))
+    ls = spec.links
+    qs = Model.objects.filter(**{spec.scope_path: landlord})
+    q = (query or "").strip()
+    if q:
+        cond = Q()
+        for f in ls.lookup:
+            cond |= Q(**{f"{f}__icontains": q})
+        qs = qs.filter(cond)
+    qs = qs.order_by(spec.default_order)
+
+    matches = list(qs[:6])
+    if not matches:
+        return {"error": f"No {spec.key} matching {query!r} in your portfolio."}
+    if len(matches) > 1:
+        return {
+            "disambiguate": [
+                {"label": str(getattr(m, ls.label_field, m.pk)), "hint": str(m.pk)}
+                for m in matches
+            ],
+            "note": f"Several {spec.key}s match {query!r} — which one?",
+        }
+
+    m = matches[0]
+    base = settings.FRONTEND_URL.rstrip("/")
+    out = {
+        "entity": spec.key,
+        "label": str(getattr(m, ls.label_field, m.pk)),
+        "link": base + ls.page.format(id=m.pk),
+    }
+    if ls.downloads:
+        out["available_there"] = list(ls.downloads)
+        out["note"] = (
+            f"Open the link to view it; {', '.join(ls.downloads)} "
+            "can be downloaded on that page."
+        )
+    return out

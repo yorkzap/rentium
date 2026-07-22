@@ -1454,6 +1454,30 @@ def test_read_indirect_scope_is_safe(landlord, other_landlord):
     assert "My Lamp" in names and "Their Lamp" not in names
 
 
+def test_generic_link_resolves_and_is_scoped(landlord, other_landlord):
+    """Phase 2: the manifest-driven link tool returns a deep link for a resolved
+    lease/property, notes its downloads, and never links a stranger's row."""
+    lease = _draft_lease(landlord, name="LinkableRoom")
+
+    res = registry.execute(
+        "link", {"entity": "lease", "query": lease.lease_number}, landlord=landlord
+    )
+    assert f"/dashboard/leases/{lease.id}" in res["link"]
+    assert "signed PDF" in res["available_there"]
+
+    prop = registry.execute(
+        "link", {"entity": "property", "query": "LinkableRoom"}, landlord=landlord
+    )
+    assert "/dashboard/properties/" in prop["link"]
+
+    # a stranger's lease number does not resolve in my portfolio
+    other = _draft_lease(other_landlord, name="StrangerRoom")
+    miss = registry.execute(
+        "link", {"entity": "lease", "query": other.lease_number}, landlord=landlord
+    )
+    assert "error" in miss
+
+
 def test_read_ledger_filter_and_enum_display(landlord):
     """read works over ledger with a numeric filter and renders enum displays."""
     lease = _draft_lease(landlord, name="LedgerReadRoom")
@@ -2912,7 +2936,7 @@ def test_tool_meta_covers_every_write_tool():
 
     read_only = {
         "portfolio_snapshot", "list_properties", "occupancy_as_of",
-        "open_lease", "open_property", "data_catalogue", "read",
+        "open_lease", "open_property", "data_catalogue", "read", "link",
         "list_leases", "list_appointments", "attention_items",
         "resolve_person", "lease_state", "charge_status", "charge_schedule",
         "month_money", "list_expenses", "deposits_summary", "next_charge",

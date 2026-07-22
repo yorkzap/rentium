@@ -34,6 +34,20 @@ class FieldSpec:
 
 
 @dataclass(frozen=True)
+class LinkSpec:
+    """How to produce a clickable in-app deep link (and note downloads) for an
+    instance of this entity — Phase 2. `page` is a frontend path templated with
+    `{id}`; `lookup` are the fields a text query resolves against; `label_field`
+    names the instance in the reply; `downloads` are artifacts (e.g. the lease
+    PDF) available on that page."""
+
+    page: str
+    lookup: tuple[str, ...]
+    label_field: str
+    downloads: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class EntitySpec:
     key: str  # what RAMA passes as entity="…"
     model: str  # "app_label.ModelName"
@@ -43,6 +57,7 @@ class EntitySpec:
     scope_path: str
     fields: list[FieldSpec] = field(default_factory=list)
     default_order: str = "-created_at"
+    links: LinkSpec | None = None
 
     def field_map(self) -> dict[str, FieldSpec]:
         return {f.name: f for f in self.fields}
@@ -74,6 +89,12 @@ PROPERTY = EntitySpec(
         FieldSpec("available_from", "Available from", "date"),
         FieldSpec("description", "Description", filterable=False),
     ],
+    links=LinkSpec(
+        page="/dashboard/properties/{id}",
+        lookup=("name", "address"),
+        label_field="name",
+        downloads=("photos & full details",),
+    ),
 )
 
 LEASE = EntitySpec(
@@ -104,6 +125,12 @@ LEASE = EntitySpec(
         FieldSpec("common_space_shared_with", "Shared areas used by", "json",
                   filterable=False),
     ],
+    links=LinkSpec(
+        page="/dashboard/leases/{id}",
+        lookup=("lease_number",),
+        label_field="lease_number",
+        downloads=("signed PDF",),
+    ),
 )
 
 LEASE_TENANT = EntitySpec(
@@ -257,6 +284,11 @@ PROPERTY_GROUP = EntitySpec(
         FieldSpec("name", "Name"),
         FieldSpec("description", "Description", filterable=False),
     ],
+    links=LinkSpec(
+        page="/dashboard/properties/view-group/{id}",
+        lookup=("name",),
+        label_field="name",
+    ),
 )
 
 MANIFEST: dict[str, EntitySpec] = {

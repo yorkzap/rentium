@@ -119,6 +119,17 @@ def read(landlord, entity: str = "", filters: str = "", fields: str = "",
     return _fn(landlord, entity=entity, filters=filters, fields=fields, limit=limit)
 
 
+def link(landlord, entity: str = "", query: str = "") -> dict:
+    """A clickable in-app LINK to one thing (+ what's downloadable there). Use
+    whenever the landlord asks to SEE / OPEN / DOWNLOAD / 'send me' / 'give me a
+    link to' a lease, property, or property group. entity = 'lease' | 'property' |
+    'property_group'; query identifies it (lease number, property name/address,
+    group name). Never refuse with 'I can't give a link' — use this and paste the
+    URL. If several match, it returns options to pick from."""
+    from .domain_read import link as _fn
+    return _fn(landlord, entity=entity, query=query)
+
+
 def open_lease(landlord, property_query: str = "", lease_number: str = "") -> dict:
     """A clickable in-app LINK to a lease. Use whenever the landlord asks to SEE /
     OPEN / DOWNLOAD / 'send me' a lease or its PDF — give them the returned link
