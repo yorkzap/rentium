@@ -166,11 +166,13 @@ def link(landlord, *, entity: str = "", query: str = "") -> dict:
 
     Model = apps.get_model(*spec.model.split("."))
     ls = spec.links
+    lookup = spec.resolve_lookup()
+    label_field = spec.resolve_label()
     qs = Model.objects.filter(**{spec.scope_path: landlord})
     q = (query or "").strip()
     if q:
         cond = Q()
-        for f in ls.lookup:
+        for f in lookup:
             cond |= Q(**{f"{f}__icontains": q})
         qs = qs.filter(cond)
     qs = qs.order_by(spec.default_order)
@@ -181,7 +183,7 @@ def link(landlord, *, entity: str = "", query: str = "") -> dict:
     if len(matches) > 1:
         return {
             "disambiguate": [
-                {"label": str(getattr(m, ls.label_field, m.pk)), "hint": str(m.pk)}
+                {"label": str(getattr(m, label_field, m.pk)), "hint": str(m.pk)}
                 for m in matches
             ],
             "note": f"Several {spec.key}s match {query!r} — which one?",
@@ -191,7 +193,7 @@ def link(landlord, *, entity: str = "", query: str = "") -> dict:
     base = settings.FRONTEND_URL.rstrip("/")
     out = {
         "entity": spec.key,
-        "label": str(getattr(m, ls.label_field, m.pk)),
+        "label": str(getattr(m, label_field, m.pk)),
         "link": base + ls.page.format(id=m.pk),
     }
     if ls.downloads:

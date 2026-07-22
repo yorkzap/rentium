@@ -134,6 +134,8 @@ LEASE = EntitySpec(
     model="leases.Lease",
     label="Lease / agreement",
     scope_path="landlord",
+    lookup=("lease_number", "property__name"),  # target by number OR its listing
+    label_field="lease_number",
     fields=[
         FieldSpec("lease_number", "Lease number"),
         FieldSpec("status", "Status", "enum", display="get_status_display"),

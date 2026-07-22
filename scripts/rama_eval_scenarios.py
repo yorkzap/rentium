@@ -72,20 +72,31 @@ def _gallery(prop, name="eval.gif"):
 
 
 def _teardown(landlord, ctx):
-    from rentium.leases.models import Lease
-    from rentium.properties.models import Property
+    # Delete PROTECT-chained children first so fixtures never leak into the next
+    # scenario (a leaked room used to poison later plans, e.g. bulk-delete seeing
+    # a stray MoveTo). Order: inspections/adjustments/occupancy/tenants → ledger
+    # → leases → groups/properties.
+    from rentium.leases.models import (
+        ConditionInspection,
+        Lease,
+        LeaseTenant,
+        RentAdjustment,
+    )
+    from rentium.leases.occupancy import Occupancy
+    from rentium.ledger.models import LedgerEntry
+    from rentium.properties.models import Property, PropertyGroup
 
     props = Property.objects.filter(landlord=landlord, name__contains=MARKER)
-    for lease in Lease.objects.filter(property__in=props):
-        try:
-            lease.delete()
-        except Exception:  # noqa: BLE001 — protected rows stay; report nothing
-            pass
-    for prop in list(props):
-        try:
-            prop.delete()
-        except Exception:  # noqa: BLE001
-            pass
+    leases = Lease.objects.filter(property__in=props)
+    ConditionInspection.objects.filter(lease__in=leases).delete()
+    RentAdjustment.objects.filter(lease_tenant__lease__in=leases).delete()
+    Occupancy.objects.filter(lease__in=leases).delete()
+    LeaseTenant.objects.filter(lease__in=leases).delete()
+    LedgerEntry.objects.filter(property__in=props).update(settles=None, reverses=None)
+    LedgerEntry.objects.filter(property__in=props).delete()
+    leases.delete()
+    props.delete()
+    PropertyGroup.objects.filter(landlord=landlord, name__contains=MARKER).delete()
 
 
 def _setup_photo_portfolio(landlord) -> dict:
@@ -243,8 +254,76 @@ def _blocked_terminated_listing_kept(landlord, ctx):
     return True, ""
 
 
+# ---------------------------------------------------- manifest (Phase 1-4)
+def _setup_read_portfolio(landlord) -> dict:
+    """Two leases at different rents, to test the generic `read` composed query."""
+    high = _lease(landlord, _room(landlord, "EvalRead High"), rent="900.00")
+    low = _lease(landlord, _room(landlord, "EvalRead Low"), rent="700.00")
+    return {"high": high, "low": low}
+
+
+def _setup_draft_lease(landlord) -> dict:
+    """A DRAFT lease, to test the generic `update` on a field update_lease lacks."""
+    lease = _lease(landlord, _room(landlord, "EvalUpd Room"), status="DRAFT")
+    return {"lease": lease, "room_name": f"{MARKER} EvalUpd Room"}
+
+
+def _parking_now_on(landlord, ctx):
+    ctx["lease"].refresh_from_db()
+    if not ctx["lease"].parking_included:
+        return False, "parking_included was not set to True via generic update"
+    return True, ""
+
+
 # ------------------------------------------------------------- scenarios
 SCENARIOS: list[dict] = [
+    {
+        "name": "generic read answers a composed query (manifest Phase 1)",
+        "setup": _setup_read_portfolio,
+        "teardown": _teardown,
+        "turns": [
+            {
+                "say": "Which of my leases have total rent over 800?",
+                "expect": {
+                    "tools_any": ["read", "find_leases"],
+                    "reply_regex": [r"900"],
+                    "reply_not_regex": [r"700"],
+                },
+            },
+        ],
+    },
+    {
+        "name": "generic update sets a field update_lease lacks (manifest Phase 3)",
+        "setup": _setup_draft_lease,
+        "teardown": _teardown,
+        "turns": [
+            {
+                "say": "On the lease for EvalUpd Room, set parking included to yes.",
+                "expect": {
+                    "tools_any": ["update", "update_lease"],
+                    "pending_plan": True,
+                },
+            },
+            {
+                "say": "yes",
+                "expect": {"pending_plan": False, "db": _parking_now_on},
+            },
+        ],
+    },
+    {
+        "name": "generic link gives a working deep link (manifest Phase 2)",
+        "setup": _setup_draft_lease,
+        "teardown": _teardown,
+        "turns": [
+            {
+                "say": "Send me the lease for EvalUpd Room to download.",
+                "expect": {
+                    "tools_any": ["link", "deliver_lease_pdf", "open_lease"],
+                    "reply_regex": [r"/dashboard/leases/|/api/leases/.+/pdf|Sending"],
+                },
+            },
+        ],
+    },
     {
         # The exact failing transcript, as a regression scenario.
         "name": "bulk delete listings without images (transcript regression)",
