@@ -36,7 +36,21 @@ def preferred_windows(landlord, property=None):
     property inherits the landlord's default (``property IS NULL``) rows.
     Returns a list ordered by weekday, start_time.
     """
-    base = AvailabilityWindow.objects.filter(landlord=landlord)
+    # Recurring weekly windows only — one-off specific_date rows are handled
+    # separately (they override just their own date), so they must not leak into
+    # the weekly schedule.
+    base = AvailabilityWindow.objects.filter(landlord=landlord, specific_date__isnull=True)
+    if property is not None:
+        overrides = list(base.filter(property=property))
+        if overrides:
+            return overrides
+    return list(base.filter(property__isnull=True))
+
+
+def _specific_windows(landlord, property, the_date):
+    """One-off windows a landlord set for exactly `the_date` (property override
+    wins over the default, same as the weekly rule)."""
+    base = AvailabilityWindow.objects.filter(landlord=landlord, specific_date=the_date)
     if property is not None:
         overrides = list(base.filter(property=property))
         if overrides:
@@ -53,13 +67,23 @@ def classify_time(landlord, property, when: datetime) -> str:
     no preferred hours are configured — the caller should say so rather than
     imply the time is bad.
     """
+    tz = landlord_tz(landlord)
+    local = when.astimezone(tz) if when.tzinfo else when.replace(tzinfo=tz)
+    at = local.time()
+
+    # A one-off window for this exact date overrides the weekly schedule.
+    specific = _specific_windows(landlord, property, local.date())
+    if specific:
+        return (
+            IN_HOURS
+            if any(w.start_time <= at < w.end_time for w in specific)
+            else OUT_OF_HOURS
+        )
+
     windows = preferred_windows(landlord, property)
     if not windows:
         return UNSET
-    tz = landlord_tz(landlord)
-    local = when.astimezone(tz) if when.tzinfo else when.replace(tzinfo=tz)
     weekday = local.weekday()
-    at = local.time()
     for w in windows:
         if w.weekday == weekday and w.start_time <= at < w.end_time:
             return IN_HOURS

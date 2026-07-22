@@ -275,6 +275,11 @@ class AvailabilityWindow(models.Model):
         help_text=_("Set to override this landlord's default hours for one property."),
     )
     weekday = models.IntegerField(choices=Weekday.choices)
+    # A one-off window for a SPECIFIC date (e.g. "only July 25, 2–4pm"). When
+    # set, it overrides the recurring weekly hours for that single date only.
+    # `weekday` is still stored (derived from the date) so indexes/constraints
+    # hold, but the recurring matcher ignores rows where this is set.
+    specific_date = models.DateField(null=True, blank=True)
     start_time = models.TimeField()
     end_time = models.TimeField()
     created_at = models.DateTimeField(auto_now_add=True)

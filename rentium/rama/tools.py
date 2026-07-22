@@ -724,17 +724,29 @@ def get_viewing_availability(landlord, property_query: str = "") -> dict:
     return _fn(landlord, property_query=property_query)
 
 
+@_params(
+    weekday="Day name (e.g. Tuesday) for RECURRING weekly hours. Omit if using "
+    "specific_date.",
+    specific_date="YYYY-MM-DD for a ONE-OFF window on a single date (e.g. 'only "
+    "July 25, 2–4pm'). Overrides the weekly hours for that date only.",
+    start="Start time 'HH:MM' 24-hour.",
+    end="End time 'HH:MM' 24-hour.",
+    property_query="Optional listing name/id for a per-property override.",
+    confirm="Leave empty to preview; 'yes' to save.",
+)
 def set_viewing_availability(
     landlord,
-    weekday: str,
-    start: str,
-    end: str,
+    weekday: str = "",
+    start: str = "",
+    end: str = "",
     property_query: str = "",
+    specific_date: str = "",
     confirm: str = "",
 ) -> dict:
-    """Add a preferred viewing window. weekday = a day name (e.g. Tuesday);
-    start/end = 'HH:MM' 24-hour. property_query sets a per-property override.
-    Preview first; confirm=yes to save."""
+    """Add a preferred viewing window — RECURRING (pass weekday) or a ONE-OFF for
+    a single date (pass specific_date=YYYY-MM-DD instead of weekday, e.g. 'only
+    available July 25, 2–4pm'). start/end = 'HH:MM' 24-hour. property_query sets a
+    per-property override. Preview; confirm=yes."""
     from .domain_actions import set_viewing_availability as _fn
 
     return _fn(
@@ -743,6 +755,7 @@ def set_viewing_availability(
         start=start,
         end=end,
         property_query=property_query,
+        specific_date=specific_date,
         confirm=confirm,
     )
 

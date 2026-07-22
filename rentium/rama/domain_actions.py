@@ -690,22 +690,35 @@ _WEEKDAYS = {
 
 def set_viewing_availability(
     landlord,
-    weekday: str,
-    start: str,
-    end: str,
+    weekday: str = "",
+    start: str = "",
+    end: str = "",
     property_query: str = "",
+    specific_date: str = "",
     confirm: str = "",
 ) -> dict:
-    """Add a preferred viewing window. weekday = a day name (e.g. Tuesday).
-    start/end = 'HH:MM' 24h. Optionally property_query for a per-property
-    override. Preview first; confirm=yes to save."""
+    """Add a preferred viewing window. For RECURRING weekly hours pass weekday (a
+    day name, e.g. Tuesday). For a ONE-OFF on a single date (e.g. 'only July 25,
+    2–4pm') pass specific_date='YYYY-MM-DD' instead of weekday — it overrides the
+    weekly hours for just that date. start/end = 'HH:MM' 24h. Optional
+    property_query for a per-property override. Preview; confirm=yes."""
+    from datetime import date as _date
     from datetime import time as _time
 
     from rentium.appointments.models import AvailabilityWindow
 
-    wd = _WEEKDAYS.get((weekday or "").strip().lower())
-    if wd is None:
-        return {"error": "weekday must be a day name like Tuesday."}
+    the_date = None
+    sd = (specific_date or "").strip()
+    if sd:
+        try:
+            the_date = _date.fromisoformat(sd[:10])
+        except ValueError:
+            return {"error": "specific_date must be YYYY-MM-DD."}
+        wd = the_date.weekday()  # derive so the index/constraint stay valid
+    else:
+        wd = _WEEKDAYS.get((weekday or "").strip().lower())
+        if wd is None:
+            return {"error": "Pass a weekday (e.g. Tuesday) OR specific_date=YYYY-MM-DD."}
 
     def _parse_hhmm(s):
         try:
@@ -727,7 +740,8 @@ def set_viewing_availability(
             return _prop_err(err)
 
     preview = {
-        "day": (weekday or "").strip().title(),
+        "when": the_date.isoformat() if the_date else (weekday or "").strip().title(),
+        "kind": "one-off date" if the_date else "every week",
         "from": start_t.strftime("%H:%M"),
         "to": end_t.strftime("%H:%M"),
         "scope": prop.name if prop else "default (all properties)",
@@ -739,7 +753,7 @@ def set_viewing_availability(
 
     AvailabilityWindow.objects.create(
         landlord=landlord, property=prop, weekday=wd,
-        start_time=start_t, end_time=end_t,
+        specific_date=the_date, start_time=start_t, end_time=end_t,
     )
     return {"created": True, "window": preview}
 

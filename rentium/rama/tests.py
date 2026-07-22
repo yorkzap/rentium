@@ -1284,6 +1284,27 @@ def test_attach_multiple_photos_bulk(landlord):
     assert RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True).count() == 0
 
 
+def test_set_one_off_viewing_availability(landlord):
+    """Per-date hours: a one-off window overrides the weekly schedule for that date."""
+    from datetime import datetime
+
+    from rentium.appointments.models import AvailabilityWindow
+    from rentium.appointments.services import IN_HOURS, OUT_OF_HOURS, classify_time
+
+    res = registry.execute(
+        "set_viewing_availability",
+        {"specific_date": "2026-07-25", "start": "14:00", "end": "16:00", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("created") is True
+    w = AvailabilityWindow.objects.get(landlord=landlord)
+    assert str(w.specific_date) == "2026-07-25"
+
+    # Inside the one-off window → IN_HOURS; outside → OUT_OF_HOURS.
+    assert classify_time(landlord, None, datetime(2026, 7, 25, 15, 0)) == IN_HOURS
+    assert classify_time(landlord, None, datetime(2026, 7, 25, 17, 0)) == OUT_OF_HOURS
+
+
 def test_add_co_host_to_lease(landlord):
     """Co-landlord/co-host recorded on the lease + shown on the agreement."""
     from rentium.leases.documents import render_lease
