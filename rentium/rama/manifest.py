@@ -31,6 +31,10 @@ class FieldSpec:
     # For enum fields, the model method that renders the display value (e.g.
     # get_status_display) so RAMA can filter/read by the readable name.
     display: str = ""
+    # Phase 3: whether the generic `update` primitive may set this field.
+    # DEFAULT-DENY — a field is never writable unless this is explicitly True and
+    # the entity's edit_guard (below) allows editing in the instance's state.
+    editable: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,9 +62,24 @@ class EntitySpec:
     fields: list[FieldSpec] = field(default_factory=list)
     default_order: str = "-created_at"
     links: LinkSpec | None = None
+    # Phase 3: a predicate (instance) -> (allowed: bool, reason: str) gating ALL
+    # edits to an instance by its current state (e.g. a locked lease). None = no
+    # state gate (individual fields still need editable=True).
+    edit_guard: object = None
 
     def field_map(self) -> dict[str, FieldSpec]:
         return {f.name: f for f in self.fields}
+
+    def editable_map(self) -> dict[str, FieldSpec]:
+        return {f.name: f for f in self.fields if f.editable}
+
+
+def _lease_edit_guard(inst):
+    """A lease's fields are editable only while it isn't locked (ACTIVE+). Mirrors
+    the LeaseNotLocked permission so RAMA can never rewrite an executed lease."""
+    if inst.is_locked():
+        return False, "This lease is active/executed and can no longer be edited."
+    return True, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -74,20 +93,21 @@ PROPERTY = EntitySpec(
     label="Property / listing",
     scope_path="landlord",
     fields=[
-        FieldSpec("name", "Name"),
-        FieldSpec("status", "Status", "enum", display="get_status_display"),
+        FieldSpec("name", "Name", editable=True),
+        FieldSpec("status", "Status", "enum", display="get_status_display",
+                  editable=True),
         FieldSpec("property_category", "Category", "enum",
                   display="get_property_category_display"),
         FieldSpec("room_type", "Room type", "enum", display="get_room_type_display"),
         FieldSpec("unit_type", "Unit type", "enum", display="get_unit_type_display"),
-        FieldSpec("address", "Address"),
-        FieldSpec("city", "City"),
-        FieldSpec("province", "Province"),
-        FieldSpec("asking_rent", "Asking rent", "money"),
-        FieldSpec("is_publicly_visible", "Publicly visible", "bool"),
-        FieldSpec("neighbourhood", "Neighbourhood"),
-        FieldSpec("available_from", "Available from", "date"),
-        FieldSpec("description", "Description", filterable=False),
+        FieldSpec("address", "Address", editable=True),
+        FieldSpec("city", "City", editable=True),
+        FieldSpec("province", "Province", editable=True),
+        FieldSpec("asking_rent", "Asking rent", "money", editable=True),
+        FieldSpec("is_publicly_visible", "Publicly visible", "bool", editable=True),
+        FieldSpec("neighbourhood", "Neighbourhood", editable=True),
+        FieldSpec("available_from", "Available from", "date", editable=True),
+        FieldSpec("description", "Description", filterable=False, editable=True),
     ],
     links=LinkSpec(
         page="/dashboard/properties/{id}",
@@ -114,17 +134,22 @@ LEASE = EntitySpec(
         FieldSpec("security_deposit", "Security deposit", "money"),
         FieldSpec("pet_deposit", "Pet deposit", "money"),
         FieldSpec("cleaning_fee", "Cleaning fee", "money"),
-        FieldSpec("pets_allowed", "Pets allowed", "bool"),
-        FieldSpec("smoking_allowed", "Smoking allowed", "bool"),
-        FieldSpec("parking_included", "Parking included", "bool"),
-        FieldSpec("rent_due_day", "Rent due day", "number"),
+        FieldSpec("pets_allowed", "Pets allowed", "bool", editable=True),
+        FieldSpec("smoking_allowed", "Smoking allowed", "bool", editable=True),
+        FieldSpec("parking_included", "Parking included", "bool", editable=True),
+        FieldSpec("rent_due_day", "Rent due day", "number", editable=True),
         FieldSpec("landlord_signed", "Landlord signed", "bool"),
-        FieldSpec("move_in_date", "Move-in date", "date"),
-        FieldSpec("move_out_date", "Move-out date", "date"),
-        FieldSpec("etransfer_email", "e-Transfer email"),
+        FieldSpec("move_in_date", "Move-in date", "date", editable=True),
+        FieldSpec("move_out_date", "Move-out date", "date", editable=True),
+        FieldSpec("etransfer_email", "e-Transfer email", editable=True),
+        FieldSpec("landlord_service_email", "Landlord notice email",
+                  editable=True),
+        FieldSpec("landlord_daytime_phone", "Landlord daytime phone",
+                  editable=True),
         FieldSpec("common_space_shared_with", "Shared areas used by", "json",
                   filterable=False),
     ],
+    edit_guard=_lease_edit_guard,
     links=LinkSpec(
         page="/dashboard/leases/{id}",
         lookup=("lease_number",),

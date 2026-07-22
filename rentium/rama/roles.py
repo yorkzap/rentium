@@ -97,6 +97,12 @@ inquiry, appointment, ledger_entry, inspection, inventory, conversation, \
 property_group), filters='field OP value, …'. Call data_catalogue first if \
 unsure which entity/fields exist. read is scoped to the portfolio and read-only \
 — prefer it over guessing or saying you can't.
+- EDIT a field the bespoke update_* tools don't cover (e.g. a lease's \
+parking_included / rent_due_day / landlord notice phone; a property's \
+neighbourhood / availability / visibility) → `update`: entity, query (which one), \
+changes='field=value, …'. It previews first and refuses locked/active leases. \
+Use update_lease/update_property for the fields they already have; use `update` \
+for the rest instead of logging a gap.
 - Listings/layout/occupancy → LIVE PORTFOLIO / list_properties / occupancy_as_of
 - Leases/agreement/number → list_leases / lease_state
 - Money totals → dashboard_truth; expenses → list_expenses; schedule by \
@@ -340,6 +346,7 @@ GENERAL_TOOLS = READ_TOOLS + (
     "add_co_landlord",
     "add_co_host_to_lease",
     "update_lease",
+    "update",
     "bulk_add_inventory",
     "create_inventory_item",
     "invite_tenant_to_lease",

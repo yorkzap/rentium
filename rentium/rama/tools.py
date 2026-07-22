@@ -130,6 +130,20 @@ def link(landlord, entity: str = "", query: str = "") -> dict:
     return _fn(landlord, entity=entity, query=query)
 
 
+def update(landlord, entity: str = "", query: str = "", changes: str = "",
+           confirm: str = "") -> dict:
+    """Edit fields on ONE catalogued thing — use for a field the bespoke update_*
+    tools don't cover (e.g. a lease's parking_included, rent_due_day, landlord
+    notice phone/email; a property's neighbourhood, availability, visibility).
+    entity = 'lease' or 'property'; query identifies it (lease number / property
+    name); changes = comma list 'field=value, …' (see data_catalogue for editable
+    fields). Locked/active leases are refused. Previews first; confirm=yes to
+    apply. Example: entity='lease', query='RMT…', changes='parking_included=true,
+    rent_due_day=1'."""
+    from .domain_write import update as _fn
+    return _fn(landlord, entity=entity, query=query, changes=changes, confirm=confirm)
+
+
 def deliver_lease_pdf(landlord, lease_number: str = "",
                       property_query: str = "") -> dict:
     """Send the lease's signed PDF as an ACTUAL FILE attachment (use on a

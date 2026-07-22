@@ -71,6 +71,7 @@ TOOL_META: dict[str, ToolMeta] = {
     "log_capability_gap": ToolMeta(risk="low"),
     "list_capability_gaps": ToolMeta(risk="low"),
     "update_property": ToolMeta(risk="low"),
+    "update": ToolMeta(risk="medium"),  # generic manifest write (previewed)
     "delete_property": ToolMeta(
         risk="high", blockers=delete_property_blockers
     ),

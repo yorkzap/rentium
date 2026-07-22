@@ -1454,6 +1454,63 @@ def test_read_indirect_scope_is_safe(landlord, other_landlord):
     assert "My Lamp" in names and "Their Lamp" not in names
 
 
+def test_generic_update_previews_then_applies(landlord):
+    """Phase 3: the generic update previews, then applies manifest-editable fields
+    on confirm — closing gaps the bespoke update_* tools don't cover."""
+    lease = _draft_lease(landlord, name="GenUpdateRoom")
+
+    prev = registry.execute(
+        "update",
+        {"entity": "lease", "query": lease.lease_number,
+         "changes": "parking_included=true, rent_due_day=5"},
+        landlord=landlord,
+    )
+    assert prev.get("needs_confirm") is True
+
+    res = registry.execute(
+        "update",
+        {"entity": "lease", "query": lease.lease_number,
+         "changes": "parking_included=true, rent_due_day=5", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("updated") is True
+    lease.refresh_from_db()
+    assert lease.parking_included is True and lease.rent_due_day == 5
+
+
+def test_generic_update_guards_and_default_deny(landlord, other_landlord):
+    """update refuses: a locked lease (state guard), an undeclared/non-editable
+    field (default-deny), and another landlord's row (scope)."""
+    from rentium.leases.models import Lease
+
+    active = _draft_lease(landlord, name="LockedRoom")
+    active.status = Lease.LeaseStatus.ACTIVE
+    active.save(update_fields=["status"])
+    guard = registry.execute(
+        "update", {"entity": "lease", "query": active.lease_number,
+                   "changes": "parking_included=true", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert "error" in guard and "edited" in guard["error"].lower()
+
+    draft = _draft_lease(landlord, name="DenyRoom")
+    # total_rent is read-only in the manifest (rebalancing lives in update_lease)
+    deny = registry.execute(
+        "update", {"entity": "lease", "query": draft.lease_number,
+                   "changes": "total_rent=9999", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert "error" in deny and "edit" in deny["error"].lower()
+
+    theirs = _draft_lease(other_landlord, name="TheirEditRoom")
+    scope = registry.execute(
+        "update", {"entity": "lease", "query": theirs.lease_number,
+                   "changes": "parking_included=true", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert "error" in scope  # not in my portfolio → unresolvable
+
+
 def test_deliver_lease_pdf_returns_attachment_marker(landlord):
     """deliver_lease_pdf resolves the lease and emits an _attachment marker the
     channel fulfils (instead of pasting a broken /api/ URL)."""
