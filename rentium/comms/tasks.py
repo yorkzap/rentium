@@ -98,6 +98,15 @@ def handle_telegram_message(
         logger.warning("telegram message for missing landlord %s", landlord_id)
         return
 
+    # Resolve the portfolio to actually operate on. A CO-LANDLORD's own account
+    # may be empty (no properties / no working RAMA key); they link Telegram to
+    # manage an OWNER's portfolio. acting_landlord() lands on that owner (with the
+    # owner's RAMA config/key) — the same smart default the web panel uses — so
+    # the co-landlord's bot works without a separate key of their own.
+    from rentium.users.access import acting_landlord
+
+    landlord = acting_landlord(landlord.user) or landlord
+
     # A photo the landlord sent to the bot: download it, stage it as a RamaUpload
     # (landlord-scoped), and tell RAMA it's attached — the same note the web
     # paperclip adds — so it can attach_photo_to_listing it.
@@ -142,6 +151,12 @@ def handle_whatsapp_message(self, landlord_id: str, wa_id: str, text: str) -> No
     if landlord is None:
         logger.warning("whatsapp message for missing landlord %s", landlord_id)
         return
+
+    # Co-landlord support: operate on the portfolio they actually manage (owner's
+    # config/key), matching the web panel + Telegram. See handle_telegram_message.
+    from rentium.users.access import acting_landlord
+
+    landlord = acting_landlord(landlord.user) or landlord
 
     result = run_turn(
         landlord,

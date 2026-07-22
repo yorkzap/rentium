@@ -206,6 +206,44 @@ def test_handle_telegram_message_runs_general_and_replies(landlord, settings):
     assert sent.call_args[0] == ("42", "Rent is on track this month.")
 
 
+def test_co_landlord_telegram_acts_on_owner_portfolio(landlord):
+    """A co-landlord's Telegram (own account empty / no working key) operates on
+    the OWNER's portfolio — so it works using the owner's RAMA config."""
+    from rentium.properties.models import Property
+    from rentium.rama import registry
+    from rentium.users.models import LandlordProfile
+    from rentium.users.tests.factories import UserFactory
+
+    Property.objects.create(
+        landlord=landlord, name="OwnerRm", address="1 A St", city="Victoria",
+        province="bc", property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    co_user = UserFactory(email="cotel@rmail.ca")
+    co_profile = LandlordProfile.objects.create(user=co_user)  # empty own portfolio
+    registry.execute(
+        "add_co_landlord",
+        {"name": "Co", "email": "cotel@rmail.ca", "property_query": "OwnerRm",
+         "confirm": "yes"},
+        landlord=landlord,
+    )
+    co_user.refresh_from_db()
+
+    from rentium.comms.tasks import handle_telegram_message
+
+    captured = {}
+
+    def fake_run_turn(ld, *a, **k):
+        captured["landlord"] = ld
+        return mock.Mock(error=None, reply="ok")
+
+    with mock.patch("rentium.rama.service.run_turn", side_effect=fake_run_turn):
+        with mock.patch("rentium.comms.telegram.send_message"):
+            handle_telegram_message(str(co_profile.pk), "77", "hi")
+
+    assert captured["landlord"].pk == landlord.pk  # ran as the OWNER, not the co
+
+
 # ---------------------------------------------------------------- outbound
 def test_send_to_landlord_respects_category_prefs(landlord):
     from rentium.comms.services import send_to_landlord
