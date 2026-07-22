@@ -10,6 +10,7 @@ from rest_framework import serializers
 
 from rentium.leases.models import Lease
 from rentium.leases.models import LeaseDocument
+from rentium.leases.models import LeaseLandlordSignatory
 from rentium.leases.models import LeaseTenant
 from rentium.leases.models import Payment
 from rentium.leases.models import PaymentReminder
@@ -76,6 +77,29 @@ class RentAdjustmentSerializer(serializers.ModelSerializer):
         except DjangoValidationError as e:
             raise serializers.ValidationError(serializers.as_serializer_error(e))
         return data
+
+
+class LeaseLandlordSignatorySerializer(serializers.ModelSerializer):
+    """A co-landlord who is a signing party on the lease (read-only display)."""
+
+    display_name = serializers.CharField(read_only=True)
+    is_linked = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LeaseLandlordSignatory
+        fields = [
+            "id",
+            "display_name",
+            "name",
+            "email",
+            "phone",
+            "has_signed",
+            "signed_date",
+            "is_linked",
+        ]
+
+    def get_is_linked(self, obj):
+        return obj.member_id is not None
 
 
 class LeaseTenantSerializer(serializers.ModelSerializer):
@@ -649,6 +673,7 @@ class LeaseSerializer(serializers.ModelSerializer):
     group = serializers.PrimaryKeyRelatedField(read_only=True)
     # Nested resources — now correctly using the single consolidated LeaseTenantSerializer
     lease_tenants = LeaseTenantSerializer(many=True, read_only=True)
+    landlord_signatories = LeaseLandlordSignatorySerializer(many=True, read_only=True)
     additional_documents = LeaseDocumentSerializer(many=True, read_only=True)
     payments = PaymentSerializer(many=True, read_only=True)
     total_monthly_rent = serializers.DecimalField(
@@ -727,6 +752,7 @@ class LeaseSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "lease_tenants",
+            "landlord_signatories",
             "additional_documents",
             "payments",
             "total_rent",
@@ -756,6 +782,7 @@ class LeaseSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "lease_tenants",
+            "landlord_signatories",
             "additional_documents",
             "payments",
             "total_monthly_rent",

@@ -882,14 +882,22 @@ def _resolve_existing_tenant(landlord, email: str):
 
 
 def add_co_landlord(
-    landlord, *, name: str, email: str, remove: str = "", confirm: str = ""
+    landlord,
+    *,
+    name: str,
+    email: str,
+    property_query: str = "",
+    lease_number: str = "",
+    remove: str = "",
+    confirm: str = "",
 ) -> dict:
-    """Give a co-landlord / property manager ACCESS to this whole portfolio (they
-    sign in and manage the properties/leases). Different from add_co_host_to_lease
-    (which only records a name on one agreement). Invites by email; links
-    immediately if they already have an account. remove=yes revokes access."""
+    """Invite a co-landlord who signs in, manages, AND co-signs leases. SCOPE:
+    pass property_query to tie them to ONE property (and every room/lease in its
+    group) — every FUTURE lease there names them as a co-signing landlord; pass
+    lease_number to also add them as a co-signer on THAT existing lease (and grant
+    the property). Pass NEITHER for whole-portfolio access. Invites by email and
+    links immediately if they already have an account. remove=yes revokes."""
     from django.db.models import Q
-    from django.utils import timezone
 
     from rentium.users.models import LandlordTeamMember, User
 
@@ -901,30 +909,46 @@ def add_co_landlord(
     if email == own_email:
         return {"error": "That's your own account — you already have access."}
 
+    # Resolve scope. A lease_number implies its property; a property_query scopes
+    # to that property (+ its group). Nothing given = whole portfolio.
+    lease = None
+    scope_property = None
+    if lease_number:
+        lease, err = _resolve_lease(landlord, lease_number=lease_number)
+        if err:
+            return _prop_err(err)
+        scope_property = lease.property
+    elif property_query:
+        scope_property, err = _resolve_property(landlord, property_query)
+        if err:
+            return _prop_err(err)
+
+    scope_label = (
+        f"{scope_property.name} (and its group)" if scope_property else "whole portfolio"
+    )
     existing_user = User.objects.filter(email__iexact=email).first()
     removing = str(remove or "").strip().lower() in ("1", "true", "yes", "y")
 
+    base = LandlordTeamMember.objects.filter(owner=landlord).filter(
+        Q(invited_email__iexact=email) | Q(member__email__iexact=email)
+    )
+    if scope_property is not None:
+        base = base.filter(scope_property=scope_property)
+
     if removing:
-        qs = LandlordTeamMember.objects.filter(owner=landlord).filter(
-            Q(invited_email__iexact=email)
-            | Q(member__email__iexact=email)
-        )
-        if not qs.exists():
-            return {"error": f"{email} is not a co-landlord on your portfolio."}
+        if not base.exists():
+            return {"error": f"{email} is not a co-landlord on {scope_label}."}
         if not _confirmed(confirm):
             return _preview(
                 "add_co_landlord",
-                {"action": f"revoke access for {email}"},
-                "Removes their access to your portfolio. confirm=yes.",
+                {"action": f"revoke {email}'s access to {scope_label}"},
+                "Removes their access. confirm=yes.",
             )
-        qs.delete()
-        return {"updated": True, "note": f"Revoked {email}'s access."}
+        base.delete()
+        return {"updated": True, "note": f"Revoked {email}'s access to {scope_label}."}
 
-    already = LandlordTeamMember.objects.filter(owner=landlord).filter(
-        Q(invited_email__iexact=email) | Q(member__email__iexact=email)
-    ).first()
-    if already:
-        return {"error": f"{email} is already a co-landlord on your portfolio."}
+    if base.exists():
+        return {"error": f"{email} is already a co-landlord on {scope_label}."}
 
     if not _confirmed(confirm):
         return _preview(
@@ -932,43 +956,46 @@ def add_co_landlord(
             {
                 "co_landlord": name or email,
                 "email": email,
-                "access": "full portfolio (manage properties, leases, etc.)",
+                "scope": scope_label,
+                "access": "manage + co-sign leases here",
+                "co_signs_lease": lease.lease_number if lease else None,
+                "future_leases": "will name them as a co-signing landlord"
+                if scope_property
+                else "n/a (portfolio-wide)",
                 "status": "linked now (they have an account)"
                 if existing_user
                 else "invited — access starts when they sign up with this email",
             },
-            "Grants portfolio access to a co-landlord. confirm=yes.",
+            "Grants a co-landlord access and co-signing. confirm=yes.",
         )
 
-    member = LandlordTeamMember(
-        owner=landlord, invited_email=email, invited_name=name[:150]
+    from rentium.leases.services import grant_co_landlord
+
+    _member, _created, emailed = grant_co_landlord(
+        landlord, name=name, email=email, scope_property=scope_property, lease=lease
     )
-    if existing_user is not None:
-        member.member = existing_user
-        member.accepted_at = timezone.now()  # immediate access on next login
-    member.save()
+    signs_lease = lease.lease_number if lease is not None else None
 
-    # Actually notify them — without this the invite was a silent DB row and the
-    # co-landlord never received anything.
-    emailed = False
-    try:
-        from rentium.showcase.emails import send_co_landlord_invite
-
-        emailed = send_co_landlord_invite(member)
-    except Exception:  # email must never block the grant
-        emailed = False
-
+    where = (
+        f"{scope_property.name} and every lease in its group"
+        if scope_property
+        else "your whole portfolio"
+    )
+    note = (
+        (f"{email} now has access to {where}"
+         if existing_user
+         else f"Invited {email} to co-manage {where} — access starts when they sign up with that email")
+        + (f"; they're a co-signer on {signs_lease}" if signs_lease else "")
+        + (f", and an invite email was sent." if emailed
+           else ". (Couldn't send the invite email — tell them to sign up with that email.)")
+    )
     return {
         "invited": True,
         "linked_now": bool(existing_user),
         "emailed": emailed,
-        "note": (
-            (f"{email} now has access to your portfolio"
-             if existing_user
-             else f"Invited {email} — they get access as soon as they sign up with that email")
-            + (f", and an invite email was sent to {email}." if emailed
-               else f". (Couldn't send the invite email — tell them to sign {'in' if existing_user else 'up'} with {email}.)")
-        ),
+        "scope": scope_label,
+        "co_signs_lease": signs_lease,
+        "note": note,
     }
 
 

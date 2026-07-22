@@ -1,29 +1,43 @@
 """
-Owner-scope resolution for co-landlords / property managers.
+Access resolution for co-landlords / property managers.
 
-ONE place decides "which landlord portfolios may this user act on", so the
-co-landlord feature can be applied surface-by-surface and always fails CLOSED:
-a viewset that hasn't been switched to these helpers keeps scoping to the user's
-own profile and grants no extra access.
+ONE place decides what a user may act on, so co-landlord access can be applied
+surface-by-surface and always fails CLOSED: a surface that doesn't consult these
+helpers keeps scoping to the user's own profile and grants no extra access.
 
-  - owner_profiles_for(user)      → every LandlordProfile the user may touch
-  - accessible_landlord_ids(user) → their pks, for READ querysets
-                                     (Model.objects.filter(landlord_id__in=...))
-  - acting_landlord(user, owner_id=None) → the SINGLE profile to act AS for a
-                                     WRITE (create/update). Own profile by
-                                     default; a managed owner if the user has no
-                                     own profile or explicitly selects one they
-                                     are allowed to.
+Scope model (users.LandlordTeamMember):
+  - both scope fields null  → WHOLE portfolio of `owner` (office manager / partner)
+  - scope_property set       → that property + every sibling in its PropertyGroup
+  - scope_group set          → the whole PropertyGroup
+
+Owner-level helpers (unchanged names, used by RAMA acting-as):
+  - owner_profiles_for(user)      → LandlordProfiles the user may act on
+  - accessible_landlord_ids(user) → their pks
+  - acting_landlord(user, owner_id=None) → the single profile to WRITE as
+
+Property/lease-level helpers (used by the dashboard viewsets):
+  - accessible_properties(user)  → Property queryset (own + granted)
+  - accessible_leases(user)      → Lease queryset (own + granted, group-aware)
 """
 
 from __future__ import annotations
 
 
+def _accepted_grants(user):
+    """Accepted co-landlord grants for this user (queryset, possibly empty)."""
+    from .models import LandlordTeamMember
+
+    if user is None or not getattr(user, "is_authenticated", False):
+        return LandlordTeamMember.objects.none()
+    return LandlordTeamMember.objects.filter(
+        member=user, accepted_at__isnull=False
+    ).select_related("scope_property", "scope_group")
+
+
 def owner_profiles_for(user):
     """LandlordProfiles this user may act on: their own (if any) + owners they
-    co-manage via an ACCEPTED team membership. Returns a queryset (possibly
-    empty)."""
-    from .models import LandlordProfile, LandlordTeamMember
+    co-manage via an ACCEPTED grant (any scope). Returns a queryset."""
+    from .models import LandlordProfile
 
     if user is None or not getattr(user, "is_authenticated", False):
         return LandlordProfile.objects.none()
@@ -32,24 +46,19 @@ def owner_profiles_for(user):
     own = getattr(user, "landlord_profile", None)
     if own is not None:
         ids.add(own.pk)
-    ids.update(
-        LandlordTeamMember.objects.filter(
-            member=user, accepted_at__isnull=False
-        ).values_list("owner_id", flat=True)
-    )
+    ids.update(_accepted_grants(user).values_list("owner_id", flat=True))
     return LandlordProfile.objects.filter(pk__in=ids)
 
 
 def accessible_landlord_ids(user) -> list:
-    """The pk list for read scoping. Empty = no access (fails closed)."""
+    """The pk list of owner profiles the user may act on. Empty = no access."""
     return list(owner_profiles_for(user).values_list("pk", flat=True))
 
 
 def acting_landlord(user, owner_id=None):
     """The single profile the user acts AS (writes / RAMA). Own profile by
-    default; a specific managed owner if `owner_id` is one they're allowed to;
-    a pure manager with no own profile acts as the owner they manage. None if
-    the user has no landlord access at all."""
+    default; a specific managed owner if `owner_id` is allowed; a pure manager
+    with no own profile acts as the owner they manage. None if no access."""
     profiles = list(owner_profiles_for(user))
     if not profiles:
         return None
@@ -59,4 +68,77 @@ def acting_landlord(user, owner_id=None):
     own = getattr(user, "landlord_profile", None)
     if own is not None:
         return own
-    return profiles[0]  # a pure manager managing a single owner
+    return profiles[0]
+
+
+def _access_scopes(user):
+    """Resolve a user's grants into concrete id sets:
+      full_owner_ids  – owners whose ENTIRE portfolio is accessible
+      property_ids    – individually-granted property pks
+      group_ids       – granted group pks (property-scoped grants expand to their
+                        group; group-scoped grants add the group directly)
+    """
+    full_owner_ids: set = set()
+    property_ids: set = set()
+    group_ids: set = set()
+    for g in _accepted_grants(user):
+        if g.scope_property_id is None and g.scope_group_id is None:
+            full_owner_ids.add(g.owner_id)
+        if g.scope_group_id is not None:
+            group_ids.add(g.scope_group_id)
+        if g.scope_property_id is not None:
+            property_ids.add(g.scope_property_id)
+            if g.scope_property is not None and g.scope_property.group_id:
+                group_ids.add(g.scope_property.group_id)
+    return full_owner_ids, property_ids, group_ids
+
+
+def accessible_properties(user):
+    """Property queryset the user may see: their own + every granted property
+    (property grants expand to their whole group; group grants to the group;
+    portfolio grants to all of that owner's properties)."""
+    from django.db.models import Q
+
+    from rentium.properties.models import Property
+
+    if user is None or not getattr(user, "is_authenticated", False):
+        return Property.objects.none()
+
+    q = Q(pk__in=[])  # start empty
+    own = getattr(user, "landlord_profile", None)
+    if own is not None:
+        q |= Q(landlord=own)
+    full_owner_ids, property_ids, group_ids = _access_scopes(user)
+    if full_owner_ids:
+        q |= Q(landlord_id__in=full_owner_ids)
+    if group_ids:
+        q |= Q(group_id__in=group_ids)
+    if property_ids:
+        q |= Q(pk__in=property_ids)
+    return Property.objects.filter(q).distinct()
+
+
+def accessible_leases(user):
+    """Lease queryset the user may see, scoped the same way as properties.
+    Group-aware: a lease attached to a granted group (even with no property) is
+    included, and older leases on a granted property are included for
+    management/messaging even if the co-landlord isn't named on them."""
+    from django.db.models import Q
+
+    from rentium.leases.models import Lease
+
+    if user is None or not getattr(user, "is_authenticated", False):
+        return Lease.objects.none()
+
+    q = Q(pk__in=[])
+    own = getattr(user, "landlord_profile", None)
+    if own is not None:
+        q |= Q(landlord=own)
+    full_owner_ids, property_ids, group_ids = _access_scopes(user)
+    if full_owner_ids:
+        q |= Q(landlord_id__in=full_owner_ids)
+    if group_ids:
+        q |= Q(group_id__in=group_ids) | Q(property__group_id__in=group_ids)
+    if property_ids:
+        q |= Q(property_id__in=property_ids)
+    return Lease.objects.filter(q).distinct()

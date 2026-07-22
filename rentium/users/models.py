@@ -109,6 +109,24 @@ class LandlordTeamMember(models.Model):
     invited_email = EmailField(blank=True, default="")
     invited_name = CharField(max_length=150, blank=True, default="")
     role = CharField(max_length=20, choices=Role.choices, default=Role.MANAGER)
+    # Scope of access. Both null = whole portfolio (legacy / office manager).
+    # `property` set = that property + any siblings in its group. `group` set =
+    # the whole group. A scoped co-landlord also becomes a co-signer on FUTURE
+    # leases created on the scoped property/group (see leases.signals).
+    scope_property = ForeignKey(
+        "properties.Property",
+        on_delete=CASCADE,
+        null=True,
+        blank=True,
+        related_name="co_landlord_grants",
+    )
+    scope_group = ForeignKey(
+        "properties.PropertyGroup",
+        on_delete=CASCADE,
+        null=True,
+        blank=True,
+        related_name="co_landlord_grants",
+    )
     invite_token = models.UUIDField(default=_uuid.uuid4, editable=False)
     accepted_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -116,9 +134,9 @@ class LandlordTeamMember(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["owner", "member"],
+                fields=["owner", "member", "scope_property", "scope_group"],
                 condition=models.Q(member__isnull=False),
-                name="uniq_team_owner_member",
+                name="uniq_team_owner_member_scope",
             ),
         ]
 

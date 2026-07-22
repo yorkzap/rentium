@@ -10,6 +10,98 @@ lives here instead.
 from decimal import Decimal
 
 
+def co_landlord_grants_for_lease(lease):
+    """LandlordTeamMember grants that make someone a co-landlord on THIS lease:
+    a grant on the lease's property, or on its group. Portfolio-wide grants are
+    NOT included — an office manager with blanket access isn't automatically a
+    named signing party on every agreement."""
+    from django.db.models import Q
+
+    from rentium.users.models import LandlordTeamMember
+
+    scope = Q()
+    if lease.property_id:
+        scope |= Q(scope_property_id=lease.property_id)
+        if lease.property and lease.property.group_id:
+            scope |= Q(scope_group_id=lease.property.group_id)
+    if lease.group_id:
+        scope |= Q(scope_group_id=lease.group_id)
+    if not scope:
+        return LandlordTeamMember.objects.none()
+    return LandlordTeamMember.objects.filter(
+        Q(owner=lease.landlord) & scope
+    ).select_related("member")
+
+
+def sync_lease_landlord_signatories(lease):
+    """Ensure every property/group co-landlord of `lease` is a signing party on
+    it. Idempotent — adds missing LeaseLandlordSignatory rows, never removes.
+    Called when a lease is created (and can be re-run safely)."""
+    from rentium.leases.models import LeaseLandlordSignatory
+
+    existing_emails = {
+        (s.email or "").lower()
+        for s in lease.landlord_signatories.all()
+    }
+    existing_members = {
+        s.member_id for s in lease.landlord_signatories.all() if s.member_id
+    }
+    created = []
+    for g in co_landlord_grants_for_lease(lease):
+        email = (g.invited_email or (g.member.email if g.member_id else "")).lower()
+        if email and email in existing_emails:
+            continue
+        if g.member_id and g.member_id in existing_members:
+            continue
+        created.append(
+            LeaseLandlordSignatory.objects.create(
+                lease=lease,
+                member=g.member if g.member_id else None,
+                name=g.invited_name or (g.member.name if g.member_id else ""),
+                email=email,
+            )
+        )
+    return created
+
+
+def grant_co_landlord(owner, *, name, email, scope_property=None, lease=None):
+    """Create (or reuse) a co-landlord grant and, if a lease is given, make them a
+    co-signer on it — the ONE place both RAMA and the dashboard invite flows call,
+    so the DB write, account-linking and invite email stay identical. Returns
+    (member, created, emailed)."""
+    from django.utils import timezone
+
+    from rentium.users.models import LandlordTeamMember, User
+
+    email = (email or "").strip().lower()
+    prop = scope_property or (lease.property if lease is not None else None)
+    existing_user = User.objects.filter(email__iexact=email).first()
+
+    member, created = LandlordTeamMember.objects.get_or_create(
+        owner=owner,
+        invited_email=email,
+        scope_property=prop,
+        scope_group=None,
+        defaults={"invited_name": (name or "")[:150]},
+    )
+    if existing_user is not None and member.member_id is None:
+        member.member = existing_user
+        member.accepted_at = timezone.now()  # immediate access on next login
+        member.save(update_fields=["member", "accepted_at"])
+
+    if lease is not None:
+        sync_lease_landlord_signatories(lease)
+
+    emailed = False
+    try:
+        from rentium.showcase.emails import send_co_landlord_invite
+
+        emailed = send_co_landlord_invite(member)
+    except Exception:  # email must never block the grant
+        emailed = False
+    return member, created, emailed
+
+
 def compute_rent_split(rows, total_rent):
     """
     The single source of truth for the "equal split with manual override

@@ -214,6 +214,8 @@ class LeaseViewSet(viewsets.ModelViewSet):
         return LeaseSerializer
 
     def get_queryset(self):
+        from rentium.users.access import accessible_leases
+
         user = self.request.user
         base_queryset = Lease.objects.select_related(
             "property", "group", "landlord__user"
@@ -221,12 +223,18 @@ class LeaseViewSet(viewsets.ModelViewSet):
             "lease_tenants__tenant__user",
             "lease_tenants__room",
             "lease_tenants__rent_adjustments",
+            "landlord_signatories__member",
             "additional_documents",
             "payments__tenant__user",
         )
 
-        if hasattr(user, "landlord_profile"):
-            return base_queryset.filter(landlord=user.landlord_profile)
+        # A landlord sees their own leases plus any granted to them as a
+        # co-landlord (scoped to a property/group). Falls closed for everyone
+        # else via accessible_leases returning an empty queryset.
+        accessible = accessible_leases(user)
+        if accessible.exists() or hasattr(user, "landlord_profile"):
+            allowed_ids = list(accessible.values_list("pk", flat=True))
+            return base_queryset.filter(pk__in=allowed_ids)
 
         if hasattr(user, "tenant_profile"):
             return base_queryset.filter(
@@ -904,6 +912,53 @@ class LeaseViewSet(viewsets.ModelViewSet):
         lease.check_and_activate()
 
         return Response(self.get_serializer(lease).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated])
+    def co_landlord_sign(self, request, pk=None):
+        """A co-landlord (additional signing party) signs the lease. The lease
+        only activates once the owner AND every co-landlord AND a tenant have
+        signed (Lease.check_and_activate)."""
+        lease = self.get_object()  # get_queryset already scopes to co-landlords
+
+        if lease.is_locked():
+            raise PermissionDenied("This lease is already fully executed.")
+
+        sig = lease.landlord_signatories.filter(member=request.user).first()
+        if sig is None:
+            raise PermissionDenied("You are not a co-landlord on this lease.")
+        if sig.has_signed:
+            raise ValidationError("You have already signed this lease.")
+        if not lease.rent_is_fully_allocated():
+            raise ValidationError(
+                f"This lease's rent isn't fully assigned yet — "
+                f"${lease.get_unallocated_rent()} of ${lease.total_rent} is still "
+                f"unassigned across tenants."
+            )
+
+        sig.sign()  # marks signed + attempts activation
+        return Response(self.get_serializer(lease).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsLandlordOwner])
+    def invite_co_landlord(self, request, pk=None):
+        """Invite a co-landlord to co-sign THIS lease (and grant its property, so
+        future leases there name them too). Mirrors the RAMA add_co_landlord flow."""
+        from rentium.leases.services import grant_co_landlord
+
+        lease = self.get_object()
+        name = (request.data.get("name") or "").strip()
+        email = (request.data.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            raise ValidationError("A valid email is required.")
+        own = getattr(request.user, "email", "").lower()
+        if email == own:
+            raise ValidationError("That's your own account.")
+        _member, _created, emailed = grant_co_landlord(
+            lease.landlord, name=name, email=email, lease=lease
+        )
+        lease.refresh_from_db()
+        data = self.get_serializer(lease).data
+        data["_emailed"] = emailed
+        return Response(data)
 
     @action(detail=True, methods=["post"], url_path="preview-split")
     def preview_split(self, request, pk=None):

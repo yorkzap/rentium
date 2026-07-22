@@ -521,7 +521,12 @@ class Lease(AgreementTerms):
         if self.status != Lease.LeaseStatus.PENDING_SIGNATURES:
             return False
         any_tenant_signed = self.lease_tenants.filter(has_signed=True).exists()
-        if self.landlord_signed and any_tenant_signed:
+        # Every additional co-landlord on the lease must also have signed —
+        # the owner alone can't activate a lease that names co-signers.
+        all_co_landlords_signed = not self.landlord_signatories.filter(
+            has_signed=False
+        ).exists()
+        if self.landlord_signed and all_co_landlords_signed and any_tenant_signed:
             self.status = Lease.LeaseStatus.ACTIVE
             self.save(update_fields=["status", "updated_at"])
             self.clip_overlapping_month_to_month_leases()
@@ -1106,6 +1111,64 @@ class LeaseTenant(models.Model):
             return None
         base = frontend_base_url.rstrip("/")
         return f"{base}/invite/{self.id}?token={self.invite_token}"
+
+
+class LeaseLandlordSignatory(models.Model):
+    """A co-landlord who is a signing party on ONE lease.
+
+    The lease's OWNER still signs via Lease.landlord_signed; each additional
+    co-landlord gets a row here and signs it. The lease only activates once the
+    owner AND every signatory (AND at least one tenant) have signed
+    (see Lease.check_and_activate). Invited by email; `member` links once they
+    have (or claim) an account, mirroring LeaseTenant's invite→claim flow.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    lease = models.ForeignKey(
+        Lease, on_delete=models.CASCADE, related_name="landlord_signatories"
+    )
+    member = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="lease_landlord_signatures",
+        help_text=_("Set once the invited co-landlord has an account."),
+    )
+    name = models.CharField(max_length=150, blank=True, default="")
+    email = models.EmailField(blank=True, default="")
+    phone = models.CharField(max_length=32, blank=True, default="")
+    invite_token = models.UUIDField(default=uuid.uuid4, editable=False)
+    has_signed = models.BooleanField(default=False)
+    signed_date = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["lease", "email"],
+                condition=models.Q(email__gt=""),
+                name="uniq_lease_signatory_email",
+            ),
+        ]
+
+    def __str__(self):
+        who = self.name or self.email or self.member_id or "?"
+        return f"Co-landlord {who} on {self.lease_id}"
+
+    @property
+    def display_name(self):
+        if self.member_id and self.member.name:
+            return self.member.name
+        return self.name or self.email
+
+    def sign(self):
+        """Mark this co-landlord's signature and try to activate the lease."""
+        self.has_signed = True
+        self.signed_date = timezone.now()
+        self.save(update_fields=["has_signed", "signed_date", "updated_at"])
+        self.lease.check_and_activate()
 
 
 class RentAdjustment(models.Model):

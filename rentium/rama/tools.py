@@ -1460,15 +1460,28 @@ def add_co_host_to_lease(
     confirm="Leave empty to preview; 'yes' to apply.",
 )
 def add_co_landlord(
-    landlord, name: str = "", email: str = "", remove: str = "", confirm: str = ""
+    landlord,
+    name: str = "",
+    email: str = "",
+    property_query: str = "",
+    lease_number: str = "",
+    remove: str = "",
+    confirm: str = "",
 ) -> dict:
-    """Give a co-landlord / property manager ACCESS to the whole portfolio — they
-    sign in and manage the properties/leases. Use for 'add a co-landlord / give
-    someone access to manage my properties'. This is DIFFERENT from
-    add_co_host_to_lease (which only prints a name on one agreement). Invites by
-    email; links immediately if they already have an account. Preview; confirm=yes."""
+    """Invite a co-landlord who signs in, manages properties/leases, AND co-signs
+    leases. Use for 'add a co-landlord / give someone access to manage my
+    properties / add another landlord to this property or lease'. SCOPE it:
+    property_query = tie them to ONE property + its group (every FUTURE lease
+    there names them as a co-signing landlord); lease_number = ALSO co-sign that
+    existing lease and grant its property; NEITHER = whole-portfolio access. The
+    lease only activates once every landlord (incl. co-signers) and a tenant sign.
+    Invites by email; links immediately if they already have an account.
+    Preview; confirm=yes."""
     from .domain_actions import add_co_landlord as _fn
-    return _fn(landlord, name=name, email=email, remove=remove, confirm=confirm)
+    return _fn(
+        landlord, name=name, email=email, property_query=property_query,
+        lease_number=lease_number, remove=remove, confirm=confirm,
+    )
 
 
 def list_co_landlords(landlord) -> dict:

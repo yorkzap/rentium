@@ -72,11 +72,14 @@ class PropertyViewSet(viewsets.ModelViewSet):
         return PropertySerializer
 
     def get_queryset(self):
+        from rentium.users.access import accessible_properties
+
         user = self.request.user
-        if hasattr(user, "landlord_profile"):
-            # Update prefetching for new M2M relations and related_names
+        accessible = accessible_properties(user)
+        if accessible.exists() or hasattr(user, "landlord_profile"):
+            # own properties + any granted to this user as a co-landlord
             return (
-                Property.objects.filter(landlord=user.landlord_profile)
+                accessible
                 .select_related(
                     "group", "landlord__user"
                 )  # Select related landlord user for name
@@ -106,6 +109,29 @@ class PropertyViewSet(viewsets.ModelViewSet):
         if not hasattr(self.request.user, "landlord_profile"):
             raise PermissionDenied("Only Landlords can create properties.")
         serializer.save(landlord=self.request.user.landlord_profile)
+
+    @action(detail=True, methods=["post"])
+    def invite_co_landlord(self, request, pk=None):
+        """Invite a co-landlord scoped to THIS property (and its group). Every
+        future lease on it names them as a co-signing landlord; they can manage
+        and message its existing tenants. Owner only."""
+        from rentium.leases.services import grant_co_landlord
+
+        prop = self.get_object()
+        if not hasattr(request.user, "landlord_profile") or (
+            prop.landlord_id != request.user.landlord_profile.id
+        ):
+            raise PermissionDenied("Only the property owner can invite co-landlords.")
+        name = (request.data.get("name") or "").strip()
+        email = (request.data.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            raise ValidationError("A valid email is required.")
+        if email == getattr(request.user, "email", "").lower():
+            raise ValidationError("That's your own account.")
+        _member, _created, emailed = grant_co_landlord(
+            prop.landlord, name=name, email=email, scope_property=prop
+        )
+        return Response({"invited": True, "emailed": emailed, "email": email})
 
     def get_serializer_context(self):
         """Add request and property instance (if applicable) to context."""

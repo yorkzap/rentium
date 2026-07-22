@@ -153,15 +153,26 @@ def tenant_rows(lease) -> list[Row]:
 
 
 def co_host_rows(lease) -> list[Row]:
-    """Co-hosts / co-landlords recorded on the lease — additional landlord
-    parties shown on the agreement."""
+    """Co-landlords on the lease — additional landlord parties shown on the
+    agreement. Prefers the real signatory records (co-signers) and falls back to
+    the lightweight co_hosts JSON (name-only, legacy)."""
     rows = []
-    for h in lease.co_hosts or []:
-        name = (h.get("name") or "").strip()
+    seen = set()
+    for sig in lease.landlord_signatories.all():
+        name = (sig.display_name or "").strip()
         if not name:
             continue
+        seen.add(name.lower())
+        contact = " · ".join(p for p in [sig.email, sig.phone] if p)
+        rows.append(
+            Row("Co-landlord", f"{name}{f' — {contact}' if contact else ''}")
+        )
+    for h in lease.co_hosts or []:
+        name = (h.get("name") or "").strip()
+        if not name or name.lower() in seen:
+            continue
         contact = " · ".join(p for p in [h.get("email", ""), h.get("phone", "")] if p)
-        rows.append(Row("Co-host", f"{name}{f' — {contact}' if contact else ''}"))
+        rows.append(Row("Co-landlord", f"{name}{f' — {contact}' if contact else ''}"))
     return rows
 
 

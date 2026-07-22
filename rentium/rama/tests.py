@@ -1466,6 +1466,146 @@ def _draft_lease(landlord, name="InviteRoom"):
     )
 
 
+def test_co_landlord_sees_and_signs_lease_via_api(landlord, other_landlord):
+    """End-to-end through the real API: an invited co-landlord signs up, the lease
+    shows up in their /api/leases/ list, they can co-sign it, and a stranger
+    landlord cannot see it."""
+    from rentium.leases.models import Lease
+
+    from rentium.leases.models import LeaseTenant
+    from rentium.users.models import TenantProfile
+
+    lease = _draft_lease(landlord, name="ApiCoSignRoom")
+    tp = TenantProfile.objects.create(user=UserFactory(email="apitenant@example.com"))
+    LeaseTenant.objects.create(
+        lease=lease, tenant=tp, rent_amount=lease.total_rent,
+        invited_email="apitenant@example.com",
+    )
+    registry.execute(
+        "add_co_landlord",
+        {"name": "Api Co", "email": "apico@example.com",
+         "lease_number": lease.lease_number, "confirm": "yes"},
+        landlord=landlord,
+    )
+    from rentium.users.models import LandlordProfile
+
+    co_user = UserFactory(email="apico@example.com")
+    LandlordProfile.objects.create(user=co_user)  # they're a landlord too
+    co_client = APIClient()
+    co_client.force_authenticate(user=co_user)
+
+    listed = co_client.get("/api/leases/").json()
+    rows = listed if isinstance(listed, list) else listed.get("results", listed)
+    assert any(r["id"] == str(lease.id) for r in rows)
+
+    # stranger landlord cannot see it
+    stranger = _client_for(other_landlord).get("/api/leases/").json()
+    srows = stranger if isinstance(stranger, list) else stranger.get("results", stranger)
+    assert all(r["id"] != str(lease.id) for r in srows)
+
+    # co-landlord signs their signatory row
+    resp = co_client.post(f"/api/leases/{lease.id}/co_landlord_sign/")
+    assert resp.status_code == 200, resp.content
+    lease.refresh_from_db()
+    assert lease.landlord_signatories.get(email="apico@example.com").has_signed
+
+
+def test_co_landlord_property_scope_access_and_group(landlord, other_landlord):
+    """A property-scoped co-landlord sees that property + its group siblings and
+    those leases — not the owner's other properties, and nothing of a stranger."""
+    from rentium.leases.models import Lease
+    from rentium.properties.models import PropertyGroup
+    from rentium.users.access import accessible_leases, accessible_properties
+
+    group = PropertyGroup.objects.create(landlord=landlord, name="Unit 1")
+    room_a = _room(landlord, "Room A", group=group)
+    room_b = _room(landlord, "Room B", group=group)
+    other_prop = _room(landlord, "Unrelated Room")  # same owner, different unit
+    lease_b = Lease.objects.create(
+        landlord=landlord, property=room_b,
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.DRAFT, start_date=date(2026, 9, 1),
+        is_month_to_month=True, total_rent="800.00",
+    )
+
+    registry.execute(
+        "add_co_landlord",
+        {"name": "Sarbjeet Kaur", "email": "scope@example.com",
+         "property_query": "Room A", "confirm": "yes"},
+        landlord=landlord,
+    )
+    u = UserFactory(email="scope@example.com")  # signs up → auto-linked
+
+    prop_ids = set(accessible_properties(u).values_list("id", flat=True))
+    assert room_a.id in prop_ids and room_b.id in prop_ids  # group sibling included
+    assert other_prop.id not in prop_ids  # owner's other unit is NOT visible
+
+    lease_ids = set(accessible_leases(u).values_list("id", flat=True))
+    assert lease_b.id in lease_ids  # older lease on the group is manageable
+
+
+def test_co_landlord_on_lease_cosigns_before_activation(landlord):
+    """Invite a co-landlord ON a lease → they're a signatory; the lease will not
+    activate until BOTH landlords and a tenant have signed."""
+    from rentium.leases.models import Lease, LeaseLandlordSignatory, LeaseTenant
+    from rentium.users.models import TenantProfile
+
+    lease = _draft_lease(landlord, name="CoSignRoom")
+    lease.status = Lease.LeaseStatus.PENDING_SIGNATURES
+    lease.save(update_fields=["status"])
+    tp = TenantProfile.objects.create(user=UserFactory(email="t@example.com"))
+    lt = LeaseTenant.objects.create(
+        lease=lease, tenant=tp, rent_amount=lease.total_rent,
+        invited_email="t@example.com",
+    )
+
+    registry.execute(
+        "add_co_landlord",
+        {"name": "Co Signer", "email": "cosign@example.com",
+         "lease_number": lease.lease_number, "confirm": "yes"},
+        landlord=landlord,
+    )
+    sig = LeaseLandlordSignatory.objects.get(lease=lease, email="cosign@example.com")
+
+    # Owner + tenant sign — still NOT active because the co-landlord hasn't signed
+    lease.landlord_signed = True
+    lease.save(update_fields=["landlord_signed"])
+    lt.sign()
+    lease.refresh_from_db()
+    assert lease.status == Lease.LeaseStatus.PENDING_SIGNATURES
+
+    # Co-landlord signs up (links the signatory) and signs → now ACTIVE
+    u = UserFactory(email="cosign@example.com")
+    sig.refresh_from_db()
+    assert sig.member_id == u.id
+    sig.sign()
+    lease.refresh_from_db()
+    assert lease.status == Lease.LeaseStatus.ACTIVE
+
+
+def test_future_lease_auto_names_property_co_landlord(landlord):
+    """After scoping a co-landlord to a property, a NEW lease created on it
+    automatically carries them as a co-signing landlord."""
+    from rentium.leases.models import Lease
+
+    room = _room(landlord, "AutoAttach Room")
+    registry.execute(
+        "add_co_landlord",
+        {"name": "Future Signer", "email": "future@example.com",
+         "property_query": "AutoAttach Room", "confirm": "yes"},
+        landlord=landlord,
+    )
+    new_lease = Lease.objects.create(
+        landlord=landlord, property=room,
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.DRAFT, start_date=date(2026, 10, 1),
+        is_month_to_month=True, total_rent="900.00",
+    )
+    assert new_lease.landlord_signatories.filter(
+        email="future@example.com"
+    ).exists()
+
+
 def test_add_co_landlord_sends_invite_email(landlord):
     """Adding a not-yet-registered co-landlord actually EMAILS them (was a silent
     DB row before)."""

@@ -27,3 +27,11 @@ def link_pending_co_landlord_invites(sender, instance, created, **kwargs):
     LandlordTeamMember.objects.filter(
         invited_email__iexact=instance.email, member__isnull=True
     ).update(member=instance, accepted_at=timezone.now())
+
+    # Link any lease co-signer slots invited to this email, so the freshly
+    # signed-up co-landlord immediately sees the leases they must sign.
+    from rentium.leases.models import LeaseLandlordSignatory
+
+    LeaseLandlordSignatory.objects.filter(
+        email__iexact=instance.email, member__isnull=True
+    ).update(member=instance)
