@@ -343,6 +343,13 @@ def run_turn(
     ctx = role_context(role, landlord)
     if ctx:
         system += "\n\n" + ctx
+    # Phase 4: the generic read/update/link surface is described by DATA (the
+    # manifest), not persona prose — so it grows automatically as the manifest
+    # does, and the prompt never needs a new hand-written line per capability.
+    if role in ("corporal", "general"):
+        from .manifest import capability_digest
+
+        system += "\n\n" + capability_digest()
     system += (
         "\n\n## LIVE PORTFOLIO (authoritative — overrides chat history)\n"
         + json.dumps(safe_context, indent=None, separators=(",", ":"))

@@ -1427,6 +1427,18 @@ def test_generic_read_is_scope_safe(landlord, other_landlord):
     assert "error" in bad and "filter" in bad["error"].lower()
 
 
+def test_capability_digest_is_data_derived(landlord):
+    """Phase 4: the prompt's capability surface is generated from the manifest —
+    new entities/editable fields appear without editing persona prose."""
+    from rentium.rama.manifest import capability_digest
+
+    d = capability_digest()
+    assert "work_order" in d and "ledger_entry" in d  # all read entities listed
+    assert "update" in d and "parking_included" not in d  # editable summarised
+    assert "lease (start_date" in d  # editable fields shown per entity
+    assert "link" in d and "property_group" in d  # linkable listed
+
+
 def test_data_catalogue_lists_entities(landlord):
     res = registry.execute("data_catalogue", {}, landlord=landlord)
     keys = {e["entity"] for e in res["entities"]}

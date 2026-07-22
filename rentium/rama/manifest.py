@@ -350,6 +350,31 @@ MANIFEST: dict[str, EntitySpec] = {
 }
 
 
+def capability_digest() -> str:
+    """A compact, MANIFEST-DERIVED summary of what the generic read/update/link
+    tools can reach, injected into the system prompt (Phase 4). Because it's
+    generated from the manifest, adding an entity/field never requires editing the
+    persona prose — capabilities come from data, the persona keeps only behaviour."""
+    readable = ", ".join(MANIFEST.keys())
+    editable_bits = []
+    linkable = []
+    for key, spec in MANIFEST.items():
+        em = list(spec.editable_map())
+        if em:
+            shown = ", ".join(em[:6]) + ("…" if len(em) > 6 else "")
+            editable_bits.append(f"{key} ({shown})")
+        if spec.links is not None:
+            linkable.append(key)
+    return (
+        "## DATA SURFACE (manifest-derived — reach it generically; don't say "
+        "'not supported' or log a gap for these)\n"
+        f"- READ/FILTER any of: {readable}. Field names come from data_catalogue; "
+        "use the `read` tool for specific/combined questions.\n"
+        f"- EDIT via `update` (previews, then confirm): {'; '.join(editable_bits)}.\n"
+        f"- DEEP-LINK / attachments via `link`: {', '.join(linkable)}."
+    )
+
+
 def entity_catalogue() -> list[dict]:
     """A compact description of every readable entity + its fields — handed to
     RAMA so it knows what it can query without a bespoke tool per entity."""
