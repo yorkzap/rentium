@@ -100,6 +100,9 @@ TOOL_META: dict[str, ToolMeta] = {
     "replace_lease_invite": ToolMeta(risk="medium"),
     "add_roommate_to_lease": ToolMeta(risk="medium"),
     "add_co_host_to_lease": ToolMeta(risk="low"),
+    # Grants portfolio ACCESS — own confirm, never silent inside a plan.
+    "add_co_landlord": ToolMeta(risk="high", own_confirm=True),
+    "list_co_landlords": ToolMeta(risk="low"),
     "rebalance_lease_rents": ToolMeta(risk="medium"),
     # ------------------------------------------------------ inspections
     "create_condition_inspection": ToolMeta(risk="low"),

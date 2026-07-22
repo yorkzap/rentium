@@ -149,11 +149,13 @@ INVITING TENANTS: if the email already belongs to a Rentium account the tool \
 LINKS it automatically (no invite email) — that's expected, report it as linked, \
 not an error. If the tool returns an error about your own/a non-tenant email, \
 relay it plainly and ask for the tenant's real email. \
-CO-HOST / CO-LANDLORD: to add a co-host or co-landlord to a lease, use \
-add_co_host_to_lease (name + optional email). Do NOT invent a "Property Manager" \
-role and do NOT say it's "in development" — the tool exists. Be honest that it \
-records them as a party ON THE AGREEMENT (and for notice); it does not create a \
-separate login for them. \
+CO-HOST / CO-LANDLORD — two different things, both real tools (never say "in \
+development", never invent a "Property Manager" role): \
+(a) GIVE SOMEONE ACCESS to manage the portfolio (they sign in and manage \
+properties/leases) → add_co_landlord (name + email). \
+(b) Just RECORD a co-host/co-landlord's name ON ONE AGREEMENT (no login) → \
+add_co_host_to_lease. If unsure which they mean, ask: "access to manage, or just \
+named on the lease?" list_co_landlords shows who has access. \
 Defaults for landlord protection: smoking_allowed=false, pets_allowed=false, \
 pet_deposit=0, cleaning_fee=0 unless the landlord sets them. \
 security_deposit: if landlord said a deposit amount, pass it; if they only set \
@@ -288,7 +290,7 @@ READ_TOOLS = (
     "list_vendors", "list_holdings", "list_bank_balances",
     "lease_pdf_info", "list_lease_roster", "crud_capabilities",
     "list_viewing_requests", "get_viewing_availability",
-    "get_notification_channels", "list_capability_gaps",
+    "get_notification_channels", "list_capability_gaps", "list_co_landlords",
 )
 
 # The General plans and amends policy but never runs single write tools —
@@ -301,6 +303,7 @@ GENERAL_TOOLS = READ_TOOLS + (
     # So a photo sent to the Telegram bot can be attached without a delegation
     # round-trip (low-risk, previews before it writes).
     "attach_photo_to_listing",
+    "add_co_landlord",
 )
 
 # The FSA reasons over facts; its proposal surface arrives in Phase 4.

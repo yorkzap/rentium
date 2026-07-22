@@ -44,7 +44,13 @@ __all__ = [
 
 
 def _landlord(request):
-    profile = getattr(request.user, "landlord_profile", None)
+    # Resolves the portfolio the user acts on: their own, OR — for a co-landlord
+    # / property manager — the owner they manage (users/access.py). A request
+    # may pass ?as=<owner_id> to pick among portfolios they're allowed.
+    from rentium.users.access import acting_landlord
+
+    owner_id = request.query_params.get("as") if hasattr(request, "query_params") else None
+    profile = acting_landlord(request.user, owner_id=owner_id)
     if profile is None:
         raise PermissionDenied("Landlords only.")
     return profile

@@ -56,6 +56,7 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.get_viewing_availability,
     tool_functions.get_notification_channels,
     tool_functions.list_capability_gaps,
+    tool_functions.list_co_landlords,
     # write actions (confirm=yes)
     tool_functions.log_capability_gap,
     tool_functions.plan_operation,
@@ -83,6 +84,7 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.list_lease_roster,
     tool_functions.add_roommate_to_lease,
     tool_functions.add_co_host_to_lease,
+    tool_functions.add_co_landlord,
     tool_functions.rebalance_lease_rents,
     tool_functions.create_property,
     tool_functions.duplicate_listing,

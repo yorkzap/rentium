@@ -76,3 +76,52 @@ class TenantProfile(models.Model):
 
     def __str__(self):
         return f"Tenant: {self.user.name}"
+
+
+class LandlordTeamMember(models.Model):
+    """A co-landlord / property manager granted access to an OWNER's portfolio.
+
+    When `member` logs in, they can act on `owner`'s data. Access is resolved
+    through one helper (users/access.py) so it can be applied surface-by-surface
+    and always fails CLOSED — a surface that doesn't consult the helper simply
+    scopes to the user's own profile and grants no extra access.
+
+    Invited by email; `member` is linked once they have (or claim) an account.
+    """
+
+    import uuid as _uuid
+
+    class Role(TextChoices):
+        MANAGER = "MANAGER", _("Manager (full access)")
+
+    id = models.UUIDField(primary_key=True, default=_uuid.uuid4, editable=False)
+    owner = ForeignKey(
+        LandlordProfile, on_delete=CASCADE, related_name="team_members"
+    )
+    member = ForeignKey(
+        User,
+        on_delete=CASCADE,
+        null=True,
+        blank=True,
+        related_name="co_landlord_memberships",
+        help_text=_("Set once the invited person has an account."),
+    )
+    invited_email = EmailField(blank=True, default="")
+    invited_name = CharField(max_length=150, blank=True, default="")
+    role = CharField(max_length=20, choices=Role.choices, default=Role.MANAGER)
+    invite_token = models.UUIDField(default=_uuid.uuid4, editable=False)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["owner", "member"],
+                condition=models.Q(member__isnull=False),
+                name="uniq_team_owner_member",
+            ),
+        ]
+
+    def __str__(self):
+        who = self.member_id or self.invited_email or "?"
+        return f"CoLandlord {who} → owner {self.owner_id}"

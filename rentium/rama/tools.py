@@ -1449,6 +1449,31 @@ def add_co_host_to_lease(
     )
 
 
+@_params(
+    name="The co-landlord's name.",
+    email="Their email — the account that gets access (required).",
+    remove="yes to REVOKE their access instead of granting it.",
+    confirm="Leave empty to preview; 'yes' to apply.",
+)
+def add_co_landlord(
+    landlord, name: str = "", email: str = "", remove: str = "", confirm: str = ""
+) -> dict:
+    """Give a co-landlord / property manager ACCESS to the whole portfolio — they
+    sign in and manage the properties/leases. Use for 'add a co-landlord / give
+    someone access to manage my properties'. This is DIFFERENT from
+    add_co_host_to_lease (which only prints a name on one agreement). Invites by
+    email; links immediately if they already have an account. Preview; confirm=yes."""
+    from .domain_actions import add_co_landlord as _fn
+    return _fn(landlord, name=name, email=email, remove=remove, confirm=confirm)
+
+
+def list_co_landlords(landlord) -> dict:
+    """The co-landlords / property managers with access to this portfolio (active
+    or invited). Answers 'who can manage my properties?'."""
+    from .domain_actions import list_co_landlords as _fn
+    return _fn(landlord)
+
+
 def delete_draft_lease(
     landlord, property_query: str = "", lease_number: str = "", confirm: str = ""
 ) -> dict:

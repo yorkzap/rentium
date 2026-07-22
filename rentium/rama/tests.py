@@ -1284,6 +1284,46 @@ def test_attach_multiple_photos_bulk(landlord):
     assert RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True).count() == 0
 
 
+def test_co_landlord_gets_portfolio_access(landlord):
+    """A co-landlord invited (with an existing account) can act on the owner's
+    portfolio; a stranger cannot — the resolution fails closed."""
+    from rentium.users.access import accessible_landlord_ids, acting_landlord
+    from rentium.users.tests.factories import UserFactory
+
+    co = UserFactory(email="co.manager@example.com")
+    res = registry.execute(
+        "add_co_landlord",
+        {"name": "Co Manager", "email": "co.manager@example.com", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("invited") is True and res["linked_now"] is True
+
+    # A pure manager (no own profile) acts AS the owner and can read their ids.
+    assert acting_landlord(co).pk == landlord.pk
+    assert landlord.pk in accessible_landlord_ids(co)
+
+    # list_co_landlords surfaces them.
+    listed = registry.execute("list_co_landlords", {}, landlord=landlord)
+    assert listed["count"] == 1 and listed["co_landlords"][0]["status"] == "active"
+
+    # Revoke → access gone.
+    registry.execute(
+        "add_co_landlord",
+        {"email": "co.manager@example.com", "remove": "yes", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert acting_landlord(co) is None
+
+
+def test_stranger_has_no_landlord_access(db):
+    from rentium.users.access import accessible_landlord_ids, acting_landlord
+    from rentium.users.tests.factories import UserFactory
+
+    stranger = UserFactory(email="stranger@example.com")
+    assert acting_landlord(stranger) is None
+    assert accessible_landlord_ids(stranger) == []
+
+
 def test_set_one_off_viewing_availability(landlord):
     """Per-date hours: a one-off window overrides the weekly schedule for that date."""
     from datetime import datetime

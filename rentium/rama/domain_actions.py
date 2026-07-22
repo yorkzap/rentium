@@ -881,6 +881,100 @@ def _resolve_existing_tenant(landlord, email: str):
     }
 
 
+def add_co_landlord(
+    landlord, *, name: str, email: str, remove: str = "", confirm: str = ""
+) -> dict:
+    """Give a co-landlord / property manager ACCESS to this whole portfolio (they
+    sign in and manage the properties/leases). Different from add_co_host_to_lease
+    (which only records a name on one agreement). Invites by email; links
+    immediately if they already have an account. remove=yes revokes access."""
+    from django.db.models import Q
+    from django.utils import timezone
+
+    from rentium.users.models import LandlordTeamMember, User
+
+    name = (name or "").strip()
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        return {"error": "A valid email is required for the co-landlord."}
+    own_email = (getattr(getattr(landlord, "user", None), "email", "") or "").lower()
+    if email == own_email:
+        return {"error": "That's your own account — you already have access."}
+
+    existing_user = User.objects.filter(email__iexact=email).first()
+    removing = str(remove or "").strip().lower() in ("1", "true", "yes", "y")
+
+    if removing:
+        qs = LandlordTeamMember.objects.filter(owner=landlord).filter(
+            Q(invited_email__iexact=email)
+            | Q(member__email__iexact=email)
+        )
+        if not qs.exists():
+            return {"error": f"{email} is not a co-landlord on your portfolio."}
+        if not _confirmed(confirm):
+            return _preview(
+                "add_co_landlord",
+                {"action": f"revoke access for {email}"},
+                "Removes their access to your portfolio. confirm=yes.",
+            )
+        qs.delete()
+        return {"updated": True, "note": f"Revoked {email}'s access."}
+
+    already = LandlordTeamMember.objects.filter(owner=landlord).filter(
+        Q(invited_email__iexact=email) | Q(member__email__iexact=email)
+    ).first()
+    if already:
+        return {"error": f"{email} is already a co-landlord on your portfolio."}
+
+    if not _confirmed(confirm):
+        return _preview(
+            "add_co_landlord",
+            {
+                "co_landlord": name or email,
+                "email": email,
+                "access": "full portfolio (manage properties, leases, etc.)",
+                "status": "linked now (they have an account)"
+                if existing_user
+                else "invited — access starts when they sign up with this email",
+            },
+            "Grants portfolio access to a co-landlord. confirm=yes.",
+        )
+
+    member = LandlordTeamMember(
+        owner=landlord, invited_email=email, invited_name=name[:150]
+    )
+    if existing_user is not None:
+        member.member = existing_user
+        member.accepted_at = timezone.now()  # immediate access on next login
+    member.save()
+    return {
+        "invited": True,
+        "linked_now": bool(existing_user),
+        "note": (
+            f"{email} now has access to your portfolio."
+            if existing_user
+            else f"Invited {email} — they get access once they sign up with that email."
+        ),
+    }
+
+
+def list_co_landlords(landlord) -> dict:
+    """The co-landlords / property managers who have (or are invited to) access to
+    this portfolio."""
+    from rentium.users.models import LandlordTeamMember
+
+    rows = []
+    for m in LandlordTeamMember.objects.filter(owner=landlord).select_related("member"):
+        rows.append(
+            {
+                "name": m.invited_name or (m.member.name if m.member_id else ""),
+                "email": m.invited_email or (m.member.email if m.member_id else ""),
+                "status": "active" if m.accepted_at else "invited (not signed up yet)",
+            }
+        )
+    return {"count": len(rows), "co_landlords": rows}
+
+
 def add_co_host_to_lease(
     landlord,
     *,
