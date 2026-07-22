@@ -56,19 +56,48 @@ def accessible_landlord_ids(user) -> list:
 
 
 def acting_landlord(user, owner_id=None):
-    """The single profile the user acts AS (writes / RAMA). Own profile by
-    default; a specific managed owner if `owner_id` is allowed; a pure manager
-    with no own profile acts as the owner they manage. None if no access."""
+    """The single profile the user acts AS (writes / RAMA). An explicit, allowed
+    `owner_id` always wins. Otherwise: the user's OWN portfolio if it has any
+    properties; else a co-managed portfolio that does (so a co-landlord whose own
+    account is empty doesn't land on a blank portfolio and RAMA report '0
+    listings'); else their own; else the single managed owner. None if no access."""
     profiles = list(owner_profiles_for(user))
     if not profiles:
         return None
     by_id = {str(p.pk): p for p in profiles}
     if owner_id and str(owner_id) in by_id:
         return by_id[str(owner_id)]
+
     own = getattr(user, "landlord_profile", None)
-    if own is not None:
+    own_in = own is not None and any(p.pk == own.pk for p in profiles)
+    if own_in and own.properties.exists():
         return own
-    return profiles[0]
+    # Own portfolio is empty (or the user is a pure manager) — prefer a co-managed
+    # portfolio that actually has properties.
+    for p in profiles:
+        if (own is None or p.pk != own.pk) and p.properties.exists():
+            return p
+    return own if own_in else profiles[0]
+
+
+def actable_portfolios(user):
+    """The portfolios this user may act AS, for a 'managing: [owner ▾]' switcher.
+    Each: {owner_id, name, is_own (primary landlord), property_count}. The user's
+    own portfolio (where they are the PRIMARY landlord) is flagged is_own; the
+    rest are portfolios they co-host as a secondary landlord."""
+    own = getattr(user, "landlord_profile", None)
+    rows = []
+    for p in owner_profiles_for(user):
+        rows.append(
+            {
+                "owner_id": str(p.pk),
+                "name": (getattr(p.user, "name", "") or p.user.email),
+                "is_own": own is not None and p.pk == own.pk,
+                "property_count": p.properties.count(),
+            }
+        )
+    rows.sort(key=lambda r: (not r["is_own"], r["name"].lower()))
+    return rows
 
 
 def _access_scopes(user):

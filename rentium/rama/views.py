@@ -120,6 +120,25 @@ def _apply_role_prefs(prefs, data, role: str):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
+def portfolios_view(request):
+    """GET /api/rama/portfolios/ — the portfolios this user can act as (their own
+    + any they co-host), plus which one is currently active. Drives the RAMA
+    'managing: [owner ▾]' switcher; every RAMA call may pass ?as=<owner_id>."""
+    from rentium.users.access import actable_portfolios
+
+    portfolios = actable_portfolios(request.user)
+    acting = _landlord(request)  # honours ?as=, applies the smart default
+    return Response(
+        {
+            "portfolios": portfolios,
+            "acting_as": str(acting.pk),
+            "acting_name": (getattr(acting.user, "name", "") or acting.user.email),
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def union_view(request):
     """GET /api/rama/state-of-the-union/ — works without RAMA enabled."""
     return Response(state_of_the_union(_landlord(request)))

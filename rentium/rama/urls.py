@@ -14,6 +14,7 @@ urlpatterns = [
     path("holdings/", views.holdings_view, name="holdings"),
     path("bank-balances/", views.bank_balances_view, name="bank-balances"),
     path("config/", views.config_view, name="config"),
+    path("portfolios/", views.portfolios_view, name="portfolios"),
     path("settings/", views.settings_view, name="settings"),
     path("state-of-the-union/", views.union_view, name="union"),
 ]

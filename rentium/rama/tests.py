@@ -1466,6 +1466,48 @@ def _draft_lease(landlord, name="InviteRoom"):
     )
 
 
+def test_acting_landlord_switcher_for_co_landlord(landlord):
+    """A co-landlord whose OWN account is empty acts on the owner's portfolio by
+    default (no more RAMA '0 listings'), can switch via ?as=, and the switcher
+    lists both portfolios with the primary flagged."""
+    from rentium.users.access import (
+        acting_landlord,
+        actable_portfolios,
+    )
+    from rentium.users.models import LandlordProfile
+
+    _room(landlord, "Owner Room")  # the owner has a property
+    co_user = UserFactory(email="switch@rmail.ca")
+    own = LandlordProfile.objects.create(user=co_user)  # empty own portfolio
+    registry.execute(
+        "add_co_landlord",
+        {"name": "Switch Co", "email": "switch@rmail.ca",
+         "property_query": "Owner Room", "confirm": "yes"},
+        landlord=landlord,
+    )
+    co_user.refresh_from_db()
+
+    # default lands on the non-empty co-managed portfolio, not her empty own
+    assert acting_landlord(co_user).pk == landlord.pk
+    # explicit selection is always honoured
+    assert acting_landlord(co_user, owner_id=str(own.pk)).pk == own.pk
+
+    ports = actable_portfolios(co_user)
+    assert {p["owner_id"] for p in ports} == {str(landlord.pk), str(own.pk)}
+    own_row = next(p for p in ports if p["owner_id"] == str(own.pk))
+    owner_row = next(p for p in ports if p["owner_id"] == str(landlord.pk))
+    assert own_row["is_own"] is True and owner_row["is_own"] is False
+    assert owner_row["property_count"] == 1
+
+
+def test_rama_portfolios_endpoint(landlord):
+    """The switcher endpoint returns the actable portfolios + active selection."""
+    _room(landlord, "Api Portfolio Room")
+    data = _client_for(landlord).get("/api/rama/portfolios/").json()
+    assert data["acting_as"] == str(landlord.pk)
+    assert any(p["owner_id"] == str(landlord.pk) and p["is_own"] for p in data["portfolios"])
+
+
 def test_scope_q_limits_ledger_to_granted_property(landlord):
     """The reusable scope_q primitive (used by every dashboard surface) scopes a
     property-scoped co-landlord to their granted property's rows only, while the
