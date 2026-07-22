@@ -1478,6 +1478,25 @@ def test_generic_update_previews_then_applies(landlord):
     assert lease.parking_included is True and lease.rent_due_day == 5
 
 
+def test_generic_update_inventory_enum_by_name(landlord):
+    """Broadened manifest: update an inventory item (an entity with no detail
+    page) by name, and resolve a human enum value ('Fair') to its choice code."""
+    from rentium.properties.models import InventoryItem
+
+    room = _room(landlord, "InvEditRoom")
+    item = InventoryItem.objects.create(property=room, name="Old Sofa", quantity=1)
+    res = registry.execute(
+        "update",
+        {"entity": "inventory", "query": "Old Sofa",
+         "changes": "condition=Fair, quantity=2", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("updated") is True
+    item.refresh_from_db()
+    assert item.quantity == 2
+    assert item.get_condition_display() == "Fair"
+
+
 def test_generic_update_guards_and_default_deny(landlord, other_landlord):
     """update refuses: a locked lease (state guard), an undeclared/non-editable
     field (default-deny), and another landlord's row (scope)."""

@@ -66,12 +66,24 @@ class EntitySpec:
     # edits to an instance by its current state (e.g. a locked lease). None = no
     # state gate (individual fields still need editable=True).
     edit_guard: object = None
+    # How `update` (and `link`) resolve ONE instance from a text query. Falls back
+    # to the LinkSpec so entities with a detail page don't repeat themselves;
+    # entities without one (work orders, inquiries, inventory) set these to be
+    # editable-by-name.
+    lookup: tuple[str, ...] = ()
+    label_field: str = ""
 
     def field_map(self) -> dict[str, FieldSpec]:
         return {f.name: f for f in self.fields}
 
     def editable_map(self) -> dict[str, FieldSpec]:
         return {f.name: f for f in self.fields if f.editable}
+
+    def resolve_lookup(self) -> tuple[str, ...]:
+        return self.lookup or (self.links.lookup if self.links else ())
+
+    def resolve_label(self) -> str:
+        return self.label_field or (self.links.label_field if self.links else "pk")
 
 
 def _lease_edit_guard(inst):
@@ -127,13 +139,13 @@ LEASE = EntitySpec(
         FieldSpec("status", "Status", "enum", display="get_status_display"),
         FieldSpec("lease_type", "Agreement type", "enum",
                   display="get_lease_type_display"),
-        FieldSpec("start_date", "Start date", "date"),
-        FieldSpec("end_date", "End date", "date"),
-        FieldSpec("is_month_to_month", "Month-to-month", "bool"),
-        FieldSpec("total_rent", "Total monthly rent", "money"),
-        FieldSpec("security_deposit", "Security deposit", "money"),
-        FieldSpec("pet_deposit", "Pet deposit", "money"),
-        FieldSpec("cleaning_fee", "Cleaning fee", "money"),
+        FieldSpec("start_date", "Start date", "date", editable=True),
+        FieldSpec("end_date", "End date", "date", editable=True),
+        FieldSpec("is_month_to_month", "Month-to-month", "bool", editable=True),
+        FieldSpec("total_rent", "Total monthly rent", "money"),  # rebalances → bespoke
+        FieldSpec("security_deposit", "Security deposit", "money", editable=True),
+        FieldSpec("pet_deposit", "Pet deposit", "money", editable=True),
+        FieldSpec("cleaning_fee", "Cleaning fee", "money", editable=True),
         FieldSpec("pets_allowed", "Pets allowed", "bool", editable=True),
         FieldSpec("smoking_allowed", "Smoking allowed", "bool", editable=True),
         FieldSpec("parking_included", "Parking included", "bool", editable=True),
@@ -144,8 +156,12 @@ LEASE = EntitySpec(
         FieldSpec("etransfer_email", "e-Transfer email", editable=True),
         FieldSpec("landlord_service_email", "Landlord notice email",
                   editable=True),
+        FieldSpec("landlord_service_address", "Landlord notice address",
+                  editable=True),
         FieldSpec("landlord_daytime_phone", "Landlord daytime phone",
                   editable=True),
+        FieldSpec("landlord_other_phone", "Landlord other phone", editable=True),
+        FieldSpec("landlord_fax", "Landlord fax", editable=True),
         FieldSpec("common_space_shared_with", "Shared areas used by", "json",
                   filterable=False),
     ],
@@ -184,19 +200,23 @@ WORK_ORDER = EntitySpec(
     model="maintenance.WorkOrder",
     label="Maintenance work order",
     scope_path="property__landlord",
+    lookup=("title",),
+    label_field="title",
     fields=[
-        FieldSpec("title", "Title"),
+        FieldSpec("title", "Title", editable=True),
         FieldSpec("status", "Status", "enum", display="get_status_display"),
-        FieldSpec("priority", "Priority", "enum", display="get_priority_display"),
-        FieldSpec("category", "Category", "enum", display="get_category_display"),
+        FieldSpec("priority", "Priority", "enum", display="get_priority_display",
+                  editable=True),
+        FieldSpec("category", "Category", "enum", display="get_category_display",
+                  editable=True),
         FieldSpec("origin", "Origin", "enum", display="get_origin_display"),
-        FieldSpec("contractor_name", "Contractor"),
-        FieldSpec("contractor_phone", "Contractor phone"),
-        FieldSpec("scheduled_date", "Scheduled", "date"),
+        FieldSpec("contractor_name", "Contractor", editable=True),
+        FieldSpec("contractor_phone", "Contractor phone", editable=True),
+        FieldSpec("scheduled_date", "Scheduled", "date", editable=True),
         FieldSpec("completed_date", "Completed", "date"),
-        FieldSpec("cost", "Cost", "money"),
+        FieldSpec("cost", "Cost", "money", editable=True),
         FieldSpec("sla_due_at", "SLA due", "date"),
-        FieldSpec("description", "Description", filterable=False),
+        FieldSpec("description", "Description", filterable=False, editable=True),
     ],
 )
 
@@ -205,6 +225,8 @@ INQUIRY = EntitySpec(
     model="showcase.Inquiry",
     label="Prospect inquiry / lead",
     scope_path="landlord",
+    lookup=("name", "email"),
+    label_field="name",
     fields=[
         FieldSpec("name", "Name"),
         FieldSpec("email", "Email"),
@@ -213,7 +235,7 @@ INQUIRY = EntitySpec(
         FieldSpec("move_in_target", "Wants to move in", "date"),
         FieldSpec("responded_at", "Responded", "date"),
         FieldSpec("message", "Message", filterable=False),
-        FieldSpec("landlord_notes", "Your notes", filterable=False),
+        FieldSpec("landlord_notes", "Your notes", filterable=False, editable=True),
     ],
 )
 
@@ -279,12 +301,15 @@ INVENTORY = EntitySpec(
     model="properties.InventoryItem",
     label="Furnishing / inventory item",
     scope_path="property__landlord",
+    lookup=("name",),
+    label_field="name",
     fields=[
-        FieldSpec("name", "Item"),
-        FieldSpec("quantity", "Quantity", "number"),
-        FieldSpec("condition", "Condition", "enum", display="get_condition_display"),
-        FieldSpec("location_description", "Location"),
-        FieldSpec("description", "Description", filterable=False),
+        FieldSpec("name", "Item", editable=True),
+        FieldSpec("quantity", "Quantity", "number", editable=True),
+        FieldSpec("condition", "Condition", "enum", display="get_condition_display",
+                  editable=True),
+        FieldSpec("location_description", "Location", editable=True),
+        FieldSpec("description", "Description", filterable=False, editable=True),
     ],
 )
 

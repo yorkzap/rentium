@@ -39,14 +39,16 @@ def _resolve_one(landlord, spec: EntitySpec, query: str):
     from django.apps import apps
     from django.db.models import Q
 
-    if spec.links is None:
+    lookup = spec.resolve_lookup()
+    if not lookup:
         return None, {"error": f"{spec.key} can't be targeted by name yet."}
+    label = spec.resolve_label()
     Model = apps.get_model(*spec.model.split("."))
     qs = Model.objects.filter(**{spec.scope_path: landlord})
     q = (query or "").strip()
     if q:
         cond = Q()
-        for f in spec.links.lookup:
+        for f in lookup:
             cond |= Q(**{f"{f}__icontains": q})
         qs = qs.filter(cond)
     matches = list(qs.order_by(spec.default_order)[:6])
@@ -55,9 +57,22 @@ def _resolve_one(landlord, spec: EntitySpec, query: str):
     if len(matches) > 1:
         return None, {
             "error": f"Several {spec.key}s match {query!r} — be more specific.",
-            "options": [str(getattr(m, spec.links.label_field, m.pk)) for m in matches],
+            "options": [str(getattr(m, label, m.pk)) for m in matches],
         }
     return matches[0], None
+
+
+def _resolve_choice(inst, fname: str, raw: str):
+    """Map a user value ('Fair', 'fair', 'FAIR') to a valid enum choice code, so
+    an enum edit passes model validation. Returns (code, error)."""
+    field_obj = inst._meta.get_field(fname)
+    choices = list(field_obj.choices or [])
+    val = raw.strip()
+    for code, label in choices:
+        if val.lower() in (str(code).lower(), str(label).lower()):
+            return code, None
+    valid = ", ".join(str(label) for _, label in choices)
+    return None, f"{fname} must be one of: {valid}."
 
 
 def update(landlord, *, entity: str = "", query: str = "", changes: str = "",
@@ -94,6 +109,12 @@ def update(landlord, *, entity: str = "", query: str = "", changes: str = "",
                 "error": f"Can't edit {fname!r} on {spec.key}. "
                 f"Editable: {', '.join(editable)}."
             }
+        if fs.type == "enum":
+            code, err = _resolve_choice(inst, fname, raw)
+            if err:
+                return {"error": err}
+            parsed[fname] = code
+            continue
         try:
             parsed[fname] = _coerce(fs, raw)
         except ValueError as exc:
@@ -101,7 +122,7 @@ def update(landlord, *, entity: str = "", query: str = "", changes: str = "",
     if not parsed:
         return {"error": "No changes given — pass changes='field=value, …'."}
 
-    label = str(getattr(inst, spec.links.label_field, inst.pk))
+    label = str(getattr(inst, spec.resolve_label(), inst.pk))
     if not _confirmed(confirm):
         return _preview(
             "update",
