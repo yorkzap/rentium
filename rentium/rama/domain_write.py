@@ -109,16 +109,30 @@ def update(landlord, *, entity: str = "", query: str = "", changes: str = "",
                 "error": f"Can't edit {fname!r} on {spec.key}. "
                 f"Editable: {', '.join(editable)}."
             }
-        if fs.type == "enum":
+        # Any field constrained by model-level choices (province='BC'→'bc',
+        # status, condition, …) is resolved to its code, tolerating case / display
+        # labels — not just fields the manifest tagged 'enum'.
+        try:
+            has_choices = bool(inst._meta.get_field(fname).choices)
+        except Exception:
+            has_choices = False
+        if fs.type == "enum" or has_choices:
             code, err = _resolve_choice(inst, fname, raw)
             if err:
                 return {"error": err}
             parsed[fname] = code
             continue
         try:
-            parsed[fname] = _coerce(fs, raw)
+            value = _coerce(fs, raw)
         except ValueError as exc:
             return {"error": str(exc)}
+        # Normalise a postal code the way the model's save() would, so full_clean
+        # validates the canonical form ('v8x 3g5' → 'V8X 3G5').
+        if fname == "postal_code":
+            from rentium.properties.models import normalise_postal_code
+
+            value = normalise_postal_code(value)
+        parsed[fname] = value
     if not parsed:
         return {"error": "No changes given — pass changes='field=value, …'."}
 

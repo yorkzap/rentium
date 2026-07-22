@@ -1509,6 +1509,29 @@ def test_generic_update_inventory_enum_by_name(landlord):
     assert item.get_condition_display() == "Fair"
 
 
+def test_generic_update_resolves_province_and_postal(landlord):
+    """Regression: generic update on a choices field ('province=BC' → 'bc') and a
+    normalised field (postal_code 'v8x 3g5' → 'V8X 3G5') — was failing with
+    'Value BC is not a valid choice'."""
+    from rentium.properties.models import Property
+
+    p = Property.objects.create(
+        landlord=landlord, name="AddrRoom", address="950 McKenzie Ave", city="X",
+        province="on", property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    res = registry.execute(
+        "update",
+        {"entity": "property", "query": "AddrRoom",
+         "changes": "city=Victoria, province=BC, postal_code=v8x 3g5",
+         "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("updated") is True, res
+    p.refresh_from_db()
+    assert p.province == "bc" and p.city == "Victoria" and p.postal_code == "V8X 3G5"
+
+
 def test_generic_update_guards_and_default_deny(landlord, other_landlord):
     """update refuses: a locked lease (state guard), an undeclared/non-editable
     field (default-deny), and another landlord's row (scope)."""
