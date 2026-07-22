@@ -367,10 +367,16 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if hasattr(user, "landlord_profile"):
-            # Use updated related_names for prefetching
-            return PropertyGroup.objects.filter(
-                landlord=user.landlord_profile
-            ).prefetch_related(
+            from django.db.models import Q
+
+            from rentium.users.access import accessible_properties, scope_q
+
+            # Own/portfolio groups + any group that contains a property this
+            # co-landlord can access (so a room-scoped grant sees its unit).
+            grp_q = scope_q(user, landlord_field="landlord") | Q(
+                grouped_properties__in=accessible_properties(user)
+            )
+            return PropertyGroup.objects.filter(grp_q).distinct().prefetch_related(
                 "grouped_properties",  # Properties primarily in this group
                 "group_shared_inventory",  # Shared inventory for this group
                 # Maybe prefetch areas shared within the group? Complex query.

@@ -62,7 +62,13 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         ).prefetch_related("images", "comments__author")
 
         if hasattr(user, "landlord_profile"):
-            return base.filter(property__landlord=user.landlord_profile)
+            from rentium.users.access import scope_q
+
+            # WorkOrder has no landlord FK — scope purely by property/lease.
+            return base.filter(
+                scope_q(user, landlord_field=None, property_field="property",
+                        lease_field="lease")
+            ).distinct()
 
         if hasattr(user, "tenant_profile"):
             tenant = user.tenant_profile

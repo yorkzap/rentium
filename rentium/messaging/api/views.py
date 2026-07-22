@@ -35,7 +35,11 @@ class ConversationViewSet(viewsets.ModelViewSet):
             "landlord__user", "tenant__user"
         ).prefetch_related("messages")
         if hasattr(u, "landlord_profile"):
-            return qs.filter(landlord=u.landlord_profile)
+            from rentium.users.access import scope_q
+
+            return qs.filter(
+                scope_q(u, property_field="property", lease_field="lease")
+            ).distinct()
         if hasattr(u, "tenant_profile"):
             return qs.filter(tenant=u.tenant_profile)
         return Conversation.objects.none()

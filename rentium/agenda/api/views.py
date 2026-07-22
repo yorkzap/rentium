@@ -41,7 +41,12 @@ class AgendaEventViewSet(viewsets.ModelViewSet):
         u = self.request.user
         if not hasattr(u, "landlord_profile"):
             return AgendaEvent.objects.none()
-        return AgendaEvent.objects.filter(owner=u.landlord_profile)
+        from rentium.users.access import scope_q
+
+        return AgendaEvent.objects.filter(
+            scope_q(u, landlord_field="owner", property_field="property",
+                    lease_field="lease")
+        ).distinct()
 
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user.landlord_profile)

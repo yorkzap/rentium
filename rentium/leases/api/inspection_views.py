@@ -77,7 +77,11 @@ class ConditionInspectionViewSet(viewsets.ModelViewSet):
             "lease", "lease_tenant__tenant__user", "lease_tenant__room", "template"
         ).prefetch_related("items__area", "key_rows")
         if hasattr(user, "landlord_profile"):
-            qs = base.filter(lease__landlord=user.landlord_profile)
+            from rentium.users.access import scope_q
+
+            qs = base.filter(
+                scope_q(user, landlord_field=None, lease_field="lease")
+            ).distinct()
         elif hasattr(user, "tenant_profile"):
             tenant = user.tenant_profile
             # Their own room inspections, plus complete-unit inspections

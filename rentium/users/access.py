@@ -118,6 +118,41 @@ def accessible_properties(user):
     return Property.objects.filter(q).distinct()
 
 
+def scope_q(user, *, landlord_field="landlord", property_field=None, lease_field=None):
+    """A Q matching the rows of ANY model this user may access — the reusable
+    primitive for wiring co-landlord access into a viewset's get_queryset().
+
+    Pass the FK field names that exist on the target model:
+      - landlord_field: matches the user's own records + records of owners whose
+        WHOLE portfolio they were granted (None if the model has no landlord FK).
+      - property_field / lease_field: match records tied to any property/lease the
+        user can access (own + property/group-scoped grants), so a property-scoped
+        co-landlord sees exactly that property's rows.
+
+    A plain owner still matches everything (accessible_properties/leases include
+    all their own), so this is safe as a drop-in for `filter(landlord=own)`.
+    """
+    from django.db.models import Q
+
+    q = Q(pk__in=[])
+    if user is None or not getattr(user, "is_authenticated", False):
+        return q
+
+    if landlord_field:
+        full_owner_ids, _p, _g = _access_scopes(user)
+        owner_ids = set(full_owner_ids)
+        own = getattr(user, "landlord_profile", None)
+        if own is not None:
+            owner_ids.add(own.pk)
+        if owner_ids:
+            q |= Q(**{f"{landlord_field}_id__in": owner_ids})
+    if property_field:
+        q |= Q(**{f"{property_field}__in": accessible_properties(user)})
+    if lease_field:
+        q |= Q(**{f"{lease_field}__in": accessible_leases(user)})
+    return q
+
+
 def accessible_leases(user):
     """Lease queryset the user may see, scoped the same way as properties.
     Group-aware: a lease attached to a granted group (even with no property) is

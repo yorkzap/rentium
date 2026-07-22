@@ -264,7 +264,11 @@ class LedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
         if hasattr(user, "landlord_profile"):
-            return qs.filter(landlord=user.landlord_profile)
+            from rentium.users.access import scope_q
+
+            return qs.filter(
+                scope_q(user, property_field="property", lease_field="lease")
+            ).distinct()
 
         if hasattr(user, "tenant_profile"):
             tp = user.tenant_profile

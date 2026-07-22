@@ -1466,6 +1466,42 @@ def _draft_lease(landlord, name="InviteRoom"):
     )
 
 
+def test_scope_q_limits_ledger_to_granted_property(landlord):
+    """The reusable scope_q primitive (used by every dashboard surface) scopes a
+    property-scoped co-landlord to their granted property's rows only, while the
+    owner still sees everything."""
+    from rentium.ledger.models import LedgerEntry
+    from rentium.users.access import scope_q
+
+    granted = _draft_lease(landlord, name="GrantedRoom")
+    other = _draft_lease(landlord, name="OtherRoom")
+    _rent_charge(landlord, granted)
+    _rent_charge(landlord, other)
+
+    registry.execute(
+        "add_co_landlord",
+        {"name": "Ledger Co", "email": "ledgerco@rmail.ca",
+         "property_query": "GrantedRoom", "confirm": "yes"},
+        landlord=landlord,
+    )
+    co = UserFactory(email="ledgerco@rmail.ca")
+
+    co_q = scope_q(co, property_field="property", lease_field="lease")
+    co_props = set(
+        LedgerEntry.objects.filter(co_q).values_list("property_id", flat=True)
+    )
+    assert granted.property_id in co_props
+    assert other.property_id not in co_props  # not granted → hidden
+
+    owner_q = scope_q(
+        landlord.user, property_field="property", lease_field="lease"
+    )
+    owner_props = set(
+        LedgerEntry.objects.filter(owner_q).values_list("property_id", flat=True)
+    )
+    assert {granted.property_id, other.property_id} <= owner_props
+
+
 def test_co_landlord_sees_and_signs_lease_via_api(landlord, other_landlord):
     """End-to-end through the real API: an invited co-landlord signs up, the lease
     shows up in their /api/leases/ list, they can co-sign it, and a stranger

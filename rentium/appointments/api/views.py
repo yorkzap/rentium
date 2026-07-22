@@ -29,7 +29,11 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         user = self.request.user
         qs = Appointment.objects.select_related("property", "lease", "work_order")
         if hasattr(user, "landlord_profile"):
-            qs = qs.filter(landlord=user.landlord_profile)
+            from rentium.users.access import scope_q
+
+            qs = qs.filter(
+                scope_q(user, property_field="property", lease_field="lease")
+            ).distinct()
         elif hasattr(user, "tenant_profile"):
             tenant = user.tenant_profile
             from django.db.models import Q

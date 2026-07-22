@@ -432,8 +432,12 @@ class InquiryViewSet(viewsets.ModelViewSet):
         if not hasattr(user, "landlord_profile"):
             return Inquiry.objects.none()
 
-        qs = Inquiry.objects.filter(landlord=user.landlord_profile).select_related(
-            "property"
+        from rentium.users.access import scope_q
+
+        qs = (
+            Inquiry.objects.filter(scope_q(user, property_field="property"))
+            .select_related("property")
+            .distinct()
         )
         wanted = self.request.query_params.get("status")
         if wanted:

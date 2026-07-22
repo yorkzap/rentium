@@ -1040,7 +1040,11 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
         ).prefetch_related("rent_adjustments")
 
         if hasattr(user, "landlord_profile"):
-            return base.filter(lease__landlord=user.landlord_profile)
+            from rentium.users.access import scope_q
+
+            return base.filter(
+                scope_q(user, landlord_field=None, lease_field="lease")
+            ).distinct()
 
         if hasattr(user, "tenant_profile"):
             return base.filter(
@@ -1520,7 +1524,11 @@ class RentAdjustmentViewSet(viewsets.ModelViewSet):
         )
 
         if hasattr(user, "landlord_profile"):
-            return base.filter(lease_tenant__lease__landlord=user.landlord_profile)
+            from rentium.users.access import scope_q
+
+            return base.filter(
+                scope_q(user, landlord_field=None, lease_field="lease_tenant__lease")
+            ).distinct()
         if hasattr(user, "tenant_profile"):
             return base.filter(lease_tenant__tenant=user.tenant_profile)
         return RentAdjustment.objects.none()
@@ -1575,7 +1583,11 @@ class LeaseDocumentViewSet(viewsets.ModelViewSet):
         base = LeaseDocument.objects.select_related("lease")
 
         if hasattr(user, "landlord_profile"):
-            return base.filter(lease__landlord=user.landlord_profile)
+            from rentium.users.access import scope_q
+
+            return base.filter(
+                scope_q(user, landlord_field=None, lease_field="lease")
+            ).distinct()
         if hasattr(user, "tenant_profile"):
             return base.filter(
                 lease__lease_tenants__tenant=user.tenant_profile
@@ -1643,7 +1655,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
         )
 
         if hasattr(user, "landlord_profile"):
-            return base.filter(lease__landlord=user.landlord_profile)
+            from rentium.users.access import scope_q
+
+            return base.filter(
+                scope_q(user, landlord_field=None, lease_field="lease")
+            ).distinct()
         if hasattr(user, "tenant_profile"):
             return base.filter(tenant=user.tenant_profile)
         return Payment.objects.none()
