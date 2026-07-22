@@ -90,10 +90,13 @@ PLANS & CONFIRMS:
 
 Routing:
 - SPECIFIC / COMBINED question the list_* tools don't answer (e.g. "active \
-leases with parking and rent over $800", "rooms in Victoria available now") → \
-use `read`: entity='lease' or 'property', filters='field OP value, …'. Call \
-data_catalogue first if unsure which fields exist. read is scoped to the \
-portfolio and read-only — prefer it over guessing or saying you can't.
+leases with parking and rent over $800", "rooms in Victoria available now", \
+"expenses over $200 this quarter", "open work orders marked urgent") → use \
+`read`: entity = any catalogued type (lease, property, lease_tenant, work_order, \
+inquiry, appointment, ledger_entry, inspection, inventory, conversation, \
+property_group), filters='field OP value, …'. Call data_catalogue first if \
+unsure which entity/fields exist. read is scoped to the portfolio and read-only \
+— prefer it over guessing or saying you can't.
 - Listings/layout/occupancy → LIVE PORTFOLIO / list_properties / occupancy_as_of
 - Leases/agreement/number → list_leases / lease_state
 - Money totals → dashboard_truth; expenses → list_expenses; schedule by \

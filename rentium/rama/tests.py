@@ -1430,7 +1430,42 @@ def test_generic_read_is_scope_safe(landlord, other_landlord):
 def test_data_catalogue_lists_entities(landlord):
     res = registry.execute("data_catalogue", {}, landlord=landlord)
     keys = {e["entity"] for e in res["entities"]}
-    assert {"lease", "property"} <= keys
+    assert {
+        "lease", "property", "work_order", "inquiry", "appointment",
+        "ledger_entry", "inspection", "inventory", "conversation",
+        "lease_tenant", "property_group",
+    } <= keys
+
+
+def test_read_indirect_scope_is_safe(landlord, other_landlord):
+    """An entity scoped via an indirect path (inventory → property → landlord)
+    still never leaks another landlord's rows."""
+    from rentium.properties.models import InventoryItem
+
+    mine = _room(landlord, "MyInvRoom")
+    theirs = _room(other_landlord, "TheirInvRoom")
+    InventoryItem.objects.create(property=mine, name="My Lamp")
+    InventoryItem.objects.create(property=theirs, name="Their Lamp")
+
+    res = registry.execute(
+        "read", {"entity": "inventory", "fields": "name"}, landlord=landlord
+    )
+    names = {r["name"] for r in res["rows"]}
+    assert "My Lamp" in names and "Their Lamp" not in names
+
+
+def test_read_ledger_filter_and_enum_display(landlord):
+    """read works over ledger with a numeric filter and renders enum displays."""
+    lease = _draft_lease(landlord, name="LedgerReadRoom")
+    _rent_charge(landlord, lease, amount="850.00")
+    res = registry.execute(
+        "read",
+        {"entity": "ledger_entry", "filters": "amount>800",
+         "fields": "entry_type,amount"},
+        landlord=landlord,
+    )
+    assert res["total_matched"] >= 1
+    assert any(r["entry_type"] == "Rent Charge" for r in res["rows"])
 
 
 def test_update_lease_sets_bills_via_rama(landlord):

@@ -106,7 +106,166 @@ LEASE = EntitySpec(
     ],
 )
 
-MANIFEST: dict[str, EntitySpec] = {e.key: e for e in (PROPERTY, LEASE)}
+LEASE_TENANT = EntitySpec(
+    key="lease_tenant",
+    model="leases.LeaseTenant",
+    label="Tenant on a lease",
+    scope_path="lease__landlord",  # secrets (invite_token) are simply not declared
+    fields=[
+        FieldSpec("invited_name", "Name"),
+        FieldSpec("invited_email", "Email"),
+        FieldSpec("invited_phone", "Phone"),
+        FieldSpec("rent_amount", "Rent share", "money"),
+        FieldSpec("cleaning_fee", "Cleaning fee", "money"),
+        FieldSpec("is_primary_tenant", "Primary tenant", "bool"),
+        FieldSpec("has_signed", "Signed", "bool"),
+        FieldSpec("signed_date", "Signed on", "date"),
+        FieldSpec("declined", "Declined", "bool"),
+        FieldSpec("individual_start_date", "Their start date", "date"),
+        FieldSpec("individual_end_date", "Their end date", "date"),
+        FieldSpec("tenant_notes", "Notes", filterable=False),
+    ],
+)
+
+WORK_ORDER = EntitySpec(
+    key="work_order",
+    model="maintenance.WorkOrder",
+    label="Maintenance work order",
+    scope_path="property__landlord",
+    fields=[
+        FieldSpec("title", "Title"),
+        FieldSpec("status", "Status", "enum", display="get_status_display"),
+        FieldSpec("priority", "Priority", "enum", display="get_priority_display"),
+        FieldSpec("category", "Category", "enum", display="get_category_display"),
+        FieldSpec("origin", "Origin", "enum", display="get_origin_display"),
+        FieldSpec("contractor_name", "Contractor"),
+        FieldSpec("contractor_phone", "Contractor phone"),
+        FieldSpec("scheduled_date", "Scheduled", "date"),
+        FieldSpec("completed_date", "Completed", "date"),
+        FieldSpec("cost", "Cost", "money"),
+        FieldSpec("sla_due_at", "SLA due", "date"),
+        FieldSpec("description", "Description", filterable=False),
+    ],
+)
+
+INQUIRY = EntitySpec(
+    key="inquiry",
+    model="showcase.Inquiry",
+    label="Prospect inquiry / lead",
+    scope_path="landlord",
+    fields=[
+        FieldSpec("name", "Name"),
+        FieldSpec("email", "Email"),
+        FieldSpec("phone", "Phone"),
+        FieldSpec("status", "Status", "enum", display="get_status_display"),
+        FieldSpec("move_in_target", "Wants to move in", "date"),
+        FieldSpec("responded_at", "Responded", "date"),
+        FieldSpec("message", "Message", filterable=False),
+        FieldSpec("landlord_notes", "Your notes", filterable=False),
+    ],
+)
+
+APPOINTMENT = EntitySpec(
+    key="appointment",
+    model="appointments.Appointment",
+    label="Viewing / visit",
+    scope_path="landlord",  # public_token is a secret → not declared
+    fields=[
+        FieldSpec("kind", "Kind", "enum", display="get_kind_display"),
+        FieldSpec("status", "Status", "enum", display="get_status_display"),
+        FieldSpec("starts_at", "Starts", "date"),
+        FieldSpec("ends_at", "Ends", "date"),
+        FieldSpec("time_class", "Timing", "enum", display="get_time_class_display"),
+        FieldSpec("contact_name", "Contact"),
+        FieldSpec("contact_email", "Contact email"),
+        FieldSpec("contact_phone", "Contact phone"),
+        FieldSpec("tenant_consent", "Tenant consent", "bool"),
+        FieldSpec("notes", "Notes", filterable=False),
+    ],
+)
+
+LEDGER_ENTRY = EntitySpec(
+    key="ledger_entry",
+    model="ledger.LedgerEntry",
+    label="Ledger entry (charge / payment / expense)",
+    scope_path="landlord",  # idempotency_key / metadata are internal → not declared
+    fields=[
+        FieldSpec("entry_type", "Type", "enum", display="get_entry_type_display"),
+        FieldSpec("amount", "Amount", "money"),
+        FieldSpec("due_date", "Due date", "date"),
+        FieldSpec("effective_date", "Effective date", "date"),
+        FieldSpec("paid_on", "Paid on", "date"),
+        FieldSpec("payment_method", "Method"),
+        FieldSpec("reference_number", "Reference"),
+        FieldSpec("category", "Category"),
+        FieldSpec("vendor", "Vendor"),
+        FieldSpec("description", "Description", filterable=False),
+    ],
+)
+
+INSPECTION = EntitySpec(
+    key="inspection",
+    model="leases.ConditionInspection",
+    label="Move-in / move-out condition inspection",
+    scope_path="lease__landlord",
+    fields=[
+        FieldSpec("status", "Status", "enum", display="get_status_display"),
+        FieldSpec("possession_date", "Possession date", "date"),
+        FieldSpec("move_in_inspection_date", "Move-in inspection", "date"),
+        FieldSpec("move_out_inspection_date", "Move-out inspection", "date"),
+        FieldSpec("move_out_date", "Move-out date", "date"),
+        FieldSpec("deduction_security_deposit", "Deposit deduction", "money"),
+        FieldSpec("deduction_pet_deposit", "Pet-deposit deduction", "money"),
+        FieldSpec("tenant_responsible_damage", "Tenant-caused damage", "bool"),
+        FieldSpec("repairs_required_at_start", "Repairs needed at start", "bool"),
+        FieldSpec("tenant_forwarding_address", "Forwarding address", filterable=False),
+    ],
+)
+
+INVENTORY = EntitySpec(
+    key="inventory",
+    model="properties.InventoryItem",
+    label="Furnishing / inventory item",
+    scope_path="property__landlord",
+    fields=[
+        FieldSpec("name", "Item"),
+        FieldSpec("quantity", "Quantity", "number"),
+        FieldSpec("condition", "Condition", "enum", display="get_condition_display"),
+        FieldSpec("location_description", "Location"),
+        FieldSpec("description", "Description", filterable=False),
+    ],
+)
+
+CONVERSATION = EntitySpec(
+    key="conversation",
+    model="messaging.Conversation",
+    label="Message thread",
+    scope_path="landlord",  # access_token is a secret → not declared
+    fields=[
+        FieldSpec("subject", "Subject"),
+        FieldSpec("prospect_name", "Prospect name"),
+        FieldSpec("prospect_email", "Prospect email"),
+    ],
+)
+
+PROPERTY_GROUP = EntitySpec(
+    key="property_group",
+    model="properties.PropertyGroup",
+    label="Property group / unit",
+    scope_path="landlord",
+    fields=[
+        FieldSpec("name", "Name"),
+        FieldSpec("description", "Description", filterable=False),
+    ],
+)
+
+MANIFEST: dict[str, EntitySpec] = {
+    e.key: e
+    for e in (
+        PROPERTY, LEASE, LEASE_TENANT, WORK_ORDER, INQUIRY, APPOINTMENT,
+        LEDGER_ENTRY, INSPECTION, INVENTORY, CONVERSATION, PROPERTY_GROUP,
+    )
+}
 
 
 def entity_catalogue() -> list[dict]:

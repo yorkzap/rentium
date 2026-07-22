@@ -108,12 +108,13 @@ def data_catalogue(landlord) -> dict:
 def read(landlord, entity: str = "", filters: str = "", fields: str = "",
          limit: str = "20") -> dict:
     """Query ANY catalogued entity directly — use for specific/composed questions
-    a fixed list_* tool doesn't answer. entity = 'property' or 'lease' (see
-    data_catalogue). filters = comma list of 'field OP value', OP in = > < >= <= ~
-    (contains) != , e.g. 'status=active, total_rent>800, parking_included=true'.
-    fields = optional comma list to return (default: all). Always scoped to your
-    portfolio; read-only. Example — active leases over $800 with parking:
-    entity='lease', filters='status=active, total_rent>800, parking_included=true'."""
+    a fixed list_* tool doesn't answer. entity = lease, property, lease_tenant,
+    work_order, inquiry, appointment, ledger_entry, inspection, inventory,
+    conversation, or property_group (call data_catalogue to see fields). filters =
+    comma list of 'field OP value', OP in = > < >= <= ~ (contains) != , e.g.
+    'status=active, total_rent>800, parking_included=true'. fields = optional
+    comma list to return (default: all). Always scoped to your portfolio;
+    read-only. Example: entity='work_order', filters='status=open, priority=urgent'."""
     from .domain_read import read as _fn
     return _fn(landlord, entity=entity, filters=filters, fields=fields, limit=limit)
 
