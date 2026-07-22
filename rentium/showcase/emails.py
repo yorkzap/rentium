@@ -75,7 +75,7 @@ def send_co_landlord_invite(member):
     accept_url = (
         f"{frontend}/auth/login"
         if linked
-        else f"{frontend}/auth/register?email={quote(email)}"
+        else f"{frontend}/auth/signup?email={quote(email)}"
     )
     owner_name = member.owner.user.name or member.owner.user.email
     return send(

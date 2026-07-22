@@ -1481,6 +1481,9 @@ def test_add_co_landlord_sends_invite_email(landlord):
     assert res.get("emailed") is True
     assert len(mail.outbox) == 1
     assert "cotest@example.com" in mail.outbox[0].to
+    # links to a real frontend route (regression: was /auth/register → 404)
+    html = mail.outbox[0].alternatives[0][0]
+    assert "/auth/signup?email=" in html
 
 
 def test_co_landlord_invite_auto_links_on_signup(landlord):
