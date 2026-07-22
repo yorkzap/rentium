@@ -1397,14 +1397,17 @@ def update_lease(
     smoking_allowed: str = "",
     special_terms: str = "",
     house_rules: str = "",
+    shared_with: str = "",
     etransfer_email: str = "",
     is_month_to_month: str = "",
     confirm: str = "",
 ) -> dict:
     """Update draft/pending lease fields. Blocked if ACTIVE/locked (LeaseNotLocked).
-    special_terms = extra clauses/terms added to the agreement; house_rules =
-    roommate-agreement house rules the landlord wants to add (both are how you
-    'customise the lease' / add clauses per lease). Changing total_rent rebalances
+    special_terms = extra clauses/terms; house_rules = roommate house rules (both
+    are how you 'customise the lease' / add clauses). shared_with = who else uses
+    the shared common areas on a ROOMMATE lease — comma list of landlord /
+    roommates / relatives (e.g. 'landlord,roommates' for 'kitchen & washroom
+    shared with the landlord and other roommates'). Changing total_rent rebalances
     unsigned shares. Preview; confirm=yes."""
     from .domain_crud import update_lease as _fn
     return _fn(
@@ -1412,8 +1415,9 @@ def update_lease(
         total_rent=total_rent, security_deposit=security_deposit,
         start_date=start_date, end_date=end_date, pets_allowed=pets_allowed,
         smoking_allowed=smoking_allowed, special_terms=special_terms,
-        house_rules=house_rules, etransfer_email=etransfer_email,
-        is_month_to_month=is_month_to_month, confirm=confirm,
+        house_rules=house_rules, shared_with=shared_with,
+        etransfer_email=etransfer_email, is_month_to_month=is_month_to_month,
+        confirm=confirm,
     )
 
 

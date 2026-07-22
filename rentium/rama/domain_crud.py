@@ -1424,6 +1424,7 @@ def update_lease(
     smoking_allowed: str = "",
     special_terms: str = "",
     house_rules: str = "",
+    shared_with: str = "",
     etransfer_email: str = "",
     is_month_to_month: str = "",
     confirm: str = "",
@@ -1473,6 +1474,24 @@ def update_lease(
         if house_rules != "":
             # Roommate-agreement house rules (extra clauses the landlord adds).
             changes["house_rules"] = house_rules[:5000]
+        if shared_with != "":
+            # Who else uses the shared common areas (roommate agreements): a
+            # subset of landlord / roommates / landlord_relatives.
+            _map = {
+                "landlord": "LANDLORD", "the landlord": "LANDLORD",
+                "roommate": "ROOMMATES", "roommates": "ROOMMATES",
+                "other roommates": "ROOMMATES",
+                "relatives": "LANDLORD_RELATIVES",
+                "landlord relatives": "LANDLORD_RELATIVES",
+                "landlord_relatives": "LANDLORD_RELATIVES",
+                "landlord's relatives": "LANDLORD_RELATIVES",
+            }
+            vals: list[str] = []
+            for tok in shared_with.replace(";", ",").split(","):
+                v = _map.get(tok.strip().lower())
+                if v and v not in vals:
+                    vals.append(v)
+            changes["common_space_shared_with"] = vals
         if etransfer_email != "":
             changes["etransfer_email"] = etransfer_email.strip()[:254]
     except ValueError as exc:

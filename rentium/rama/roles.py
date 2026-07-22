@@ -305,10 +305,16 @@ GENERAL_TOOLS = READ_TOOLS + (
     "plan_move_tenant",
     "amend_constitution",
     "log_capability_gap",
-    # So a photo sent to the Telegram bot can be attached without a delegation
-    # round-trip (low-risk, previews before it writes).
+    # Common landlord edits the General should do DIRECTLY (previews before any
+    # write), instead of a delegation round-trip that weak models fumble — this
+    # is what made Telegram RAMA fall back to hallucinated "not available" answers.
     "attach_photo_to_listing",
     "add_co_landlord",
+    "add_co_host_to_lease",
+    "update_lease",
+    "bulk_add_inventory",
+    "create_inventory_item",
+    "invite_tenant_to_lease",
 )
 
 # The FSA reasons over facts; its proposal surface arrives in Phase 4.

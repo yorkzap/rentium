@@ -1373,6 +1373,40 @@ def test_add_co_host_to_lease(landlord):
     assert lease.co_hosts == []
 
 
+def test_lease_shared_with_landlord_and_cohost_render(landlord):
+    """The exact ask: add a co-landlord to the lease + set shared-with-landlord;
+    both land on the roommate agreement. Order doesn't matter, unsigned lease."""
+    from rentium.leases.documents import render_lease
+    from rentium.properties.models import InventoryItem
+
+    lease = _draft_lease(landlord, name="SharedBasementRoom")  # GENERIC_ROOMMATE
+
+    registry.execute(
+        "add_co_host_to_lease",
+        {"lease_number": lease.lease_number, "name": "Sarbjeet Kaur", "email": "sarbjitkaur9@hotmail.com", "confirm": "yes"},
+        landlord=landlord,
+    )
+    res = registry.execute(
+        "update_lease",
+        {"lease_number": lease.lease_number, "shared_with": "landlord,roommates", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert "error" not in res
+    lease.refresh_from_db()
+    assert set(lease.common_space_shared_with) == {"LANDLORD", "ROOMMATES"}
+
+    InventoryItem.objects.create(property=lease.property, name="Queen bed")
+
+    doc = render_lease(lease)
+    blob = "\n".join(
+        [r.value for s in doc.sections for r in s.rows]
+        + [c for s in doc.sections for c in s.clauses]
+    )
+    assert "Sarbjeet Kaur" in blob      # co-host on the agreement
+    assert "landlord" in blob.lower()   # shared-with-landlord clause
+    assert "Queen bed" in blob          # inventory auto-appears
+
+
 def test_update_lease_sets_house_rules(landlord):
     """Custom clauses: house_rules is editable via update_lease."""
     lease = _draft_lease(landlord, name="RulesRoom")
