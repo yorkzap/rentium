@@ -22,12 +22,18 @@ vars**; **redeploy frontend = push `main` (Vercel auto-builds)**.
 
 ## 1. Restart / redeploy — the exact commands
 
-**Backend after a CODE change** (git pull): code is mounted into the container,
-so most changes need no restart. Management commands reload each run. For changed
-Python that the *server* imports, recreate:
+**Backend after a CODE change** (git pull, or edits): the code is mounted, but
+long-running processes hold it in memory. The **web** (django) dev-server
+auto-reloads; the **Celery worker does NOT** — so Telegram RAMA and any
+background task keep running the OLD code until you restart it. After any backend
+change, restart the workers (management commands reload each run, so they're
+fine):
 ```bash
-docker compose -f docker-compose.local.yml up -d --force-recreate django celeryworker celerybeat
+docker compose -f docker-compose.local.yml restart celeryworker celerybeat django
 ```
+Symptom of stale workers: RAMA over Telegram ignores a new tool or repeats old
+behaviour (e.g. "that feature isn't available yet") even though the code is
+updated. Restarting the worker fixes it.
 
 **Backend after an ENV change** (`.envs/.local/.django`): `restart` does NOT
 reload env; plain `up -d` often won't recreate on an env-content change. Always:
