@@ -947,13 +947,27 @@ def add_co_landlord(
         member.member = existing_user
         member.accepted_at = timezone.now()  # immediate access on next login
     member.save()
+
+    # Actually notify them — without this the invite was a silent DB row and the
+    # co-landlord never received anything.
+    emailed = False
+    try:
+        from rentium.showcase.emails import send_co_landlord_invite
+
+        emailed = send_co_landlord_invite(member)
+    except Exception:  # email must never block the grant
+        emailed = False
+
     return {
         "invited": True,
         "linked_now": bool(existing_user),
+        "emailed": emailed,
         "note": (
-            f"{email} now has access to your portfolio."
-            if existing_user
-            else f"Invited {email} — they get access once they sign up with that email."
+            (f"{email} now has access to your portfolio"
+             if existing_user
+             else f"Invited {email} — they get access as soon as they sign up with that email")
+            + (f", and an invite email was sent to {email}." if emailed
+               else f". (Couldn't send the invite email — tell them to sign {'in' if existing_user else 'up'} with {email}.)")
         ),
     }
 

@@ -1,0 +1,27 @@
+{% extends "emails/base_email.html" %}
+{% block content %}
+  <h1 style="margin:0 0 6px;font-size:19px;font-weight:600;">
+    {% if name %}{{ name }}, you've{% else %}You've{% endif %} been invited to co-manage a portfolio
+  </h1>
+  <p style="margin:0 0 20px;color:#6b6862;font-size:14px;">
+    {{ landlord_name }} has invited you to help manage their properties and leases on Rentium.
+  </p>
+
+  <p style="margin:0 0 0;font-size:14px;line-height:1.6;">
+    {% if existing %}Your account already has access — just sign in with this email and you'll
+    see {{ landlord_name }}'s portfolio.{% else %}Create your account with <strong style="color:#1c1c1a;">{{ email }}</strong>
+    and access is granted automatically — you'll be able to manage the properties, leases, and
+    tenants alongside {{ landlord_name }}.{% endif %}
+  </p>
+
+  <p style="margin:22px 0 0;">
+    <a href="{{ accept_url }}" style="display:inline-block;padding:12px 20px;background:#0f766e;color:#ffffff;text-decoration:none;border-radius:8px;font-size:14px;font-weight:600;">
+      {% if existing %}Sign in{% else %}Create your account{% endif %}
+    </a>
+  </p>
+
+  <p style="margin:18px 0 0;font-size:12px;color:#8a8681;">
+    If you weren't expecting this, you can ignore this email — no access is granted until you
+    sign in with this address.
+  </p>
+{% endblock %}

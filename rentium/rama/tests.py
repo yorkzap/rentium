@@ -1466,6 +1466,60 @@ def _draft_lease(landlord, name="InviteRoom"):
     )
 
 
+def test_add_co_landlord_sends_invite_email(landlord):
+    """Adding a not-yet-registered co-landlord actually EMAILS them (was a silent
+    DB row before)."""
+    from django.core import mail
+
+    mail.outbox = []
+    res = registry.execute(
+        "add_co_landlord",
+        {"name": "Sarbjeet Kaur", "email": "cotest@example.com", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert res.get("invited") is True
+    assert res.get("emailed") is True
+    assert len(mail.outbox) == 1
+    assert "cotest@example.com" in mail.outbox[0].to
+
+
+def test_co_landlord_invite_auto_links_on_signup(landlord):
+    """A pending invite links + accepts the moment that email signs up, so
+    access.owner_profiles_for grants the portfolio."""
+    from rentium.users.access import owner_profiles_for
+    from rentium.users.models import LandlordTeamMember
+
+    registry.execute(
+        "add_co_landlord",
+        {"name": "Later Signup", "email": "later@example.com", "confirm": "yes"},
+        landlord=landlord,
+    )
+    m = LandlordTeamMember.objects.get(invited_email="later@example.com")
+    assert m.member_id is None and m.accepted_at is None
+
+    u = UserFactory(email="later@example.com")  # they sign up afterwards
+    m.refresh_from_db()
+    assert m.member_id == u.id
+    assert m.accepted_at is not None
+    assert landlord.pk in set(owner_profiles_for(u).values_list("pk", flat=True))
+
+
+def test_lease_serializer_exposes_co_hosts(landlord):
+    """The lease detail API returns co_hosts so the page can show the co-landlord
+    (previously only the PDF did)."""
+    from rentium.leases.api.serializers import LeaseSerializer
+
+    lease = _draft_lease(landlord, name="CoHostSerRoom")
+    registry.execute(
+        "add_co_host_to_lease",
+        {"lease_number": lease.lease_number, "name": "Sarbjeet Kaur", "confirm": "yes"},
+        landlord=landlord,
+    )
+    lease.refresh_from_db()
+    data = LeaseSerializer(lease).data
+    assert data["co_hosts"] == [{"name": "Sarbjeet Kaur", "email": "", "phone": ""}]
+
+
 def test_invite_links_existing_tenant_account(landlord):
     """Inviting an email that already has a tenant account LINKS it — no dangling
     invited-email slot, no crash."""

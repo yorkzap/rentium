@@ -61,6 +61,37 @@ def send_inquiry_to_landlord(inquiry):
     )
 
 
+def send_co_landlord_invite(member):
+    """Tell a co-landlord / property manager they've been granted access. Without
+    this the LandlordTeamMember row was a silent record — the invitee never heard
+    about it. `member` is a users.LandlordTeamMember."""
+    email = member.invited_email or (member.member.email if member.member_id else "")
+    if not email:
+        return False
+    linked = bool(member.member_id)
+    frontend = settings.FRONTEND_URL.rstrip("/")
+    from urllib.parse import quote
+
+    accept_url = (
+        f"{frontend}/auth/login"
+        if linked
+        else f"{frontend}/auth/register?email={quote(email)}"
+    )
+    owner_name = member.owner.user.name or member.owner.user.email
+    return send(
+        "co_landlord_invite",
+        to=[email],
+        subject=f"{owner_name} invited you to co-manage their properties on Rentium",
+        context={
+            "name": member.invited_name or "",
+            "landlord_name": owner_name,
+            "email": email,
+            "existing": linked,
+            "accept_url": accept_url,
+        },
+    )
+
+
 def send_tenant_invite(lease_tenant):
     """The invite link that was previously never actually emailed."""
     if not lease_tenant.invited_email or lease_tenant.tenant_id:

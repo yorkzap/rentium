@@ -154,8 +154,14 @@ development", never invent a "Property Manager" role): \
 (a) GIVE SOMEONE ACCESS to manage the portfolio (they sign in and manage \
 properties/leases) → add_co_landlord (name + email). \
 (b) Just RECORD a co-host/co-landlord's name ON ONE AGREEMENT (no login) → \
-add_co_host_to_lease. If unsure which they mean, ask: "access to manage, or just \
-named on the lease?" list_co_landlords shows who has access. \
+add_co_host_to_lease. If unsure which they mean, ask ONCE: "access to manage, \
+just named on the lease, or both?" If they say BOTH (or "co-landlord on the lease \
+with access"), do BOTH in the same turn — call add_co_landlord AND \
+add_co_host_to_lease; never say "one at a time". A co-host is only a NAME on the \
+document — it does NOT create a separate signature line or a signing email; only \
+the tenants and the owner sign. add_co_landlord emails them an invite to join; \
+if the tool result says emailed=false, tell the landlord the invite email didn't \
+send. list_co_landlords shows who has access. \
 Defaults for landlord protection: smoking_allowed=false, pets_allowed=false, \
 pet_deposit=0, cleaning_fee=0 unless the landlord sets them. \
 security_deposit: if landlord said a deposit amount, pass it; if they only set \
