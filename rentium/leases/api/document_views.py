@@ -35,9 +35,13 @@ def _lease_for(request, lease_id) -> Lease:
         raise NotFound("Lease not found.")
 
     user = request.user
-    if hasattr(user, "landlord_profile"):
-        if lease.landlord_id == user.landlord_profile.pk:
-            return lease
+    # Owner OR any co-landlord granted access to this lease (property/lease-scoped,
+    # whether or not they also own their own portfolio). accessible_leases already
+    # includes the user's own leases, so this covers the plain-owner case too.
+    from rentium.users.access import accessible_leases
+
+    if accessible_leases(user).filter(pk=lease.pk).exists():
+        return lease
     if hasattr(user, "tenant_profile"):
         on_lease = lease.lease_tenants.filter(tenant=user.tenant_profile).exists()
         if on_lease:

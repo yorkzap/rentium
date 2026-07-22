@@ -96,6 +96,24 @@ def list_leases(landlord, include_ended: str = "") -> dict:
     return _list(landlord, include_ended=flag)
 
 
+def open_lease(landlord, property_query: str = "", lease_number: str = "") -> dict:
+    """A clickable in-app LINK to a lease. Use whenever the landlord asks to SEE /
+    OPEN / DOWNLOAD / 'send me' a lease or its PDF — give them the returned link
+    (opening it lets them click Download PDF). Identify the lease by lease_number
+    or property_query (e.g. Room C)."""
+    from .domain_actions import open_lease as _fn
+    return _fn(landlord, property_query=property_query, lease_number=lease_number)
+
+
+def open_property(landlord, property_query: str = "") -> dict:
+    """A clickable in-app LINK to a property's full listing (details + photos).
+    Use whenever the landlord asks to SEE / OPEN / 'show me' / 'send me' a property
+    or its photos/metadata — give them the returned link. Identify by name/address
+    (e.g. Room C)."""
+    from .domain_actions import open_property as _fn
+    return _fn(landlord, property_query=property_query)
+
+
 def list_appointments(landlord, day: str = "", days_ahead: str = "60") -> dict:
     """List viewings, showings, and contractor appointments. Optional day as
     YYYY-MM-DD (e.g. 2026-07-30) filters that calendar day; otherwise returns

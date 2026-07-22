@@ -839,6 +839,46 @@ def _resolve_lease(landlord, *, property_query: str = "", lease_number: str = ""
     return lease, None
 
 
+def open_lease(landlord, *, property_query: str = "", lease_number: str = "") -> dict:
+    """A clickable in-app link to a lease (to view it or download its PDF)."""
+    from django.conf import settings
+
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return _prop_err(err)
+    base = settings.FRONTEND_URL.rstrip("/")
+    return {
+        "lease_number": lease.lease_number,
+        "property": lease.property.name if lease.property_id else "",
+        "status": lease.get_status_display(),
+        "link": f"{base}/dashboard/leases/{lease.id}",
+        "note": (
+            f"Open this link to view lease {lease.lease_number} and click "
+            "'Download PDF' for the signed agreement."
+        ),
+    }
+
+
+def open_property(landlord, *, property_query: str = "") -> dict:
+    """A clickable in-app link to a property's full listing (details + photos)."""
+    from django.conf import settings
+
+    prop, err = _resolve_property(landlord, property_query)
+    if err:
+        return _prop_err(err)
+    base = settings.FRONTEND_URL.rstrip("/")
+    photos = prop.property_images.count() if hasattr(prop, "property_images") else 0
+    return {
+        "name": prop.name,
+        "address": prop.address,
+        "photos": photos,
+        "link": f"{base}/dashboard/properties/{prop.id}",
+        "note": f"Open this link to view {prop.name} — its photos and full details.",
+    }
+
+
 def _place(lease) -> str:
     if lease.property_id:
         return lease.property.name

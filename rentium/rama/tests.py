@@ -1466,6 +1466,65 @@ def _draft_lease(landlord, name="InviteRoom"):
     )
 
 
+def test_co_landlord_can_download_lease_pdf(landlord):
+    """A co-landlord on the lease can hit the PDF endpoint (was 'This isn't your
+    lease')."""
+    lease = _draft_lease(landlord, name="PdfRoom")
+    registry.execute(
+        "add_co_landlord",
+        {"name": "Pdf Co", "email": "pdfco@rmail.ca",
+         "lease_number": lease.lease_number, "confirm": "yes"},
+        landlord=landlord,
+    )
+    co = UserFactory(email="pdfco@rmail.ca")
+    client = APIClient()
+    client.force_authenticate(user=co)
+    resp = client.get(f"/api/leases/{lease.id}/pdf/")
+    assert resp.status_code == 200
+    assert resp["Content-Type"] == "application/pdf"
+
+
+def test_new_lease_inherits_property_default_bills(landlord):
+    """A property's default_bills_included flows into a new lease created on it."""
+    from rentium.leases.api.serializers import LeaseSerializer
+
+    room = _room(landlord, "BillsRoom")
+    room.default_bills_included = {
+        "water": {"included": True, "provider": "City", "category": "water",
+                  "tenant_responsibility": {}, "notes": ""}
+    }
+    room.save(update_fields=["default_bills_included"])
+
+    client = _client_for(landlord)
+    resp = client.post("/api/leases/", {
+        "lease_type": "GENERIC_ROOMMATE",
+        "property_id": room.id,
+        "start_date": "2026-09-01",
+        "is_month_to_month": True,
+        "total_rent": "800.00",
+    }, format="json")
+    assert resp.status_code in (200, 201), resp.content
+    from rentium.leases.models import Lease
+
+    lease = Lease.objects.get(id=resp.json()["id"])
+    assert "water" in lease.bills_included
+    assert lease.get_bills_summary() != "No bills information available"
+
+
+def test_open_lease_and_property_return_links(landlord):
+    """RAMA can hand the landlord a clickable link instead of refusing."""
+    lease = _draft_lease(landlord, name="LinkRoom")
+    out = registry.execute(
+        "open_lease", {"lease_number": lease.lease_number}, landlord=landlord
+    )
+    assert f"/dashboard/leases/{lease.id}" in out["link"]
+
+    prop_out = registry.execute(
+        "open_property", {"property_query": "LinkRoom"}, landlord=landlord
+    )
+    assert "/dashboard/properties/" in prop_out["link"]
+
+
 def test_acting_landlord_switcher_for_co_landlord(landlord):
     """A co-landlord whose OWN account is empty acts on the owner's portfolio by
     default (no more RAMA '0 listings'), can switch via ?as=, and the switcher
@@ -2741,6 +2800,7 @@ def test_tool_meta_covers_every_write_tool():
 
     read_only = {
         "portfolio_snapshot", "list_properties", "occupancy_as_of",
+        "open_lease", "open_property",
         "list_leases", "list_appointments", "attention_items",
         "resolve_person", "lease_state", "charge_status", "charge_schedule",
         "month_money", "list_expenses", "deposits_summary", "next_charge",

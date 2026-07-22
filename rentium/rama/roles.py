@@ -181,7 +181,12 @@ Roster: list_lease_roster first. ADD roommate → add_roommate_to_lease (never r
 REPLACE invite → replace_lease_invite. CANCEL → cancel_lease_invite (rebalances rent). \
 total_rent = unit rent; unsigned tenants share equally ($1000/2 → $500 each). \
 Lease PDF: call lease_pdf_info — PDF is ALWAYS downloadable via UI /api/leases/<id>/pdf/ \
-even if document_file is empty. NEVER say "no PDF exists" for an existing lease.
+even if document_file is empty. NEVER say "no PDF exists" for an existing lease. \
+LINKS: when the landlord asks to SEE / OPEN / DOWNLOAD / 'send me' / 'give me a \
+link to' a lease → call open_lease and give them the returned link verbatim (it \
+opens the lease page where Download PDF works). Same for a property or its \
+photos/details → open_property. NEVER refuse with "I can't provide a link" or \
+"search for it in the app" — you HAVE these link tools, use them and paste the URL.
 
 MULTI-STEP ROOM SETUP (be smart — do not drop steps):
 When the landlord asks for a room together with any of furniture / lease / rent /
@@ -297,6 +302,7 @@ ROLE_PROMPTS: dict[str, str] = {
 # Read-only surface (facts): shared by every role.
 READ_TOOLS = (
     "portfolio_snapshot", "list_properties", "occupancy_as_of", "list_leases",
+    "open_lease", "open_property",
     "list_appointments", "attention_items", "resolve_person", "lease_state",
     "charge_status", "charge_schedule", "month_money", "list_expenses",
     "deposits_summary", "next_charge", "open_work_orders", "list_work_orders",

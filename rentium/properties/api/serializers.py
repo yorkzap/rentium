@@ -459,6 +459,7 @@ class PropertySerializer(serializers.ModelSerializer):
             "is_furnished",  # read-only: derived from inventory
             "neighbourhood",
             "building_amenities",
+            "default_bills_included",
             "latitude",
             "longitude",
             "publish_blockers",

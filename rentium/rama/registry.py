@@ -25,6 +25,8 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.list_properties,
     tool_functions.occupancy_as_of,
     tool_functions.list_leases,
+    tool_functions.open_lease,
+    tool_functions.open_property,
     tool_functions.list_appointments,
     tool_functions.attention_items,
     tool_functions.resolve_person,

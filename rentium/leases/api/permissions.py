@@ -59,15 +59,15 @@ class IsLandlordOrTenantMember(IsAuthenticated):
         if lease is None:
             return False
 
-        # Landlord who owns the lease — or a co-landlord granted access to it
-        # (property/lease-scoped). Without the second check a co-landlord could
-        # see the lease in their list but 403 on opening it.
-        if hasattr(user, "landlord_profile"):
-            if lease.landlord == user.landlord_profile:
-                return True
-            from rentium.users.access import accessible_leases
+        # Owner OR a co-landlord granted access to this lease (property/lease-
+        # scoped, with or without their own portfolio). Without this a co-landlord
+        # could see the lease in their list but 403 on opening it.
+        from rentium.users.access import accessible_leases
 
-            return accessible_leases(user).filter(pk=lease.pk).exists()
+        if accessible_leases(user).filter(pk=lease.pk).exists():
+            return True
+        if hasattr(user, "landlord_profile"):
+            return lease.landlord == user.landlord_profile
 
         # Tenant path
         if hasattr(user, "tenant_profile"):

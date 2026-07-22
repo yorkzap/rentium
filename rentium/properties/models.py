@@ -371,6 +371,17 @@ class Property(models.Model):
             "a ROOM's shared spaces come from its property group's common areas."
         ),
     )
+    default_bills_included = models.JSONField(
+        _("Default Bills / Utilities"),
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Bills/utilities configuration inherited by NEW leases created on this "
+            "property (same shape as Lease.bills_included). Lets a landlord set "
+            "'water included, hydro tenant-paid' once, so future leases start with "
+            "it pre-filled instead of blank."
+        ),
+    )
 
     # Fields for Rooms
     room_type = models.CharField(

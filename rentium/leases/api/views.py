@@ -250,7 +250,15 @@ class LeaseViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         if not hasattr(self.request.user, "landlord_profile"):
             raise PermissionDenied("Only landlords can create leases.")
-        serializer.save(landlord=self.request.user.landlord_profile)
+        # Inherit the property's default bills/utilities when the new lease didn't
+        # specify any, so a landlord who set them on the property doesn't have to
+        # re-enter them for every future lease.
+        extra = {}
+        if not serializer.validated_data.get("bills_included"):
+            prop = serializer.validated_data.get("property")
+            if prop is not None and getattr(prop, "default_bills_included", None):
+                extra["bills_included"] = prop.default_bills_included
+        serializer.save(landlord=self.request.user.landlord_profile, **extra)
 
     def destroy(self, request, *args, **kwargs):
         """
