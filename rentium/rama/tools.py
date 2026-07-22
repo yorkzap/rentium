@@ -1416,6 +1416,7 @@ def update_lease(
     special_terms: str = "",
     house_rules: str = "",
     shared_with: str = "",
+    bills: str = "",
     etransfer_email: str = "",
     is_month_to_month: str = "",
     confirm: str = "",
@@ -1424,16 +1425,18 @@ def update_lease(
     special_terms = extra clauses/terms; house_rules = roommate house rules (both
     are how you 'customise the lease' / add clauses). shared_with = who else uses
     the shared common areas on a ROOMMATE lease — comma list of landlord /
-    roommates / relatives (e.g. 'landlord,roommates' for 'kitchen & washroom
-    shared with the landlord and other roommates'). Changing total_rent rebalances
-    unsigned shares. Preview; confirm=yes."""
+    roommates / relatives. bills = utilities on the lease, a comma list like
+    'water included, hydro tenant pays, internet included' (utilities: hydro/
+    electricity, water, gas, heat, internet, cable, garbage, sewer; each is either
+    'included' in rent or 'tenant pays'); merges onto existing bills. Changing
+    total_rent rebalances unsigned shares. Preview; confirm=yes."""
     from .domain_crud import update_lease as _fn
     return _fn(
         landlord, property_query=property_query, lease_number=lease_number,
         total_rent=total_rent, security_deposit=security_deposit,
         start_date=start_date, end_date=end_date, pets_allowed=pets_allowed,
         smoking_allowed=smoking_allowed, special_terms=special_terms,
-        house_rules=house_rules, shared_with=shared_with,
+        house_rules=house_rules, shared_with=shared_with, bills=bills,
         etransfer_email=etransfer_email, is_month_to_month=is_month_to_month,
         confirm=confirm,
     )

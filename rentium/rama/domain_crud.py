@@ -1425,6 +1425,7 @@ def update_lease(
     special_terms: str = "",
     house_rules: str = "",
     shared_with: str = "",
+    bills: str = "",
     etransfer_email: str = "",
     is_month_to_month: str = "",
     confirm: str = "",
@@ -1492,6 +1493,39 @@ def update_lease(
                 if v and v not in vals:
                     vals.append(v)
             changes["common_space_shared_with"] = vals
+        if bills != "":
+            # "water included, hydro tenant pays, internet included" → merge onto
+            # the existing bills_included (same shape the UI editor writes).
+            util_map = {
+                "electricity": "electricity", "hydro": "electricity",
+                "power": "electricity", "electric": "electricity",
+                "water": "water", "gas": "gas", "heat": "heat", "heating": "heat",
+                "internet": "internet", "wifi": "internet", "wi-fi": "internet",
+                "cable": "cable", "tv": "cable",
+                "garbage": "waste", "trash": "waste", "waste": "waste",
+                "recycling": "waste", "sewer": "sewer", "sewage": "sewer",
+            }
+            merged = dict(lease.bills_included or {})
+            for part in bills.replace(";", ",").split(","):
+                s = part.strip().lower()
+                if not s:
+                    continue
+                util = next((v for k, v in util_map.items() if k in s), None)
+                if not util:
+                    continue
+                included = "includ" in s and "not includ" not in s
+                entry = {"provider": "", "category": util, "notes": ""}
+                if included:
+                    entry["included"] = True
+                    entry["tenant_responsibility"] = {}
+                else:  # tenant pays / not included
+                    entry["included"] = False
+                    entry["tenant_responsibility"] = {
+                        "type": "percentage", "value": 100, "distribution": "equal",
+                    }
+                merged[util] = entry
+            if merged != (lease.bills_included or {}):
+                changes["bills_included"] = merged
         if etransfer_email != "":
             changes["etransfer_email"] = etransfer_email.strip()[:254]
     except ValueError as exc:

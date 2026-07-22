@@ -1373,6 +1373,23 @@ def test_add_co_host_to_lease(landlord):
     assert lease.co_hosts == []
 
 
+def test_update_lease_sets_bills_via_rama(landlord):
+    """RAMA can set bills on an EXISTING lease (the Phase-0 treadmill example):
+    'water included, hydro tenant pays' merges into bills_included."""
+    lease = _draft_lease(landlord, name="RamaBillsRoom")
+    res = registry.execute(
+        "update_lease",
+        {"lease_number": lease.lease_number,
+         "bills": "water included, hydro tenant pays", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert "error" not in res
+    lease.refresh_from_db()
+    assert lease.bills_included["water"]["included"] is True
+    assert lease.bills_included["electricity"]["included"] is False
+    assert lease.get_bills_summary() != "No bills information available"
+
+
 def test_lease_shared_with_landlord_and_cohost_render(landlord):
     """The exact ask: add a co-landlord to the lease + set shared-with-landlord;
     both land on the roommate agreement. Order doesn't matter, unsigned lease."""
