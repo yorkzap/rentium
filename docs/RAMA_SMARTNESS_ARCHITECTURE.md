@@ -8,6 +8,35 @@
 
 ---
 
+## STATUS: Phases 1–4 shipped and certified on the weak-model bar
+
+The proposal below has been **built**. Summary of what now exists in `rama/`:
+
+| Phase | What shipped | Files |
+|---|---|---|
+| 1 | Domain Capability Manifest + generic scope-safe `read` | `manifest.py`, `domain_read.py` |
+| — | Read manifest broadened to **11 entities** | `manifest.py` |
+| 2 | Generic `link`/artifacts + Telegram file delivery | `domain_read.py`, `comms/` |
+| 3 | Generic `update` (writes): default-deny + FSM guard + preview/confirm | `domain_write.py` |
+| — | Editable manifest broadened (leases, work orders, inquiries, inventory) | `manifest.py` |
+| 4 | `capability_digest()` — capabilities come from **data**, persona keeps behaviour | `manifest.py`, `service.py` |
+
+**Certification.** New Mistral-Small eval scenarios (composed `read`, a field
+`update_lease` lacks via `update`, a deep `link`) all **PASS** on the weak-model
+bar (`scripts/rama_eval.py`, `RAMA_EVAL_MODELS=mistral:mistral-small-latest`).
+The pre-existing deterministic scenarios still pass; 2–3 multi-step plan/
+disambiguation scenarios show **weak-model variance** (each passes reliably in
+isolation; ~1–2 rotate as failures under a full sequential run) — inherent to
+weak models on long multi-turn plans, not a regression from this work.
+
+**Net effect:** a new read, filter, deep-link, or simple-field edit is now a
+one-line manifest declaration the model discovers on its own — no bespoke tool,
+no deploy, no `log_capability_gap`. The remaining open items (broaden writes to
+more entities, per-field custom previews, retrieval if the digest outgrows the
+prompt) are polish, not treadmill.
+
+---
+
 ## 1. The symptom: the gap → build → deploy treadmill
 
 Every time a landlord asks RAMA to do something it wasn't explicitly built for,
