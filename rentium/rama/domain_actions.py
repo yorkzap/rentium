@@ -861,6 +861,47 @@ def open_lease(landlord, *, property_query: str = "", lease_number: str = "") ->
     }
 
 
+def deliver_lease_pdf(landlord, *, lease_number: str = "",
+                      property_query: str = "") -> dict:
+    """Deliver a lease's signed PDF as an actual file (messaging channels send it
+    as an attachment). Returns an `_attachment` marker the channel fulfils."""
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return _prop_err(err)
+    return {
+        "delivering": "lease_pdf",
+        "_attachment": {
+            "kind": "lease_pdf",
+            "lease_id": str(lease.pk),
+            "filename": f"lease_{lease.lease_number}.pdf",
+        },
+        "note": f"Sending the signed PDF for {lease.lease_number} now.",
+    }
+
+
+def deliver_property_photos(landlord, *, property_query: str = "") -> dict:
+    """Deliver a property's photos as actual images (messaging channels send them
+    as photos). Returns an `_attachment` marker the channel fulfils."""
+    prop, err = _resolve_property(landlord, property_query)
+    if err:
+        return _prop_err(err)
+    count = prop.property_images.count() if hasattr(prop, "property_images") else 0
+    if not count:
+        return {"note": f"{prop.name} has no photos uploaded yet."}
+    return {
+        "delivering": "property_photos",
+        "_attachment": {
+            "kind": "property_photos",
+            "property_id": str(prop.pk),
+            "label": prop.name,
+        },
+        "count": count,
+        "note": f"Sending {prop.name}'s {count} photo(s) now.",
+    }
+
+
 def open_property(landlord, *, property_query: str = "") -> dict:
     """A clickable in-app link to a property's full listing (details + photos)."""
     from django.conf import settings

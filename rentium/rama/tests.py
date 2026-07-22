@@ -1454,6 +1454,17 @@ def test_read_indirect_scope_is_safe(landlord, other_landlord):
     assert "My Lamp" in names and "Their Lamp" not in names
 
 
+def test_deliver_lease_pdf_returns_attachment_marker(landlord):
+    """deliver_lease_pdf resolves the lease and emits an _attachment marker the
+    channel fulfils (instead of pasting a broken /api/ URL)."""
+    lease = _draft_lease(landlord, name="DeliverRoom")
+    res = registry.execute(
+        "deliver_lease_pdf", {"lease_number": lease.lease_number}, landlord=landlord
+    )
+    assert res["_attachment"]["kind"] == "lease_pdf"
+    assert res["_attachment"]["lease_id"] == str(lease.id)
+
+
 def test_generic_link_resolves_and_is_scoped(landlord, other_landlord):
     """Phase 2: the manifest-driven link tool returns a deep link for a resolved
     lease/property, notes its downloads, and never links a stranger's row."""
@@ -2937,6 +2948,7 @@ def test_tool_meta_covers_every_write_tool():
     read_only = {
         "portfolio_snapshot", "list_properties", "occupancy_as_of",
         "open_lease", "open_property", "data_catalogue", "read", "link",
+        "deliver_lease_pdf", "deliver_property_photos",
         "list_leases", "list_appointments", "attention_items",
         "resolve_person", "lease_state", "charge_status", "charge_schedule",
         "month_money", "list_expenses", "deposits_summary", "next_charge",

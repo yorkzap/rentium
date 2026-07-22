@@ -235,13 +235,53 @@ def test_co_landlord_telegram_acts_on_owner_portfolio(landlord):
 
     def fake_run_turn(ld, *a, **k):
         captured["landlord"] = ld
-        return mock.Mock(error=None, reply="ok")
+        return mock.Mock(error=None, reply="ok", attachments=[])
 
     with mock.patch("rentium.rama.service.run_turn", side_effect=fake_run_turn):
         with mock.patch("rentium.comms.telegram.send_message"):
             handle_telegram_message(str(co_profile.pk), "77", "hi")
 
     assert captured["landlord"].pk == landlord.pk  # ran as the OWNER, not the co
+
+
+def test_telegram_delivers_pdf_attachment_and_strips_markdown(landlord):
+    """A lease_pdf delivery marker becomes a real sendDocument; **bold** and
+    [x](url) markdown is stripped from the text reply."""
+    from datetime import date
+
+    from rentium.comms.tasks import handle_telegram_message
+    from rentium.leases.models import Lease
+    from rentium.properties.models import Property
+
+    ChannelAccount.objects.create(
+        landlord=landlord, channel_type=ChannelAccount.ChannelType.TELEGRAM,
+        address="55", verified=True,
+    )
+    prop = Property.objects.create(
+        landlord=landlord, name="Rm", address="1 A", city="Victoria",
+        province="bc", property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    lease = Lease.objects.create(
+        landlord=landlord, property=prop,
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.DRAFT, start_date=date(2026, 9, 1),
+        is_month_to_month=True, total_rent="800.00",
+    )
+    fake = mock.Mock(
+        error=None,
+        reply="Here is the **lease**, see [it](http://x/y).",
+        attachments=[{"kind": "lease_pdf", "lease_id": str(lease.id),
+                      "filename": "lease.pdf"}],
+    )
+    with mock.patch("rentium.rama.service.run_turn", return_value=fake):
+        with mock.patch("rentium.comms.telegram.send_message") as sm, \
+             mock.patch("rentium.comms.telegram.send_document") as sd:
+            handle_telegram_message(str(landlord.pk), "55", "send me the pdf")
+
+    sent_text = sm.call_args[0][1]
+    assert "**" not in sent_text and "](" not in sent_text  # markdown stripped
+    assert sd.called  # PDF sent as a real document
 
 
 # ---------------------------------------------------------------- outbound

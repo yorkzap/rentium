@@ -312,6 +312,7 @@ ROLE_PROMPTS: dict[str, str] = {
 READ_TOOLS = (
     "portfolio_snapshot", "list_properties", "occupancy_as_of", "list_leases",
     "data_catalogue", "read", "link",
+    "deliver_lease_pdf", "deliver_property_photos",
     "open_lease", "open_property",
     "list_appointments", "attention_items", "resolve_person", "lease_state",
     "charge_status", "charge_schedule", "month_money", "list_expenses",

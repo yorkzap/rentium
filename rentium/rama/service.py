@@ -264,6 +264,10 @@ class TurnResult:
     tools_used: list[str] = field(default_factory=list)
     pending_plan: dict | None = None
     deterministic: bool = False
+    # Files a delivery tool asked the CHANNEL to send (e.g. a lease PDF, property
+    # photos). The web ignores these; Telegram/WhatsApp turn them into real
+    # attachments. Each is the tool's `_attachment` marker.
+    attachments: list[dict] = field(default_factory=list)
     # Set instead of raising: {"detail": str, "code": str, "status_hint": int}
     error: dict | None = None
 
@@ -343,6 +347,18 @@ def run_turn(
         "\n\n## LIVE PORTFOLIO (authoritative — overrides chat history)\n"
         + json.dumps(safe_context, indent=None, separators=(",", ":"))
     )
+    if channel in ("telegram", "whatsapp"):
+        system += (
+            "\n\n## MESSAGING STYLE (you are in a " + channel + " chat)\n"
+            "Write like a person texting: warm, natural, concise, professional. "
+            "PLAIN TEXT ONLY — no markdown: never use *, **, _, #, backticks, "
+            "tables, or [label](url) links. Write any URL bare. Use short "
+            "sentences; if you list things, use '• ' bullets, at most a handful. "
+            "Keep replies short — a few lines, not a long report. To hand over a "
+            "lease PDF or a listing's photos, call deliver_lease_pdf / "
+            "deliver_property_photos (they send the real file) — never paste an "
+            "/api/... URL or a markdown download link."
+        )
     if extra_system:
         system += "\n\n" + extra_system
     done_notes = _recent_writes_note(landlord, conversation_id)
@@ -370,6 +386,7 @@ def run_turn(
     schemas = role_tool_schemas(role, depth)
     max_rounds = SUB_TURN_MAX_ROUNDS if depth >= 1 else MAX_TOOL_ROUNDS
     tools_used: list[str] = ["_live_context"]
+    turn_attachments: list[dict] = []
     turn = Turn()
 
     # Deterministic confirm state machine: on yes/no the backend itself runs
@@ -484,6 +501,10 @@ def run_turn(
                     result = execute(call.name, call.arguments, landlord=landlord)
                 # JSON-safe for audit + tool message content (UUIDs, Decimals).
                 safe_result = json.loads(json.dumps(result, default=str))
+                if isinstance(result, dict) and isinstance(
+                    result.get("_attachment"), dict
+                ):
+                    turn_attachments.append(result["_attachment"])
                 tools_used.append(call.name)
                 audit(
                     RamaAudit.Kind.TOOL_CALL,
@@ -588,5 +609,6 @@ def run_turn(
         provider=provider_name,
         model=model,
         tools_used=tools_used,
+        attachments=turn_attachments,
         pending_plan=plan_brief(outstanding) if outstanding else None,
     )

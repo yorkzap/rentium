@@ -130,6 +130,22 @@ def link(landlord, entity: str = "", query: str = "") -> dict:
     return _fn(landlord, entity=entity, query=query)
 
 
+def deliver_lease_pdf(landlord, lease_number: str = "",
+                      property_query: str = "") -> dict:
+    """Send the lease's signed PDF as an ACTUAL FILE attachment (use on a
+    messaging channel like Telegram when the landlord asks to download/get the
+    PDF — do NOT paste an /api/ URL). Identify by lease_number or property_query."""
+    from .domain_actions import deliver_lease_pdf as _fn
+    return _fn(landlord, lease_number=lease_number, property_query=property_query)
+
+
+def deliver_property_photos(landlord, property_query: str = "") -> dict:
+    """Send a property's photos as ACTUAL images (use on Telegram when the
+    landlord asks to see/show a specific listing's photos). Identify by name."""
+    from .domain_actions import deliver_property_photos as _fn
+    return _fn(landlord, property_query=property_query)
+
+
 def open_lease(landlord, property_query: str = "", lease_number: str = "") -> dict:
     """A clickable in-app LINK to a lease. Use whenever the landlord asks to SEE /
     OPEN / DOWNLOAD / 'send me' a lease or its PDF — give them the returned link

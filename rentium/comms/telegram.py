@@ -76,3 +76,50 @@ def send_message(chat_id: str, text: str) -> bool:
     except requests.RequestException:
         logger.exception("telegram sendMessage failed")
         return False
+
+
+def send_document(chat_id: str, content: bytes, filename: str,
+                  caption: str = "") -> bool:
+    """Upload a file (e.g. a lease PDF) as a real Telegram attachment. Bytes are
+    posted multipart so no public URL / auth token is needed."""
+    token = _token()
+    if not token or not content:
+        return False
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendDocument",
+            data={"chat_id": chat_id, "caption": caption[:1000]},
+            files={"document": (filename or "file", content)},
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            logger.warning("telegram sendDocument %s: %s", response.status_code,
+                           response.text[:300])
+            return False
+        return True
+    except requests.RequestException:
+        logger.exception("telegram sendDocument failed")
+        return False
+
+
+def send_photo(chat_id: str, content: bytes, filename: str = "photo.jpg",
+               caption: str = "") -> bool:
+    """Send an image as a real Telegram photo (bytes, multipart)."""
+    token = _token()
+    if not token or not content:
+        return False
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption[:1000]},
+            files={"photo": (filename or "photo.jpg", content)},
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            logger.warning("telegram sendPhoto %s: %s", response.status_code,
+                           response.text[:300])
+            return False
+        return True
+    except requests.RequestException:
+        logger.exception("telegram sendPhoto failed")
+        return False

@@ -134,7 +134,58 @@ def handle_telegram_message(
             chat_id, f"Sorry — {result.error.get('detail', 'something went wrong')}"
         )
         return
-    transport.send_message(chat_id, result.reply or "…")
+    transport.send_message(chat_id, _plain(result.reply) or "…")
+    _deliver_attachments(landlord, chat_id, result.attachments, transport)
+
+
+def _plain(text: str) -> str:
+    """Strip markdown that Telegram shows as literal noise (**, #, [x](url), etc.)
+    — a safety net over the plain-text style directive."""
+    import re
+
+    s = text or ""
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1: \2", s)  # links → "text: url"
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)  # bold
+    s = re.sub(r"(?<!\w)[*_`]([^*_`]+)[*_`](?!\w)", r"\1", s)  # italic/code
+    s = re.sub(r"^\s{0,3}#{1,6}\s*", "", s, flags=re.MULTILINE)  # headers
+    s = re.sub(r"^\s*[-*]\s+", "• ", s, flags=re.MULTILINE)  # bullets
+    return s.strip()
+
+
+def _deliver_attachments(landlord, chat_id, attachments, transport) -> None:
+    """Turn a turn's delivery markers into real Telegram files."""
+    for att in attachments or []:
+        kind = att.get("kind")
+        try:
+            if kind == "lease_pdf":
+                from rentium.leases.models import Lease
+                from rentium.leases.pdf import build_lease_pdf
+
+                lease = Lease.objects.filter(pk=att.get("lease_id")).first()
+                if lease is not None:
+                    transport.send_document(
+                        chat_id, build_lease_pdf(lease),
+                        att.get("filename") or "lease.pdf",
+                        caption=f"Lease {lease.lease_number}",
+                    )
+            elif kind == "property_photos":
+                from rentium.properties.models import Property
+
+                prop = Property.objects.filter(pk=att.get("property_id")).first()
+                if prop is not None:
+                    for img in prop.property_images.all()[:10]:
+                        try:
+                            img.image.open("rb")
+                            data = img.image.read()
+                            img.image.close()
+                            transport.send_photo(
+                                chat_id, data,
+                                caption=att.get("label") or prop.name,
+                            )
+                        except Exception:  # one bad image mustn't stop the rest
+                            logger.exception("telegram photo send failed")
+        except Exception:  # a delivery failure must never break the turn
+            logger.exception("attachment delivery failed for %s", kind)
 
 
 @app.task(bind=True, max_retries=2)

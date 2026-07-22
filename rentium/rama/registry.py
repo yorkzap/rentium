@@ -28,6 +28,8 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.data_catalogue,
     tool_functions.read,
     tool_functions.link,
+    tool_functions.deliver_lease_pdf,
+    tool_functions.deliver_property_photos,
     tool_functions.open_lease,
     tool_functions.open_property,
     tool_functions.list_appointments,
