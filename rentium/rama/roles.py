@@ -89,6 +89,11 @@ PLANS & CONFIRMS:
   PROGRESS says awaiting, ask ONLY about that step and wait.
 
 Routing:
+- SPECIFIC / COMBINED question the list_* tools don't answer (e.g. "active \
+leases with parking and rent over $800", "rooms in Victoria available now") → \
+use `read`: entity='lease' or 'property', filters='field OP value, …'. Call \
+data_catalogue first if unsure which fields exist. read is scoped to the \
+portfolio and read-only — prefer it over guessing or saying you can't.
 - Listings/layout/occupancy → LIVE PORTFOLIO / list_properties / occupancy_as_of
 - Leases/agreement/number → list_leases / lease_state
 - Money totals → dashboard_truth; expenses → list_expenses; schedule by \
@@ -302,6 +307,7 @@ ROLE_PROMPTS: dict[str, str] = {
 # Read-only surface (facts): shared by every role.
 READ_TOOLS = (
     "portfolio_snapshot", "list_properties", "occupancy_as_of", "list_leases",
+    "data_catalogue", "read",
     "open_lease", "open_property",
     "list_appointments", "attention_items", "resolve_person", "lease_state",
     "charge_status", "charge_schedule", "month_money", "list_expenses",

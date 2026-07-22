@@ -96,6 +96,28 @@ def list_leases(landlord, include_ended: str = "") -> dict:
     return _list(landlord, include_ended=flag)
 
 
+def data_catalogue(landlord) -> dict:
+    """What RAMA can query with the generic `read` tool: the entities and their
+    filterable/readable fields. Call this when a landlord asks a specific/composed
+    question (e.g. 'active leases with parking and rent over 800') to see what
+    fields exist, then use `read`."""
+    from .manifest import entity_catalogue
+    return {"entities": entity_catalogue()}
+
+
+def read(landlord, entity: str = "", filters: str = "", fields: str = "",
+         limit: str = "20") -> dict:
+    """Query ANY catalogued entity directly — use for specific/composed questions
+    a fixed list_* tool doesn't answer. entity = 'property' or 'lease' (see
+    data_catalogue). filters = comma list of 'field OP value', OP in = > < >= <= ~
+    (contains) != , e.g. 'status=active, total_rent>800, parking_included=true'.
+    fields = optional comma list to return (default: all). Always scoped to your
+    portfolio; read-only. Example — active leases over $800 with parking:
+    entity='lease', filters='status=active, total_rent>800, parking_included=true'."""
+    from .domain_read import read as _fn
+    return _fn(landlord, entity=entity, filters=filters, fields=fields, limit=limit)
+
+
 def open_lease(landlord, property_query: str = "", lease_number: str = "") -> dict:
     """A clickable in-app LINK to a lease. Use whenever the landlord asks to SEE /
     OPEN / DOWNLOAD / 'send me' a lease or its PDF — give them the returned link

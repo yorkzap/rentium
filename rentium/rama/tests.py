@@ -1373,6 +1373,66 @@ def test_add_co_host_to_lease(landlord):
     assert lease.co_hosts == []
 
 
+def test_generic_read_answers_composed_lease_query(landlord):
+    """The Phase-1 manifest read: a composed question that no bespoke list_* tool
+    answers — 'active leases with rent over 800' — works via one generic tool."""
+    from rentium.leases.models import Lease
+
+    def _lease(name, rent, status):
+        p = _room(landlord, name)
+        return Lease.objects.create(
+            landlord=landlord, property=p,
+            lease_type=Lease.LeaseType.GENERIC_ROOMMATE, status=status,
+            start_date=date(2026, 9, 1), is_month_to_month=True, total_rent=rent,
+        )
+
+    hit = _lease("HighActive", "900.00", Lease.LeaseStatus.ACTIVE)
+    _lease("LowActive", "700.00", Lease.LeaseStatus.ACTIVE)   # rent too low
+    _lease("HighDraft", "950.00", Lease.LeaseStatus.DRAFT)     # wrong status
+
+    res = registry.execute(
+        "read",
+        {"entity": "lease", "filters": "status=active, total_rent>800",
+         "fields": "lease_number,total_rent,status"},
+        landlord=landlord,
+    )
+    assert "error" not in res
+    nums = {r["lease_number"] for r in res["rows"]}
+    assert nums == {hit.lease_number}
+    assert res["rows"][0]["status"] == "Active"  # enum rendered via display
+
+
+def test_generic_read_is_scope_safe(landlord, other_landlord):
+    """read only ever returns the acting landlord's rows, and refuses undeclared
+    fields — the two safety properties the manifest guarantees."""
+    from rentium.leases.models import Lease
+
+    Lease.objects.create(
+        landlord=other_landlord, property=_room(other_landlord, "TheirRoom"),
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.ACTIVE, start_date=date(2026, 9, 1),
+        is_month_to_month=True, total_rent="999.00",
+    )
+    # Even with a filter that would match the stranger's lease, it's invisible.
+    res = registry.execute(
+        "read", {"entity": "lease", "filters": "total_rent>0"}, landlord=landlord
+    )
+    assert res["total_matched"] == 0
+
+    # An undeclared/sensitive field cannot be filtered (default-deny).
+    bad = registry.execute(
+        "read", {"entity": "lease", "filters": "signed_document_sha256=x"},
+        landlord=landlord,
+    )
+    assert "error" in bad and "filter" in bad["error"].lower()
+
+
+def test_data_catalogue_lists_entities(landlord):
+    res = registry.execute("data_catalogue", {}, landlord=landlord)
+    keys = {e["entity"] for e in res["entities"]}
+    assert {"lease", "property"} <= keys
+
+
 def test_update_lease_sets_bills_via_rama(landlord):
     """RAMA can set bills on an EXISTING lease (the Phase-0 treadmill example):
     'water included, hydro tenant pays' merges into bills_included."""
@@ -2817,7 +2877,7 @@ def test_tool_meta_covers_every_write_tool():
 
     read_only = {
         "portfolio_snapshot", "list_properties", "occupancy_as_of",
-        "open_lease", "open_property",
+        "open_lease", "open_property", "data_catalogue", "read",
         "list_leases", "list_appointments", "attention_items",
         "resolve_person", "lease_state", "charge_status", "charge_schedule",
         "month_money", "list_expenses", "deposits_summary", "next_charge",
