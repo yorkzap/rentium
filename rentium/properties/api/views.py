@@ -58,7 +58,29 @@ class IsLandlordOwner(BasePermission):
         elif isinstance(obj, PropertyImage):
             owner_profile = obj.property.landlord
 
-        return owner_profile == request.user.landlord_profile
+        if owner_profile == request.user.landlord_profile:
+            return True
+
+        # A co-landlord granted access to this property (or its group) may also
+        # act on it — mirrors accessible_properties() used by the list view.
+        from rentium.users.access import accessible_properties
+
+        prop = None
+        group = None
+        if isinstance(obj, Property):
+            prop = obj
+        elif isinstance(obj, PropertyGroup):
+            group = obj
+        elif isinstance(obj, SharedInventoryItem):
+            group = obj.group
+        elif isinstance(obj, (PropertyArea, InventoryItem, PropertyImage)):
+            prop = getattr(obj, "property", None)
+        acc = accessible_properties(request.user)
+        if prop is not None:
+            return acc.filter(pk=prop.pk).exists()
+        if group is not None:
+            return acc.filter(group=group).exists()
+        return False
 
 
 # --- PropertyViewSet ---

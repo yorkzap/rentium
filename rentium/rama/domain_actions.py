@@ -905,6 +905,14 @@ def add_co_landlord(
     email = (email or "").strip().lower()
     if not email or "@" not in email:
         return {"error": "A valid email is required for the co-landlord."}
+    # RFC-2606 reserved domains are never real inboxes — reject them so a
+    # placeholder the model invented ('name@example.com') can't be used as if it
+    # were the co-landlord's address. Forces RAMA to ask for the real one.
+    if email.rsplit("@", 1)[-1] in ("example.com", "example.org", "example.net", "test", "localhost"):
+        return {
+            "error": "That looks like a placeholder email — ask the landlord for "
+            "the co-landlord's real email address and use exactly that."
+        }
     own_email = (getattr(getattr(landlord, "user", None), "email", "") or "").lower()
     if email == own_email:
         return {"error": "That's your own account — you already have access."}

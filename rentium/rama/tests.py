@@ -1290,10 +1290,10 @@ def test_co_landlord_gets_portfolio_access(landlord):
     from rentium.users.access import accessible_landlord_ids, acting_landlord
     from rentium.users.tests.factories import UserFactory
 
-    co = UserFactory(email="co.manager@example.com")
+    co = UserFactory(email="co.manager@rmail.ca")
     res = registry.execute(
         "add_co_landlord",
-        {"name": "Co Manager", "email": "co.manager@example.com", "confirm": "yes"},
+        {"name": "Co Manager", "email": "co.manager@rmail.ca", "confirm": "yes"},
         landlord=landlord,
     )
     assert res.get("invited") is True and res["linked_now"] is True
@@ -1309,7 +1309,7 @@ def test_co_landlord_gets_portfolio_access(landlord):
     # Revoke → access gone.
     registry.execute(
         "add_co_landlord",
-        {"email": "co.manager@example.com", "remove": "yes", "confirm": "yes"},
+        {"email": "co.manager@rmail.ca", "remove": "yes", "confirm": "yes"},
         landlord=landlord,
     )
     assert acting_landlord(co) is None
@@ -1483,13 +1483,13 @@ def test_co_landlord_sees_and_signs_lease_via_api(landlord, other_landlord):
     )
     registry.execute(
         "add_co_landlord",
-        {"name": "Api Co", "email": "apico@example.com",
+        {"name": "Api Co", "email": "apico@rmail.ca",
          "lease_number": lease.lease_number, "confirm": "yes"},
         landlord=landlord,
     )
     from rentium.users.models import LandlordProfile
 
-    co_user = UserFactory(email="apico@example.com")
+    co_user = UserFactory(email="apico@rmail.ca")
     LandlordProfile.objects.create(user=co_user)  # they're a landlord too
     co_client = APIClient()
     co_client.force_authenticate(user=co_user)
@@ -1497,6 +1497,10 @@ def test_co_landlord_sees_and_signs_lease_via_api(landlord, other_landlord):
     listed = co_client.get("/api/leases/").json()
     rows = listed if isinstance(listed, list) else listed.get("results", listed)
     assert any(r["id"] == str(lease.id) for r in rows)
+
+    # opening the lease detail must NOT 403 (the object-permission trap)
+    detail = co_client.get(f"/api/leases/{lease.id}/")
+    assert detail.status_code == 200, detail.content
 
     # stranger landlord cannot see it
     stranger = _client_for(other_landlord).get("/api/leases/").json()
@@ -1507,7 +1511,7 @@ def test_co_landlord_sees_and_signs_lease_via_api(landlord, other_landlord):
     resp = co_client.post(f"/api/leases/{lease.id}/co_landlord_sign/")
     assert resp.status_code == 200, resp.content
     lease.refresh_from_db()
-    assert lease.landlord_signatories.get(email="apico@example.com").has_signed
+    assert lease.landlord_signatories.get(email="apico@rmail.ca").has_signed
 
 
 def test_co_landlord_property_scope_access_and_group(landlord, other_landlord):
@@ -1530,11 +1534,11 @@ def test_co_landlord_property_scope_access_and_group(landlord, other_landlord):
 
     registry.execute(
         "add_co_landlord",
-        {"name": "Sarbjeet Kaur", "email": "scope@example.com",
+        {"name": "Sarbjeet Kaur", "email": "scope@rmail.ca",
          "property_query": "Room A", "confirm": "yes"},
         landlord=landlord,
     )
-    u = UserFactory(email="scope@example.com")  # signs up → auto-linked
+    u = UserFactory(email="scope@rmail.ca")  # signs up → auto-linked
 
     prop_ids = set(accessible_properties(u).values_list("id", flat=True))
     assert room_a.id in prop_ids and room_b.id in prop_ids  # group sibling included
@@ -1561,11 +1565,11 @@ def test_co_landlord_on_lease_cosigns_before_activation(landlord):
 
     registry.execute(
         "add_co_landlord",
-        {"name": "Co Signer", "email": "cosign@example.com",
+        {"name": "Co Signer", "email": "cosign@rmail.ca",
          "lease_number": lease.lease_number, "confirm": "yes"},
         landlord=landlord,
     )
-    sig = LeaseLandlordSignatory.objects.get(lease=lease, email="cosign@example.com")
+    sig = LeaseLandlordSignatory.objects.get(lease=lease, email="cosign@rmail.ca")
 
     # Owner + tenant sign — still NOT active because the co-landlord hasn't signed
     lease.landlord_signed = True
@@ -1575,7 +1579,7 @@ def test_co_landlord_on_lease_cosigns_before_activation(landlord):
     assert lease.status == Lease.LeaseStatus.PENDING_SIGNATURES
 
     # Co-landlord signs up (links the signatory) and signs → now ACTIVE
-    u = UserFactory(email="cosign@example.com")
+    u = UserFactory(email="cosign@rmail.ca")
     sig.refresh_from_db()
     assert sig.member_id == u.id
     sig.sign()
@@ -1591,7 +1595,7 @@ def test_future_lease_auto_names_property_co_landlord(landlord):
     room = _room(landlord, "AutoAttach Room")
     registry.execute(
         "add_co_landlord",
-        {"name": "Future Signer", "email": "future@example.com",
+        {"name": "Future Signer", "email": "future@rmail.ca",
          "property_query": "AutoAttach Room", "confirm": "yes"},
         landlord=landlord,
     )
@@ -1602,7 +1606,7 @@ def test_future_lease_auto_names_property_co_landlord(landlord):
         is_month_to_month=True, total_rent="900.00",
     )
     assert new_lease.landlord_signatories.filter(
-        email="future@example.com"
+        email="future@rmail.ca"
     ).exists()
 
 
@@ -1614,13 +1618,13 @@ def test_add_co_landlord_sends_invite_email(landlord):
     mail.outbox = []
     res = registry.execute(
         "add_co_landlord",
-        {"name": "Sarbjeet Kaur", "email": "cotest@example.com", "confirm": "yes"},
+        {"name": "Sarbjeet Kaur", "email": "cotest@rmail.ca", "confirm": "yes"},
         landlord=landlord,
     )
     assert res.get("invited") is True
     assert res.get("emailed") is True
     assert len(mail.outbox) == 1
-    assert "cotest@example.com" in mail.outbox[0].to
+    assert "cotest@rmail.ca" in mail.outbox[0].to
     # links to a real frontend route (regression: was /auth/register → 404)
     html = mail.outbox[0].alternatives[0][0]
     assert "/auth/signup?email=" in html
@@ -1634,13 +1638,13 @@ def test_co_landlord_invite_auto_links_on_signup(landlord):
 
     registry.execute(
         "add_co_landlord",
-        {"name": "Later Signup", "email": "later@example.com", "confirm": "yes"},
+        {"name": "Later Signup", "email": "later@rmail.ca", "confirm": "yes"},
         landlord=landlord,
     )
-    m = LandlordTeamMember.objects.get(invited_email="later@example.com")
+    m = LandlordTeamMember.objects.get(invited_email="later@rmail.ca")
     assert m.member_id is None and m.accepted_at is None
 
-    u = UserFactory(email="later@example.com")  # they sign up afterwards
+    u = UserFactory(email="later@rmail.ca")  # they sign up afterwards
     m.refresh_from_db()
     assert m.member_id == u.id
     assert m.accepted_at is not None
