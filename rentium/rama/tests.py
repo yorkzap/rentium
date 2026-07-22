@@ -2316,6 +2316,32 @@ def test_list_inspections_includes_checklist(landlord, bc_lease, signed_tenant):
 # ---------------------------------------------------------------------------
 
 
+def test_create_property_accepts_human_type_values(landlord):
+    """Regression: a Garden Suite failed because 'Garden Suite' uppercased to
+    'GARDEN SUITE' (space) — not the enum code — and the error was hidden. Now
+    human values resolve, and any validation error is legible."""
+    from rentium.properties.models import Property
+    from rentium.rama import domain_crud as crud
+
+    res = crud.create_property(
+        landlord, name="Garden Unit A", address="9 X", city="Vancouver",
+        province="BC", property_category="Complete Unit", unit_type="Garden Suite",
+        asking_rent="2000", confirm="yes",
+    )
+    assert res.get("created") is True, res
+    p = Property.objects.get(landlord=landlord, name="Garden Unit A")
+    assert p.property_category == "COMPLETE_UNIT"
+    assert p.get_unit_type_display() == "Garden Suite"
+
+    # a genuinely invalid type gives a legible error, not a bare "Validation failed"
+    bad = crud.create_property(
+        landlord, name="Garden Unit B", address="9 X", city="Vancouver",
+        province="BC", property_category="COMPLETE_UNIT", unit_type="Treehouse",
+        confirm="yes",
+    )
+    assert "error" in bad and "unit_type must be one of" in bad["error"]
+
+
 def test_create_property_preview_then_confirm(landlord):
     from rentium.properties.models import Property
     from rentium.rama import domain_crud as crud

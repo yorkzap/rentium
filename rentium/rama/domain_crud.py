@@ -312,13 +312,38 @@ def _default_lease_type(prop) -> str:
     return Lease.LeaseType.GENERIC_RESIDENTIAL
 
 
+def _choice_code(choices, value):
+    """Map a human value to a valid choice code, tolerating case, spaces vs
+    underscores, and the display label ('Garden Suite' / 'garden suite' /
+    'GARDEN_SUITE' → 'GARDEN_SUITE'). Returns the code, or None if no match."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    cands = {v.lower(), v.lower().replace(" ", "_"), v.lower().replace("_", " ")}
+    for code, label in choices:
+        if str(code).lower() in cands or str(label).lower() in cands:
+            return code
+    return None
+
+
 def _validation_error_payload(exc: Exception) -> dict:
     if isinstance(exc, ValidationError):
         if hasattr(exc, "message_dict"):
-            return {"error": "Validation failed", "details": exc.message_dict}
+            # Flatten the field errors INTO the message so the real reason always
+            # reaches the plan report and the landlord — "Validation failed" alone
+            # (with the detail hidden in a separate key) left RAMA unable to say
+            # why, and guessing a different property type.
+            parts = []
+            for field, msgs in exc.message_dict.items():
+                label = "form" if field == "__all__" else field
+                parts.append(f"{label}: {'; '.join(str(m) for m in msgs)}")
+            return {
+                "error": "Couldn't save — " + " | ".join(parts),
+                "details": exc.message_dict,
+            }
         if hasattr(exc, "messages"):
-            return {"error": "; ".join(str(m) for m in exc.messages)}
-        return {"error": str(exc)}
+            return {"error": "Couldn't save — " + "; ".join(str(m) for m in exc.messages)}
+        return {"error": f"Couldn't save — {exc}"}
     return {"error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -446,15 +471,15 @@ def create_property(
             ),
         }
 
-    cat = (property_category or "ROOM").strip().upper()
-    if cat not in Property.PropertyCategory.values:
+    cat = _choice_code(Property.PropertyCategory.choices, property_category or "ROOM")
+    if cat is None:
         return {
-            "error": f"property_category must be one of {list(Property.PropertyCategory.values)}"
+            "error": "property_category must be one of "
+            f"{[l for _, l in Property.PropertyCategory.choices]}"
         }
 
-    st = (status or "AVAILABLE").strip().upper()
-    if st not in Property.PropertyStatus.values:
-        st = Property.PropertyStatus.AVAILABLE
+    st = _choice_code(Property.PropertyStatus.choices, status or "AVAILABLE") \
+        or Property.PropertyStatus.AVAILABLE
 
     prov_raw = (province or "bc").strip().lower()
     from rentium.properties.models import normalise_province
@@ -465,8 +490,18 @@ def create_property(
             "error": f"Invalid province {province!r}. Use BC, ON, AB, … (two-letter)."
         }
 
-    ut = (unit_type or "").strip().upper() or None
-    rt = (room_type or "PRIVATE").strip().upper() or None
+    ut = _choice_code(Property.UnitType.choices, unit_type)
+    if unit_type.strip() and ut is None:
+        return {
+            "error": "unit_type must be one of: "
+            + ", ".join(str(l) for _, l in Property.UnitType.choices)
+        }
+    rt = _choice_code(Property.RoomType.choices, room_type)
+    if room_type.strip() and rt is None:
+        return {
+            "error": "room_type must be one of: "
+            + ", ".join(str(l) for _, l in Property.RoomType.choices)
+        }
     if cat == Property.PropertyCategory.COMPLETE_UNIT:
         ut = ut or Property.UnitType.OTHER
         rt = None
@@ -843,10 +878,11 @@ def update_property(
     if name.strip():
         changes["name"] = name.strip()[:255]
     if status.strip():
-        st = status.strip().upper()
-        if st not in Property.PropertyStatus.values:
+        st = _choice_code(Property.PropertyStatus.choices, status)
+        if st is None:
             return {
-                "error": f"Invalid status. Use {list(Property.PropertyStatus.values)}"
+                "error": "status must be one of: "
+                + ", ".join(str(l) for _, l in Property.PropertyStatus.choices)
             }
         changes["status"] = st
     if description != "":
@@ -861,16 +897,22 @@ def update_property(
             return {"error": f"Invalid province {province!r}."}
         changes["province"] = prov
     if unit_type.strip():
-        ut = unit_type.strip().upper()
-        if ut not in Property.UnitType.values:
-            return {"error": f"Invalid unit_type {unit_type!r}."}
+        ut = _choice_code(Property.UnitType.choices, unit_type)
+        if ut is None:
+            return {
+                "error": "unit_type must be one of: "
+                + ", ".join(str(l) for _, l in Property.UnitType.choices)
+            }
         if prop.property_category != Property.PropertyCategory.COMPLETE_UNIT:
             return {"error": "unit_type only applies to COMPLETE_UNIT listings."}
         changes["unit_type"] = ut
     if room_type.strip():
-        rt = room_type.strip().upper()
-        if rt not in Property.RoomType.values:
-            return {"error": f"Invalid room_type {room_type!r}."}
+        rt = _choice_code(Property.RoomType.choices, room_type)
+        if rt is None:
+            return {
+                "error": "room_type must be one of: "
+                + ", ".join(str(l) for _, l in Property.RoomType.choices)
+            }
         if prop.property_category != Property.PropertyCategory.ROOM:
             return {"error": "room_type only applies to ROOM listings."}
         changes["room_type"] = rt
