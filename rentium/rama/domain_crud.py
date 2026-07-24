@@ -1002,21 +1002,24 @@ def update_property(
     rename_conflicts: list[dict] = []
     if name.strip():
         new_name = name.strip()[:255]
-        rename_conflicts = listing_name_conflicts(
-            landlord, new_name, exclude_id=prop.pk
-        )
-        exact_conflicts = [
-            conflict for conflict in rename_conflicts if conflict["match"] == "exact"
-        ]
-        if exact_conflicts:
-            return {
-                "error": (
-                    f"Another listing is already named {new_name!r}. "
-                    "Choose a distinct name instead of creating an ambiguous duplicate."
-                ),
-                "name_conflicts": exact_conflicts,
-            }
-        changes["name"] = new_name
+        if new_name != prop.name:
+            rename_conflicts = listing_name_conflicts(
+                landlord, new_name, exclude_id=prop.pk
+            )
+            exact_conflicts = [
+                conflict
+                for conflict in rename_conflicts
+                if conflict["match"] == "exact"
+            ]
+            if exact_conflicts:
+                return {
+                    "error": (
+                        f"Another listing is already named {new_name!r}. "
+                        "Choose a distinct name instead of creating an ambiguous duplicate."
+                    ),
+                    "name_conflicts": exact_conflicts,
+                }
+            changes["name"] = new_name
     if status.strip():
         st = _choice_code(Property.PropertyStatus.choices, status)
         if st is None:
@@ -1067,6 +1070,27 @@ def update_property(
     if is_publicly_visible != "":
         changes["is_publicly_visible"] = _truthy(is_publicly_visible)
 
+    requested_a_field = any(
+        value != ""
+        for value in (
+            name,
+            status,
+            description,
+            address,
+            city,
+            province,
+            asking_rent,
+            unit_type,
+            room_type,
+            is_publicly_visible,
+        )
+    )
+    if not changes and requested_a_field:
+        return {
+            "unchanged": True,
+            "property": prop.name,
+            "message": f"No change needed — {prop.name} already has those values.",
+        }
     if not changes:
         return {"error": "No fields to update. Pass name/status/description/…"}
 
@@ -1197,7 +1221,14 @@ def assign_property_to_group(
         }
 
     if _truthy(clear) or not group_name.strip():
-        if not prop.group_id and not group_name.strip():
+        if _truthy(clear) and not prop.group_id:
+            return {
+                "unchanged": True,
+                "property": prop.name,
+                "group": None,
+                "message": f"No change needed — {prop.name} is not in a group.",
+            }
+        if not _truthy(clear) and not group_name.strip():
             return {"error": "Pass group_name or clear=yes."}
         preview = {
             "property": prop.name,
@@ -1225,6 +1256,13 @@ def assign_property_to_group(
     group, gerr = _resolve_group(landlord, group_name)
     if gerr:
         return {"error": gerr}
+    if prop.group_id == group.pk:
+        return {
+            "unchanged": True,
+            "property": prop.name,
+            "group": group.name,
+            "message": f"No change needed — {prop.name} is already in {group.name}.",
+        }
 
     preview = {
         "property": prop.name,

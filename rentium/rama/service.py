@@ -19,6 +19,9 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import timedelta
+
+from django.utils import timezone
 
 from .models import RamaAudit, RamaPendingPlan
 from .plan_runner import (
@@ -27,12 +30,13 @@ from .plan_runner import (
     load_fresh_plan,
     plan_brief,
     run_plan,
+    save_batch,
     save_plan,
     save_single,
 )
 from .plan_runner import plan_to_payload
 from .providers import ProviderError, Turn, get_provider
-from .registry import execute
+from .registry import REGISTRY, execute
 from .roles import (
     DELEGATION_TOOL_NAMES,
     ROLE_PROMPTS,
@@ -98,6 +102,40 @@ _NEGATIVE_EXACT = {
 
 def _is_negative(text: str) -> bool:
     return _norm_affirm(text) in _NEGATIVE_EXACT
+
+
+def _recent_confirmed_reply(landlord, conversation_id) -> str:
+    """Return the just-completed plan reply for a duplicate bare ``yes``.
+
+    Telegram can deliver a repeated acknowledgement after the plan row has
+    already been consumed. Only an audited auto-confirmed tool call qualifies;
+    ordinary read-only deterministic replies must not swallow a new message.
+    """
+    confirmed_call = (
+        RamaAudit.objects.filter(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            kind=RamaAudit.Kind.TOOL_CALL,
+            content__auto_confirmed=True,
+            created_at__gte=timezone.now()
+            - timedelta(minutes=2),
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if confirmed_call is None:
+        return ""
+    reply = (
+        RamaAudit.objects.filter(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            kind=RamaAudit.Kind.ASSISTANT_MESSAGE,
+            created_at__gte=confirmed_call.created_at,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    return str((reply.content or {}).get("text") or "") if reply else ""
 
 
 def _write_label(result: dict) -> str:
@@ -170,6 +208,16 @@ def _rename_intent(landlord, message: str) -> dict | None:
     source = match.group(1).strip()
     new_name = match.group(2).strip()
     if not source or not new_name:
+        return None
+    # This router is deliberately for one unambiguous rename. A compound
+    # command belongs to the collected-preview planner; treating its entire
+    # tail as the new listing name produced absurd names such as
+    # "Room 1 and Room 5 to Room 2, then assign …".
+    if re.search(
+        r"\b(?:then|assign|move|put)\b|(?:,|\band\b).+\bto\b",
+        new_name,
+        flags=re.IGNORECASE,
+    ):
         return None
     room_label = re.fullmatch(r"room\s+([a-z])", new_name, flags=re.IGNORECASE)
     if room_label:
@@ -283,6 +331,15 @@ def _group_room_intent(landlord, message: str) -> dict | None:
     if not group_match:
         return None
     lead = text[: group_match.start()]
+    # create_group_room is intentionally singular. Plural/range requests must
+    # stay with the collected-preview path so every requested room is retained
+    # under one confirmation.
+    if re.search(
+        r"\brooms\b|\broom\s+\w+\s*(?:,|and|through)\s*(?:room\s+)?\w+",
+        lead,
+        flags=re.IGNORECASE,
+    ):
+        return None
     room_name = re.sub(
         r"^\s*(?:please\s+)?(?:create|add|make)\s+"
         r"(?:a\s+)?(?:new\s+)?(?:room\s+)?(?:named\s+|called\s+)?",
@@ -426,25 +483,116 @@ def _preview_reply(tool: str, result: dict) -> str:
     )
 
 
-def _persist_pending(landlord, conversation_id, pending_spec: dict | None) -> None:
+def _pending_spec_key(spec: dict) -> str:
+    """Stable identity for de-duplicating repeated previews in one turn."""
+    if spec.get("kind") == "plan":
+        return "plan:" + json.dumps(
+            spec.get("payload") or {},
+            sort_keys=True,
+            default=str,
+        )
+    arguments = {
+        key: value
+        for key, value in (spec.get("arguments") or {}).items()
+        if key != "confirm"
+    }
+    return (
+        f"single:{spec.get('tool')}:"
+        + json.dumps(arguments, sort_keys=True, default=str)
+    )
+
+
+def _append_pending_spec(pending_specs: list[dict], spec: dict) -> bool:
+    """Append a preview once. Returns True when it was newly collected."""
+    key = _pending_spec_key(spec)
+    if any(_pending_spec_key(existing) == key for existing in pending_specs):
+        return False
+    pending_specs.append(spec)
+    return True
+
+
+def _remove_executed_preview(
+    pending_specs: list[dict],
+    tool: str,
+    arguments: dict,
+) -> None:
+    """Drop only the preview matching a write the model already completed.
+
+    Model-issued confirmation is now stripped before execution, but retaining
+    exact removal keeps this invariant safe for non-confirming/idempotent tools
+    and avoids the old behaviour of clearing every preview for the same tool.
+    """
+    wanted = _pending_spec_key(
+        {"kind": "single", "tool": tool, "arguments": arguments}
+    )
+    pending_specs[:] = [
+        spec for spec in pending_specs if _pending_spec_key(spec) != wanted
+    ]
+
+
+def _batch_preview_reply(
+    plan: RamaPendingPlan,
+    excluded_errors: list[dict] | None = None,
+) -> str:
+    """Truthful deterministic preview for a collected multi-write turn."""
+    lines = [
+        f"Preview — one “Yes” will run all {plan.steps.count()} changes:"
+    ]
+    for index, step in enumerate(plan.steps.order_by("order"), start=1):
+        args = step.arguments or {}
+        target = step.target_label or str(
+            args.get("property_query") or args.get("name") or "item"
+        )
+        if step.tool == "create_property":
+            detail = f"Create {args.get('name') or target}"
+            if args.get("group_name"):
+                detail += f" in {args['group_name']}"
+            if args.get("address"):
+                detail += f" at {args['address']}"
+        elif step.tool == "update_property" and args.get("name"):
+            detail = f"Rename {target} to {args['name']}"
+        elif step.tool == "assign_property_to_group":
+            if str(args.get("clear") or "").casefold() in {"yes", "true", "1"}:
+                detail = f"Remove {target} from its property group"
+            else:
+                detail = f"Put {target} in {args.get('group_name')}"
+        elif step.tool == "create_property_group":
+            detail = f"Create property group {args.get('name') or target}"
+        else:
+            detail = (
+                f"{step.tool.replace('_', ' ').capitalize()}: {target}"
+            )
+        lines.append(f"{index}. {detail}")
+
+    if excluded_errors:
+        lines.append("")
+        lines.append("Not included:")
+        for item in excluded_errors:
+            lines.append(f"• {item['target']}: {item['error']}")
+    lines.append("")
+    lines.append("Reply yes to confirm the complete batch, or no to cancel.")
+    return "\n".join(lines)
+
+
+def _persist_pending(
+    landlord,
+    conversation_id,
+    pending_specs: list[dict] | None,
+) -> None:
     """End-of-turn invariant: a plan row exists IFF something is outstanding.
 
-    - A preview produced this turn is persisted (replacing any older one).
+    - Every preview produced this turn is persisted in call order as one plan
+      (replacing any older one).
     - No preview: an unstarted plan from an earlier turn is treated as a
       change of subject and cleared — but a plan PAUSED mid-execution
       (awaiting a step's own confirm) survives an interjected question.
     """
-    if pending_spec is None:
+    if not pending_specs:
         plan = load_fresh_plan(landlord, conversation_id)
         if plan is not None and plan.status != RamaPendingPlan.Status.AWAITING_STEP_CONFIRM:
             clear_plan(landlord, conversation_id)
         return
-    if pending_spec["kind"] == "plan":
-        save_plan(landlord, conversation_id, pending_spec["payload"])
-    else:
-        save_single(
-            landlord, conversation_id, pending_spec["tool"], pending_spec["arguments"]
-        )
+    save_batch(landlord, conversation_id, pending_specs)
 
 
 def _tool_facts_note(
@@ -791,6 +939,21 @@ def run_turn(
                     or result
                 )
 
+    # A bare repeated confirmation immediately after an audited plan execution
+    # must never become a brand-new model turn. A standalone "yes" with no such
+    # execution remains ordinary conversation for backwards compatibility.
+    if (
+        deterministic_reply is None
+        and pending_plan is None
+        and _norm_affirm(message) in _AFFIRM_EXACT
+    ):
+        recent_reply = _recent_confirmed_reply(landlord, conversation_id)
+        if recent_reply:
+            deterministic_reply = (
+                "That confirmation was already applied. No action was repeated.\n"
+                + recent_reply
+            )
+
     # High-confidence property operations bypass model intent selection. A
     # rename can therefore never drift into an availability/status plan.
     if deterministic_reply is None and pending_plan is None:
@@ -877,9 +1040,12 @@ def run_turn(
             deterministic=True,
         )
 
-    # The still-outstanding preview produced THIS turn, if any. Persisted at
-    # end of turn so the next "yes" runs deterministically.
-    pending_spec: dict | None = None
+    # Every still-outstanding preview produced THIS turn.  They are persisted
+    # together, in call order, so the next "yes" runs the complete batch the
+    # landlord was shown—not whichever tool happened to be called last.
+    pending_specs: list[dict] = []
+    excluded_preview_errors: list[dict] = []
+    planned_property_aliases: dict[str, str] = {}
     turn_tools = schemas
     try:
         for _ in range(max_rounds):
@@ -909,14 +1075,36 @@ def run_turn(
                 }
             )
             for call in turn.tool_calls:
+                effective_arguments = dict(call.arguments or {})
+                original_property_query = str(
+                    effective_arguments.get("property_query") or ""
+                ).strip()
+                alias_id = planned_property_aliases.get(
+                    " ".join(original_property_query.casefold().split())
+                )
+                if alias_id:
+                    # A later step may refer to the name an earlier preview
+                    # will create. Resolve it to the earlier listing's stable
+                    # id now, while still preserving the human-facing target.
+                    effective_arguments["property_query"] = alias_id
+
+                registered_tool = REGISTRY.get(call.name)
+                if (
+                    registered_tool is not None
+                    and "confirm" in registered_tool.parameters["properties"]
+                ):
+                    # Only run_plan() may inject confirm=yes after loading a
+                    # persisted landlord-approved preview. A model can prepare
+                    # writes, but it cannot approve its own proposal.
+                    effective_arguments["confirm"] = ""
                 if (
                     role == "general"
                     and depth == 0
                     and call.name in DELEGATION_TOOL_NAMES
                 ):
-                    result = _delegate(landlord, call.name, call.arguments)
+                    result = _delegate(landlord, call.name, effective_arguments)
                 else:
-                    result = execute(call.name, call.arguments, landlord=landlord)
+                    result = execute(call.name, effective_arguments, landlord=landlord)
                 # JSON-safe for audit + tool message content (UUIDs, Decimals).
                 safe_result = json.loads(json.dumps(result, default=str))
                 if isinstance(result, dict) and isinstance(
@@ -928,20 +1116,58 @@ def run_turn(
                     RamaAudit.Kind.TOOL_CALL,
                     {
                         "tool": call.name,
-                        "arguments": call.arguments,
+                        "arguments": effective_arguments,
                         "result": safe_result,
                     },
                 )
                 if isinstance(result, dict) and result.get("needs_confirm"):
                     if isinstance(result.get("plan"), dict):
                         # A playbook plan (plan_operation / plan_move_tenant).
-                        pending_spec = {"kind": "plan", "payload": result["plan"]}
+                        spec = {"kind": "plan", "payload": result["plan"]}
                     else:
-                        pending_spec = {
+                        stable_arguments = dict(effective_arguments)
+                        preview = result.get("preview") or {}
+                        if (
+                            call.name == "update_property"
+                            and preview.get("id")
+                            and str(
+                                effective_arguments.get("name") or ""
+                            ).strip()
+                        ):
+                            stable_arguments["property_query"] = str(
+                                preview["id"]
+                            )
+                        target = str(
+                            (
+                                original_property_query
+                                if alias_id and original_property_query
+                                else preview.get("property")
+                            )
+                            or stable_arguments.get("property_query")
+                            or stable_arguments.get("room_name")
+                            or stable_arguments.get("name")
+                            or ""
+                        )
+                        spec = {
                             "kind": "single",
                             "tool": call.name,
-                            "arguments": call.arguments or {},
+                            "arguments": stable_arguments,
+                            "target": target,
                         }
+                    _append_pending_spec(pending_specs, spec)
+
+                    # Make the future name addressable by later calls in this
+                    # same model turn. The pending step itself already uses the
+                    # stable id, so execution remains correct after the rename.
+                    if call.name == "update_property":
+                        preview = result.get("preview") or {}
+                        future_name = str(
+                            effective_arguments.get("name") or ""
+                        ).strip()
+                        if preview.get("id") and future_name:
+                            planned_property_aliases[
+                                " ".join(future_name.casefold().split())
+                            ] = str(preview["id"])
                 elif isinstance(result, dict) and (
                     result.get("created")
                     or result.get("updated")
@@ -950,8 +1176,25 @@ def run_turn(
                 ):
                     # A write went through — clear any matching outstanding
                     # preview so we don't ask the landlord to confirm it again.
-                    if pending_spec and pending_spec.get("tool") == call.name:
-                        pending_spec = None
+                    _remove_executed_preview(
+                        pending_specs,
+                        call.name,
+                        effective_arguments,
+                    )
+                elif (
+                    isinstance(result, dict)
+                    and result.get("error")
+                    and registered_tool is not None
+                    and "confirm" in registered_tool.parameters["properties"]
+                ):
+                    target = (
+                        original_property_query
+                        or str(effective_arguments.get("name") or "")
+                        or call.name.replace("_", " ")
+                    )
+                    excluded_preview_errors.append(
+                        {"target": target, "error": str(result["error"])}
+                    )
                 messages.append(
                     {
                         "role": "tool",
@@ -981,7 +1224,7 @@ def run_turn(
         # If a confirmed plan already ran, don't surface an error for work
         # that actually succeeded — report it deterministically instead.
         if plan_progress is not None:
-            _persist_pending(landlord, conversation_id, pending_spec)
+            _persist_pending(landlord, conversation_id, pending_specs)
             outstanding = load_fresh_plan(landlord, conversation_id)
             reply = _plan_fallback_reply(plan_progress)
             audit(
@@ -1013,9 +1256,15 @@ def run_turn(
             },
         )
 
-    _persist_pending(landlord, conversation_id, pending_spec)
+    _persist_pending(landlord, conversation_id, pending_specs)
     outstanding = load_fresh_plan(landlord, conversation_id)
-    reply = turn.text.strip() or "I wasn't able to produce an answer — try rephrasing."
+    if outstanding is not None and outstanding.operation == "preview_batch":
+        reply = _batch_preview_reply(outstanding, excluded_preview_errors)
+    else:
+        reply = (
+            turn.text.strip()
+            or "I wasn't able to produce an answer — try rephrasing."
+        )
     audit(
         RamaAudit.Kind.ASSISTANT_MESSAGE,
         {"text": reply, "tools_used": tools_used},

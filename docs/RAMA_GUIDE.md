@@ -86,6 +86,15 @@ the universal safety boundary: RAMA shows one complete preview, waits for an
 explicit confirmation, then reports the concrete result (for example,
 “Renamed McKenzie B to Room A”).
 
+Compound routine instructions use the same boundary. If one turn previews
+several creations, renames, or group assignments, RAMA persists every preview
+in dependency order as one confirmation batch; it never keeps only the final
+tool call. Chained operations resolve future names to stable listing IDs, so
+“rename Room 5 to Room 3, then assign Room 3” does not fail a pre-rename
+existence check. Only the pending-plan runner can add `confirm=yes`; a model
+cannot approve its own write. Duplicate confirmations are idempotent, and
+already-correct names/group memberships are reported as no-ops.
+
 `create_group_room` derives address, city, province, holding, and related
 property data only when all existing group rooms agree. Private inventory and
 group common areas appear together in the preview. If RAMA would create or

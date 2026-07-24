@@ -128,6 +128,125 @@ def save_single(landlord, conversation_id, tool: str, arguments: dict) -> RamaPe
     )
 
 
+def save_batch(
+    landlord,
+    conversation_id,
+    pending_specs: list[dict],
+) -> RamaPendingPlan:
+    """Persist every preview a model produced in one turn as one plan.
+
+    Weak models sometimes preview several routine writes before asking for one
+    confirmation.  Persisting only the final preview makes the displayed batch
+    a lie: the landlord's ``yes`` runs one arbitrary step and the model starts
+    reconstructing the rest from prose.  This collector preserves the original
+    call order and stable entity ids so one confirmation runs the exact batch.
+    """
+    if len(pending_specs) == 1:
+        spec = pending_specs[0]
+        if spec["kind"] == "plan":
+            return save_plan(landlord, conversation_id, spec["payload"])
+        if spec.get("target"):
+            return save_plan(
+                landlord,
+                conversation_id,
+                {
+                    "operation": "single",
+                    "summary": (
+                        f"{spec['tool']} {str(spec['target']).strip()}".strip()
+                    ),
+                    "steps": [
+                        {
+                            "tool": spec["tool"],
+                            "arguments": {
+                                key: value
+                                for key, value in (
+                                    spec.get("arguments") or {}
+                                ).items()
+                                if key != "confirm"
+                            },
+                            "target": str(spec["target"]).strip(),
+                            "item_key": "single",
+                            "requires_own_confirm": meta_for(
+                                spec["tool"],
+                            ).own_confirm,
+                        },
+                    ],
+                },
+            )
+        return save_single(
+            landlord,
+            conversation_id,
+            spec["tool"],
+            spec["arguments"],
+        )
+
+    steps: list[dict] = []
+    blocked: list[dict] = []
+    for spec_index, spec in enumerate(pending_specs):
+        if spec["kind"] == "plan":
+            payload = spec["payload"]
+            blocked.extend(payload.get("blocked") or [])
+            for step_index, step in enumerate(payload.get("steps") or []):
+                copied = dict(step)
+                copied["item_key"] = (
+                    copied.get("item_key")
+                    or f"plan-{spec_index}-step-{step_index}"
+                )
+                steps.append(copied)
+            continue
+
+        arguments = {
+            key: value
+            for key, value in (spec.get("arguments") or {}).items()
+            if key != "confirm"
+        }
+        target = str(spec.get("target") or "").strip()
+        if not target:
+            for key in (
+                "property_query",
+                "lease_number",
+                "room_name",
+                "name",
+                "email",
+            ):
+                if arguments.get(key):
+                    target = str(arguments[key])
+                    break
+
+        # Chained operations on one property share an item key.  If its rename
+        # fails, its later group assignment is skipped while unrelated items
+        # can still proceed and be reported honestly.
+        entity_key = (
+            arguments.get("property_query")
+            or arguments.get("lease_number")
+            or arguments.get("room_name")
+            or arguments.get("name")
+            or f"step-{len(steps)}"
+        )
+        steps.append(
+            {
+                "tool": spec["tool"],
+                "arguments": arguments,
+                "target": target,
+                "item_key": f"entity:{entity_key}"[:64],
+                "requires_own_confirm": meta_for(spec["tool"]).own_confirm,
+            },
+        )
+
+    return save_plan(
+        landlord,
+        conversation_id,
+        {
+            "operation": "preview_batch",
+            "summary": (
+                f"{len(steps)} previewed changes collected from one request."
+            ),
+            "steps": steps,
+            "blocked": blocked,
+        },
+    )
+
+
 def load_fresh_plan(landlord, conversation_id) -> RamaPendingPlan | None:
     """The still-valid outstanding plan for this conversation, or None."""
     plan = (
