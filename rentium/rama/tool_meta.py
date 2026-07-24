@@ -83,6 +83,7 @@ TOOL_META: dict[str, ToolMeta] = {
     # its own explicit confirmation, even inside a larger plan.
     "update_bank_balance": ToolMeta(risk="medium", own_confirm=True),
     "setup_room_tenancy": ToolMeta(risk="medium"),
+    "create_group_room": ToolMeta(risk="medium"),
     # ----------------------------------------------------------- leases
     "create_lease": ToolMeta(risk="medium"),
     "update_lease": ToolMeta(risk="medium"),

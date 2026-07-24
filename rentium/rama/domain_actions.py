@@ -42,7 +42,7 @@ def _resolve_property(landlord, property_query: str, pick: str = ""):
 def _prop_err(err):
     if isinstance(err, dict):
         return err if "error" in err else {"error": err}
-    return _prop_err(err)
+    return {"error": str(err)}
 
 
 def _parse_when(when: str):
@@ -291,6 +291,7 @@ def send_tenant_message(
     subject: str = "",
     confirm: str = "",
 ) -> dict:
+    from rentium.leases.models import LeaseTenant
     from rentium.messaging.models import Conversation
     from rentium.messaging.services import send_message
 
@@ -841,19 +842,18 @@ def _resolve_lease(landlord, *, property_query: str = "", lease_number: str = ""
 
 def open_lease(landlord, *, property_query: str = "", lease_number: str = "") -> dict:
     """A clickable in-app link to a lease (to view it or download its PDF)."""
-    from django.conf import settings
+    from .links import url_for_path
 
     lease, err = _resolve_lease(
         landlord, property_query=property_query, lease_number=lease_number
     )
     if err:
         return _prop_err(err)
-    base = settings.FRONTEND_URL.rstrip("/")
     return {
         "lease_number": lease.lease_number,
         "property": lease.property.name if lease.property_id else "",
         "status": lease.get_status_display(),
-        "link": f"{base}/dashboard/leases/{lease.id}",
+        "link": url_for_path(f"/dashboard/leases/{lease.id}"),
         "note": (
             f"Open this link to view lease {lease.lease_number} and click "
             "'Download PDF' for the signed agreement."
@@ -904,18 +904,17 @@ def deliver_property_photos(landlord, *, property_query: str = "") -> dict:
 
 def open_property(landlord, *, property_query: str = "") -> dict:
     """A clickable in-app link to a property's full listing (details + photos)."""
-    from django.conf import settings
+    from .links import url_for_path
 
     prop, err = _resolve_property(landlord, property_query)
     if err:
         return _prop_err(err)
-    base = settings.FRONTEND_URL.rstrip("/")
     photos = prop.property_images.count() if hasattr(prop, "property_images") else 0
     return {
         "name": prop.name,
         "address": prop.address,
         "photos": photos,
-        "link": f"{base}/dashboard/properties/{prop.id}",
+        "link": url_for_path(f"/dashboard/properties/{prop.id}"),
         "note": f"Open this link to view {prop.name} — its photos and full details.",
     }
 
@@ -1175,6 +1174,19 @@ def log_capability_gap(landlord, *, request: str, detail: str = "", learn_now: s
     req = (request or "").strip()
     if not req:
         return {"error": "request is required — what did the landlord want?"}
+    from .capabilities import supported_tool_for_request
+
+    supported_tool = supported_tool_for_request(req)
+    if supported_tool:
+        return {
+            "logged": False,
+            "supported": True,
+            "tool": supported_tool,
+            "note": (
+                f"This request is already supported by {supported_tool}. "
+                "Do not create a capability gap; retry with that tool."
+            ),
+        }
     prioritised = str(learn_now or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
     existing = RamaCapabilityGap.objects.filter(
@@ -1697,7 +1709,9 @@ def invite_tenant_to_lease(
         rebalance_lease_rent_shares(lease, force_equal_unsigned=True)
         lt.refresh_from_db()
 
-    frontend = getattr(settings, "FRONTEND_URL", "http://localhost:3000")
+    from .links import canonical_frontend_origin
+
+    frontend = canonical_frontend_origin()
     invite_url = lt.get_invite_url(frontend)
     email_sent = False
     email_error = None
@@ -1899,7 +1913,9 @@ def resend_lease_invite(
 
     lt.invite_sent_at = timezone.now()
     lt.save(update_fields=["invite_sent_at", "updated_at"])
-    frontend = getattr(settings, "FRONTEND_URL", "http://localhost:3000")
+    from .links import canonical_frontend_origin
+
+    frontend = canonical_frontend_origin()
     invite_url = lt.get_invite_url(frontend)
     sent = bool(send_tenant_invite(lt))
     return {

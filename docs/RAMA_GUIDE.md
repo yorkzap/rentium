@@ -74,3 +74,27 @@ screen.
 **Bottom line:** your Mistral Small key *is* working (it runs the Corporal). A
 smarter decision-layer model is supported by the architecture but not yet
 switch-on-able from the UI.
+## Routine property operations
+
+High-confidence renames, grouped room listings, dashboard navigation, and room
+creation inside an existing property group are routed deterministically. They
+do not depend on the planner guessing the operation, and supported requests
+cannot be logged as capability gaps.
+
+The General may call routine property tools directly. Mutations still follow
+the universal safety boundary: RAMA shows one complete preview, waits for an
+explicit confirmation, then reports the concrete result (for example,
+“Renamed McKenzie B to Room A”).
+
+`create_group_room` derives address, city, province, holding, and related
+property data only when all existing group rooms agree. Private inventory and
+group common areas appear together in the preview. If RAMA would create or
+change a common area's landlord-use classification, it first asks whether the
+landlord or an immediate relative uses that area. Confirmation creates the
+room, inventory, group membership, and area associations in one database
+transaction.
+
+RAMA emits dashboard links only from the registered link map and canonical
+frontend origin. “Show my dashboard properties” therefore resolves to
+`https://www.rentium.ca/dashboard/properties`; legacy `app.rentium.ca` links
+are never generated.

@@ -25,10 +25,11 @@ vars**; **redeploy frontend = push `main` (Vercel auto-builds)**.
 **Backend after a CODE change** (git pull, or edits): the code is mounted, but
 long-running processes hold it in memory. The **web** (django) dev-server
 auto-reloads; the **Celery worker does NOT** — so Telegram RAMA and any
-background task keep running the OLD code until you restart it. After any backend
-change, restart the workers (management commands reload each run, so they're
-fine):
+background task keep running the OLD code until you restart it. Apply migrations
+through the service entrypoint, then restart the workers:
 ```bash
+docker compose -f docker-compose.local.yml run --rm --no-deps django \
+  python manage.py migrate
 docker compose -f docker-compose.local.yml restart celeryworker celerybeat django
 ```
 Symptom of stale workers: RAMA over Telegram ignores a new tool or repeats old
@@ -42,7 +43,7 @@ docker compose -f docker-compose.local.yml up -d --force-recreate django celeryw
 ```
 Verify a var actually reached the server (not just your shell):
 ```bash
-docker compose -f docker-compose.local.yml exec django \
+docker compose -f docker-compose.local.yml run --rm --no-deps django \
   python -c "from django.conf import settings; print(bool(settings.TELEGRAM_BOT_TOKEN))"
 ```
 `True` = loaded. **`export` in a shell does not count** — that was the Telegram bug.
@@ -52,8 +53,13 @@ Deployments → Redeploy.
 
 **Migrations after a pull:**
 ```bash
-docker compose -f docker-compose.local.yml exec django python manage.py migrate
+docker compose -f docker-compose.local.yml run --rm --no-deps django \
+  python manage.py migrate
 ```
+
+Normal full startup is `docker compose -f docker-compose.local.yml up -d`.
+Compose waits for PostgreSQL and Redis health, runs the one-shot `migrate`
+service, and starts Django/Celery only after migrations exit successfully.
 
 ---
 
@@ -124,7 +130,7 @@ wildcard domain, DNS resolves but Vercel returns "domain not configured".)
    is the step that was missing; a shell `export` doesn't reach gunicorn.
 4. Register the webhook (host only; the path is appended automatically):
    ```bash
-   docker compose -f docker-compose.local.yml exec django \
+   docker compose -f docker-compose.local.yml run --rm --no-deps django \
      python manage.py set_telegram_webhook --url https://api.rentium.ca
    ```
    Inspect: `... set_telegram_webhook --info`.
@@ -143,6 +149,14 @@ expiry, SLA checks, event replay, RAMA briefings. If either is down:
 ```bash
 docker compose -f docker-compose.local.yml up -d celeryworker celerybeat
 ```
+
+## 5a. PostgreSQL recovery
+
+Never recreate or delete the local PostgreSQL named volume to clear a startup
+failure. Stop the database, prove no process owns the volume, take a
+filesystem-level backup, and remove `postmaster.pid` only when it is confirmed
+to contain all NUL bytes. The complete command-by-command procedure and
+read/write verification are in `POSTGRES_RECOVERY.md`.
 
 ---
 

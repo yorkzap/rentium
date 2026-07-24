@@ -32,13 +32,15 @@ clause from it automatically; already-signed leases keep the clause they
 were signed with (rules also re-check the live flag, so move-out rules
 stay current either way).
 """
-from django.db.models import Count
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from rentium.properties.models import Property, PropertyArea, PropertyGroup
+from rentium.properties.services import create_group_common_area
+from rentium.properties.services import group_common_areas as common_area_queryset
+from rentium.properties.services import update_group_common_area
 
 
 def _landlord(request):
@@ -70,13 +72,13 @@ def _serialize(area: PropertyArea) -> dict:
 
 def _group_common_areas_qs(group: PropertyGroup):
     room_ids = list(group.grouped_properties.values_list("id", flat=True))
-    return (
-        PropertyArea.objects.filter(property_id__in=room_ids)
-        .annotate(n_shared=Count("shared_by"))
-        .filter(n_shared__gte=2)
-        .select_related("property")
-        .order_by("area_type")
-    ), room_ids
+    return common_area_queryset(group), room_ids
+
+
+def _bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "y", "on"}
 
 
 @api_view(["GET", "POST"])
@@ -100,15 +102,13 @@ def group_common_areas(request, group_id):
         count = max(int(request.data.get("count", 1)), 1)
     except (TypeError, ValueError):
         raise ValidationError({"count": "Must be a positive integer."})
-    first_room = Property.objects.filter(id__in=room_ids).order_by("created_at").first()
-    area = PropertyArea.objects.create(
-        property=first_room,
+    area, _created = create_group_common_area(
+        group,
         area_type=area_type,
         count=count,
         description=(request.data.get("description") or "").strip(),
-        shared_with_landlord=bool(request.data.get("shared_with_landlord", False)),
+        shared_with_landlord=_bool(request.data.get("shared_with_landlord", False)),
     )
-    area.shared_by.set(room_ids)
     return Response(_serialize(area), status=201)
 
 
@@ -126,14 +126,24 @@ def group_common_area_detail(request, group_id, area_id):
         return Response(status=204)
 
     data = request.data
+    shared_with_landlord = None
     if "shared_with_landlord" in data:
-        area.shared_with_landlord = bool(data["shared_with_landlord"])
+        shared_with_landlord = _bool(data["shared_with_landlord"])
+    count = None
     if "count" in data:
         try:
-            area.count = max(int(data["count"]), 1)
+            count = max(int(data["count"]), 1)
         except (TypeError, ValueError):
             raise ValidationError({"count": "Must be a positive integer."})
-    if "description" in data:
-        area.description = (data["description"] or "").strip()
-    area.save()
+    area = update_group_common_area(
+        group,
+        area,
+        count=count,
+        description=(
+            (data["description"] or "").strip()
+            if "description" in data
+            else None
+        ),
+        shared_with_landlord=shared_with_landlord,
+    )
     return Response(_serialize(area))

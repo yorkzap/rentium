@@ -120,12 +120,14 @@ def read(landlord, entity: str = "", filters: str = "", fields: str = "",
 
 
 def link(landlord, entity: str = "", query: str = "") -> dict:
-    """A clickable in-app LINK to one thing (+ what's downloadable there). Use
+    """A canonical clickable Rentium LINK to a dashboard collection or one thing.
+    Fixed collections: dashboard, properties, property_groups, documents, leases,
+    finances, maintenance, settings (query is omitted for these). Use
     whenever the landlord asks to SEE / OPEN / DOWNLOAD / 'send me' / 'give me a
     link to' a lease, property, or property group. entity = 'lease' | 'property' |
-    'property_group'; query identifies it (lease number, property name/address,
-    group name). Never refuse with 'I can't give a link' — use this and paste the
-    URL. If several match, it returns options to pick from."""
+    'property_group' for one record; query identifies it (lease number, property
+    name/address, group name). Never refuse with 'I can't give a link' — use this
+    and paste the returned URL. If several entities match, it returns choices."""
     from .domain_read import link as _fn
     return _fn(landlord, entity=entity, query=query)
 
@@ -1172,7 +1174,9 @@ def log_capability_gap(
     """Log something you genuinely CANNOT do yet as a structured gap for the team
     to build — instead of just saying 'I can't'. Call this whenever you hit a
     real capability limit, and especially when the landlord says 'learn now'.
-    Then tell them it's been noted (and prioritised if learn_now). This never
+    Known property operations, room/group creation, room lists, and dashboard
+    links are rejected as false gaps and return the tool to retry. Then tell the
+    landlord a genuine gap was noted (and prioritised if learn_now). This never
     writes code; it records the need for a human to build safely."""
     from .domain_actions import log_capability_gap as _fn
     return _fn(landlord, request=request, detail=detail, learn_now=learn_now)
@@ -1266,6 +1270,45 @@ def setup_room_tenancy(
         pets_allowed=pets_allowed,
         create_inspection=create_inspection,
         use_existing_if_name_matches=use_existing_if_name_matches,
+        confirm=confirm,
+    )
+
+
+@_params(
+    name="The new room/listing name (for example, Mackenzie B).",
+    group_name="Existing property group whose agreed address and holding are inherited.",
+    inventory_items="Private room inventory as a comma-separated list or JSON list.",
+    shared_areas="Group common areas to associate, e.g. bathroom, kitchen, living room.",
+    shared_with_landlord=(
+        "yes/no: whether the landlord or immediate relatives also use NEW common "
+        "areas. Leave blank only when no new classification is being created or changed."
+    ),
+    confirm="Leave empty to preview; pass 'yes' to run the whole atomic operation.",
+)
+def create_group_room(
+    landlord,
+    name: str,
+    group_name: str,
+    inventory_items: str = "",
+    shared_areas: str = "",
+    shared_with_landlord: str = "",
+    confirm: str = "",
+) -> dict:
+    """Create one ROOM inside an existing property group as a single atomic
+    operation. Derives address, city, province, postal code, country, and holding
+    from consistent group members; asks when group data conflicts. Creates private
+    inventory and associates all requested group common areas in the same
+    transaction. New shared areas require an explicit landlord-sharing yes/no.
+    Exact/near duplicate names are surfaced. Preview first; confirm=yes."""
+    from .domain_crud import create_group_room as _fn
+
+    return _fn(
+        landlord,
+        name=name,
+        group_name=group_name,
+        inventory_items=inventory_items,
+        shared_areas=shared_areas,
+        shared_with_landlord=shared_with_landlord,
         confirm=confirm,
     )
 

@@ -461,6 +461,13 @@ CORS_ALLOW_HEADERS = [
 
 # The logged-in app (invite links, dashboard deep links).
 FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000")
+# URLs RAMA hands to people must be stable production-facing links. FRONTEND_URL
+# can be localhost (development) or the legacy app.rentium.ca redirect, so it is
+# intentionally not the canonical link origin.
+CANONICAL_FRONTEND_ORIGIN = env(
+    "CANONICAL_FRONTEND_ORIGIN",
+    default="https://www.rentium.ca",
+)
 
 # The PUBLIC, indexable site — canonical origin for /l/<slug> and
 # /<province>/<city>. Same host as FRONTEND_URL today; split them the day the

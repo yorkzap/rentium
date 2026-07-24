@@ -803,7 +803,7 @@ def test_yes_executes_pending_deterministically(landlord, settings):
     assert Property.objects.filter(landlord=landlord, name__iexact="McKenzie Room G").count() == 1
     assert "create_property" in body["tools_used"]
     assert yes.requests == []  # no provider round-trip at all
-    assert body["reply"].startswith("Done:")
+    assert body["reply"] == "Created McKenzie Room G."
     assert not RamaPendingPlan.objects.filter(conversation_id=conv).exists()
     assert body["pending_plan"] is None
 
@@ -3572,7 +3572,13 @@ def test_general_role_toolset_and_context(landlord):
 
     names = {t["name"] for t in role_tool_schemas("general", depth=0)}
     assert {"ask_corporal", "ask_fsa", "plan_operation", "amend_constitution"} <= names
-    assert "create_property" not in names  # single writes are the Corporal's job
+    assert {
+        "create_property",
+        "update_property",
+        "create_property_group",
+        "assign_property_to_group",
+        "create_group_room",
+    } <= names
     # depth >= 1 strips delegation — strictly single-level hierarchy.
     sub = {t["name"] for t in role_tool_schemas("general", depth=1)}
     assert "ask_corporal" not in sub and "ask_fsa" not in sub
@@ -3583,6 +3589,282 @@ def test_general_role_toolset_and_context(landlord):
     amend(landlord, key="balances", body_md="Keep $5k minimum.")
     ctx = role_context("general", landlord)
     assert "Keep $5k minimum." in ctx and "THE CONSTITUTION" in ctx
+
+
+def _property_group_with_consensus(landlord, name="Upstairs Property Group"):
+    from rentium.properties.models import Property, PropertyGroup, PropertyHolding
+
+    holding = PropertyHolding.objects.create(
+        landlord=landlord,
+        name="McKenzie House",
+        address="950 McKenzie Ave",
+        city="Victoria",
+    )
+    group = PropertyGroup.objects.create(landlord=landlord, name=name)
+    room = Property.objects.create(
+        landlord=landlord,
+        holding=holding,
+        group=group,
+        name="Mackenzie A",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        postal_code="V8Z 3T7",
+        country="Canada",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    return holding, group, room
+
+
+def test_create_group_room_clarifies_previews_and_commits_atomically(landlord):
+    from rentium.properties.models import InventoryItem, Property, PropertyArea
+
+    _holding, group, first_room = _property_group_with_consensus(landlord)
+    args = {
+        "name": "Mackenzie B",
+        "group_name": group.name,
+        "inventory_items": "Queen bed, Queen mattress, Desk",
+        "shared_areas": "Bathroom, Kitchen, Living Room",
+    }
+    clarification = registry.execute("create_group_room", args, landlord=landlord)
+    assert clarification["needs_input"] is True
+    assert clarification["missing_field"] == "shared_with_landlord"
+    assert not Property.objects.filter(landlord=landlord, name="Mackenzie B").exists()
+
+    preview_args = {**args, "shared_with_landlord": "no"}
+    preview = registry.execute("create_group_room", preview_args, landlord=landlord)
+    assert preview["needs_confirm"] is True
+    assert preview["preview"]["atomic"] is True
+    assert preview["preview"]["derived_property_data"]["holding"] == "McKenzie House"
+    assert len(preview["preview"]["shared_areas"]) == 3
+
+    done = registry.execute(
+        "create_group_room",
+        {**preview_args, "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert done["created"] is True
+    room = Property.objects.get(landlord=landlord, name="Mackenzie B")
+    assert room.group_id == group.pk and room.holding_id == first_room.holding_id
+    assert set(
+        InventoryItem.objects.filter(property=room).values_list("name", flat=True)
+    ) == {"Queen bed", "Queen mattress", "Desk"}
+    areas = PropertyArea.objects.filter(
+        property__group=group,
+        is_group_common=True,
+    )
+    assert areas.count() == 3
+    assert all(area.shared_by.count() == 2 for area in areas)
+    assert not areas.filter(shared_with_landlord=True).exists()
+
+    retry = registry.execute(
+        "create_group_room",
+        {**preview_args, "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert retry["idempotent"] is True
+    assert Property.objects.filter(landlord=landlord, name="Mackenzie B").count() == 1
+
+
+def test_create_group_room_rolls_back_every_step_on_failure(landlord):
+    from rentium.properties.models import InventoryItem, Property
+
+    _holding, group, _room = _property_group_with_consensus(landlord)
+    args = {
+        "name": "Rollback Room",
+        "group_name": group.name,
+        "inventory_items": "Desk",
+        "shared_areas": "Kitchen",
+        "shared_with_landlord": "no",
+        "confirm": "yes",
+    }
+    with mock.patch(
+        "rentium.properties.services.create_group_common_area",
+        side_effect=RuntimeError("injected area failure"),
+    ):
+        result = registry.execute("create_group_room", args, landlord=landlord)
+    assert "nothing was saved" in result["error"]
+    assert not Property.objects.filter(landlord=landlord, name="Rollback Room").exists()
+    assert not InventoryItem.objects.filter(property__name="Rollback Room").exists()
+
+
+def test_create_group_room_surfaces_near_duplicate_and_bad_group_data(landlord):
+    from rentium.properties.models import Property
+
+    _holding, group, room = _property_group_with_consensus(landlord)
+    room.name = "McKenzie B"
+    room.save(update_fields=["name", "updated_at"])
+    near = registry.execute(
+        "create_group_room",
+        {
+            "name": "Mackenzie B",
+            "group_name": group.name,
+            "shared_areas": "",
+        },
+        landlord=landlord,
+    )
+    assert near["needs_confirm"] is True
+    assert near["preview"]["name_conflicts"][0]["match"] == "near"
+
+    Property.objects.create(
+        landlord=landlord,
+        holding=room.holding,
+        group=group,
+        name="Different Address Room",
+        address="999 Other St",
+        city="Victoria",
+        province="bc",
+        postal_code="V8Z 3T7",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    inconsistent = registry.execute(
+        "create_group_room",
+        {"name": "Room C", "group_name": group.name},
+        landlord=landlord,
+    )
+    assert inconsistent["needs_input"] is True
+    assert any(
+        problem["field"] == "address"
+        for problem in inconsistent["group_data_problems"]
+    )
+
+
+def test_link_dashboard_collections_use_canonical_origin(landlord, settings):
+    settings.FRONTEND_URL = "https://app.rentium.ca"
+    settings.CANONICAL_FRONTEND_ORIGIN = "https://www.rentium.ca"
+    expected = {
+        "dashboard": "/dashboard",
+        "properties": "/dashboard/properties",
+        "property_groups": "/dashboard/properties?view=groups",
+        "documents": "/dashboard/documents",
+        "leases": "/dashboard/leases",
+        "finances": "/dashboard/financial",
+        "maintenance": "/dashboard/maintenance",
+        "settings": "/dashboard/settings",
+    }
+    for entity, path in expected.items():
+        result = registry.execute("link", {"entity": entity}, landlord=landlord)
+        assert result["link"] == f"https://www.rentium.ca{path}"
+        assert "app.rentium.ca" not in result["link"]
+
+
+def test_supported_operations_cannot_be_logged_as_capability_gaps(landlord):
+    from rentium.rama.models import RamaCapabilityGap
+
+    for request, tool in (
+        ("Rename room B to room A", "update_property"),
+        ("Show all my rooms", "list_properties"),
+        ("Open the dashboard properties link", "link"),
+        ("Create a room in a property group", "create_group_room"),
+    ):
+        result = registry.execute(
+            "log_capability_gap", {"request": request}, landlord=landlord
+        )
+        assert result["supported"] is True
+        assert result["tool"] == tool
+    assert not RamaCapabilityGap.objects.filter(landlord=landlord).exists()
+
+
+def test_deterministic_rename_transcript_and_grouped_room_display(landlord, settings):
+    from rentium.properties.models import Property
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord, settings=settings)
+    _holding, group, room = _property_group_with_consensus(landlord)
+    room.name = "McKenzie B"
+    room.save(update_fields=["name", "updated_at"])
+    provider = ScriptedProvider([Turn(text="must not run")])
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(
+            landlord,
+            "Rename room B to room A",
+            role="general",
+            channel="telegram",
+        )
+    assert preview.deterministic is True
+    assert preview.tools_used == ["_live_context", "update_property"]
+    assert "rename McKenzie B to Room A" in preview.reply
+    assert provider.requests == []
+    assert Property.objects.get(pk=room.pk).name == "McKenzie B"
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        confirmed = run_turn(
+            landlord,
+            "Yes",
+            preview.conversation_id,
+            role="general",
+            channel="telegram",
+        )
+    room.refresh_from_db()
+    assert room.name == "Room A"
+    assert confirmed.reply == "Renamed McKenzie B to Room A."
+    tools = list(
+        RamaAudit.objects.filter(
+            conversation_id=preview.conversation_id,
+            kind=RamaAudit.Kind.TOOL_CALL,
+        ).values_list("content", flat=True)
+    )
+    assert not any(row.get("tool") in {"plan_operation", "log_capability_gap"} for row in tools)
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        shown = run_turn(
+            landlord,
+            "Show all my rooms",
+            preview.conversation_id,
+            role="general",
+            channel="telegram",
+        )
+    assert group.name in shown.reply
+    assert "McKenzie House" in shown.reply
+    assert "Room A" in shown.reply
+
+
+def test_group_room_instruction_one_clarification_one_preview(landlord, settings):
+    from rentium.properties.models import Property
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord, settings=settings)
+    _holding, group, _room = _property_group_with_consensus(landlord)
+    provider = ScriptedProvider([Turn(text="must not run")])
+    instruction = (
+        "Create a new room called Mackenzie B in Upstairs Property Group with "
+        "a queen bed, queen mattress, and desk, sharing the bathroom, kitchen, "
+        "and living room."
+    )
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        clarification = run_turn(
+            landlord, instruction, role="general", channel="telegram"
+        )
+    assert "Does the landlord" in clarification.reply
+    assert clarification.pending_plan is None
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(
+            landlord,
+            "No",
+            clarification.conversation_id,
+            role="general",
+            channel="telegram",
+        )
+    assert "Preview: create Mackenzie B" in preview.reply
+    assert "Queen bed, Queen mattress, Desk" in preview.reply
+    assert preview.pending_plan["steps"][0]["tool"] == "create_group_room"
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        done = run_turn(
+            landlord,
+            "Yes",
+            clarification.conversation_id,
+            role="general",
+            channel="telegram",
+        )
+    assert done.reply.startswith(f"Created Mackenzie B in {group.name}")
+    assert Property.objects.filter(
+        landlord=landlord, name="Mackenzie B", group=group
+    ).exists()
 
 
 def test_general_delegates_and_rehomes_sub_plan(landlord, settings):

@@ -433,15 +433,14 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
                 f"Property '{prop.name}' is already assigned to group '{prop.group.name}'. Remove it first."
             )
 
-        # Assign property to the group
-        prop.group = group
         try:
-            prop.full_clean()  # Run model validation before saving
+            from rentium.properties.services import assign_room_to_group
+
+            prop = assign_room_to_group(prop, group)
         except DjangoValidationError as e:
             raise ValidationError(
                 serializers.as_serializer_error(e)
             )  # Convert to DRF error
-        prop.save()
 
         # Return summary of the added property
         serializer = PropertySummaryForGroupSerializer(
@@ -464,17 +463,12 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
         except Property.DoesNotExist:
             raise NotFound("Property not found in this group or not owned by you.")
 
-        # Check if removing would violate area sharing rules?
-        # If this property shares areas with others ONLY via this group, removing it
-        # might invalidate those PropertyArea.shared_by settings.
-        # This requires careful consideration. Simplest: Allow removal, but maybe
-        # add a cleanup task or warning later. For now, just remove from group.
-        prop.group = None
         try:
-            prop.full_clean()
+            from rentium.properties.services import assign_room_to_group
+
+            assign_room_to_group(prop, None)
         except DjangoValidationError as e:
             raise ValidationError(serializers.as_serializer_error(e))
-        prop.save()
 
         return Response(
             {"message": "Property removed from group."}, status=status.HTTP_200_OK

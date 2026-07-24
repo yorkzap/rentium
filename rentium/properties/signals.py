@@ -19,10 +19,51 @@ WIRING: properties/apps.py ready() imports this module.
 import logging
 
 from django.db.models.signals import post_delete
+from django.db.models.signals import pre_save
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
 logger = logging.getLogger(__name__)
+
+
+@receiver(
+    pre_save,
+    sender="properties.Property",
+    dispatch_uid="remember_property_group_before_save",
+)
+def remember_property_group_before_save(sender, instance, raw=False, **kwargs):
+    if raw or not instance.pk:
+        instance._previous_group_id = None
+        return
+    instance._previous_group_id = (
+        sender.objects.filter(pk=instance.pk)
+        .values_list("group_id", flat=True)
+        .first()
+    )
+
+
+@receiver(
+    post_save,
+    sender="properties.Property",
+    dispatch_uid="sync_common_areas_on_property_group_change",
+)
+def sync_common_areas_on_property_group_change(
+    sender, instance, created, raw=False, **kwargs
+):
+    if raw:
+        return
+    old_group_id = getattr(instance, "_previous_group_id", None)
+    if not created and old_group_id == instance.group_id:
+        return
+    from .models import PropertyGroup
+    from .services import sync_room_group_membership
+
+    old_group = (
+        PropertyGroup.objects.filter(pk=old_group_id).first()
+        if old_group_id
+        else None
+    )
+    sync_room_group_membership(instance, old_group=old_group)
 
 
 # --- is_furnished --------------------------------------------------------

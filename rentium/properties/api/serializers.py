@@ -113,6 +113,8 @@ class PropertyAreaSerializer(serializers.ModelSerializer):
             "description",
             "shared_by",  # Writable list of IDs
             "shared_by_details",  # Read-only nested details
+            "shared_with_landlord",
+            "is_group_common",
             "created_at",
             "updated_at",
         ]
@@ -122,6 +124,7 @@ class PropertyAreaSerializer(serializers.ModelSerializer):
             "updated_at",
             "area_type_display",
             "shared_by_details",
+            "is_group_common",
         ]
         extra_kwargs = {
             "property": {

@@ -16,6 +16,7 @@ backend already knows exactly what ran or was cancelled; weak models asked to
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 
@@ -107,12 +108,43 @@ def _write_label(result: dict) -> str:
     return ""
 
 
+def _write_result_message(tool: str, result: dict, target: str = "") -> str:
+    message = str(result.get("message") or result.get("note") or "").strip()
+    if message:
+        return message
+    if tool == "update_property":
+        before = str(result.get("previous_name") or target or "").strip()
+        prop = result.get("property") or {}
+        after = str(prop.get("name") if isinstance(prop, dict) else prop).strip()
+        if before and after and before != after:
+            return f"Renamed {before} to {after}."
+        if after:
+            return f"Updated {after}."
+    label = _write_label(result) or target
+    if result.get("created") and label:
+        return f"Created {label}."
+    if result.get("updated") and label:
+        return f"Updated {label}."
+    if result.get("deleted") and label:
+        return f"Deleted {label}."
+    return f"Completed {tool.replace('_', ' ')}" + (f" for {label}." if label else ".")
+
+
 def _plan_fallback_reply(progress: dict) -> str:
     """Deterministic per-item report for an executed plan — completed work
     must never look like an error, and never needs a model to describe it."""
     parts: list[str] = []
     for it in progress.get("executed") or []:
-        parts.append(f"Done: {it.get('target') or it.get('tool')}")
+        result = it.get("result") or {}
+        parts.append(
+            _write_result_message(
+                str(it.get("tool") or ""),
+                result,
+                str(it.get("target") or ""),
+            )
+        )
+        if result.get("documents_page"):
+            parts.append(f"Open document: {result['documents_page']}")
     for it in progress.get("failed") or []:
         err = (it.get("result") or {}).get("error") or "failed"
         parts.append(f"Failed: {it.get('target') or it.get('tool')} — {err}")
@@ -125,6 +157,273 @@ def _plan_fallback_reply(progress: dict) -> str:
             "own confirmation — reply yes to run it, or no to stop here."
         )
     return "\n".join(parts) or "Done."
+
+
+def _rename_intent(landlord, message: str) -> dict | None:
+    match = re.match(
+        r"^\s*(?:please\s+)?rename\s+(?:the\s+)?(.+?)\s+to\s+(.+?)\s*[.!]?\s*$",
+        message or "",
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    source = match.group(1).strip()
+    new_name = match.group(2).strip()
+    if not source or not new_name:
+        return None
+    room_label = re.fullmatch(r"room\s+([a-z])", new_name, flags=re.IGNORECASE)
+    if room_label:
+        new_name = f"Room {room_label.group(1).upper()}"
+
+    from .resolve import resolve_property
+
+    prop, err = resolve_property(landlord, source)
+    if err and re.match(r"^room\s+", source, flags=re.IGNORECASE):
+        suffix = re.sub(r"^room\s+", "", source, flags=re.IGNORECASE).strip()
+        from rentium.properties.models import Property
+
+        candidates = list(
+            Property.objects.filter(
+                landlord=landlord,
+                property_category=Property.PropertyCategory.ROOM,
+                name__iendswith=suffix,
+            ).order_by("created_at")[:3]
+        )
+        if len(candidates) == 1:
+            prop, err = candidates[0], None
+    return {
+        "tool": "update_property",
+        "arguments": {
+            "property_query": str(prop.pk) if prop is not None else source,
+            "name": new_name,
+        },
+    }
+
+
+def _dashboard_collection_intent(message: str) -> str | None:
+    text = " ".join((message or "").casefold().split())
+    if "dashboard" not in text or not re.search(
+        r"\b(link|open|view|show|go|take|send|where)\b", text
+    ):
+        return None
+    for pattern, collection in (
+        (r"\bproperty groups?\b", "property_groups"),
+        (r"\bproperties\b|\blistings\b", "properties"),
+        (r"\bdocuments?\b", "documents"),
+        (r"\bleases?\b", "leases"),
+        (r"\bfinances?\b|\bfinancial\b", "finances"),
+        (r"\bmaintenance\b|\brepairs?\b", "maintenance"),
+        (r"\bsettings?\b", "settings"),
+    ):
+        if re.search(pattern, text):
+            return collection
+    return "dashboard"
+
+
+def _show_all_rooms_intent(message: str) -> bool:
+    text = " ".join((message or "").casefold().split())
+    return bool(
+        re.search(r"\b(show|list|view)\b", text)
+        and re.search(r"\b(all|every|my)\b", text)
+        and re.search(r"\brooms?\b", text)
+    )
+
+
+def _rooms_reply(result: dict) -> str:
+    rooms = result.get("rooms") or []
+    if not rooms:
+        return "No room listings are recorded."
+    parents: dict[tuple[str, str], dict[str, list[dict]]] = {}
+    for room in rooms:
+        parent = room.get("holding") or room.get("address") or "No holding/address"
+        address = room.get("address") or ""
+        group = room.get("group") or "Ungrouped rooms"
+        parents.setdefault((parent, address), {}).setdefault(group, []).append(room)
+    lines = [f"Rooms ({len(rooms)}):"]
+    for (parent, address), groups in parents.items():
+        heading = parent
+        if address and address.casefold() not in parent.casefold():
+            heading += f" — {address}"
+        lines.append(heading)
+        for group, members in groups.items():
+            lines.append(f"  {group}")
+            for room in members:
+                occupancy = room.get("occupancy") or {}
+                state = (
+                    "occupied today"
+                    if occupancy.get("occupied_today")
+                    else "vacant today"
+                )
+                lines.append(f"  • {room.get('name')} — {state}")
+    return "\n".join(lines)
+
+
+def _group_room_intent(landlord, message: str) -> dict | None:
+    text = message or ""
+    lowered = text.casefold()
+    if not re.search(r"\b(create|add|make)\b", lowered):
+        return None
+    from rentium.properties.models import PropertyGroup
+    from rentium.properties.services import parse_common_area_types
+
+    matched_groups = [
+        group
+        for group in PropertyGroup.objects.filter(landlord=landlord)
+        if group.name.casefold() in lowered
+    ]
+    if not matched_groups:
+        return None
+    matched_groups.sort(key=lambda group: len(group.name), reverse=True)
+    group = matched_groups[0]
+    group_match = re.search(
+        rf"\b(?:in|to|under)\s+(?:the\s+)?{re.escape(group.name)}\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not group_match:
+        return None
+    lead = text[: group_match.start()]
+    room_name = re.sub(
+        r"^\s*(?:please\s+)?(?:create|add|make)\s+"
+        r"(?:a\s+)?(?:new\s+)?(?:room\s+)?(?:named\s+|called\s+)?",
+        "",
+        lead,
+        flags=re.IGNORECASE,
+    ).strip(" ,.-")
+    room_name = re.sub(r"^room\s+", "", room_name, flags=re.IGNORECASE).strip()
+    if not room_name or len(room_name) > 255:
+        return None
+
+    inventory: list[str] = []
+    for pattern, label in (
+        (r"\bqueen(?:-size[dn]?)?\s+bed\b", "Queen bed"),
+        (r"\bqueen(?:-size[dn]?)?\s+mattress\b", "Queen mattress"),
+        (r"\bking(?:-size[dn]?)?\s+bed\b", "King bed"),
+        (r"\bking(?:-size[dn]?)?\s+mattress\b", "King mattress"),
+        (r"\bdouble\s+bed\b", "Double bed"),
+        (r"\bsingle\s+bed\b", "Single bed"),
+        (r"\btwin\s+bed\b", "Twin bed"),
+        (r"\bmattress\b", "Mattress"),
+        (r"\bdesk\b", "Desk"),
+        (r"\bdresser\b", "Dresser"),
+        (r"\bnightstand\b|\bbedside table\b", "Nightstand"),
+    ):
+        if (
+            label == "Mattress"
+            and any(item.casefold().endswith("mattress") for item in inventory)
+        ):
+            continue
+        if re.search(pattern, lowered) and label not in inventory:
+            inventory.append(label)
+
+    area_types = parse_common_area_types(text)
+    from rentium.properties.models import PropertyArea
+
+    shared_areas = ", ".join(
+        str(PropertyArea.AreaType(area_type).label) for area_type in area_types
+    )
+    classification = ""
+    if "landlord" in lowered:
+        if re.search(
+            r"\b(landlord|owner).{0,30}\b(does not|doesn't|not|never|no)\b"
+            r"|\b(no|not).{0,30}\b(landlord|owner)\b",
+            lowered,
+        ):
+            classification = "no"
+        elif re.search(
+            r"\b(landlord|owner).{0,40}\b(use|uses|share|shares|live|lives)\b"
+            r"|\bshared? with (?:the )?(landlord|owner)\b",
+            lowered,
+        ):
+            classification = "yes"
+    return {
+        "tool": "create_group_room",
+        "arguments": {
+            "name": room_name,
+            "group_name": group.name,
+            "inventory_items": ", ".join(inventory),
+            "shared_areas": shared_areas,
+            "shared_with_landlord": classification,
+        },
+    }
+
+
+def _group_room_clarification(landlord, conversation_id) -> dict | None:
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+    ).order_by("-created_at")[:20]
+    for row in rows:
+        content = row.content or {}
+        if content.get("tool") != "create_group_room":
+            continue
+        result = content.get("result") or {}
+        if not result.get("needs_input") or result.get("missing_field") != (
+            "shared_with_landlord"
+        ):
+            return None
+        latest_assistant = (
+            RamaAudit.objects.filter(
+                landlord=landlord,
+                conversation_id=conversation_id,
+                kind=RamaAudit.Kind.ASSISTANT_MESSAGE,
+                created_at__gte=row.created_at,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+        if latest_assistant is None:
+            return None
+        return {
+            "tool": "create_group_room",
+            "arguments": dict(content.get("arguments") or {}),
+        }
+    return None
+
+
+def _preview_reply(tool: str, result: dict) -> str:
+    preview = result.get("preview") or {}
+    if tool == "update_property":
+        before = preview.get("property") or "the listing"
+        after = (preview.get("changes") or {}).get("name")
+        conflicts = preview.get("name_conflicts") or []
+        text = f"Preview: rename {before} to {after}."
+        if conflicts:
+            text += " Similar listing names: " + ", ".join(
+                conflict["name"] for conflict in conflicts
+            ) + "."
+        return text + " Reply yes to confirm, or no to cancel."
+    if tool == "create_group_room":
+        inventory = preview.get("private_inventory_to_create") or []
+        areas = preview.get("shared_areas") or []
+        text = (
+            f"Preview: create {preview.get('name')} in "
+            f"{preview.get('property_group')} at "
+            f"{(preview.get('derived_property_data') or {}).get('address')}."
+        )
+        text += "\nPrivate inventory: " + (
+            ", ".join(inventory) if inventory else "none"
+        ) + "."
+        text += "\nShared areas: " + (
+            ", ".join(
+                f"{area['name']} "
+                f"({'landlord also uses it' if area['shared_with_landlord'] else 'tenant-only'})"
+                for area in areas
+            )
+            if areas
+            else "none"
+        ) + "."
+        conflicts = preview.get("name_conflicts") or []
+        if conflicts:
+            text += "\nSimilar listing names: " + ", ".join(
+                conflict["name"] for conflict in conflicts
+            ) + "."
+        return text + "\nReply yes to confirm the complete operation, or no to cancel."
+    return (
+        f"Preview for {tool.replace('_', ' ')}: "
+        f"{json.dumps(preview, default=str)}. Reply yes to confirm, or no to cancel."
+    )
 
 
 def _persist_pending(landlord, conversation_id, pending_spec: dict | None) -> None:
@@ -446,11 +745,123 @@ def run_turn(
             + json.dumps(plan_brief(pending_plan), default=str)
         )
 
+    def _run_deterministic_tool(tool_name: str, arguments: dict) -> dict:
+        result = execute(tool_name, arguments, landlord=landlord)
+        safe_result = json.loads(json.dumps(result, default=str))
+        tools_used.append(tool_name)
+        audit(
+            RamaAudit.Kind.TOOL_CALL,
+            {
+                "tool": tool_name,
+                "arguments": arguments,
+                "result": safe_result,
+                "deterministic_routing": True,
+            },
+        )
+        return result
+
+    # A yes/no immediately after create_group_room asked its legal
+    # landlord-sharing question is an answer to that question, not a fresh
+    # command and not an action confirmation yet.
+    if (
+        deterministic_reply is None
+        and pending_plan is None
+        and (_is_affirmative(message) or _is_negative(message))
+    ):
+        clarification = _group_room_clarification(landlord, conversation_id)
+        if clarification is not None:
+            arguments = clarification["arguments"]
+            arguments["shared_with_landlord"] = (
+                "yes" if _is_affirmative(message) else "no"
+            )
+            result = _run_deterministic_tool("create_group_room", arguments)
+            if result.get("needs_confirm"):
+                save_single(
+                    landlord,
+                    conversation_id,
+                    "create_group_room",
+                    arguments,
+                )
+                deterministic_reply = _preview_reply("create_group_room", result)
+            else:
+                deterministic_reply = str(
+                    result.get("error")
+                    or result.get("question_for_user")
+                    or result.get("message")
+                    or result
+                )
+
+    # High-confidence property operations bypass model intent selection. A
+    # rename can therefore never drift into an availability/status plan.
+    if deterministic_reply is None and pending_plan is None:
+        intent = _rename_intent(landlord, message)
+        if intent is not None:
+            result = _run_deterministic_tool(
+                intent["tool"], intent["arguments"]
+            )
+            if result.get("needs_confirm"):
+                save_single(
+                    landlord,
+                    conversation_id,
+                    intent["tool"],
+                    intent["arguments"],
+                )
+                deterministic_reply = _preview_reply(intent["tool"], result)
+            else:
+                deterministic_reply = str(
+                    result.get("error") or result.get("message") or result
+                )
+
+    if deterministic_reply is None and pending_plan is None:
+        collection = _dashboard_collection_intent(message)
+        if collection is not None:
+            result = _run_deterministic_tool(
+                "link", {"entity": collection, "query": ""}
+            )
+            deterministic_reply = str(
+                result.get("error")
+                or f"{result.get('label')}: {result.get('link')}"
+            )
+
+    if (
+        deterministic_reply is None
+        and pending_plan is None
+        and _show_all_rooms_intent(message)
+    ):
+        result = _run_deterministic_tool("list_properties", {})
+        deterministic_reply = (
+            str(result["error"]) if result.get("error") else _rooms_reply(result)
+        )
+
+    if deterministic_reply is None and pending_plan is None:
+        intent = _group_room_intent(landlord, message)
+        if intent is not None:
+            result = _run_deterministic_tool(
+                intent["tool"], intent["arguments"]
+            )
+            if result.get("needs_input"):
+                deterministic_reply = str(result.get("question_for_user"))
+            elif result.get("needs_confirm"):
+                save_single(
+                    landlord,
+                    conversation_id,
+                    intent["tool"],
+                    intent["arguments"],
+                )
+                deterministic_reply = _preview_reply(intent["tool"], result)
+            else:
+                deterministic_reply = str(
+                    result.get("error") or result.get("message") or result
+                )
+
     # Bare yes/no is fully handled above — answer without any provider
     # round-trip, so a weak model can never "narrate" actions that didn't
     # happen or spin up a fresh plan after a cancellation.
     if deterministic_reply is not None:
-        _persist_pending(landlord, conversation_id, None)
+        # A deterministic router may itself have just created a preview plan.
+        # Preserve it; confirmations/cancellations have no outstanding plan.
+        if load_fresh_plan(landlord, conversation_id) is None:
+            _persist_pending(landlord, conversation_id, None)
         outstanding = load_fresh_plan(landlord, conversation_id)
         audit(
             RamaAudit.Kind.ASSISTANT_MESSAGE,

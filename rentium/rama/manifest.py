@@ -368,13 +368,16 @@ def capability_digest() -> str:
             editable_bits.append(f"{key} ({shown})")
         if spec.links is not None:
             linkable.append(key)
+    from .links import DASHBOARD_COLLECTIONS
+
     return (
         "## DATA SURFACE (manifest-derived — reach it generically; don't say "
         "'not supported' or log a gap for these)\n"
         f"- READ/FILTER any of: {readable}. Field names come from data_catalogue; "
         "use the `read` tool for specific/combined questions.\n"
         f"- EDIT via `update` (previews, then confirm): {'; '.join(editable_bits)}.\n"
-        f"- DEEP-LINK / attachments via `link`: {', '.join(linkable)}."
+        f"- DEEP-LINK / attachments via `link`: {', '.join(linkable)}. "
+        f"Dashboard collections: {', '.join(DASHBOARD_COLLECTIONS)}."
     )
 
 

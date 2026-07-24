@@ -793,6 +793,15 @@ class PropertyArea(models.Model):
             "the provincial tenancy act applies to leases on these rooms."
         ),
     )
+    is_group_common = models.BooleanField(
+        _("Group Common Area"),
+        default=False,
+        db_index=True,
+        help_text=_(
+            "This area belongs to the whole property group. Membership is "
+            "synchronized automatically as rooms join, move, or leave."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -49,7 +49,7 @@ RUN groupadd --gid 1000 dev-user \
 RUN apt-get update && apt-get install --no-install-recommends -y \
   # psycopg dependencies
   libpq-dev  \
-  wait-for-it \
+  postgresql-client \
   # Translations dependencies
   gettext \
   # cleaning up unused files

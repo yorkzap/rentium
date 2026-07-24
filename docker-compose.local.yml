@@ -3,26 +3,18 @@ volumes:
   rentium_local_postgres_data_backups: {}
   rentium_local_redis_data: {}
 
-services:
-  django: &django
-    build:
-      context: .
-      dockerfile: ./compose/local/django/Dockerfile
-    image: rentium_local_django
-    container_name: rentium_local_django
-    depends_on:
-      - postgres
-      - redis
-      - mailpit
-    volumes:
-      - .:/app:z
-    env_file:
-      - ./.envs/.local/.django
-      - ./.envs/.local/.postgres
-    ports:
-      - '8000:8000'
-    command: /start
+x-django: &django
+  build:
+    context: .
+    dockerfile: ./compose/local/django/Dockerfile
+  image: rentium_local_django
+  volumes:
+    - .:/app:z
+  env_file:
+    - ./.envs/.local/.django
+    - ./.envs/.local/.postgres
 
+services:
   postgres:
     build:
       context: .
@@ -34,12 +26,20 @@ services:
       - rentium_local_postgres_data_backups:/backups
     env_file:
       - ./.envs/.local/.postgres
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
 
   mailpit:
     image: docker.io/axllent/mailpit:latest
     container_name: rentium_local_mailpit
     ports:
       - "8025:8025"
+    restart: unless-stopped
 
   redis:
     image: docker.io/redis:6
@@ -47,17 +47,55 @@ services:
     
     volumes:
       - rentium_local_redis_data:/data
-    
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *django
+    container_name: rentium_local_migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports: []
+    restart: 'no'
+    command: python manage.py migrate
+
+  django:
+    <<: *django
+    container_name: rentium_local_django
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    ports:
+      - '8000:8000'
+    restart: unless-stopped
+    command: /start
 
   celeryworker:
     <<: *django
     image: rentium_local_celeryworker
     container_name: rentium_local_celeryworker
     depends_on:
-      - redis
-      - postgres
-      - mailpit
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
     ports: []
+    restart: unless-stopped
     command: /start-celeryworker
 
   celerybeat:
@@ -65,17 +103,30 @@ services:
     image: rentium_local_celerybeat
     container_name: rentium_local_celerybeat
     depends_on:
-      - redis
-      - postgres
-      - mailpit
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
     ports: []
+    restart: unless-stopped
     command: /start-celerybeat
 
   flower:
     <<: *django
     image: rentium_local_flower
     container_name: rentium_local_flower
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     ports:
       - '5555:5555'
+    restart: unless-stopped
     command: /start-flower
-

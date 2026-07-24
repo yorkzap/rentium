@@ -151,13 +151,29 @@ def link(landlord, *, entity: str = "", query: str = "") -> dict:
     return a clickable in-app deep link (+ what can be downloaded there). Generic
     Phase-2 replacement for per-entity open_* tools — driven by the manifest's
     LinkSpec. Same scope guarantee as read: only the landlord's own rows resolve."""
-    from django.conf import settings
     from django.db.models import Q
+    from .links import dashboard_collection, url_for_path
+
+    collection = dashboard_collection(entity)
+    if collection is not None:
+        label, path = collection
+        return {
+            "entity": (entity or "").strip().casefold(),
+            "label": label,
+            "link": url_for_path(path),
+            "collection": True,
+            "note": f"Open the {label} dashboard page.",
+        }
 
     spec = MANIFEST.get((entity or "").strip().lower())
     if spec is None:
         linkable = [k for k, s in MANIFEST.items() if s.links]
-        return {"error": f"Unknown entity {entity!r}.", "linkable": linkable}
+        from .links import DASHBOARD_COLLECTIONS
+
+        return {
+            "error": f"Unknown entity {entity!r}.",
+            "linkable": linkable + list(DASHBOARD_COLLECTIONS),
+        }
     if spec.links is None:
         linkable = [k for k, s in MANIFEST.items() if s.links]
         return {"error": f"{spec.key} has no page to link to.", "linkable": linkable}
@@ -190,11 +206,10 @@ def link(landlord, *, entity: str = "", query: str = "") -> dict:
         }
 
     m = matches[0]
-    base = settings.FRONTEND_URL.rstrip("/")
     out = {
         "entity": spec.key,
         "label": str(getattr(m, label_field, m.pk)),
-        "link": base + ls.page.format(id=m.pk),
+        "link": url_for_path(ls.page.format(id=m.pk)),
     }
     if ls.downloads:
         out["available_there"] = list(ls.downloads)

@@ -930,7 +930,7 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
     today = date.today()
     qs = list(
         Property.objects.filter(landlord=landlord)
-        .select_related("group")
+        .select_related("group", "holding")
         # Grounds has_images/image_count without an N+1; Property helpers
         # (gallery_image_count etc.) honour this annotation.
         .annotate(_gallery_count=Count("property_images", distinct=True))
@@ -1039,6 +1039,7 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             "address": prop.address,
             "city": prop.city,
             "group": prop.group.name if prop.group_id else None,
+            "holding": prop.holding.name if prop.holding_id else None,
             "occupancy": occupancy,
             # Photos — computed in Python, never for the model to infer.
             "has_primary_image": bool(prop.primary_image),
@@ -1062,6 +1063,33 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
     ).count()
 
     layout = property_layout(landlord)
+    room_hierarchy: list[dict] = []
+    hierarchy_index: dict[tuple[str, str, str], dict] = {}
+    for room in rooms:
+        key = (
+            room.get("holding") or "",
+            room.get("address") or "",
+            room.get("group") or "",
+        )
+        bucket = hierarchy_index.get(key)
+        if bucket is None:
+            bucket = {
+                "holding": room.get("holding"),
+                "address": room.get("address"),
+                "city": room.get("city"),
+                "property_group": room.get("group"),
+                "rooms": [],
+            }
+            hierarchy_index[key] = bucket
+            room_hierarchy.append(bucket)
+        bucket["rooms"].append(
+            {
+                "id": room["id"],
+                "name": room["name"],
+                "listing_status": room["listing_status"],
+                "occupancy": room["occupancy"],
+            }
+        )
     return {
         "as_of": today.isoformat(),
         "layout": layout,
@@ -1101,6 +1129,12 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             "by_occupancy": occ_counts,
         },
         "rooms": rooms,
+        "room_hierarchy": room_hierarchy,
+        "room_display_rule": (
+            "When showing all rooms, group room_hierarchy by physical holding/"
+            "address, then property_group. Do not present each room as a separate "
+            "physical property."
+        ),
         "complete_units": units,
         "truncated": total > len(rooms) + len(units),
     }

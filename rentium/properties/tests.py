@@ -91,3 +91,65 @@ def test_display_image_falls_back_to_first_gallery_image(bc_property):
 
 def test_display_image_none_when_no_images(bc_property):
     assert bc_property.display_image is None
+
+
+def test_group_membership_keeps_common_area_associations_synchronized(landlord):
+    from rentium.properties.models import Property, PropertyArea, PropertyGroup
+    from rentium.properties.services import assign_room_to_group
+    from rentium.properties.services import create_group_common_area
+
+    first = Property.objects.create(
+        landlord=landlord,
+        name="Group Room A",
+        address="1 Shared St",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    second = Property.objects.create(
+        landlord=landlord,
+        name="Group Room B",
+        address="1 Shared St",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    third = Property.objects.create(
+        landlord=landlord,
+        name="Group Room C",
+        address="1 Shared St",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    group = PropertyGroup.objects.create(landlord=landlord, name="Shared Group")
+    other_group = PropertyGroup.objects.create(landlord=landlord, name="Other Group")
+    assign_room_to_group(first, group)
+    assign_room_to_group(second, group)
+    area, _ = create_group_common_area(
+        group,
+        area_type=PropertyArea.AreaType.KITCHEN,
+        shared_with_landlord=False,
+    )
+    assert set(area.shared_by.values_list("pk", flat=True)) == {first.pk, second.pk}
+
+    assign_room_to_group(third, group)
+    area.refresh_from_db()
+    assert set(area.shared_by.values_list("pk", flat=True)) == {
+        first.pk,
+        second.pk,
+        third.pk,
+    }
+
+    assign_room_to_group(second, other_group)
+    area.refresh_from_db()
+    assert set(area.shared_by.values_list("pk", flat=True)) == {first.pk, third.pk}
+
+    assign_room_to_group(first, None)
+    area.refresh_from_db()
+    assert area.property_id == third.pk
+    assert set(area.shared_by.values_list("pk", flat=True)) == {third.pk}
+    assert area.is_group_common is True

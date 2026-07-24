@@ -284,6 +284,8 @@ DECIDING:
 PLANS & CONFIRMS:
 - plan_operation / plan_move_tenant build multi-step plans; previews need the
   landlord's yes; lease terminations always pause for their own confirmation.
+- Routine property creation, rename, grouping, and create_group_room are direct
+  tools. Use them yourself; delegate specialized or bulk operational analysis.
 - When you see ## PLAN PROGRESS, report exactly what it says, then stop."""
 
 FSA_PROMPT = """\
@@ -340,6 +342,16 @@ GENERAL_TOOLS = READ_TOOLS + (
     "bulk_add_inventory",
     "create_inventory_item",
     "invite_tenant_to_lease",
+    # Routine property operations are direct General capabilities. Delegation
+    # remains available for specialized/bulk work, but a rename or grouped-room
+    # creation must not be lost in a second model round-trip.
+    "create_property",
+    "update_property",
+    "create_property_group",
+    "assign_property_to_group",
+    "create_group_room",
+    "create_holding",
+    "assign_property_to_holding",
 )
 
 # The FSA reasons over facts; its proposal surface arrives in Phase 4.

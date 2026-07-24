@@ -419,6 +419,116 @@ def _parse_item_names(inventory_items: str) -> list[str]:
     return [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
 
 
+def _group_property_consensus(group) -> tuple[dict | None, dict | None]:
+    """Derive room-level location/container fields from a group's members."""
+    members = list(
+        group.grouped_properties.select_related("holding").order_by("created_at", "pk")
+    )
+    if not members:
+        return None, {
+            "needs_input": True,
+            "question_for_user": (
+                f"{group.name} has no rooms to derive an address and holding from. "
+                "Add an existing room to the group first."
+            ),
+            "missing_group_data": ["members"],
+        }
+
+    def agreed(field: str, *, required: bool = False):
+        raw = [getattr(member, field) for member in members]
+        normalised = {
+            str(value).strip().casefold()
+            for value in raw
+            if value is not None and str(value).strip()
+        }
+        missing = any(value is None or not str(value).strip() for value in raw)
+        # A partial value is not consensus: copying it would silently make the
+        # new room more specific than some of its siblings. Optional fields may
+        # be blank only when every member leaves them blank.
+        if len(normalised) > 1 or (missing and (required or bool(normalised))):
+            return None, {
+                "field": field,
+                "values": [
+                    {
+                        "room": member.name,
+                        "value": getattr(member, field) or None,
+                    }
+                    for member in members
+                ],
+                "reason": "inconsistent" if len(normalised) > 1 else "missing",
+            }
+        if not normalised:
+            return "", None
+        return next(
+            value
+            for value in raw
+            if value is not None and str(value).strip()
+        ), None
+
+    derived: dict = {}
+    problems: list[dict] = []
+    for field, required in (
+        ("address", True),
+        ("city", True),
+        ("province", True),
+        ("postal_code", False),
+        ("country", False),
+    ):
+        value, problem = agreed(field, required=required)
+        if problem:
+            problems.append(problem)
+        else:
+            derived[field] = value
+
+    holding_ids = {member.holding_id for member in members}
+    if len(holding_ids) != 1 or None in holding_ids:
+        problems.append(
+            {
+                "field": "holding",
+                "reason": "missing" if holding_ids == {None} else "inconsistent",
+                "values": [
+                    {
+                        "room": member.name,
+                        "value": member.holding.name if member.holding_id else None,
+                    }
+                    for member in members
+                ],
+            }
+        )
+    else:
+        derived["holding"] = members[0].holding
+
+    verified_values = {bool(member.address_verified) for member in members}
+    if len(verified_values) == 1:
+        derived["address_verified"] = verified_values.pop()
+    else:
+        problems.append(
+            {
+                "field": "address_verified",
+                "reason": "inconsistent",
+                "values": [
+                    {
+                        "room": member.name,
+                        "value": bool(member.address_verified),
+                    }
+                    for member in members
+                ],
+            }
+        )
+    if problems:
+        fields = ", ".join(problem["field"] for problem in problems)
+        return None, {
+            "needs_input": True,
+            "question_for_user": (
+                f"I can't safely derive the new room's property data from "
+                f"{group.name}: {fields} is missing or inconsistent across its "
+                "rooms. Correct the group members first, then ask me again."
+            ),
+            "group_data_problems": problems,
+        }
+    return derived, None
+
+
 def create_property(
     landlord,
     *,
@@ -444,6 +554,7 @@ def create_property(
     is not empty after the user mentioned furniture.
     Rejects exact-name duplicates unless allow_duplicate_name=yes."""
     from rentium.properties.models import InventoryItem, Property, Province
+    from rentium.properties.services import listing_name_conflicts
 
     name = (name or "").strip()
     address = (address or "").strip()
@@ -470,6 +581,11 @@ def create_property(
                 "then continue lease/invite/inspection on the remaining listing."
             ),
         }
+    name_conflicts = [
+        row
+        for row in listing_name_conflicts(landlord, name)
+        if row["match"] == "near"
+    ]
 
     cat = _choice_code(Property.PropertyCategory.choices, property_category or "ROOM")
     if cat is None:
@@ -547,6 +663,13 @@ def create_property(
         "asking_rent": str(ask) if ask is not None else None,
         "description": (description or "")[:200],
         "inventory_items_to_create": inv_names,
+        "name_conflicts": name_conflicts,
+        "duplicate_warning": (
+            "A similarly named listing already exists. Confirm only if this is "
+            "a genuinely separate room."
+            if name_conflicts
+            else None
+        ),
         "note": (
             "Furniture listed here becomes private inventory (What's in it / "
             "prints on roommate agreement + condition inspection)."
@@ -869,14 +992,31 @@ def update_property(
     confirm: str = "",
 ) -> dict:
     from rentium.properties.models import Property, Province, normalise_province
+    from rentium.properties.services import listing_name_conflicts
 
     prop, err = _resolve_property(landlord, property_query, pick=pick)
     if err:
         return _prop_err(err)
 
     changes: dict = {}
+    rename_conflicts: list[dict] = []
     if name.strip():
-        changes["name"] = name.strip()[:255]
+        new_name = name.strip()[:255]
+        rename_conflicts = listing_name_conflicts(
+            landlord, new_name, exclude_id=prop.pk
+        )
+        exact_conflicts = [
+            conflict for conflict in rename_conflicts if conflict["match"] == "exact"
+        ]
+        if exact_conflicts:
+            return {
+                "error": (
+                    f"Another listing is already named {new_name!r}. "
+                    "Choose a distinct name instead of creating an ambiguous duplicate."
+                ),
+                "name_conflicts": exact_conflicts,
+            }
+        changes["name"] = new_name
     if status.strip():
         st = _choice_code(Property.PropertyStatus.choices, status)
         if st is None:
@@ -936,10 +1076,17 @@ def update_property(
         "changes": {
             k: (str(v) if isinstance(v, Decimal) else v) for k, v in changes.items()
         },
+        "name_conflicts": rename_conflicts,
+        "duplicate_warning": (
+            "The new name is similar to an existing listing."
+            if rename_conflicts
+            else None
+        ),
     }
     if not _confirmed(confirm):
         return _preview("update_property", preview, "Updates listing fields.")
 
+    previous_name = prop.name
     for k, v in changes.items():
         setattr(prop, k, v)
     try:
@@ -958,6 +1105,12 @@ def update_property(
             "city": prop.city,
         },
         "applied": list(changes.keys()),
+        "previous_name": previous_name,
+        "message": (
+            f"Renamed {previous_name} to {prop.name}."
+            if "name" in changes
+            else f"Updated {prop.name}: {', '.join(changes)}."
+        ),
     }
 
 
@@ -1032,6 +1185,7 @@ def assign_property_to_group(
 ) -> dict:
     """Attach a ROOM listing to a group, or clear group membership (clear=yes)."""
     from rentium.properties.models import Property
+    from rentium.properties.services import assign_room_to_group
 
     prop, err = _resolve_property(landlord, property_query, pick=pick)
     if err:
@@ -1057,13 +1211,16 @@ def assign_property_to_group(
                 preview,
                 "Removes listing from its property group.",
             )
-        prop.group = None
         try:
-            prop.full_clean()
-            prop.save(update_fields=["group", "updated_at"])
+            prop = assign_room_to_group(prop, None)
         except ValidationError as exc:
             return _validation_error_payload(exc)
-        return {"updated": True, "property": prop.name, "group": None}
+        return {
+            "updated": True,
+            "property": prop.name,
+            "group": None,
+            "message": f"Removed {prop.name} from {preview['from_group']}.",
+        }
 
     group, gerr = _resolve_group(landlord, group_name)
     if gerr:
@@ -1081,16 +1238,270 @@ def assign_property_to_group(
             "Puts a room into a shared household group.",
         )
 
-    prop.group = group
     try:
-        prop.full_clean()
-        prop.save(update_fields=["group", "updated_at"])
+        prop = assign_room_to_group(prop, group)
     except ValidationError as exc:
         return _validation_error_payload(exc)
     return {
         "updated": True,
         "property": prop.name,
         "group": group.name,
+        "message": f"Moved {prop.name} into {group.name}.",
+    }
+
+
+def create_group_room(
+    landlord,
+    *,
+    name: str,
+    group_name: str,
+    inventory_items: str = "",
+    shared_areas: str = "",
+    shared_with_landlord: str = "",
+    confirm: str = "",
+) -> dict:
+    """Atomically create a room inside an existing group.
+
+    Address/container data comes from the group's current rooms. Private
+    inventory, group membership, and group-wide common areas commit together.
+    """
+    from rentium.properties.models import InventoryItem, Property, PropertyArea
+    from rentium.properties.services import create_group_common_area
+    from rentium.properties.services import group_common_areas
+    from rentium.properties.services import listing_name_conflicts
+    from rentium.properties.services import parse_common_area_types
+
+    room_name = (name or "").strip()
+    if not room_name:
+        return {"error": "name is required."}
+    group, gerr = _resolve_group(landlord, group_name)
+    if gerr:
+        return {"error": gerr}
+    derived, derr = _group_property_consensus(group)
+    if derr:
+        return derr
+
+    inventory = _parse_item_names(inventory_items)
+    area_types = parse_common_area_types(shared_areas)
+    if (shared_areas or "").strip() and not area_types:
+        return {
+            "error": (
+                "No recognized shared area. Use names such as bathroom, kitchen, "
+                "living room, laundry, hallway, or yard."
+            )
+        }
+
+    classification_raw = (shared_with_landlord or "").strip().casefold()
+    truth_values = {"1", "true", "yes", "y", "on", "shared"}
+    false_values = {"0", "false", "no", "n", "off", "tenant only", "tenants only"}
+    classification_given = classification_raw in truth_values | false_values
+    if classification_raw and not classification_given:
+        return {
+            "error": (
+                "shared_with_landlord must be yes or no. It means whether the "
+                "landlord or immediate relatives also use the common areas."
+            )
+        }
+    classification = classification_raw in truth_values
+
+    existing_areas = {
+        area.area_type: area for area in group_common_areas(group)
+    }
+    new_area_types = [area_type for area_type in area_types if area_type not in existing_areas]
+    if new_area_types and not classification_given:
+        labels = [
+            str(PropertyArea.AreaType(area_type).label) for area_type in new_area_types
+        ]
+        return {
+            "needs_input": True,
+            "question_for_user": (
+                "Does the landlord or an immediate relative also use the "
+                f"{', '.join(labels)}? Please answer yes or no. This legal "
+                "classification is required before I prepare the creation preview."
+            ),
+            "missing_field": "shared_with_landlord",
+            "new_shared_areas": labels,
+        }
+
+    conflicts = listing_name_conflicts(landlord, room_name)
+    exact = [row for row in conflicts if row["match"] == "exact"]
+    near = [row for row in conflicts if row["match"] == "near"]
+
+    area_preview = []
+    for area_type in area_types:
+        existing = existing_areas.get(area_type)
+        desired_classification = (
+            classification
+            if classification_given
+            else bool(existing.shared_with_landlord)
+        )
+        area_preview.append(
+            {
+                "type": area_type,
+                "name": str(PropertyArea.AreaType(area_type).label),
+                "action": "update_existing" if existing and classification_given else (
+                    "keep_existing" if existing else "create"
+                ),
+                "shared_with_landlord": desired_classification,
+            }
+        )
+
+    def existing_is_complete(prop) -> bool:
+        if (
+            prop.property_category != Property.PropertyCategory.ROOM
+            or prop.group_id != group.pk
+        ):
+            return False
+        existing_inventory = {
+            value.casefold()
+            for value in prop.inventory_items.values_list("name", flat=True)
+        }
+        if any(item.casefold() not in existing_inventory for item in inventory):
+            return False
+        current = {area.area_type: area for area in group_common_areas(group)}
+        for row in area_preview:
+            area = current.get(row["type"])
+            if area is None or bool(area.shared_with_landlord) != bool(
+                row["shared_with_landlord"]
+            ):
+                return False
+        return True
+
+    if exact:
+        existing = Property.objects.filter(
+            landlord=landlord,
+            pk__in=[row["id"] for row in exact],
+        ).first()
+        if _confirmed(confirm) and existing is not None and existing_is_complete(existing):
+            return {
+                "created": False,
+                "idempotent": True,
+                "property": {
+                    "id": str(existing.pk),
+                    "name": existing.name,
+                    "group": group.name,
+                },
+                "message": (
+                    f"{existing.name} already exists in {group.name} with the "
+                    "requested inventory and common areas; nothing was duplicated."
+                ),
+            }
+        return {
+            "error": (
+                f"A listing named {room_name!r} already exists. "
+                "Use that room or choose a distinct name."
+            ),
+            "name_conflicts": exact,
+        }
+
+    preview = {
+        "name": room_name,
+        "property_group": group.name,
+        "derived_property_data": {
+            "address": derived["address"],
+            "city": derived["city"],
+            "province": derived["province"],
+            "postal_code": derived["postal_code"] or None,
+            "country": derived["country"] or "Canada",
+            "holding": derived["holding"].name,
+        },
+        "private_inventory_to_create": inventory,
+        "shared_areas": area_preview,
+        "name_conflicts": near,
+        "duplicate_warning": (
+            "A similarly named listing already exists. Review it before confirming."
+            if near
+            else None
+        ),
+        "atomic": True,
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "create_group_room",
+            preview,
+            "Creates the room, inventory, group membership, and common-area "
+            "associations in one transaction.",
+        )
+
+    try:
+        with transaction.atomic():
+            # Re-lock and re-derive at execution time in case group data changed
+            # after the preview.
+            locked_group = type(group).objects.select_for_update().get(pk=group.pk)
+            locked_derived, locked_error = _group_property_consensus(locked_group)
+            if locked_error:
+                raise ValidationError(locked_error["question_for_user"])
+            if any(
+                row["match"] == "exact"
+                for row in listing_name_conflicts(landlord, room_name)
+            ):
+                raise ValidationError(
+                    f"A listing matching {room_name!r} appeared after the preview."
+                )
+
+            prop = Property(
+                landlord=landlord,
+                name=room_name[:255],
+                address=locked_derived["address"][:255],
+                city=locked_derived["city"][:100],
+                province=locked_derived["province"],
+                postal_code=locked_derived["postal_code"] or "",
+                country=locked_derived["country"] or "Canada",
+                address_verified=locked_derived["address_verified"],
+                status=Property.PropertyStatus.AVAILABLE,
+                property_category=Property.PropertyCategory.ROOM,
+                room_type=Property.RoomType.PRIVATE,
+                group=locked_group,
+                holding=locked_derived["holding"],
+            )
+            prop.full_clean()
+            prop.save()
+            created_inventory = []
+            for item_name in inventory:
+                item = InventoryItem.objects.create(
+                    property=prop,
+                    name=item_name[:200],
+                    quantity=1,
+                    condition=InventoryItem.ItemCondition.GOOD,
+                )
+                created_inventory.append(item.name)
+
+            created_areas = []
+            for row in area_preview:
+                area, was_created = create_group_common_area(
+                    locked_group,
+                    area_type=row["type"],
+                    count=1,
+                    shared_with_landlord=bool(row["shared_with_landlord"]),
+                )
+                created_areas.append(
+                    {
+                        "name": area.get_area_type_display(),
+                        "created": was_created,
+                        "shared_with_landlord": area.shared_with_landlord,
+                    }
+                )
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+    except Exception as exc:  # noqa: BLE001 - transaction has already rolled back
+        return {"error": f"Could not create the group room; nothing was saved: {exc}"}
+
+    return {
+        "created": True,
+        "property": {
+            "id": str(prop.pk),
+            "name": prop.name,
+            "group": locked_group.name,
+            "holding": prop.holding.name,
+            "address": prop.address,
+        },
+        "inventory": created_inventory,
+        "shared_areas": created_areas,
+        "message": (
+            f"Created {prop.name} in {locked_group.name} with "
+            f"{len(created_inventory)} private inventory item(s) and "
+            f"{len(created_areas)} shared area association(s)."
+        ),
     }
 
 
