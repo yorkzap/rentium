@@ -14,8 +14,11 @@ Rules (same as the dashboard / API):
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+import re
+from datetime import date
+from datetime import datetime
+from decimal import Decimal
+from decimal import InvalidOperation
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -297,6 +300,36 @@ def _resolve_holding(landlord, holding_name: str):
     return qs.first(), None
 
 
+def _normalise_location(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+
+def _holding_for_location(landlord, address: str, holding_name: str = ""):
+    """Resolve a physical holding without guessing across similar addresses."""
+    from rentium.properties.models import PropertyHolding
+
+    if (holding_name or "").strip():
+        return _resolve_holding(landlord, holding_name)
+    wanted = _normalise_location(address)
+    if not wanted:
+        return None, None
+    matches = [
+        holding
+        for holding in PropertyHolding.objects.filter(landlord=landlord)
+        if wanted
+        in {
+            _normalise_location(holding.address),
+            _normalise_location(holding.name),
+        }
+    ]
+    if len(matches) > 1:
+        return None, (
+            f"Multiple holdings match address {address!r}: "
+            f"{[holding.name for holding in matches[:8]]}."
+        )
+    return (matches[0], None) if matches else (None, None)
+
+
 def _default_lease_type(prop) -> str:
     """Mirror leases/api/views.py lease_types_view for NEW leases."""
     from rentium.leases.models import Lease
@@ -529,6 +562,159 @@ def _group_property_consensus(group) -> tuple[dict | None, dict | None]:
     return derived, None
 
 
+def _group_room_property_data(
+    landlord,
+    group,
+    *,
+    address: str = "",
+    city: str = "",
+    province: str = "",
+    holding_name: str = "",
+) -> tuple[dict | None, dict | None]:
+    """Derive group-room location, with an explicit empty-group bootstrap.
+
+    Existing member consensus always wins. An empty group may be initialized
+    from a uniquely resolved holding plus explicit missing location fields; the
+    preview exposes those values before anything is written.
+    """
+    members_exist = group.grouped_properties.exists()
+    if members_exist:
+        derived, error = _group_property_consensus(group)
+        if error:
+            return derived, error
+        supplied = {
+            "address": (address or "").strip(),
+            "city": (city or "").strip(),
+            "province": (province or "").strip(),
+        }
+        conflicts = [
+            field
+            for field, value in supplied.items()
+            if value
+            and _normalise_location(value)
+            != _normalise_location(str(derived.get(field) or ""))
+        ]
+        if holding_name.strip():
+            holding, holding_error = _resolve_holding(landlord, holding_name)
+            if holding_error:
+                return None, {"error": holding_error}
+            if holding.pk != derived["holding"].pk:
+                conflicts.append("holding")
+        if conflicts:
+            return None, {
+                "needs_input": True,
+                "question_for_user": (
+                    f"The supplied {', '.join(conflicts)} conflicts with the "
+                    f"recorded rooms in {group.name}. Correct the group or omit "
+                    "the conflicting bootstrap values."
+                ),
+                "group_data_problems": conflicts,
+            }
+        return derived, None
+
+    holding, holding_error = _holding_for_location(
+        landlord,
+        address,
+        holding_name,
+    )
+    if holding_error:
+        return None, {"error": holding_error}
+    if holding is None:
+        return None, {
+            "needs_input": True,
+            "question_for_user": (
+                f"{group.name} is empty. Which existing physical holding should "
+                "this group use? Give its holding name or exact street address."
+            ),
+            "missing_group_data": ["holding"],
+        }
+
+    canonical_address = (holding.address or address or "").strip()
+    canonical_city = (holding.city or city or "").strip()
+    if (
+        address.strip()
+        and holding.address.strip()
+        and _normalise_location(address) != _normalise_location(holding.address)
+    ):
+        return None, {
+            "needs_input": True,
+            "question_for_user": (
+                f"{holding.name} is recorded at {holding.address}, not {address}. "
+                "Correct the holding or choose the right one."
+            ),
+            "group_data_problems": ["address"],
+        }
+    if (
+        city.strip()
+        and holding.city.strip()
+        and _normalise_location(city) != _normalise_location(holding.city)
+    ):
+        return None, {
+            "needs_input": True,
+            "question_for_user": (
+                f"{holding.name} is recorded in {holding.city}, not {city}. "
+                "Correct the holding or choose the right one."
+            ),
+            "group_data_problems": ["city"],
+        }
+
+    sibling_rows = list(holding.listings.all())
+
+    def sibling_consensus(field: str) -> str:
+        values = {
+            str(getattr(item, field) or "").strip()
+            for item in sibling_rows
+            if str(getattr(item, field) or "").strip()
+        }
+        return values.pop() if len(values) == 1 else ""
+
+    raw_province = (province or sibling_consensus("province")).strip()
+    if raw_province:
+        from rentium.properties.models import Province
+        from rentium.properties.models import normalise_province
+
+        canonical_province = (
+            normalise_province(raw_province) or raw_province.casefold()[:2]
+        )
+        if canonical_province not in Province.values:
+            return None, {
+                "error": (
+                    f"Invalid province {raw_province!r}. Use a two-letter "
+                    "Canadian province code."
+                )
+            }
+    else:
+        canonical_province = ""
+    missing = [
+        field
+        for field, value in (
+            ("address", canonical_address),
+            ("city", canonical_city),
+            ("province", canonical_province),
+        )
+        if not value
+    ]
+    if missing:
+        return None, {
+            "needs_input": True,
+            "question_for_user": (
+                f"{group.name} can use holding {holding.name}, but "
+                f"{', '.join(missing)} is not recorded. Provide it before I "
+                "prepare the room preview."
+            ),
+            "missing_group_data": missing,
+        }
+    return {
+        "address": canonical_address,
+        "city": canonical_city,
+        "province": canonical_province,
+        "postal_code": sibling_consensus("postal_code"),
+        "country": sibling_consensus("country") or "Canada",
+        "holding": holding,
+        "address_verified": False,
+    }, None
+
+
 def create_property(
     landlord,
     *,
@@ -632,6 +818,33 @@ def create_property(
         group, gerr = _resolve_group(landlord, group_name)
         if gerr:
             return {"error": gerr}
+    holding, holding_error = _holding_for_location(landlord, address)
+    if holding_error:
+        return {"error": holding_error}
+    if holding is not None:
+        # The exact-address holding is the canonical physical record. Model
+        # arguments copied from old prose must not create a listing whose city
+        # disagrees with its own holding.
+        address = (holding.address or address).strip()
+        city = (holding.city or city).strip()
+    if group is not None and group.grouped_properties.exists():
+        group_data, group_error = _group_property_consensus(group)
+        if group_error is None:
+            for field, supplied in (
+                ("address", address),
+                ("city", city),
+                ("province", prov),
+            ):
+                if _normalise_location(supplied) != _normalise_location(
+                    str(group_data.get(field) or "")
+                ):
+                    return {
+                        "error": (
+                            f"{field}={supplied!r} conflicts with the recorded "
+                            f"{group.name} value {group_data.get(field)!r}."
+                        )
+                    }
+            holding = group_data["holding"]
 
     beds = int(bedrooms) if str(bedrooms).strip().isdigit() else None
     baths = None
@@ -660,6 +873,7 @@ def create_property(
         "room_type": rt,
         "status": st,
         "group": group.name if group else None,
+        "holding": holding.name if holding else None,
         "asking_rent": str(ask) if ask is not None else None,
         "description": (description or "")[:200],
         "inventory_items_to_create": inv_names,
@@ -699,6 +913,7 @@ def create_property(
         bathrooms=baths,
         description=(description or "")[:5000],
         group=group,
+        holding=holding,
         asking_rent=ask,
         country="Canada",
     )
@@ -721,6 +936,11 @@ def create_property(
 
     return {
         "created": True,
+        "message": (
+            f"Created {prop.name} in {prop.group.name}."
+            if prop.group_id
+            else f"Created {prop.name}."
+        ),
         "property": {
             "id": str(prop.pk),
             "name": prop.name,
@@ -1296,12 +1516,18 @@ def create_group_room(
     inventory_items: str = "",
     shared_areas: str = "",
     shared_with_landlord: str = "",
+    address: str = "",
+    city: str = "",
+    province: str = "",
+    holding_name: str = "",
     confirm: str = "",
 ) -> dict:
     """Atomically create a room inside an existing group.
 
-    Address/container data comes from the group's current rooms. Private
-    inventory, group membership, and group-wide common areas commit together.
+    Address/container data comes from the group's current rooms. An empty group
+    can be bootstrapped from a named/exact-address holding plus any missing
+    city/province. Private inventory, group membership, and group-wide common
+    areas commit together.
     """
     from rentium.properties.models import InventoryItem, Property, PropertyArea
     from rentium.properties.services import create_group_common_area
@@ -1315,7 +1541,14 @@ def create_group_room(
     group, gerr = _resolve_group(landlord, group_name)
     if gerr:
         return {"error": gerr}
-    derived, derr = _group_property_consensus(group)
+    derived, derr = _group_room_property_data(
+        landlord,
+        group,
+        address=address,
+        city=city,
+        province=province,
+        holding_name=holding_name,
+    )
     if derr:
         return derr
 
@@ -1466,9 +1699,20 @@ def create_group_room(
             # Re-lock and re-derive at execution time in case group data changed
             # after the preview.
             locked_group = type(group).objects.select_for_update().get(pk=group.pk)
-            locked_derived, locked_error = _group_property_consensus(locked_group)
+            locked_derived, locked_error = _group_room_property_data(
+                landlord,
+                locked_group,
+                address=address,
+                city=city,
+                province=province,
+                holding_name=holding_name,
+            )
             if locked_error:
-                raise ValidationError(locked_error["question_for_user"])
+                raise ValidationError(
+                    locked_error.get("question_for_user")
+                    or locked_error.get("error")
+                    or "The group property data is no longer valid."
+                )
             if any(
                 row["match"] == "exact"
                 for row in listing_name_conflicts(landlord, room_name)

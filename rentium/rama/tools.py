@@ -1283,6 +1283,18 @@ def setup_room_tenancy(
         "yes/no: whether the landlord or immediate relatives also use NEW common "
         "areas. Leave blank only when no new classification is being created or changed."
     ),
+    holding_name=(
+        "For an EMPTY group only: existing physical holding name. Pass this when "
+        "the landlord identified the house/building."
+    ),
+    address=(
+        "For an EMPTY group only: exact street address used to resolve its holding."
+    ),
+    city="For an EMPTY group only: city, when the holding does not record it.",
+    province=(
+        "For an EMPTY group only: two-letter province code, when no sibling "
+        "listing can supply it."
+    ),
     confirm="Leave empty to preview; pass 'yes' to run the whole atomic operation.",
 )
 def create_group_room(
@@ -1292,14 +1304,20 @@ def create_group_room(
     inventory_items: str = "",
     shared_areas: str = "",
     shared_with_landlord: str = "",
+    holding_name: str = "",
+    address: str = "",
+    city: str = "",
+    province: str = "",
     confirm: str = "",
 ) -> dict:
     """Create one ROOM inside an existing property group as a single atomic
     operation. Derives address, city, province, postal code, country, and holding
-    from consistent group members; asks when group data conflicts. Creates private
-    inventory and associates all requested group common areas in the same
-    transaction. New shared areas require an explicit landlord-sharing yes/no.
-    Exact/near duplicate names are surfaced. Preview first; confirm=yes."""
+    from consistent group members. For an empty group, holding_name or exact
+    address safely bootstraps the first room; missing/conflicting data is asked
+    for rather than guessed. Creates private inventory and associates all
+    requested group common areas in the same transaction. New shared areas
+    require an explicit landlord-sharing yes/no. Exact/near duplicate names are
+    surfaced. Preview first; confirm=yes."""
     from .domain_crud import create_group_room as _fn
 
     return _fn(
@@ -1309,6 +1327,10 @@ def create_group_room(
         inventory_items=inventory_items,
         shared_areas=shared_areas,
         shared_with_landlord=shared_with_landlord,
+        holding_name=holding_name,
+        address=address,
+        city=city,
+        province=province,
         confirm=confirm,
     )
 

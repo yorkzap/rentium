@@ -95,13 +95,23 @@ existence check. Only the pending-plan runner can add `confirm=yes`; a model
 cannot approve its own write. Duplicate confirmations are idempotent, and
 already-correct names/group memberships are reported as no-ops.
 
+Confirmation language is backed by state, not prose. RAMA suppresses any
+model-authored “reply yes” request when no executable pending plan was saved and
+instead returns the actual `needs_input` question or validation error. Ordinary
+side questions keep a pending plan intact. A correction such as “No, make it
+like this…” rejects the old steps, retains structured address/city/province
+defaults, validates the replacement tool calls, and returns one newly persisted
+preview.
+
 `create_group_room` derives address, city, province, holding, and related
 property data only when all existing group rooms agree. Private inventory and
 group common areas appear together in the preview. If RAMA would create or
 change a common area's landlord-use classification, it first asks whether the
 landlord or an immediate relative uses that area. Confirmation creates the
 room, inventory, group membership, and area associations in one database
-transaction.
+transaction. An empty group does not require a disposable “first room” as a
+workaround: the operation can bootstrap directly from one exact existing
+holding/address plus any missing city/province, all shown in the preview.
 
 RAMA emits dashboard links only from the registered link map and canonical
 frontend origin. “Show my dashboard properties” therefore resolves to

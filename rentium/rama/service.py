@@ -135,7 +135,19 @@ def _recent_confirmed_reply(landlord, conversation_id) -> str:
         .order_by("-created_at")
         .first()
     )
-    return str((reply.content or {}).get("text") or "") if reply else ""
+    if reply is None:
+        return ""
+    content = reply.content or {}
+    # Only replay the deterministic result emitted by the confirm machine.
+    # A later model-authored "preview" is not proof that the preceding Yes was
+    # already handled; treating it as such created nested "already applied"
+    # replies while leaving the newly described work impossible to confirm.
+    if not content.get("confirmation_result"):
+        return ""
+    text = str(content.get("text") or "")
+    if "That confirmation was already applied" in text:
+        return ""
+    return text
 
 
 def _write_label(result: dict) -> str:
@@ -549,6 +561,31 @@ def _batch_preview_reply(
                 detail += f" in {args['group_name']}"
             if args.get("address"):
                 detail += f" at {args['address']}"
+            locality = ", ".join(
+                str(value)
+                for value in (args.get("city"), args.get("province"))
+                if value
+            )
+            if locality:
+                detail += f", {locality}"
+            if args.get("inventory_items"):
+                detail += f"; private inventory: {args['inventory_items']}"
+        elif step.tool == "create_group_room":
+            detail = (
+                f"Create {args.get('name') or target} in "
+                f"{args.get('group_name') or 'property group'}"
+            )
+            if args.get("address"):
+                detail += f" at {args['address']}"
+            if args.get("inventory_items"):
+                detail += f"; private inventory: {args['inventory_items']}"
+            if args.get("shared_areas"):
+                detail += f"; shared areas: {args['shared_areas']}"
+                if args.get("shared_with_landlord"):
+                    detail += (
+                        "; landlord/immediate-relative use: "
+                        f"{args['shared_with_landlord']}"
+                    )
         elif step.tool == "update_property" and args.get("name"):
             detail = f"Rename {target} to {args['name']}"
         elif step.tool == "assign_property_to_group":
@@ -574,6 +611,241 @@ def _batch_preview_reply(
     return "\n".join(lines)
 
 
+def _replacement_request(message: str) -> bool:
+    """A rejection that also supplies corrected work, not a bare cancellation."""
+    return bool(
+        re.match(
+            r"^\s*(?:no|nope|nah|cancel(?:\s+that)?|don't|do not)\b"
+            r"[\s,:;.-]+"
+            r"(?:instead\b|make\b|change\b|replace\b|use\b|do\s+this\b|"
+            r"like\s+this\b|it\s+should\b|the\s+correct\b).+",
+            message or "",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    )
+
+
+def _creation_defaults_from_plan(plan: RamaPendingPlan | None) -> list[dict]:
+    if plan is None:
+        return []
+    return [
+        dict(step.arguments)
+        for step in plan.steps.order_by("order")
+        if step.tool == "create_property"
+    ]
+
+
+def _recent_creation_defaults(landlord, conversation_id) -> list[dict]:
+    """Recover location defaults from earlier *executable* creation plans.
+
+    This is deliberately structural: it reads audited tool arguments and nested
+    delegated plans, never assistant prose. It lets a correction such as
+    "No, make it like this: [new room names]" retain the already-previewed
+    address/city/province without asking the model to reconstruct them.
+    """
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+    ).order_by("-created_at")[:80]
+    live_defaults: list[dict] = []
+    planned_defaults: list[dict] = []
+    for row in rows:
+        content = row.content or {}
+        if content.get("tool") == "_live_context":
+            result = content.get("result") or {}
+            for listing in (
+                list(result.get("rooms") or [])
+                + list(result.get("complete_units") or [])
+                + list(result.get("listings") or [])
+            ):
+                if listing.get("address") and listing.get("city"):
+                    live_defaults.append(
+                        {
+                            "name": listing.get("name"),
+                            "address": listing.get("address"),
+                            "city": listing.get("city"),
+                            "province": listing.get("province"),
+                            "group_name": listing.get("group"),
+                        }
+                    )
+        if content.get("tool") == "create_property":
+            planned_defaults.append(dict(content.get("arguments") or {}))
+        plan = (content.get("result") or {}).get("plan") or {}
+        for step in plan.get("steps") or []:
+            if step.get("tool") == "create_property":
+                planned_defaults.append(dict(step.get("arguments") or {}))
+    # Recorded portfolio facts outrank model-prepared arguments. Historical
+    # snapshots remain useful after the landlord deletes rooms specifically to
+    # rebuild their layout at the same physical holding.
+    return live_defaults + planned_defaults
+
+
+def _enrich_empty_group_room_arguments(
+    landlord,
+    conversation_id,
+    arguments: dict,
+) -> dict:
+    """Carry audited location facts into create_group_room retries.
+
+    Weak models often retry a corrected batch from a bare "Yes" and omit the
+    address that appeared two messages earlier. We recover only arguments from
+    prior executable create_property plans, then resolve the holding by exact
+    recorded address. No assistant prose or fuzzy address guess is trusted.
+    """
+    from rentium.properties.models import PropertyHolding
+
+    enriched = dict(arguments)
+    if any(
+        str(enriched.get(key) or "").strip()
+        for key in ("holding_name", "address", "city", "province")
+    ):
+        return enriched
+    group_key = " ".join(
+        str(enriched.get("group_name") or "").casefold().split()
+    )
+    if not group_key:
+        return enriched
+    for candidate in _recent_creation_defaults(landlord, conversation_id):
+        candidate_group = " ".join(
+            str(candidate.get("group_name") or "").casefold().split()
+        )
+        if candidate_group != group_key:
+            continue
+        address = str(candidate.get("address") or "").strip()
+        if not address:
+            continue
+        holdings = list(
+            PropertyHolding.objects.filter(
+                landlord=landlord,
+                address__iexact=address,
+            )[:2]
+        )
+        if len(holdings) != 1:
+            continue
+        holding = holdings[0]
+        enriched["holding_name"] = holding.name
+        enriched["address"] = holding.address
+        if not holding.city:
+            enriched["city"] = str(candidate.get("city") or "")
+        enriched["province"] = str(candidate.get("province") or "")
+        return enriched
+    return enriched
+
+
+def _explicit_room_creation_rows(
+    landlord,
+    conversation_id,
+    message: str,
+    pending_plan: RamaPendingPlan | None = None,
+) -> list[dict] | None:
+    """Parse an explicit numbered "Create X in GROUP at ADDRESS" batch.
+
+    This is intentionally narrow and high-confidence. It handles the exact
+    correction format landlords naturally use while leaving free-form planning
+    to the model. Every parsed row is still previewed through create_property,
+    so validation, duplicate checks, tenancy scoping, and confirmation remain
+    unchanged.
+    """
+    from rentium.properties.models import PropertyGroup
+
+    groups = list(
+        PropertyGroup.objects.filter(landlord=landlord).order_by("-name")
+    )
+    if not groups:
+        return None
+    candidates = re.findall(
+        r"(?im)^\s*(?:\d+\s*[.)-]\s*)?create\s+.+$",
+        message or "",
+    )
+    if len(candidates) < 2:
+        return None
+
+    parsed: list[tuple[str, object, str]] = []
+    for raw_line in candidates:
+        line = re.sub(
+            r"^\s*(?:\d+\s*[.)-]\s*)?create\s+",
+            "",
+            raw_line,
+            flags=re.IGNORECASE,
+        ).strip(" \t\r\n\"'")
+        matched = None
+        for group in sorted(groups, key=lambda item: len(item.name), reverse=True):
+            match = re.match(
+                rf"^(.+?)\s+in\s+{re.escape(group.name)}\s+at\s+(.+?)$",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                matched = (
+                    match.group(1).strip(" ,.-"),
+                    group,
+                    match.group(2).strip(" ,.-"),
+                )
+                break
+        if matched is None:
+            return None
+        parsed.append(matched)
+
+    defaults = _recent_creation_defaults(landlord, conversation_id)
+    defaults.extend(_creation_defaults_from_plan(pending_plan))
+
+    def location_for(group_name: str, address: str) -> dict | None:
+        group_key = " ".join(group_name.casefold().split())
+        address_key = " ".join(address.casefold().split())
+        for candidate in defaults:
+            candidate_group = " ".join(
+                str(candidate.get("group_name") or "").casefold().split()
+            )
+            candidate_address = " ".join(
+                str(candidate.get("address") or "").casefold().split()
+            )
+            if candidate_group == group_key and candidate_address == address_key:
+                if candidate.get("city") and candidate.get("province"):
+                    return candidate
+        for candidate in defaults:
+            candidate_address = " ".join(
+                str(candidate.get("address") or "").casefold().split()
+            )
+            if candidate_address == address_key:
+                if candidate.get("city") and candidate.get("province"):
+                    return candidate
+        return None
+
+    rows: list[dict] = []
+    for name, group, address in parsed:
+        location = location_for(group.name, address)
+        if location is None:
+            # An address alone is not enough to safely invent city/province.
+            # Fall back to the model, which can ask the landlord explicitly.
+            return None
+        rows.append(
+            {
+                "name": name,
+                "address": address,
+                "city": str(location["city"]),
+                "province": str(location["province"]),
+                "property_category": "ROOM",
+                "room_type": "PRIVATE",
+                "group_name": group.name,
+            }
+        )
+    return rows
+
+
+def _looks_like_confirmation_request(text: str) -> bool:
+    """True for model prose claiming that an executable preview exists."""
+    return bool(
+        re.search(
+            r"\breply\s+(?:yes|y)\s+to\s+confirm\b"
+            r"|\bconfirm\s+yes\b"
+            r"|\bone\s+[“\"']?yes[”\"']?\s+will\s+run\b",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _persist_pending(
     landlord,
     conversation_id,
@@ -583,14 +855,11 @@ def _persist_pending(
 
     - Every preview produced this turn is persisted in call order as one plan
       (replacing any older one).
-    - No preview: an unstarted plan from an earlier turn is treated as a
-      change of subject and cleared — but a plan PAUSED mid-execution
-      (awaiting a step's own confirm) survives an interjected question.
+    - No preview: keep the prior plan. A side question must not silently destroy
+      confirmed intent; only an explicit no/cancel, a corrected replacement, or
+      a newly previewed plan replaces it.
     """
     if not pending_specs:
-        plan = load_fresh_plan(landlord, conversation_id)
-        if plan is not None and plan.status != RamaPendingPlan.Status.AWAITING_STEP_CONFIRM:
-            clear_plan(landlord, conversation_id)
         return
     save_batch(landlord, conversation_id, pending_specs)
 
@@ -843,6 +1112,73 @@ def run_turn(
     turn_attachments: list[dict] = []
     turn = Turn()
 
+    def _run_deterministic_tool(tool_name: str, arguments: dict) -> dict:
+        result = execute(tool_name, arguments, landlord=landlord)
+        safe_result = json.loads(json.dumps(result, default=str))
+        tools_used.append(tool_name)
+        audit(
+            RamaAudit.Kind.TOOL_CALL,
+            {
+                "tool": tool_name,
+                "arguments": arguments,
+                "result": safe_result,
+                "deterministic_routing": True,
+            },
+        )
+        return result
+
+    def _prepare_explicit_creation_batch(rows: list[dict]) -> str:
+        specs: list[dict] = []
+        excluded: list[dict] = []
+        questions: list[str] = []
+        for arguments in rows:
+            result = _run_deterministic_tool("create_property", arguments)
+            if result.get("needs_confirm"):
+                stable_arguments = dict(arguments)
+                preview = result.get("preview") or {}
+                for field in ("address", "city", "province"):
+                    if preview.get(field):
+                        stable_arguments[field] = preview[field]
+                specs.append(
+                    {
+                        "kind": "single",
+                        "tool": "create_property",
+                        "arguments": stable_arguments,
+                        "target": arguments["name"],
+                    }
+                )
+            elif result.get("needs_input"):
+                questions.append(str(result.get("question_for_user") or ""))
+            elif result.get("unchanged") or result.get("idempotent"):
+                excluded.append(
+                    {
+                        "target": arguments["name"],
+                        "error": str(
+                            result.get("message") or "No change is needed."
+                        ),
+                    }
+                )
+            else:
+                excluded.append(
+                    {
+                        "target": arguments["name"],
+                        "error": str(result.get("error") or result),
+                    }
+                )
+        if specs:
+            plan = save_batch(landlord, conversation_id, specs)
+            return _batch_preview_reply(plan, excluded)
+        clear_plan(landlord, conversation_id)
+        if questions:
+            return "\n".join(
+                dict.fromkeys(question for question in questions if question)
+            )
+        if excluded:
+            return "Nothing is waiting for confirmation.\n" + "\n".join(
+                f"• {item['target']}: {item['error']}" for item in excluded
+            )
+        return "Nothing is waiting for confirmation."
+
     # Deterministic confirm state machine: on yes/no the backend itself runs
     # or cancels the previewed PLAN (single writes are one-step plans) — the
     # model never reconstructs tool calls (that was the endless re-preview
@@ -851,7 +1187,33 @@ def run_turn(
     plan_progress: dict | None = None
     deterministic_reply: str | None = None
     pending_plan = load_fresh_plan(landlord, conversation_id)
-    if pending_plan is not None and _is_affirmative(message):
+    replacement_rows = (
+        _explicit_room_creation_rows(
+            landlord,
+            conversation_id,
+            message,
+            pending_plan,
+        )
+        if pending_plan is not None and _replacement_request(message)
+        else None
+    )
+    if pending_plan is not None and replacement_rows is not None:
+        # save_batch replaces the rejected plan only after every replacement
+        # row has gone through the real create_property preview contract.
+        deterministic_reply = _prepare_explicit_creation_batch(replacement_rows)
+    elif pending_plan is not None and _replacement_request(message):
+        # The old proposal was explicitly rejected. Keep it only as structured
+        # defaults for the model rebuilding the correction; it is no longer
+        # something a later bare Yes may execute.
+        rejected = plan_to_payload(pending_plan)
+        clear_plan(landlord, conversation_id)
+        pending_plan = None
+        system += (
+            "\n\n## REJECTED PLAN (do not execute; use only unchanged facts such "
+            "as addresses while preparing the landlord's corrected request)\n"
+            + json.dumps(rejected, default=str)
+        )
+    elif pending_plan is not None and _is_affirmative(message):
 
         def _plan_audit(content):
             tools_used.append(content.get("tool", ""))
@@ -892,21 +1254,6 @@ def run_turn(
             "the plan is still waiting for a yes/no)\n"
             + json.dumps(plan_brief(pending_plan), default=str)
         )
-
-    def _run_deterministic_tool(tool_name: str, arguments: dict) -> dict:
-        result = execute(tool_name, arguments, landlord=landlord)
-        safe_result = json.loads(json.dumps(result, default=str))
-        tools_used.append(tool_name)
-        audit(
-            RamaAudit.Kind.TOOL_CALL,
-            {
-                "tool": tool_name,
-                "arguments": arguments,
-                "result": safe_result,
-                "deterministic_routing": True,
-            },
-        )
-        return result
 
     # A yes/no immediately after create_group_room asked its legal
     # landlord-sharing question is an answer to that question, not a fresh
@@ -953,6 +1300,19 @@ def run_turn(
                 "That confirmation was already applied. No action was repeated.\n"
                 + recent_reply
             )
+
+    # Explicit numbered creation batches are executable syntax, not prose for
+    # the model to paraphrase. This also handles a corrected replacement after
+    # the old plan was rejected: audited create_property plans provide the
+    # unchanged location defaults.
+    if deterministic_reply is None and pending_plan is None:
+        creation_rows = _explicit_room_creation_rows(
+            landlord,
+            conversation_id,
+            message,
+        )
+        if creation_rows is not None:
+            deterministic_reply = _prepare_explicit_creation_batch(creation_rows)
 
     # High-confidence property operations bypass model intent selection. A
     # rename can therefore never drift into an availability/status plan.
@@ -1028,7 +1388,16 @@ def run_turn(
         outstanding = load_fresh_plan(landlord, conversation_id)
         audit(
             RamaAudit.Kind.ASSISTANT_MESSAGE,
-            {"text": deterministic_reply, "tools_used": tools_used, "deterministic": True},
+            {
+                "text": deterministic_reply,
+                "tools_used": tools_used,
+                "deterministic": True,
+                **(
+                    {"confirmation_result": True}
+                    if plan_progress is not None
+                    else {}
+                ),
+            },
         )
         return TurnResult(
             conversation_id=conversation_id,
@@ -1045,6 +1414,7 @@ def run_turn(
     # landlord was shown—not whichever tool happened to be called last.
     pending_specs: list[dict] = []
     excluded_preview_errors: list[dict] = []
+    unresolved_write_inputs: list[str] = []
     planned_property_aliases: dict[str, str] = {}
     turn_tools = schemas
     try:
@@ -1076,6 +1446,12 @@ def run_turn(
             )
             for call in turn.tool_calls:
                 effective_arguments = dict(call.arguments or {})
+                if call.name == "create_group_room":
+                    effective_arguments = _enrich_empty_group_room_arguments(
+                        landlord,
+                        conversation_id,
+                        effective_arguments,
+                    )
                 original_property_query = str(
                     effective_arguments.get("property_query") or ""
                 ).strip()
@@ -1127,6 +1503,10 @@ def run_turn(
                     else:
                         stable_arguments = dict(effective_arguments)
                         preview = result.get("preview") or {}
+                        if call.name == "create_property":
+                            for field in ("address", "city", "province"):
+                                if preview.get(field):
+                                    stable_arguments[field] = preview[field]
                         if (
                             call.name == "update_property"
                             and preview.get("id")
@@ -1195,6 +1575,15 @@ def run_turn(
                     excluded_preview_errors.append(
                         {"target": target, "error": str(result["error"])}
                     )
+                elif (
+                    isinstance(result, dict)
+                    and result.get("needs_input")
+                    and registered_tool is not None
+                    and "confirm" in registered_tool.parameters["properties"]
+                ):
+                    question = str(result.get("question_for_user") or "").strip()
+                    if question and question not in unresolved_write_inputs:
+                        unresolved_write_inputs.append(question)
                 messages.append(
                     {
                         "role": "tool",
@@ -1265,9 +1654,34 @@ def run_turn(
             turn.text.strip()
             or "I wasn't able to produce an answer — try rephrasing."
         )
+    response_deterministic = False
+    if outstanding is None and _looks_like_confirmation_request(reply):
+        # A model cannot create a confirmation contract with prose. If no
+        # persisted plan backs its "reply yes", replace that claim with the
+        # real blocker collected from the write tools (or an honest failure).
+        response_deterministic = True
+        if unresolved_write_inputs:
+            reply = "I couldn't prepare an executable preview yet:\n" + "\n".join(
+                f"• {question}" for question in unresolved_write_inputs
+            )
+        elif excluded_preview_errors:
+            reply = "I couldn't prepare an executable preview:\n" + "\n".join(
+                f"• {item['target']}: {item['error']}"
+                for item in excluded_preview_errors
+            )
+        else:
+            reply = (
+                "I couldn't prepare an executable plan, so nothing is waiting "
+                "for confirmation. Please resend the changes; I will only ask "
+                "for Yes after the complete plan is saved."
+            )
     audit(
         RamaAudit.Kind.ASSISTANT_MESSAGE,
-        {"text": reply, "tools_used": tools_used},
+        {
+            "text": reply,
+            "tools_used": tools_used,
+            **({"deterministic": True} if response_deterministic else {}),
+        },
     )
 
     return TurnResult(
@@ -1278,4 +1692,5 @@ def run_turn(
         tools_used=tools_used,
         attachments=turn_attachments,
         pending_plan=plan_brief(outstanding) if outstanding else None,
+        deterministic=response_deterministic,
     )

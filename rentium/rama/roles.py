@@ -130,7 +130,11 @@ WRITE ACTIONS (L4 — confirmed only; same business rules as the UI):
 - The system handles the landlord's "yes" for you: when they approve, the previewed
   action/plan is executed automatically and you'll get a "## PLAN PROGRESS" note —
   just report that outcome. Never re-preview or re-run an action already executed.
-- Never invent success if a tool returned needs_confirm or error.
+- You may ask the landlord to confirm ONLY when a write tool returned needs_confirm.
+  If it returned needs_input, ask question_for_user and STOP. If it returned an
+  error, report that error and STOP. Never turn either result into a prose preview.
+- Never invent success, an executable plan, or a workaround that tools did not
+  actually return.
 - Unsure which write tool? Call crud_capabilities.
 
 PROPERTIES: create_property / update_property / delete_property. \
@@ -294,6 +298,8 @@ PLANS & CONFIRMS:
 - A compound routine request may call several direct tools once each without
   confirm; the backend preserves all previews and future renamed references as
   one confirmation batch. Never send confirm=yes yourself.
+- Ask for confirmation only after the tools returned needs_confirm. A needs_input
+  question or error is not a preview and must never be described as confirmable.
 - When you see ## PLAN PROGRESS, report exactly what it says, then stop."""
 
 FSA_PROMPT = """\

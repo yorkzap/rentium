@@ -415,3 +415,248 @@ def test_property_name_and_group_noops_do_not_request_confirmation(landlord):
     assert "needs_confirm" not in rename
     assert "needs_confirm" not in grouping
     assert "already in Wascana Main Floor" in grouping["message"]
+
+
+def test_numbered_replacement_rebuilds_real_plan_and_one_yes_creates_all_rooms(
+    landlord,
+):
+    """Replay the six-room Wascana loop.
+
+    "No, make it like this" edits the prior executable plan, retaining its
+    location defaults. The returned preview is backed by six persisted steps;
+    one Yes creates all six and anchors them to the existing holding.
+    """
+    import uuid
+
+    from rentium.properties.models import Property
+    from rentium.properties.models import PropertyGroup
+    from rentium.properties.models import PropertyHolding
+    from rentium.rama.models import RamaAudit
+    from rentium.rama.plan_runner import save_plan
+    from rentium.rama.service import run_turn
+
+    _enable(landlord)
+    holding = PropertyHolding.objects.create(
+        landlord=landlord,
+        name="3213 Wascana St",
+        address="3213 Wascana St",
+        city="Victoria",
+    )
+    groups = {
+        name: PropertyGroup.objects.create(landlord=landlord, name=name)
+        for name in (
+            "Wascana Main Floor",
+            "Wascana Basement",
+            "Wascana Upstairs",
+        )
+    }
+    conversation_id = uuid.uuid4()
+    RamaAudit.objects.create(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+        content={
+            "tool": "_live_context",
+            "arguments": {},
+            "result": {
+                "rooms": [
+                    {
+                        "name": f"Old {group_name}",
+                        "address": holding.address,
+                        "city": holding.city,
+                        "province": "bc",
+                        "group": group_name,
+                    }
+                    for group_name in groups
+                ]
+            },
+        },
+    )
+    old_rows = [
+        ("Room 1", "Wascana Main Floor"),
+        ("Room 2", "Wascana Main Floor"),
+        ("Room Basement", "Wascana Basement"),
+        ("Room Upstairs 1", "Wascana Upstairs"),
+        ("Room Upstairs 2", "Wascana Upstairs"),
+    ]
+    save_plan(
+        landlord,
+        conversation_id,
+        {
+            "operation": "preview_batch",
+            "summary": "Old five-room proposal.",
+            "steps": [
+                {
+                    "tool": "create_property",
+                    "target": name,
+                    "item_key": f"old:{name}",
+                    "arguments": {
+                        "name": name,
+                        "address": holding.address,
+                        # Deliberately stale model-prepared values. The audited
+                        # live portfolio above is authoritative.
+                        "city": "Regina",
+                        "province": "SK",
+                        "property_category": "ROOM",
+                        "room_type": "PRIVATE",
+                        "group_name": group_name,
+                    },
+                }
+                for name, group_name in old_rows
+            ],
+        },
+    )
+    correction = """No, make it like this:
+
+1. Create Room 1 in Wascana Main Floor at 3213 Wascana St
+2. Create Room 2 in Wascana Main Floor at 3213 Wascana St
+3. Create Room Basement in Wascana Basement at 3213 Wascana St
+4. Create Room Den Basement in Wascana Basement at 3213 Wascana St
+5. Create Room Upstairs 3 in Wascana Upstairs at 3213 Wascana St
+6. Create Room Upstairs 4 in Wascana Upstairs at 3213 Wascana St"""
+    never = ScriptedProvider([Turn(text="must not run")])
+    with mock.patch("rentium.rama.service.get_provider", return_value=never):
+        preview = run_turn(
+            landlord,
+            correction,
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert preview.deterministic is True
+    assert never.requests == []
+    assert "one “Yes” will run all 6 changes" in preview.reply
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    assert plan.steps.count() == 6
+    assert list(plan.steps.order_by("order").values_list("target_label", flat=True)) == [
+        "Room 1",
+        "Room 2",
+        "Room Basement",
+        "Room Den Basement",
+        "Room Upstairs 3",
+        "Room Upstairs 4",
+    ]
+    assert {
+        (step.arguments["city"], step.arguments["province"])
+        for step in plan.steps.all()
+    } == {(holding.city, "bc")}
+
+    with mock.patch(
+        "rentium.rama.service.get_provider",
+        return_value=ScriptedProvider([]),
+    ):
+        done = run_turn(
+            landlord,
+            "Yes",
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    created = list(
+        Property.objects.filter(landlord=landlord, address=holding.address)
+        .order_by("name")
+        .values_list("name", "group__name", "holding_id")
+    )
+    assert len(created) == 6
+    assert {row[2] for row in created} == {holding.pk}
+    assert {row[1] for row in created} == set(groups)
+    assert done.reply.count("Created Room") == 6
+    assert not RamaPendingPlan.objects.filter(
+        conversation_id=conversation_id
+    ).exists()
+
+
+def test_model_cannot_turn_needs_input_into_a_fake_confirmable_preview(landlord):
+    from rentium.properties.models import PropertyGroup
+    from rentium.rama.service import run_turn
+
+    _enable(landlord)
+    group = PropertyGroup.objects.create(
+        landlord=landlord,
+        name="Wascana Main Floor",
+    )
+    provider = ScriptedProvider(
+        [
+            Turn(
+                tool_calls=[
+                    ToolCall(
+                        id="empty-group",
+                        name="create_group_room",
+                        arguments={
+                            "name": "Room 1",
+                            "group_name": group.name,
+                        },
+                    )
+                ]
+            ),
+            Turn(
+                text=(
+                    "Preview — I will create Room 1. "
+                    "Reply yes to confirm the complete batch."
+                )
+            ),
+        ]
+    )
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        result = run_turn(
+            landlord,
+            "Please handle the requested Wascana setup.",
+            role="general",
+            channel="telegram",
+        )
+
+    assert result.deterministic is True
+    assert result.pending_plan is None
+    assert "I couldn't prepare an executable preview yet" in result.reply
+    assert "Which existing physical holding" in result.reply
+    assert "Reply yes" not in result.reply
+
+
+def test_create_group_room_bootstraps_empty_group_from_exact_holding(landlord):
+    from rentium.properties.models import Property
+    from rentium.properties.models import PropertyGroup
+    from rentium.properties.models import PropertyHolding
+
+    holding = PropertyHolding.objects.create(
+        landlord=landlord,
+        name="Wascana House",
+        address="3213 Wascana St",
+        city="Victoria",
+    )
+    group = PropertyGroup.objects.create(
+        landlord=landlord,
+        name="Wascana Upstairs",
+    )
+    arguments = {
+        "name": "Room Upstairs 3",
+        "group_name": group.name,
+        "holding_name": holding.name,
+        "province": "bc",
+    }
+    preview = registry.execute(
+        "create_group_room",
+        arguments,
+        landlord=landlord,
+    )
+    assert preview["needs_confirm"] is True
+    assert preview["preview"]["derived_property_data"] == {
+        "address": holding.address,
+        "city": holding.city,
+        "province": "bc",
+        "postal_code": None,
+        "country": "Canada",
+        "holding": holding.name,
+    }
+
+    done = registry.execute(
+        "create_group_room",
+        {**arguments, "confirm": "yes"},
+        landlord=landlord,
+    )
+    room = Property.objects.get(landlord=landlord, name="Room Upstairs 3")
+    assert done["created"] is True
+    assert room.group_id == group.pk
+    assert room.holding_id == holding.pk
+    assert room.address == holding.address
