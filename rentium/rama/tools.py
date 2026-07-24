@@ -1275,6 +1275,59 @@ def setup_room_tenancy(
 
 
 @_params(
+    holding_name=(
+        "Name for the physical house/holding, normally its canonical street address."
+    ),
+    address="Canonical street address for the house.",
+    city="City for every room in the layout. Never guess; leave blank to clarify.",
+    province=(
+        "Canadian province name or two-letter code for every room. Never guess; "
+        "leave blank to clarify."
+    ),
+    layout_json=(
+        'JSON object {"groups":[{"name":"...","rooms":[{"name":"...",'
+        '"private_areas":["BATHROOM"]}],"shared_areas":[{"area_type":'
+        '"BATHROOM","rooms":["Room 2","Room 3"]}]}]}. Empty groups are allowed. '
+        "Use private_areas for an ensuite and explicit room lists for subset-shared "
+        "areas."
+    ),
+    shared_with_landlord=(
+        "yes/no: whether the landlord or immediate relatives use any shared areas. "
+        "Leave blank to ask the required legal-classification question."
+    ),
+    confirm="Leave empty to preview; pass yes only after the landlord confirms.",
+)
+def create_house_layout(  # noqa: PLR0913 - explicit public tool fields
+    landlord,
+    holding_name: str,
+    address: str,
+    layout_json: str,
+    city: str = "",
+    province: str = "",
+    shared_with_landlord: str = "",
+    confirm: str = "",
+) -> dict:
+    """Atomically create/reuse one physical house, its property groups, rooms,
+    private areas, and exact room-to-common-area associations. Use for a
+    hierarchical instruction such as "add a house with a basement group and a
+    three-room main floor; master has a private bathroom; the other two share
+    one." Missing city/province or landlord-sharing classification returns one
+    focused clarification. One complete preview, then confirm=yes."""
+    from .house_layout import create_house_layout as _fn
+
+    return _fn(
+        landlord,
+        holding_name=holding_name,
+        address=address,
+        city=city,
+        province=province,
+        layout_json=layout_json,
+        shared_with_landlord=shared_with_landlord,
+        confirm=confirm,
+    )
+
+
+@_params(
     name="The new room/listing name (for example, Mackenzie B).",
     group_name="Existing property group whose agreed address and holding are inherited.",
     inventory_items="Private room inventory as a comma-separated list or JSON list.",

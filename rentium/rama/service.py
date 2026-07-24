@@ -451,8 +451,366 @@ def _group_room_clarification(landlord, conversation_id) -> dict | None:
     return None
 
 
+_PROVINCE_FULL_NAMES = (
+    "alberta|british columbia|manitoba|new brunswick|"
+    "newfoundland and labrador|newfoundland|nova scotia|"
+    "northwest territories|nunavut|ontario|prince edward island|"
+    "quebec|saskatchewan|yukon"
+)
+_PROVINCE_CODES = "AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT"
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+}
+MAX_HOUSE_CITY_CHARS = 60
+MAX_HOUSE_ROOMS = 8
+MCC_PREFIX_LENGTH = 3
+MIN_HOUSE_ROOMS = 2
+
+
+def _smart_title(value: str) -> str:
+    words: list[str] = []
+    for word in re.split(r"(\s+)", str(value or "").strip()):
+        if not word or word.isspace():
+            words.append(word)
+            continue
+        titled = word.lower().capitalize()
+        if (
+            titled.casefold().startswith("mcc")
+            and len(titled) > MCC_PREFIX_LENGTH
+        ):
+            titled = "McC" + titled[3].lower() + titled[4:]
+        words.append(titled)
+    return "".join(words)
+
+
+def _canonical_street_address(raw: str) -> str:
+    address = _smart_title(raw)
+    suffixes = {
+        " St": " Street",
+        " Ave": " Avenue",
+        " Rd": " Road",
+        " Dr": " Drive",
+        " Blvd": " Boulevard",
+        " Cres": " Crescent",
+        " Ct": " Court",
+    }
+    for short, full in suffixes.items():
+        if address.endswith(short):
+            return address[: -len(short)] + full
+    return address
+
+
+def _location_from_text(text: str) -> tuple[str, str]:
+    """Extract an explicitly supplied Canadian city/province pair."""
+    from rentium.properties.models import normalise_province
+
+    raw = str(text or "")
+    province_match = re.search(
+        rf"\b({_PROVINCE_FULL_NAMES})\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if province_match is None:
+        # Two-letter codes are accepted when capitalized, after a comma, or
+        # explicitly labelled as a province. This prevents ordinary prose such
+        # as "on the main floor" from being misread as Ontario.
+        province_match = re.search(rf"\b({_PROVINCE_CODES})\b", raw)
+    if province_match is None:
+        province_match = re.search(
+            rf"(?:,|\bprovince\s*(?:is|=|:)?)\s*({_PROVINCE_CODES})\b",
+            raw,
+            flags=re.IGNORECASE,
+        )
+    if province_match is None:
+        return "", ""
+    province = normalise_province(province_match.group(1))
+    if not province:
+        return "", ""
+
+    explicit_city = re.search(
+        r"\bcity\s*(?:is|=|:)?\s*([A-Za-z][A-Za-z .'-]{1,50}?)"
+        r"(?=\s+(?:and\s+)?(?:the\s+)?province\b|[,.;]|$)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if explicit_city:
+        return _smart_title(explicit_city.group(1).strip()), province
+
+    prefix = raw[: province_match.start()].strip(" ,.;:-")
+    prefix = re.sub(
+        r"^(?:it(?:'s| is)?\s+)?(?:located\s+)?(?:in\s+)?",
+        "",
+        prefix,
+        flags=re.IGNORECASE,
+    )
+    # Follow-up answers are commonly "Regina, SK, and no landlord use".
+    candidate = re.split(r"[,.;]|\band\b", prefix, flags=re.IGNORECASE)[-1]
+    candidate = re.sub(
+        r"^(?:the\s+)?(?:city\s+is\s+|city\s*:?\s*)",
+        "",
+        candidate.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    if (
+        not candidate
+        or len(candidate) > MAX_HOUSE_CITY_CHARS
+        or re.search(r"\d", candidate)
+    ):
+        return "", province
+    return _smart_title(candidate), province
+
+
+def _landlord_sharing_from_text(text: str) -> str:
+    lowered = " ".join(str(text or "").casefold().split())
+    subject = r"(?:landlord|owner|immediate relative|relative)"
+    if re.search(
+        rf"\b{subject}\b.{{0,45}}\b(?:does not|doesn't|won't|not|never)\b"
+        rf"|\b(?:no|not|never)\b.{{0,45}}\b{subject}\b",
+        lowered,
+    ):
+        return "no"
+    if re.search(
+        rf"\b{subject}\b.{{0,45}}\b(?:use|uses|share|shares|live|lives)\b"
+        rf"|\bshared?\s+with\s+(?:the\s+)?{subject}\b",
+        lowered,
+    ):
+        return "yes"
+    trailing = re.search(r"(?:^|[,;]|\band\b)\s*(yes|no)\s*[.!]?\s*$", lowered)
+    return trailing.group(1) if trailing else ""
+
+
+def _house_layout_intent(  # noqa: PLR0911 - each guard rejects ambiguity
+    message: str,
+) -> dict | None:
+    """Parse a high-confidence house/group/room hierarchy instruction.
+
+    This intentionally recognizes only a complete structural pattern. The
+    exact legal/location gaps remain blank so the real tool asks one focused
+    clarification instead of the model inventing them or returning "resend".
+    """
+    text = str(message or "")
+    lowered = " ".join(text.casefold().split())
+    if not (
+        re.search(r"\b(?:add|create|make)\b.{0,30}\b(?:another\s+)?house\b", lowered)
+        and re.search(r"\bproperty groups?\b", lowered)
+        and "basement" in lowered
+        and re.search(r"\bmain\s+floor\b", lowered)
+    ):
+        return None
+    address_match = re.search(
+        r"\b(\d{1,6}\s+[A-Za-z][A-Za-z0-9 .'-]*?\s+"
+        r"(?:street|st|avenue|ave|road|rd|drive|dr|boulevard|blvd|"
+        r"crescent|cres|court|ct|lane|way))\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if address_match is None:
+        return None
+    address = _canonical_street_address(address_match.group(1))
+    street_stem = re.sub(
+        r"^\d+\s+|\s+(?:street|avenue|road|drive|boulevard|crescent|court|lane|way)$",
+        "",
+        address,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not street_stem:
+        return None
+
+    count_match = re.search(
+        r"\bmain\s+floor\b.{0,100}?\b("
+        + "|".join([r"\d+", *_NUMBER_WORDS])
+        + r")\s+(?:private\s+)?rooms?\b",
+        lowered,
+    )
+    if count_match is None:
+        return None
+    raw_count = count_match.group(1)
+    room_count = (
+        int(raw_count) if raw_count.isdigit() else _NUMBER_WORDS.get(raw_count, 0)
+    )
+    if room_count < MIN_HOUSE_ROOMS or room_count > MAX_HOUSE_ROOMS:
+        return None
+    has_private_master_bath = bool(
+        re.search(
+            r"\b(?:one\s+of\s+the\s+)?(?:washrooms?|bathrooms?)\b"
+            r".{0,80}\bprivate\b.{0,80}\bmaster\b"
+            r"|\bmaster\b.{0,80}\bprivate\b.{0,80}\b(?:washroom|bathroom)\b",
+            lowered,
+        ),
+    )
+    has_subset_shared_bath = bool(
+        re.search(
+            r"\b(?:other|second)\s+(?:washroom|bathroom)\b.{0,80}\bshared\b"
+            r".{0,80}\b(?:other\s+)?two\s+rooms?\b",
+            lowered,
+        ),
+    )
+    if not has_private_master_bath or not has_subset_shared_bath:
+        return None
+
+    master_name = f"{street_stem} Master Bedroom"
+    other_names = [
+        f"{street_stem} Main Floor Room {index}"
+        for index in range(2, room_count + 1)
+    ]
+    all_names = [master_name, *other_names]
+    rooms = [
+        {"name": master_name, "private_areas": ["BATHROOM"]},
+        *[{"name": name, "private_areas": []} for name in other_names],
+    ]
+    shared_areas = [
+        {
+            "area_type": "BATHROOM",
+            "rooms": other_names,
+            "description": "Shared washroom for the non-master rooms.",
+        },
+    ]
+    if re.search(r"\bkitchen\b", lowered):
+        shared_areas.append({"area_type": "KITCHEN", "rooms": all_names})
+    if re.search(r"\bliving\s+room\b", lowered):
+        shared_areas.append({"area_type": "LIVING_ROOM", "rooms": all_names})
+    city, province = _location_from_text(text)
+    layout = {
+        "groups": [
+            {
+                "name": f"{street_stem} Basement",
+                "description": "Basement property group; rooms can be added later.",
+                "rooms": [],
+                "shared_areas": [],
+            },
+            {
+                "name": f"{street_stem} Main Floor",
+                "rooms": rooms,
+                "shared_areas": shared_areas,
+            },
+        ],
+    }
+    return {
+        "tool": "create_house_layout",
+        "arguments": {
+            "holding_name": address,
+            "address": address,
+            "city": city,
+            "province": province,
+            "layout_json": json.dumps(layout, separators=(",", ":")),
+            "shared_with_landlord": _landlord_sharing_from_text(text),
+        },
+    }
+
+
+def _house_layout_clarification(landlord, conversation_id) -> dict | None:
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+    ).order_by("-created_at")[:30]
+    latest_assistant = (
+        RamaAudit.objects.filter(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            kind=RamaAudit.Kind.ASSISTANT_MESSAGE,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    for row in rows:
+        content = row.content or {}
+        if content.get("tool") != "create_house_layout":
+            continue
+        result = content.get("result") or {}
+        question = str(result.get("question_for_user") or "").strip()
+        if (
+            not result.get("needs_input")
+            or latest_assistant is None
+            or latest_assistant.created_at < row.created_at
+            or str((latest_assistant.content or {}).get("text") or "").strip()
+            != question
+        ):
+            return None
+        return {
+            "arguments": dict(content.get("arguments") or {}),
+            "missing_fields": list(result.get("missing_fields") or []),
+        }
+    return None
+
+
+def _merge_house_layout_answer(arguments: dict, message: str) -> dict:
+    merged = dict(arguments)
+    city, province = _location_from_text(message)
+    if city:
+        merged["city"] = city
+    if province:
+        merged["province"] = province
+    classification = _landlord_sharing_from_text(message)
+    if not classification and (
+        _is_affirmative(message) or _is_negative(message)
+    ):
+        classification = "yes" if _is_affirmative(message) else "no"
+    if classification:
+        merged["shared_with_landlord"] = classification
+    return merged
+
+
 def _preview_reply(tool: str, result: dict) -> str:
     preview = result.get("preview") or {}
+    if tool == "create_house_layout":
+        holding = preview.get("holding") or {}
+        lines = [
+            (
+                f"Preview: add house {holding.get('address')} in "
+                f"{holding.get('city')}, {str(holding.get('province') or '').upper()} "
+                f"({holding.get('action') or 'create'} holding)."
+            ),
+            "Property groups:",
+        ]
+        for group in preview.get("groups") or []:
+            room_text = (
+                f"{group['room_count']} room(s)"
+                if group.get("room_count")
+                else "empty for now"
+            )
+            lines.append(
+                f"• {group.get('name')} — {room_text}; {group.get('action')}",
+            )
+        lines.append("Rooms and private areas:")
+        for room in preview.get("rooms") or []:
+            private = ", ".join(room.get("private_areas") or []) or "none"
+            lines.append(
+                f"• {room.get('name')} — private areas: {private}; "
+                f"{room.get('action')}",
+            )
+        lines.append("Shared-area access:")
+        for area in preview.get("shared_areas") or []:
+            classification = (
+                "landlord also uses it"
+                if area.get("shared_with_landlord")
+                else "tenant-only"
+            )
+            lines.append(
+                f"• {area.get('name')} in {area.get('group')} — "
+                f"{', '.join(area.get('rooms') or [])}; {classification}",
+            )
+        conflicts = preview.get("near_duplicate_names") or []
+        if conflicts:
+            lines.append(
+                "Similar existing listing names: "
+                + ", ".join(
+                    [str(item.get("name") or "") for item in conflicts],
+                )
+                + ".",
+            )
+        lines.append(
+            "Reply yes to create this complete layout in one transaction, "
+            "or no to cancel.",
+        )
+        return "\n".join(lines)
     if tool == "update_property":
         before = preview.get("property") or "the listing"
         after = (preview.get("changes") or {}).get("name")
@@ -1300,6 +1658,65 @@ def run_turn(
                 "That confirmation was already applied. No action was repeated.\n"
                 + recent_reply
             )
+
+    # A hierarchical house request is one domain operation, not loose prose
+    # and not a fragile series of model-authored writes. The deterministic
+    # parser captures the understood layout; the composite tool asks only for
+    # missing legal/location facts and then persists one atomic preview.
+    if deterministic_reply is None and pending_plan is None:
+        house_intent = _house_layout_intent(message)
+        house_clarification = (
+            None
+            if house_intent is not None
+            else _house_layout_clarification(landlord, conversation_id)
+        )
+        if house_intent is not None:
+            house_arguments = house_intent["arguments"]
+        elif house_clarification is not None and _norm_affirm(message) in {
+            "cancel",
+            "cancel that",
+            "cancel it",
+            "abort",
+            "never mind",
+            "nevermind",
+            "forget it",
+        }:
+            house_arguments = None
+            deterministic_reply = (
+                "Cancelled the house-layout draft. Nothing was created."
+            )
+        elif house_clarification is not None:
+            house_arguments = _merge_house_layout_answer(
+                house_clarification["arguments"],
+                message,
+            )
+        else:
+            house_arguments = None
+
+        if house_arguments is not None:
+            result = _run_deterministic_tool(
+                "create_house_layout",
+                house_arguments,
+            )
+            if result.get("needs_input"):
+                deterministic_reply = str(result.get("question_for_user"))
+            elif result.get("needs_confirm"):
+                save_single(
+                    landlord,
+                    conversation_id,
+                    "create_house_layout",
+                    house_arguments,
+                )
+                deterministic_reply = _preview_reply(
+                    "create_house_layout",
+                    result,
+                )
+            else:
+                deterministic_reply = str(
+                    result.get("error")
+                    or result.get("message")
+                    or result
+                )
 
     # Explicit numbered creation batches are executable syntax, not prose for
     # the model to paraphrase. This also handles a corrected replacement after

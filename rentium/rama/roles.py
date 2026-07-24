@@ -293,8 +293,10 @@ DECIDING:
 PLANS & CONFIRMS:
 - plan_operation / plan_move_tenant build multi-step plans; previews need the
   landlord's yes; lease terminations always pause for their own confirmation.
-- Routine property creation, rename, grouping, and create_group_room are direct
-  tools. Use them yourself; delegate specialized or bulk operational analysis.
+- Routine property creation, rename, grouping, create_group_room, and atomic
+  create_house_layout are direct tools. Use create_house_layout when one
+  instruction describes a house, groups, rooms, and private/shared areas.
+  Delegate specialized or bulk operational analysis.
 - A compound routine request may call several direct tools once each without
   confirm; the backend preserves all previews and future renamed references as
   one confirmation batch. Never send confirm=yes yourself.
@@ -363,6 +365,7 @@ GENERAL_TOOLS = READ_TOOLS + (
     "update_property",
     "create_property_group",
     "assign_property_to_group",
+    "create_house_layout",
     "create_group_room",
     "create_holding",
     "assign_property_to_holding",

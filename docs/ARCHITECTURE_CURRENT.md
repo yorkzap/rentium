@@ -72,6 +72,14 @@ when every existing group member agrees, asks once for a missing landlord-use
 classification, warns about exact and near-duplicate names, and rolls the
 whole operation back on failure.
 
+Whole-house descriptions use the atomic `create_house_layout` service rather
+than a model-authored sequence of unrelated calls. It can create one holding,
+empty or populated property groups, room listings, private areas such as an
+ensuite, subset-shared areas such as a bathroom used by two named rooms, and
+group-wide areas. Missing location and landlord-use facts produce one
+state-backed clarification; the completed hierarchy then receives one preview
+and one transaction.
+
 RAMA links come from `rentium.rama.links`, never from model-generated prose.
 Registered collection routes include dashboard home, properties, property
 groups, documents, leases, finances, maintenance, and settings. Entity routes

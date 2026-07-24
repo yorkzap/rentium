@@ -113,6 +113,15 @@ transaction. An empty group does not require a disposable “first room” as a
 workaround: the operation can bootstrap directly from one exact existing
 holding/address plus any missing city/province, all shown in the preview.
 
+`create_house_layout` is the composite boundary for a landlord describing a
+whole hierarchy at once: physical house, property groups, rooms, private areas,
+and exact shared-area access. RAMA keeps the understood hierarchy as a draft,
+asks one focused question for missing city/province and landlord-sharing
+classification, then saves one preview. Confirmation creates or idempotently
+reuses the holding and groups, creates the rooms, and records private, subset-
+shared, and group-wide areas inside one transaction. An unspecified group may
+remain empty until the landlord describes its rooms.
+
 RAMA emits dashboard links only from the registered link map and canonical
 frontend origin. “Show my dashboard properties” therefore resolves to
 `https://www.rentium.ca/dashboard/properties`; legacy `app.rentium.ca` links

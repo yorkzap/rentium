@@ -28,6 +28,13 @@ def supported_tool_for_request(request: str) -> str | None:
         tool = "list_properties"
     elif (
         re.search(r"\b(create|add|make)\b", text)
+        and re.search(r"\b(house|holding|building)\b", text)
+        and re.search(r"\b(property )?groups?\b", text)
+        and re.search(r"\brooms?\b", text)
+    ):
+        tool = "create_house_layout"
+    elif (
+        re.search(r"\b(create|add|make)\b", text)
         and re.search(r"\broom\b", text)
         and re.search(r"\b(property )?group\b", text)
     ):
