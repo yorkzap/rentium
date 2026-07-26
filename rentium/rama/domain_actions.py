@@ -70,6 +70,104 @@ def _parse_when(when: str):
 # ---------------------------------------------------------------------------
 
 
+def _resolve_maintenance_target(landlord, query: str):
+    """(property, unit, area, error) for "where is the fault?".
+
+    A listing, a whole unit, or a named space inside one. The unit and area
+    paths exist because a shared washroom belongs to no single room: with only
+    property_query available, RAMA could not say "the shared washroom in
+    McKenzie Basement" and kept re-offering one of the three rooms that share
+    it while the landlord said no.
+    """
+    from rentium.properties.models import PropertyUnit
+
+    q = (query or "").strip()
+    if not q:
+        return None, None, None, {"error": "Say which listing or unit this is for."}
+
+    # A listing name is the most specific thing, so try it first.
+    prop, err = _resolve_property(landlord, q)
+    if not err:
+        return prop, None, None, None
+
+    units = list(
+        PropertyUnit.objects.filter(landlord=landlord)
+        .select_related("holding")
+        .filter(name__icontains=q)[:6]
+    )
+    if not units:
+        # "McKenzie Basement" reads as holding + unit; match on both together.
+        tokens = [t for t in q.replace(",", " ").split() if t]
+        candidates = PropertyUnit.objects.filter(landlord=landlord).select_related(
+            "holding"
+        )
+        for token in tokens:
+            from django.db.models import Q as _Q
+
+            candidates = candidates.filter(
+                _Q(name__icontains=token) | _Q(holding__name__icontains=token)
+            )
+        units = list(candidates[:6])
+
+    if len(units) == 1:
+        return None, units[0], None, None
+    if len(units) > 1:
+        return None, None, None, {
+            "error": f"Several units match {q!r} — which one?",
+            "candidates": [f"{u.name} ({u.holding.name})" for u in units],
+        }
+    return None, None, None, _prop_err(err)
+
+
+def _resolve_area(landlord, target_property, target_unit, area_query: str):
+    """A named space on the target, or (None, error)."""
+    from django.db.models import Q
+
+    from rentium.properties.models import PropertyArea
+
+    q = (area_query or "").strip()
+    if not q:
+        return None, None
+
+    scope = Q(pk__in=[])
+    unit_id = target_unit.pk if target_unit else (
+        target_property.unit_id if target_property else None
+    )
+    if unit_id:
+        scope |= Q(unit_id=unit_id)
+    if target_property is not None:
+        scope |= Q(property_id=target_property.pk)
+        if target_property.group_id:
+            scope |= Q(group_id=target_property.group_id)
+    if target_unit is not None:
+        group = getattr(target_unit, "room_group", None)
+        if group is not None:
+            scope |= Q(group_id=group.pk)
+
+    matches = list(
+        PropertyArea.objects.filter(scope)
+        .filter(Q(name__icontains=q) | Q(area_type__icontains=q.replace(" ", "_")))
+        .distinct()[:6]
+    )
+    if not matches:
+        return None, {
+            "error": f"No space called {q!r} is recorded there.",
+            "hint": (
+                "Record it first with update_unit_layout, or leave the space out "
+                "and describe it in the work order text."
+            ),
+        }
+    if len(matches) > 1:
+        exact = [a for a in matches if (a.name or "").casefold() == q.casefold()]
+        if len(exact) == 1:
+            return exact[0], None
+        return None, {
+            "error": f"Several spaces match {q!r} — which one?",
+            "candidates": [a.label for a in matches],
+        }
+    return matches[0], None
+
+
 def create_work_order(
     landlord,
     *,
@@ -78,13 +176,17 @@ def create_work_order(
     description: str = "",
     priority: str = "MEDIUM",
     category: str = "OTHER",
+    area: str = "",
     confirm: str = "",
 ) -> dict:
     from rentium.maintenance.models import WorkOrder
 
-    prop, err = _resolve_property(landlord, property_query)
+    prop, unit, _a, err = _resolve_maintenance_target(landlord, property_query)
     if err:
-        return _prop_err(err)
+        return err
+    area_obj, area_err = _resolve_area(landlord, prop, unit, area)
+    if area_err:
+        return area_err
     title = (title or "").strip()
     if not title:
         return {"error": "title is required."}
@@ -95,14 +197,43 @@ def create_work_order(
     if cat not in WorkOrder.Category.values:
         cat = WorkOrder.Category.OTHER
 
+    if prop is not None:
+        where = prop.name
+    else:
+        # "(shared)" for a by-room unit, "(whole unit)" for one let as a home —
+        # the landlord needs to see which of the two we understood.
+        from rentium.properties.models import PropertyUnit as _PU
+
+        qualifier = (
+            "whole unit" if unit.rental_mode == _PU.RentalMode.WHOLE_UNIT else "shared"
+        )
+        where = f"{unit.name} ({unit.holding.name}) — {qualifier}"
+    shared_note = None
+    if unit is not None or (area_obj is not None and area_obj.unit_id):
+        target_unit = unit or (prop.unit if prop is not None else None)
+        if target_unit is not None:
+            sharers = [
+                p.name
+                for p in target_unit.offerings.filter(is_active_offering=True)
+            ]
+            if len(sharers) > 1:
+                shared_note = (
+                    "Shared space — everyone renting "
+                    + ", ".join(sharers)
+                    + " will see this."
+                )
+
     preview = {
-        "property": prop.name,
+        "property": where,
+        "area": area_obj.label if area_obj is not None else None,
         "title": title,
         "description": (description or "")[:500],
         "priority": pr,
         "category": cat,
         "origin": "LANDLORD",
     }
+    if shared_note:
+        preview["note"] = shared_note
     if not _confirmed(confirm):
         return _preview(
             "create_work_order",
@@ -112,6 +243,8 @@ def create_work_order(
 
     wo = WorkOrder.objects.create(
         property=prop,
+        unit=unit,
+        area=area_obj,
         reported_by=landlord.user,
         title=title[:200],
         description=(description or title)[:5000],
@@ -125,7 +258,9 @@ def create_work_order(
         "work_order": {
             "id": str(wo.pk),
             "title": wo.title,
-            "property": prop.name,
+            # place_name covers both targets — a shared-space job has no listing.
+            "property": wo.place_name,
+            "area": area_obj.label if area_obj is not None else None,
             "status": wo.status,
             "priority": wo.priority,
             "sla_due_at": wo.sla_due_at.isoformat() if wo.sla_due_at else None,
@@ -774,11 +909,14 @@ def get_notification_channels(landlord) -> dict:
                     "verified": c.verified,
                     "active": c.is_active,
                     "name": c.display_name or "",
+                    # Whether the daily 07:00 briefing goes to this channel.
+                    "morning_briefing": bool((c.prefs or {}).get("briefing")),
                 }
             )
     except Exception:  # noqa: BLE001
         pass
     verified = [c for c in linked if c["verified"] and c["active"]]
+    briefing_on = [c["channel"] for c in linked if c["morning_briefing"]]
     return {
         "always_on": ["in-app dashboard", "email"],
         "external_channels": linked,
@@ -787,6 +925,28 @@ def get_notification_channels(landlord) -> dict:
         "telegram_linked": any(
             c["channel"] == "TELEGRAM" and c["verified"] for c in linked
         ),
+        # Rentium DOES send a scheduled daily briefing. RAMA used to answer
+        # "I don't send scheduled morning messages" and offer to log a
+        # capability gap for a feature that already ships — because nothing in
+        # its read surface mentioned it. Now it can say why they aren't
+        # arriving instead of denying they exist.
+        "morning_briefing": {
+            "exists": True,
+            "sends_daily_at": "07:00 in the landlord's timezone",
+            "enabled_on": briefing_on,
+            "status": (
+                f"On for {', '.join(briefing_on)}."
+                if briefing_on
+                else (
+                    "Not switched on for any channel yet — that is why no "
+                    "morning updates are arriving."
+                )
+            ),
+            "how_to_enable": (
+                "Turn on the morning briefing for a linked channel in "
+                "Settings > Notifications."
+            ),
+        },
     }
 
 

@@ -91,8 +91,25 @@ class WorkOrder(models.Model):
     ACTIONED_STATUSES = {Status.SCHEDULED, Status.IN_PROGRESS, Status.COMPLETED}
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # Nullable because not every fault belongs to a listing. A leaking shower in
+    # a shared washroom belongs to the UNIT: pinning it to one of the three
+    # rooms that share the washroom is both wrong on the maintenance list and
+    # impossible to state — which is exactly where RAMA got stuck, re-offering
+    # "Room C" while the landlord kept saying "no, it's the shared one".
     property = models.ForeignKey(
-        Property, on_delete=models.PROTECT, related_name="work_orders"
+        Property,
+        on_delete=models.PROTECT,
+        related_name="work_orders",
+        null=True,
+        blank=True,
+    )
+    unit = models.ForeignKey(
+        "properties.PropertyUnit",
+        on_delete=models.PROTECT,
+        related_name="work_orders",
+        null=True,
+        blank=True,
+        help_text=_("For faults in shared space rather than one listing."),
     )
     area = models.ForeignKey(
         PropertyArea,
@@ -152,8 +169,17 @@ class WorkOrder(models.Model):
         verbose_name = _("Work Order")
         verbose_name_plural = _("Work Orders")
 
+    @builtins.property
+    def place_name(self) -> str:
+        """Where this job is, whether it hangs off a listing or a unit."""
+        if self.property_id:
+            return self.property.name
+        if self.unit_id:
+            return f"{self.unit.name} (shared)"
+        return "unassigned"
+
     def __str__(self):
-        return f"[{self.get_priority_display()}] {self.title} — {self.property.name}"
+        return f"[{self.get_priority_display()}] {self.title} — {self.place_name}"
 
     # -------------------------------------------------------------- hooks
     def save(self, *args, **kwargs):
@@ -182,31 +208,47 @@ class WorkOrder(models.Model):
 
     def clean(self):
         super().clean()
+        if not self.property_id and not self.unit_id:
+            raise ValidationError(
+                _("A work order needs a listing or a unit to belong to.")
+            )
         if (
             self.lease
             and self.lease.property_id
+            and self.property_id
             and self.lease.property_id != self.property_id
         ):
             raise ValidationError(
                 {"lease": _("The linked lease does not belong to this property.")}
             )
         if self.area:
+            target_unit_id = self.unit_id or (
+                self.property.unit_id if self.property_id else None
+            )
+            target_group_id = (
+                self.property.group_id if self.property_id else None
+            ) or (
+                getattr(getattr(self.unit, "room_group", None), "pk", None)
+                if self.unit_id
+                else None
+            )
             area_parent_ok = (
-                (self.area.property_id and self.area.property_id == self.property_id)
-                or (
-                    self.area.group_id
-                    and self.area.group_id == self.property.group_id
+                (
+                    self.area.property_id
+                    and self.property_id
+                    and self.area.property_id == self.property_id
                 )
-                # The unit's internal layout: a whole-unit listing's kitchen is
-                # an area on the unit, not on the listing.
-                or (self.area.unit_id and self.area.unit_id == self.property.unit_id)
+                or (self.area.group_id and self.area.group_id == target_group_id)
+                # The unit's internal layout: a shared washroom, or a whole-unit
+                # listing's kitchen, is an area on the unit not on the listing.
+                or (self.area.unit_id and self.area.unit_id == target_unit_id)
             )
             if not area_parent_ok:
                 raise ValidationError(
                     {
                         "area": _(
-                            "Area does not belong to this property, its unit, or "
-                            "its group."
+                            "Area does not belong to this work order's listing, "
+                            "unit, or group."
                         )
                     }
                 )

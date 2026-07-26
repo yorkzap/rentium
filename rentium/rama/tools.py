@@ -724,13 +724,18 @@ def create_work_order(
     description: str = "",
     priority: str = "MEDIUM",
     category: str = "OTHER",
+    area: str = "",
     confirm: str = "",
 ) -> dict:
     """Create a maintenance work order. ALWAYS call once WITHOUT confirm to
     preview, show the landlord, then call again with confirm=yes to save.
 
-    property_query = listing name (e.g. 'Room E'). priority HIGH/MEDIUM/LOW/EMERGENCY.
-    category PLUMBING/ELECTRICAL/…/OTHER."""
+    property_query = the listing name ('Room C') OR the unit when the fault is
+    in SHARED space ('McKenzie Basement'). If the landlord says the space is
+    shared, or names several rooms that are in one unit, target the UNIT — do
+    not pick one of the rooms. area = the space inside it ('shared washroom',
+    'kitchen'); everyone renting that unit then sees the job.
+    priority HIGH/MEDIUM/LOW/EMERGENCY. category PLUMBING/ELECTRICAL/…/OTHER."""
     from .domain_actions import create_work_order as _fn
 
     return _fn(
@@ -740,6 +745,7 @@ def create_work_order(
         description=description,
         priority=priority,
         category=category,
+        area=area,
         confirm=confirm,
     )
 
@@ -916,7 +922,10 @@ def set_viewing_availability(
 def get_notification_channels(landlord) -> dict:
     """How this landlord is reachable outside the app: which external channels
     (Telegram now, WhatsApp later) they've linked and verified, plus the
-    always-on in-app dashboard and email. Use to answer "how will you reach
+    always-on in-app dashboard and email. ALSO reports the daily morning
+    briefing — whether it is switched on and where it goes — so use this to
+    answer "why am I not getting morning updates?". Rentium DOES send a
+    scheduled daily briefing; never say it doesn't. Use to answer "how will you reach
     me?", "am I on Telegram?", or "how were people notified?" grounding."""
     from .domain_actions import get_notification_channels as _fn
 

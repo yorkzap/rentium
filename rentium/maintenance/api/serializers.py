@@ -3,6 +3,7 @@ from rest_framework import serializers
 
 from rentium.leases.models import Lease
 from rentium.properties.models import PropertyArea
+from rentium.properties.models import PropertyUnit
 from rentium.properties.models import Property
 
 from ..models import WorkOrder, WorkOrderComment, WorkOrderImage
@@ -46,8 +47,19 @@ class WorkOrderCommentSerializer(serializers.ModelSerializer):
 
 
 class WorkOrderSerializer(serializers.ModelSerializer):
-    property_name = serializers.CharField(source="property.name", read_only=True)
-    property_address = serializers.CharField(source="property.address", read_only=True)
+    property_name = serializers.CharField(
+        source="property.name", read_only=True, allow_null=True
+    )
+    property_address = serializers.CharField(
+        source="property.address", read_only=True, allow_null=True
+    )
+    # Where the job is, whichever target it has. A fault in shared space belongs
+    # to the unit and has no listing, so property_name is null for it — clients
+    # must show `place` or the ticket appears to be nowhere.
+    place = serializers.CharField(source="place_name", read_only=True)
+    unit_name = serializers.CharField(
+        source="unit.name", read_only=True, allow_null=True
+    )
     area_name = serializers.CharField(source="area.name", read_only=True, allow_null=True)
     reported_by_name = serializers.SerializerMethodField()
     category_display = serializers.CharField(source="get_category_display", read_only=True)
@@ -60,8 +72,15 @@ class WorkOrderSerializer(serializers.ModelSerializer):
     images = WorkOrderImageSerializer(many=True, read_only=True)
     comments = WorkOrderCommentSerializer(many=True, read_only=True)
 
+    # One of property_id / unit_id. Unit-scoped jobs are how a shared washroom
+    # is reported without pinning it to one of the rooms that share it.
     property_id = serializers.PrimaryKeyRelatedField(
-        queryset=Property.objects.all(), source="property", write_only=True
+        queryset=Property.objects.all(), source="property", write_only=True,
+        required=False, allow_null=True,
+    )
+    unit_id = serializers.PrimaryKeyRelatedField(
+        queryset=PropertyUnit.objects.all(), source="unit", write_only=True,
+        required=False, allow_null=True,
     )
     area_id = serializers.PrimaryKeyRelatedField(
         queryset=PropertyArea.objects.all(), source="area", write_only=True, required=False, allow_null=True
@@ -74,6 +93,7 @@ class WorkOrderSerializer(serializers.ModelSerializer):
         model = WorkOrder
         fields = [
             "id", "property_id", "property_name", "property_address",
+            "unit_id", "unit_name", "place",
             "area_id", "area_name", "lease_id",
             "reported_by_name", "origin", "origin_display",
             "title", "description",
@@ -85,7 +105,8 @@ class WorkOrderSerializer(serializers.ModelSerializer):
             "images", "comments", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "property_name", "property_address", "area_name",
+            "id", "property_name", "property_address", "unit_name", "place",
+            "area_name",
             "reported_by_name", "origin_display", "category_display",
             "priority_display", "status_display", "allowed_transitions",
             "sla_due_at", "is_rta_emergency", "sla_breached",
@@ -93,6 +114,16 @@ class WorkOrderSerializer(serializers.ModelSerializer):
             # status changes go through the `transition` action only (FSM)
             "status", "completed_date",
         ]
+
+    def validate(self, data):
+        data = super().validate(data)
+        target = data.get("property", getattr(self.instance, "property", None))
+        unit = data.get("unit", getattr(self.instance, "unit", None))
+        if not target and not unit:
+            raise serializers.ValidationError(
+                {"property_id": "Give a listing, or a unit for shared space."}
+            )
+        return data
 
     def get_reported_by_name(self, obj):
         return obj.reported_by.name if obj.reported_by else "—"

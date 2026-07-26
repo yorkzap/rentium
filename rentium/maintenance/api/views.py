@@ -93,10 +93,15 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             for room in rooms:
                 visible_areas = visible_areas | areas_for_tenant_room(room)
 
+            # A fault in shared space is filed against the UNIT, so a tenant
+            # whose room sits in that unit must see it even though the ticket
+            # names no listing of theirs.
+            unit_ids = [r.unit_id for r in rooms if r.unit_id]
             return base.filter(
                 Q(reported_by=user)
                 | Q(area__in=visible_areas)
                 | (Q(area__isnull=True) & Q(property__in=rooms))
+                | (Q(area__isnull=True) & Q(unit_id__in=unit_ids))
             ).distinct()
 
         return WorkOrder.objects.none()
