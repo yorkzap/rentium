@@ -68,9 +68,49 @@ class TenancyRules:
     landlord_notice_months: int | None  # statutory minimum for landlord-use notice; None = no statutory minimum
     mutual_agreement_form: str     # "RTB-8" for BC, "MUTUAL" generic label elsewhere
     summary: str                   # one-paragraph human/AI-readable explanation
+    covers_whole_unit: bool = False  # whole self-contained unit vs one room in a shared one
+    landlord_shares: bool = False    # the s.4(c) test that drove `rta_applies`
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+def lease_covers_whole_unit(lease) -> bool:
+    """Does this lease cover a whole self-contained unit, or one room in a
+    shared one?
+
+    This is the distinction that decides the legal regime, and it is NOT the
+    same as the unit's rental_mode. rental_mode says how the landlord is
+    OFFERING the space right now; this says what a particular tenancy actually
+    got. A floor let room-by-room where ONE party ends up holding every room is
+    a whole-unit tenancy in law, whatever the offering looked like.
+
+    Three ways to cover a whole unit:
+      - the lease is on a COMPLETE_UNIT listing;
+      - it is a group lease whose tenants between them hold every room;
+      - it is a group lease with no per-room assignment at all, which means
+        the whole group.
+    """
+    from rentium.properties.models import Property
+
+    if lease.property_id and lease.property.property_category == (
+        Property.PropertyCategory.COMPLETE_UNIT
+    ):
+        return True
+
+    if lease.group_id:
+        room_ids = set(lease.group.grouped_properties.values_list("id", flat=True))
+        if not room_ids:
+            return False
+        assigned = set(
+            lease.lease_tenants.filter(room__isnull=False).values_list(
+                "room_id", flat=True
+            )
+        )
+        # No room assignment on a group lease = the whole group.
+        return not assigned or room_ids <= assigned
+
+    return False
 
 
 def landlord_shares_common_areas(lease) -> bool:
@@ -79,11 +119,18 @@ def landlord_shares_common_areas(lease) -> bool:
     with this tenancy? Two sources of truth, either one suffices:
 
     1. The lease's own signed clause: common_space_shared_with containing
-       LANDLORD or LANDLORD_RELATIVES.
+       LANDLORD or LANDLORD_RELATIVES. Authoritative — it is a signed
+       statement about this specific tenancy, so it is checked first and is
+       never overridden by inferred area flags.
     2. Area-level flags: any PropertyArea with shared_with_landlord=True
-       that belongs to (or is shared by) this lease's property/rooms.
-       This is what the property-group pages edit, and what lease creation
-       derives the clause from.
+       that belongs to (or is shared by) this lease's property/rooms, or to
+       the UNIT they sit in. This is what the property-group pages edit, and
+       what lease creation derives the clause from.
+
+    The unit lookup matters: once a floor's layout lives on its PropertyUnit
+    rather than on per-room listings, a landlord-shared kitchen recorded
+    against the unit would otherwise be invisible here — and an invisible
+    landlord-sharing flag means an RTA exemption silently stops being applied.
     """
     csw = set(lease.common_space_shared_with or [])
     if csw & {"LANDLORD", "LANDLORD_RELATIVES"}:
@@ -101,18 +148,55 @@ def landlord_shares_common_areas(lease) -> bool:
         return False
     if not prop_ids:
         return False
+
+    scope = Q(property_id__in=prop_ids) | Q(shared_by__id__in=prop_ids)
+
+    # Areas recorded against the unit(s) and room-group(s) these listings
+    # belong to. Derived from the listings themselves, not from lease.group_id:
+    # a lease on ONE room of a shared floor has no group_id, yet the shared
+    # kitchen it uses is recorded against that room's group.
+    from rentium.properties.models import Property
+
+    parents = Property.objects.filter(id__in=prop_ids).values_list(
+        "unit_id", "group_id"
+    )
+    unit_ids = {u for u, _g in parents if u}
+    group_ids = {g for _u, g in parents if g}
+    if lease.group_id:
+        group_ids.add(lease.group_id)
+    if unit_ids:
+        scope |= Q(unit_id__in=unit_ids)
+    if group_ids:
+        scope |= Q(group_id__in=group_ids)
+
     return (
-        PropertyArea.objects.filter(shared_with_landlord=True)
-        .filter(Q(property_id__in=prop_ids) | Q(shared_by__id__in=prop_ids))
-        .exists()
+        PropertyArea.objects.filter(shared_with_landlord=True).filter(scope).exists()
     )
 
 
 def _jurisdiction(lease) -> str:
+    """Which province's rulebook governs.
+
+    The lease type names it when it can (BC_RESIDENTIAL, SK_RESIDENTIAL). It
+    often can't: every NEW room lease uses the one GENERIC_ROOMMATE agreement
+    regardless of province, so a BC room tenancy would otherwise fall through
+    to GENERIC and be offered a generic mutual-agreement form instead of BC's
+    RTB-8. Fall back to where the property actually is — the same thing
+    inspection_services.resolve_template() does.
+    """
     t = (lease.lease_type or "").upper()
     if t.startswith("BC"):
         return "BC"
     if t.startswith("SK"):
+        return "SK"
+
+    prop = lease.property if lease.property_id else None
+    if prop is None and lease.group_id:
+        prop = lease.group.grouped_properties.first()
+    province = ((prop.province if prop else "") or "").strip().lower()
+    if province in ("bc", "british columbia"):
+        return "BC"
+    if province in ("sk", "saskatchewan"):
         return "SK"
     return "GENERIC"
 
@@ -122,6 +206,7 @@ def _resolve_rules(lease) -> TenancyRules:
     add new provinces/agreement types here and only here."""
     juris = _jurisdiction(lease)
     shared = landlord_shares_common_areas(lease)
+    whole_unit = lease_covers_whole_unit(lease)
     custom_months = max(int(getattr(lease, "custom_tenant_notice_months", 1) or 1), 1)
 
     if shared:
@@ -134,6 +219,8 @@ def _resolve_rules(lease) -> TenancyRules:
             tenant_notice_months=custom_months,
             landlord_notice_months=None,  # no statutory minimum
             mutual_agreement_form="RTB-8" if juris == "BC" else "MUTUAL",
+            covers_whole_unit=whole_unit,
+            landlord_shares=shared,
             summary=(
                 "The landlord (or their relatives) shares kitchen/bathroom or "
                 "common areas with this tenancy, so the provincial tenancy act "
@@ -153,6 +240,8 @@ def _resolve_rules(lease) -> TenancyRules:
             tenant_notice_months=1,
             landlord_notice_months=3,
             mutual_agreement_form="RTB-8",
+            covers_whole_unit=whole_unit,
+            landlord_shares=shared,
             summary=(
                 "BC Residential Tenancy Act applies. The tenant must give one "
                 "clear month's written notice (given this month, the tenancy "
@@ -175,6 +264,8 @@ def _resolve_rules(lease) -> TenancyRules:
         tenant_notice_months=1,
         landlord_notice_months=3,
         mutual_agreement_form="MUTUAL",
+        covers_whole_unit=whole_unit,
+        landlord_shares=shared,
         summary=(
             "Standard terms: one clear month's notice from the tenant "
             "(accepted automatically when valid), three from the landlord for "
