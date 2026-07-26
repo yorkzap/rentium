@@ -1164,6 +1164,142 @@ def add_co_host_to_lease(
     }
 
 
+def _normalise_request(text: str) -> str:
+    """Lowercase, strip punctuation and collapse whitespace, so two phrasings of
+    the same ask compare on their words rather than their formatting."""
+    import re
+
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (text or "").casefold()).split())
+
+
+# When two requests are the same ask reworded.
+#
+# Character similarity alone is the wrong measure here. The real backlog
+# accumulated five rows for one co-landlord request, and consecutive pairs
+# differed only by an inserted email address or a trailing clause — which barely
+# changes the meaning but moves a character ratio a long way. So we also compare
+# WORD SETS: if nearly every word of the shorter request appears in the longer
+# one, and the two are of comparable length, it is a restatement.
+#
+# The length guard is what stops containment over-merging: a five-word ask is
+# trivially "contained" in an unrelated thirty-word one.
+GAP_SEQUENCE_THRESHOLD = 0.82
+GAP_CONTAINMENT_THRESHOLD = 0.85
+GAP_LENGTH_RATIO_FLOOR = 0.6
+
+
+def _same_ask(a: str, b: str) -> bool:
+    from difflib import SequenceMatcher
+
+    left, right = _normalise_request(a), _normalise_request(b)
+    if not left or not right:
+        return False
+    if SequenceMatcher(None, left, right).ratio() >= GAP_SEQUENCE_THRESHOLD:
+        return True
+
+    ltok, rtok = set(left.split()), set(right.split())
+    if not ltok or not rtok:
+        return False
+    smaller, larger = sorted((ltok, rtok), key=len)
+    if len(smaller) / len(larger) < GAP_LENGTH_RATIO_FLOOR:
+        return False
+    containment = len(smaller & larger) / len(smaller)
+    return containment >= GAP_CONTAINMENT_THRESHOLD
+
+
+def _matching_open_gap(landlord, request: str):
+    """An already-open gap that is the same ask as `request`, or None.
+
+    Exact match first (cheap and certain), then a similarity pass over the
+    landlord's open gaps. Only NEW/REVIEWED rows are candidates — a gap that
+    was BUILT or DISMISSED has been decided, and raising it again is new
+    information, not a duplicate.
+    """
+    from rentium.rama.models import RamaCapabilityGap
+
+    open_statuses = (
+        RamaCapabilityGap.Status.NEW,
+        RamaCapabilityGap.Status.REVIEWED,
+    )
+    exact = RamaCapabilityGap.objects.filter(
+        landlord=landlord, request__iexact=request, status__in=open_statuses
+    ).first()
+    if exact is not None:
+        return exact
+
+    if not _normalise_request(request):
+        return None
+    for gap in RamaCapabilityGap.objects.filter(
+        landlord=landlord, status__in=open_statuses
+    ).order_by("-created_at"):
+        if _same_ask(request, gap.request):
+            return gap
+    return None
+
+
+def triage_capability_gap(
+    landlord, *, gap_query: str, status: str = "", prioritise: str = "",
+    confirm: str = "",
+) -> dict:
+    """Move a logged gap through the backlog. Nothing here builds anything —
+    it only records a decision a human made."""
+    from rentium.rama.models import RamaCapabilityGap
+
+    from .domain_crud import _confirmed, _preview
+
+    query = (gap_query or "").strip()
+    if not query:
+        return {"error": "gap_query is required (the gap id, or words from it)."}
+
+    qs = RamaCapabilityGap.objects.filter(landlord=landlord)
+    gap = None
+    try:
+        gap = qs.filter(pk=query).first()
+    except (ValueError, ValidationError):
+        gap = None
+    if gap is None:
+        matches = list(qs.filter(request__icontains=query)[:6])
+        if not matches:
+            return {"error": f"No logged gap matching {query!r}."}
+        if len(matches) > 1:
+            return {
+                "error": f"Several gaps match {query!r} — which one?",
+                "candidates": [
+                    {"id": str(g.pk), "request": g.request[:120]} for g in matches
+                ],
+            }
+        gap = matches[0]
+
+    new_status = (status or "").strip().upper()
+    valid = {c for c, _ in RamaCapabilityGap.Status.choices}
+    if new_status and new_status not in valid:
+        return {"error": f"status must be one of {sorted(valid)}."}
+
+    wants_priority = str(prioritise or "").strip().lower() in (
+        "1", "true", "yes", "y", "on",
+    )
+    preview = {
+        "gap": gap.request[:200],
+        "from_status": gap.status,
+        "to_status": new_status or gap.status,
+        "prioritised": wants_priority or gap.prioritised,
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "triage_capability_gap", preview, "Records a triage decision only."
+        )
+
+    fields = ["updated_at"]
+    if new_status:
+        gap.status = new_status
+        fields.append("status")
+    if wants_priority and not gap.prioritised:
+        gap.prioritised = True
+        fields.append("prioritised")
+    gap.save(update_fields=fields)
+    return {"updated": True, **preview}
+
+
 def log_capability_gap(landlord, *, request: str, detail: str = "", learn_now: str = "") -> dict:
     """Record something RAMA couldn't do as a STRUCTURED gap (never code). The
     safe first half of self-evolving: instead of failing silently, RAMA logs
@@ -1189,16 +1325,20 @@ def log_capability_gap(landlord, *, request: str, detail: str = "", learn_now: s
         }
     prioritised = str(learn_now or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
-    existing = RamaCapabilityGap.objects.filter(
-        landlord=landlord,
-        request__iexact=req,
-        status=RamaCapabilityGap.Status.NEW,
-    ).first()
+    existing = _matching_open_gap(landlord, req)
     if existing is not None:
         gap = existing
+        fields = ["updated_at"]
         if prioritised and not gap.prioritised:
             gap.prioritised = True
-            gap.save(update_fields=["prioritised", "updated_at"])
+            fields.append("prioritised")
+        # Keep the fuller description — a restatement often carries more detail
+        # than the first attempt did.
+        new_detail = (detail or "").strip()
+        if len(new_detail) > len(gap.detail or ""):
+            gap.detail = new_detail[:2000]
+            fields.append("detail")
+        gap.save(update_fields=fields)
     else:
         gap = RamaCapabilityGap.objects.create(
             landlord=landlord,

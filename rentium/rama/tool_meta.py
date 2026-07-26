@@ -77,6 +77,8 @@ TOOL_META: dict[str, ToolMeta] = {
         risk="high", blockers=delete_property_blockers
     ),
     "create_property_group": ToolMeta(risk="low"),
+    # Records a decision about the backlog; touches no landlord data.
+    "triage_capability_gap": ToolMeta(risk="low"),
     "assign_property_to_group": ToolMeta(risk="low"),
     "create_holding": ToolMeta(risk="low"),
     "assign_property_to_holding": ToolMeta(risk="low"),

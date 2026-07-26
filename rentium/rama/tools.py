@@ -2254,3 +2254,26 @@ def set_unit_rental_mode(
     return _fn(
         landlord, unit_name=unit_name, rental_mode=rental_mode, confirm=confirm
     )
+
+
+def triage_capability_gap(
+    landlord,
+    gap_query: str,
+    status: str = "",
+    prioritise: str = "",
+    confirm: str = "",
+) -> dict:
+    """Move a logged capability gap through the backlog: status=REVIEWED |
+    BUILT | DISMISSED, prioritise=yes to flag it as wanted next. Records a
+    human decision only — it never builds or runs anything. gap_query is the
+    gap id or distinctive words from the request. One preview, then
+    confirm=yes."""
+    from .domain_actions import triage_capability_gap as _fn
+
+    return _fn(
+        landlord,
+        gap_query=gap_query,
+        status=status,
+        prioritise=prioritise,
+        confirm=confirm,
+    )

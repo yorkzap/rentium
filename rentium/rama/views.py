@@ -809,3 +809,77 @@ def constitution_view(request):
         origin=RamaConstitutionSection.Origin.LANDLORD,
     )
     return Response({**result, **section_payload(landlord)})
+
+
+@api_view(["GET", "PATCH"])
+@permission_classes([IsAuthenticated])
+def capability_gaps_view(request):
+    """GET  /api/rama/capability-gaps/?status=NEW — the backlog of things RAMA
+    was asked for and couldn't do.
+    PATCH /api/rama/capability-gaps/ {"id": ..., "status": "BUILT",
+    "prioritised": true} — record a triage decision.
+
+    RAMA already logged these; until now they were only readable from inside a
+    chat, so "what have you been unable to do?" was invisible to anyone
+    planning the work. Nothing here builds a capability — it records human
+    decisions about a worklist.
+    """
+    from .models import RamaCapabilityGap
+
+    landlord = _landlord(request)
+    qs = RamaCapabilityGap.objects.filter(landlord=landlord)
+
+    if request.method == "PATCH":
+        gap_id = request.data.get("id")
+        gap = qs.filter(pk=gap_id).first() if gap_id else None
+        if gap is None:
+            return Response({"error": "Unknown gap id."}, status=404)
+        fields = ["updated_at"]
+        new_status = str(request.data.get("status") or "").strip().upper()
+        if new_status:
+            valid = {c for c, _ in RamaCapabilityGap.Status.choices}
+            if new_status not in valid:
+                return Response(
+                    {"error": f"status must be one of {sorted(valid)}."}, status=400
+                )
+            gap.status = new_status
+            fields.append("status")
+        if "prioritised" in request.data:
+            gap.prioritised = bool(request.data.get("prioritised"))
+            fields.append("prioritised")
+        gap.save(update_fields=fields)
+        return Response(
+            {
+                "id": str(gap.pk),
+                "status": gap.status,
+                "prioritised": gap.prioritised,
+            }
+        )
+
+    status_filter = request.query_params.get("status")
+    if status_filter:
+        qs = qs.filter(status=status_filter.upper())
+
+    counts = {}
+    for code, _label in RamaCapabilityGap.Status.choices:
+        counts[code] = RamaCapabilityGap.objects.filter(
+            landlord=landlord, status=code
+        ).count()
+
+    return Response(
+        {
+            "counts": counts,
+            "gaps": [
+                {
+                    "id": str(g.pk),
+                    "request": g.request,
+                    "detail": g.detail,
+                    "status": g.status,
+                    "prioritised": g.prioritised,
+                    "created_at": g.created_at,
+                    "updated_at": g.updated_at,
+                }
+                for g in qs[:200]
+            ],
+        }
+    )
