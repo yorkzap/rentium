@@ -176,6 +176,31 @@ it, it vanishes, and the tool behaves as if it were never sent. This bit twice
 `test_wrapper_exposes_every_argument_the_implementation_accepts` now fails on
 that drift.
 
+### Damage, claims and deposits
+
+`attribute_work_order` records WHO caused a repair and whether they are being
+charged. `deposit_position` reports what is held on a lease versus what is
+claimed against it.
+
+What these deliberately do NOT do is deduct. Under the BC RTA a landlord may
+keep deposit money only with the tenant's WRITTEN agreement, or by applying to
+the RTB within 15 days of the later of the tenancy ending and receiving the
+forwarding address — and getting it wrong loses the claim AND makes double the
+deposit payable. So damage raises a CLAIM the tenant owes; the deposit stays a
+separate liability; nothing nets one off the other. Every deposit_position
+response carries `lawful_routes` and the double-penalty warning, and the
+"what's left" field is named `returnable_if_all_claims_agreed` so it cannot be
+read as permission.
+
+Two chain details worth keeping:
+
+- Blame is usually assigned AFTER the job closes ("fixed it, closed it, later
+  worked out who broke it"). COMPLETED is terminal, so attribution raises the
+  claim itself rather than relying on completion. Idempotent per work order.
+- A shared-space job carries no lease, so the claim falls back to the
+  responsible tenant's live lease — otherwise it never appears in the deposit
+  position and the gap surfaces at move-out.
+
 ### Capability gaps
 
 `log_capability_gap` dedupes restatements: identical text first, then a

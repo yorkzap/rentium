@@ -205,3 +205,22 @@ The dedicated migration service ensures schema changes finish before web or
 worker code starts. PostgreSQL recovery must preserve the named data volume;
 see `POSTGRES_RECOVERY.md` for the backed-up, single-file PID recovery
 procedure and verification checklist.
+
+
+## Maintenance, damage and deposits
+
+A work order belongs to a LISTING or, for a fault in shared space, to a
+PropertyUnit — a washroom serving three rooms is nobody's room.
+`WorkOrder.objects.for_landlord()` is THE scoping rule (listing OR unit);
+nothing may reimplement it. Six hand-written `property__landlord` filters is
+exactly how shared-space jobs became invisible the day `property` went
+nullable.
+
+`responsible_tenant` + `tenant_chargeable` record who caused damage. Completing
+or attributing a chargeable job raises a FEE_CHARGE claim against that tenant,
+linked to the work order and to the lease whose deposit it may be claimed
+against.
+
+Deposits are never netted automatically — see `ledger.services.deposit_position`
+and the RAMA guide for why (BC RTA: written agreement or an RTB application
+within 15 days, else the claim is lost and double the deposit is payable).
