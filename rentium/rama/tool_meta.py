@@ -85,6 +85,11 @@ TOOL_META: dict[str, ToolMeta] = {
     "update_bank_balance": ToolMeta(risk="medium", own_confirm=True),
     "setup_room_tenancy": ToolMeta(risk="medium"),
     "create_house_layout": ToolMeta(risk="medium"),
+    "create_property_structure": ToolMeta(risk="medium"),
+    "update_unit_layout": ToolMeta(risk="low"),
+    # Reshapes what is on the market, so it pauses for its own confirmation
+    # inside a multi-step plan even though it deletes nothing.
+    "set_unit_rental_mode": ToolMeta(risk="high", own_confirm=True),
     "create_group_room": ToolMeta(risk="medium"),
     # ----------------------------------------------------------- leases
     "create_lease": ToolMeta(risk="medium"),

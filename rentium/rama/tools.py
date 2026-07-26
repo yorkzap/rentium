@@ -1381,12 +1381,15 @@ def create_house_layout(  # noqa: PLR0913 - explicit public tool fields
     shared_with_landlord: str = "",
     confirm: str = "",
 ) -> dict:
-    """Atomically create/reuse one physical house, its property groups, rooms,
-    private areas, and exact room-to-common-area associations. Use for a
-    hierarchical instruction such as "add a house with a basement group and a
-    three-room main floor; master has a private bathroom; the other two share
-    one." Missing city/province or landlord-sharing classification returns one
-    focused clarification. One complete preview, then confirm=yes."""
+    """LEGACY — use create_property_structure instead for anything new. This
+    tool makes EVERY described bedroom its own rentable room listing, which is
+    only right when the landlord genuinely lets bedrooms separately to
+    different people. For a floor let as one home it produces one listing per
+    bedroom and no way to say they are a single place. Kept only for existing
+    room-by-room houses whose shared-area associations are already expressed
+    this way. Atomically creates/reuses one house, its property groups, rooms,
+    private areas, and room-to-common-area associations. One preview, then
+    confirm=yes."""
     from .house_layout import create_house_layout as _fn
 
     return _fn(
@@ -2171,3 +2174,74 @@ def list_vendors(landlord) -> dict:
             "If empty, ask the landlord who they use."
         ),
     }
+
+
+def create_property_structure(  # noqa: PLR0913 - explicit public tool fields
+    landlord,
+    holding_name: str,
+    address: str,
+    units_json: str,
+    city: str = "",
+    province: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record a building as UNITS (floors/suites) with their internal layout.
+    PREFER THIS over create_house_layout. Bedrooms described inside a unit are
+    internal layout, NOT rentable listings — set rental_mode=BY_ROOM only when
+    the landlord lets the bedrooms separately to different people. units_json:
+    [{"name":"Main Floor","rental_mode":"WHOLE_UNIT","spaces":[{"name":"Master
+    Bedroom","type":"BEDROOM"},{"name":"Ensuite","type":"BATHROOM","serves":
+    ["Master Bedroom"]},{"name":"Kitchen"}]}]. Leave rental_mode out when the
+    landlord hasn't said — the tool asks once instead of guessing. One preview,
+    then confirm=yes."""
+    from .unit_structure import create_property_structure as _fn
+
+    return _fn(
+        landlord,
+        holding_name=holding_name,
+        address=address,
+        city=city,
+        province=province,
+        units_json=units_json,
+        confirm=confirm,
+    )
+
+
+def update_unit_layout(
+    landlord,
+    unit_name: str,
+    spaces_json: str = "",
+    layout_complete: str = "",
+    missing: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record what is INSIDE one unit — bedrooms, bathrooms, kitchen, living
+    room. Never creates a listing: describing a bedroom does not put it on the
+    market. spaces_json: [{"name":"Master Bedroom","type":"BEDROOM"},
+    {"name":"Second Bathroom","type":"BATHROOM","serves":["Bedroom 2",
+    "Bedroom 3"]}]. Use `missing` to say what is still unknown instead of
+    guessing it. One preview, then confirm=yes."""
+    from .unit_structure import update_unit_layout as _fn
+
+    return _fn(
+        landlord,
+        unit_name=unit_name,
+        spaces_json=spaces_json,
+        layout_complete=layout_complete,
+        missing=missing,
+        confirm=confirm,
+    )
+
+
+def set_unit_rental_mode(
+    landlord, unit_name: str, rental_mode: str, confirm: str = ""
+) -> dict:
+    """Switch a unit between being let as ONE home (WHOLE_UNIT) and let room by
+    room (BY_ROOM). Nothing is deleted — the other mode's listings are parked
+    and return if you switch back. Refused while any draft, pending or active
+    lease exists anywhere in the unit. One preview, then confirm=yes."""
+    from .unit_structure import set_unit_rental_mode as _fn
+
+    return _fn(
+        landlord, unit_name=unit_name, rental_mode=rental_mode, confirm=confirm
+    )
