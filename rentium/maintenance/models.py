@@ -160,6 +160,26 @@ class WorkOrder(models.Model):
         related_name="work_orders",
         help_text=_("Lease active when the issue was reported, if any."),
     )
+    # Who caused it, when it wasn't fair wear and tear. Recorded at the time,
+    # because at move-out — possibly a year later — nobody remembers which
+    # tenant broke the shower knob, and the evidence has to exist BEFORE the
+    # 15-day deposit clock starts.
+    responsible_tenant = models.ForeignKey(
+        "users.TenantProfile",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="attributed_work_orders",
+        help_text=_("The tenant who caused this, if it wasn't wear and tear."),
+    )
+    tenant_chargeable = models.BooleanField(
+        _("Chargeable to tenant"),
+        default=False,
+        help_text=_(
+            "The cost is claimed from the responsible tenant. This raises a "
+            "CLAIM they owe — it never deducts from a deposit by itself."
+        ),
+    )
     reported_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -246,6 +266,15 @@ class WorkOrder(models.Model):
         if not self.property_id and not self.unit_id:
             raise ValidationError(
                 _("A work order needs a listing or a unit to belong to.")
+            )
+        if self.tenant_chargeable and not self.responsible_tenant_id:
+            raise ValidationError(
+                {
+                    "responsible_tenant": _(
+                        "Say who is being charged before marking this "
+                        "chargeable to a tenant."
+                    )
+                }
             )
         if (
             self.lease

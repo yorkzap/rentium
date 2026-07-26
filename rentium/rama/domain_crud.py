@@ -14,6 +14,8 @@ Rules (same as the dashboard / API):
 
 from __future__ import annotations
 
+import datetime as _dt
+
 import re
 from datetime import date
 from datetime import datetime
@@ -2811,6 +2813,11 @@ def complete_work_order(
         "to_status": WorkOrder.Status.COMPLETED,
         "cost": str(cost_dec) if cost_dec is not None else None,
         "post_expense": will_expense,
+        "charges_tenant": (
+            wo.responsible_tenant.user.name
+            if wo.tenant_chargeable and wo.responsible_tenant_id
+            else None
+        ),
         "vendor": (vendor or wo.contractor_name or "")[:150],
     }
     if not _confirmed(confirm):
@@ -2830,6 +2837,15 @@ def complete_work_order(
         return _validation_error_payload(exc)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Transition failed: {exc}"}
+
+    # A tenant-caused repair also raises a CLAIM against that tenant. It is a
+    # debt they owe, NOT a deposit deduction — BC RTA lets a landlord keep
+    # deposit money only with written agreement or an RTB application within 15
+    # days, and getting that wrong costs double the deposit.
+    claim_id = None
+    if cost_dec is not None:
+        wo.cost = cost_dec
+        claim_id = _raise_tenant_claim(landlord, wo)
 
     expense_id = None
     if will_expense and cost_dec is not None:
@@ -2867,6 +2883,17 @@ def complete_work_order(
         },
         "expense_posted": will_expense,
         "expense_id": expense_id or None,
+        "tenant_claim_id": claim_id,
+        "tenant_claim_note": (
+            (
+                f"Claimed {cost_dec} from {wo.responsible_tenant.user.name}. This "
+                "is a debt they owe — it does NOT come out of their deposit "
+                "unless they agree in writing or you apply to the RTB within 15 "
+                "days of the tenancy ending."
+            )
+            if claim_id
+            else None
+        ),
     }
 
 
@@ -3412,3 +3439,187 @@ def setup_room_tenancy(
         "Landlord sign when ready",
     ]
     return results
+
+
+def _raise_tenant_claim(landlord, wo):
+    """Post the damage claim for an already-costed, tenant-chargeable job.
+
+    Shared by completion and by attributing blame AFTER the fact. Late
+    attribution is the common case — the landlord fixes the shower, closes the
+    job, and only later works out which tenant broke it — and COMPLETED is
+    terminal, so without this the claim could never be raised at all.
+
+    Idempotent on the work order, so attributing twice cannot double-charge.
+    """
+    from rentium.leases.models import Lease
+    from rentium.ledger.models import EntryType
+    from rentium.ledger.services import post_charge
+
+    if wo.cost is None or not wo.tenant_chargeable or not wo.responsible_tenant_id:
+        return None
+
+    # The claim has to sit on the LEASE whose deposit it may be set against,
+    # or it never shows up in deposit_position and the landlord discovers the
+    # gap at move-out. A shared-space job carries no lease of its own, so fall
+    # back to the responsible tenant's live lease with this landlord.
+    lease = wo.lease
+    if lease is None:
+        lease = (
+            Lease.objects.filter(
+                landlord=landlord,
+                lease_tenants__tenant=wo.responsible_tenant,
+                status__in=("DRAFT", "PENDING", "ACTIVE"),
+            )
+            .order_by("-start_date")
+            .first()
+        )
+
+    claim, _made = post_charge(
+        landlord=landlord,
+        tenant=wo.responsible_tenant,
+        lease=lease,
+        property=wo.property,
+        holding=(
+            wo.property.holding
+            if wo.property_id
+            else (wo.unit.holding if wo.unit_id else None)
+        ),
+        amount=wo.cost,
+        due_date=_dt.date.today(),
+        entry_type=EntryType.FEE_CHARGE,
+        description=f"Damage recovery: {wo.title} ({wo.place_name})",
+        work_order=wo,
+        idempotency_key=f"woclaim:{wo.pk}",
+        created_by=landlord.user,
+        metadata={"damage_claim": True, "work_order": str(wo.pk)},
+    )
+    return str(getattr(claim, "pk", "") or "")
+
+
+def _resolve_tenant_profile(landlord, query: str):
+    """(TenantProfile, error) for a tenant in this landlord's portfolio.
+
+    Never guesses between people — attributing damage to the wrong tenant is
+    not a mistake a landlord discovers before it has cost somebody money.
+    """
+    from django.db.models import Q
+
+    from rentium.leases.models import LeaseTenant
+
+    q = (query or "").strip()
+    if not q:
+        return None, {"error": "Say which tenant."}
+
+    hits = (
+        LeaseTenant.objects.filter(lease__landlord=landlord, tenant__isnull=False)
+        .filter(
+            Q(invited_name__icontains=q)
+            | Q(invited_email__icontains=q)
+            | Q(tenant__user__name__icontains=q)
+            | Q(tenant__user__email__icontains=q)
+        )
+        .select_related("tenant__user")
+    )
+    people = {lt.tenant_id: lt.tenant for lt in hits}
+    if not people:
+        return None, {"error": f"No tenant matching {q!r} in your portfolio."}
+    if len(people) > 1:
+        return None, {
+            "error": f"Several tenants match {q!r} — which one?",
+            "candidates": [p.user.name for p in people.values()],
+        }
+    return next(iter(people.values())), None
+
+
+def attribute_work_order(
+    landlord,
+    *,
+    work_order_id: str = "",
+    title_query: str = "",
+    tenant: str = "",
+    chargeable: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record who caused a repair, and whether they are being charged for it."""
+    wo, err = _resolve_work_order(
+        landlord, work_order_id=work_order_id, title_query=title_query
+    )
+    if err:
+        return _prop_err(err)
+
+    person = None
+    if (tenant or "").strip():
+        person, perr = _resolve_tenant_profile(landlord, tenant)
+        if perr:
+            return perr
+
+    wants_charge = _truthy(chargeable)
+    if wants_charge and person is None and wo.responsible_tenant_id is None:
+        return {
+            "error": "Say which tenant is being charged before marking it chargeable."
+        }
+
+    target = person or wo.responsible_tenant
+    preview = {
+        "work_order": wo.title,
+        "place": wo.place_name,
+        "responsible_tenant": target.user.name if target else None,
+        "chargeable_to_tenant": wants_charge,
+        "cost_on_file": str(wo.cost) if wo.cost is not None else None,
+    }
+    if wants_charge:
+        preview["what_this_does"] = (
+            "Raises a claim the tenant owes once the job is completed with a "
+            "cost. It does NOT deduct from their deposit — that needs their "
+            "written agreement, or an RTB application within 15 days of the "
+            "tenancy ending."
+        )
+    if not _confirmed(confirm):
+        return _preview(
+            "attribute_work_order",
+            preview,
+            "Records responsibility for this repair.",
+        )
+
+    fields = ["updated_at"]
+    if person is not None:
+        wo.responsible_tenant = person
+        fields.append("responsible_tenant")
+    if str(chargeable).strip():
+        wo.tenant_chargeable = wants_charge
+        fields.append("tenant_chargeable")
+    wo.save(update_fields=fields)
+
+    # Already finished and costed? Raise the claim now — otherwise blaming a
+    # tenant after the job closed would never produce one, because COMPLETED
+    # is terminal and the claim rides on completion.
+    claim_id = None
+    if wo.status == wo.Status.COMPLETED:
+        claim_id = _raise_tenant_claim(landlord, wo)
+    return {
+        "updated": True,
+        **preview,
+        "tenant_claim_id": claim_id,
+        "tenant_claim_note": (
+            (
+                f"Claimed {wo.cost} from {target.user.name}. A debt they owe — "
+                "NOT a deposit deduction. Keeping deposit money needs their "
+                "written agreement, or an RTB application within 15 days of "
+                "the tenancy ending."
+            )
+            if claim_id
+            else None
+        ),
+    }
+
+
+def deposit_position(landlord, *, lease_number: str = "") -> dict:
+    """Deposit held on a lease vs what is claimed against it, and the deadline."""
+    from rentium.ledger.services import deposit_position as _position
+
+    lease, err = _resolve_lease(landlord, lease_number=lease_number)
+    if err:
+        return _prop_err(err)
+    out = _position(landlord, lease=lease)
+    out["lease"] = lease.lease_number
+    return out

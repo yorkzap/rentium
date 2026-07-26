@@ -10,6 +10,7 @@ Consequences live in handlers.py, downstream of the outbox.
 """
 
 from datetime import date
+from datetime import timedelta
 from decimal import Decimal
 
 from django.db import IntegrityError
@@ -511,4 +512,90 @@ def next_upcoming_charge(landlord, property_id=None) -> dict | None:
         # Stringify: RAMA audit / JSONField cannot store raw UUID objects.
         "lease_id": str(charge.lease_id) if charge.lease_id else None,
         "property_name": charge.property.name if charge.property else "",
+    }
+
+
+# ----------------------------------------------------- deposits vs claims
+# BC RTA: a landlord may NOT keep any part of a deposit without the tenant's
+# written agreement or an RTB dispute-resolution application filed within 15
+# days of the later of (tenancy end, receiving the forwarding address). Getting
+# it wrong costs DOUBLE the deposit.
+#
+# So damage never auto-deducts. It raises a CLAIM the tenant owes, and the
+# deposit stays a separate liability until the landlord does one of the two
+# lawful things. This function reports the position; it decides nothing.
+DEPOSIT_CLAIM_WINDOW_DAYS = 15
+
+
+def deposit_position(landlord, *, lease) -> dict:
+    """Deposit held for a lease, what is claimed against it, and the deadline.
+
+    Returns plain numbers plus `lawful_routes` — the only two ways the money
+    can actually be kept — so no caller is tempted to net one off the other and
+    call it settled.
+    """
+    from django.db.models import Sum
+
+    held = LedgerEntry.objects.not_voided().filter(
+        landlord=landlord,
+        lease=lease,
+        entry_type=EntryType.PAYMENT,
+        settles__entry_type=EntryType.DEPOSIT_CHARGE,
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+    returned = LedgerEntry.objects.not_voided().filter(
+        landlord=landlord, lease=lease, entry_type=EntryType.DEPOSIT_RETURN
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+    held = held - returned
+
+    # Everything still owed on this lease — damage claims and unpaid rent alike.
+    claims = []
+    outstanding = Decimal("0.00")
+    for entry in (
+        # `outstanding` is a with_settlement() annotation, not a field.
+        LedgerEntry.objects.with_settlement()
+        .filter(
+            landlord=landlord,
+            lease=lease,
+            entry_type__in=CHARGE_TYPES,
+            reversed_by__isnull=True,
+        )
+        .exclude(entry_type=EntryType.DEPOSIT_CHARGE)
+        .select_related("work_order")
+    ):
+        owing = entry.outstanding or Decimal("0.00")
+        if owing <= 0:
+            continue
+        outstanding += owing
+        claims.append(
+            {
+                "description": entry.description,
+                "amount": str(owing),
+                "is_damage": bool(entry.work_order_id),
+                "work_order": str(entry.work_order_id) if entry.work_order_id else None,
+            }
+        )
+
+    ended = lease.move_out_date or lease.end_date
+    deadline = None
+    if ended:
+        deadline = ended + timedelta(days=DEPOSIT_CLAIM_WINDOW_DAYS)
+
+    return {
+        "deposit_held": str(held),
+        "claimed": str(outstanding),
+        "claims": claims,
+        # What is left IF every claim were agreed in writing. Not an
+        # entitlement — see lawful_routes.
+        "returnable_if_all_claims_agreed": str(max(held - outstanding, Decimal("0.00"))),
+        "tenancy_ended": ended.isoformat() if ended else None,
+        "claim_deadline": deadline.isoformat() if deadline else None,
+        "lawful_routes": [
+            "the tenant agrees IN WRITING to the amount being kept, or",
+            "you apply for RTB dispute resolution within 15 days of the later "
+            "of the tenancy ending and receiving their forwarding address.",
+        ],
+        "warning": (
+            "Do not deduct unilaterally. Missing the 15-day route means the "
+            "claim is lost AND double the deposit becomes payable."
+        ),
     }

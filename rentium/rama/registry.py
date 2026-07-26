@@ -67,6 +67,7 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.get_notification_channels,
     tool_functions.list_capability_gaps,
     tool_functions.list_co_landlords,
+    tool_functions.deposit_position,
     # write actions (confirm=yes)
     tool_functions.log_capability_gap,
     tool_functions.triage_capability_gap,
@@ -117,6 +118,7 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.landlord_sign_lease,
     tool_functions.update_work_order,
     tool_functions.complete_work_order,
+    tool_functions.attribute_work_order,
     tool_functions.add_work_order_comment,
     tool_functions.create_inventory_item,
     tool_functions.update_inventory_item,

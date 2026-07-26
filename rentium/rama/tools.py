@@ -2288,3 +2288,43 @@ def triage_capability_gap(
         prioritise=prioritise,
         confirm=confirm,
     )
+
+
+def attribute_work_order(
+    landlord,
+    work_order_id: str = "",
+    title_query: str = "",
+    tenant: str = "",
+    chargeable: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record WHO caused a repair and whether they are being charged for it —
+    e.g. "the shower knob was broken by the tenant in Room C". Use as soon as
+    the landlord says a tenant caused the damage, because at move-out nobody
+    remembers, and the evidence has to exist before the deposit clock starts.
+    chargeable=yes raises a claim the tenant owes once the job is completed
+    with a cost. It NEVER deducts from a deposit — say so if asked. One
+    preview, then confirm=yes."""
+    from .domain_crud import attribute_work_order as _fn
+
+    return _fn(
+        landlord,
+        work_order_id=work_order_id,
+        title_query=title_query,
+        tenant=tenant,
+        chargeable=chargeable,
+        confirm=confirm,
+    )
+
+
+def deposit_position(landlord, lease_number: str = "") -> dict:
+    """What is held as a deposit on a lease, what is claimed against it, and
+    the 15-day deadline. Answers "how much of their deposit can I keep?" —
+    the answer is NEVER "just deduct it": BC law allows keeping deposit money
+    only with the tenant's WRITTEN agreement or an RTB application within 15
+    days of the tenancy ending, and getting it wrong means the claim is lost
+    AND double the deposit becomes payable. Relay lawful_routes and the
+    deadline whenever a landlord talks about keeping a deposit."""
+    from .domain_crud import deposit_position as _fn
+
+    return _fn(landlord, lease_number=lease_number)

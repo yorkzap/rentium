@@ -45,6 +45,9 @@ TOOL_META: dict[str, ToolMeta] = {
     "transition_work_order": ToolMeta(risk="low"),
     "update_work_order": ToolMeta(risk="low"),
     "complete_work_order": ToolMeta(risk="low"),
+    # Attributing damage to a person decides who pays; a wrong name costs
+    # somebody money, so it confirms on its own inside a plan.
+    "attribute_work_order": ToolMeta(risk="high", own_confirm=True),
     "add_work_order_comment": ToolMeta(risk="low"),
     # ------------------------------------------------------ communication
     "mark_inquiry_replied": ToolMeta(risk="low"),
