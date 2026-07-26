@@ -134,6 +134,59 @@ def _enumerate_listing_targets(
     return props, [], [], found["match_rule"]
 
 
+def _enumerate_unit_targets(landlord, *, include: str = "", holding: str = ""):
+    """(units, unresolved, match_rule) for unit-scoped playbooks.
+
+    Units resolve by their own name ("Main Floor"), optionally narrowed by
+    holding, because a landlord almost always has several "Main Floor"s across
+    a portfolio. An ambiguous name is reported as unresolved WITH its
+    candidates rather than silently taking the first — picking the wrong floor
+    to restructure is not recoverable by re-running.
+    """
+    from rentium.properties.models import PropertyUnit
+
+    qs = PropertyUnit.objects.filter(landlord=landlord).select_related("holding")
+    if holding.strip():
+        qs = qs.filter(holding__name__icontains=holding.strip())
+
+    tokens = [t.strip() for t in (include or "").split(",") if t.strip()]
+    if not tokens:
+        units = list(qs.order_by("holding__name", "name"))
+        rule = f"All units{f' in {holding}' if holding.strip() else ''}: {len(units)}."
+        return units, [], rule
+
+    units, unresolved = [], []
+    for tok in tokens:
+        matches = list(qs.filter(name__icontains=tok)[:6])
+        exact = [u for u in matches if u.name.casefold() == tok.casefold()]
+        if len(exact) == 1:
+            units.append(exact[0])
+        elif len(matches) == 1:
+            units.append(matches[0])
+        elif not matches:
+            unresolved.append(
+                _blocked(tok, "unresolved", f"No unit matching {tok!r}.",
+                         ["give the exact unit name, or narrow with holding="])
+            )
+        else:
+            unresolved.append(
+                _blocked(
+                    tok,
+                    "ambiguous",
+                    f"{tok!r} matches {len(matches)} units: "
+                    + "; ".join(f"{u.name} ({u.holding.name})" for u in matches),
+                    ["narrow with holding=<address or house name>"],
+                )
+            )
+    seen, deduped = set(), []
+    for u in units:
+        if u.pk not in seen:
+            seen.add(u.pk)
+            deduped.append(u)
+    rule = f"Named units: {len(deduped)} of {len(tokens)} resolved."
+    return deduped, unresolved, rule
+
+
 # -------------------------------------------------------------- playbooks
 def _compose_delete_listings(landlord, props, params) -> Composition:
     comp = Composition()
@@ -306,10 +359,188 @@ def _compose_update_status(landlord, props, params) -> Composition:
     return comp
 
 
+def _compose_retire_listings(landlord, props, params) -> Composition:
+    """Take listings off the market without destroying them.
+
+    _compose_terminate_and_delete has always TOLD the landlord this is the way
+    out for a listing that lease history protects ("retire it — say: retire
+    X"), but no playbook existed to do it, so the advice dead-ended and the
+    model had to improvise a bulk update. This is that action.
+    """
+    comp = Composition()
+    for prop in props:
+        if prop.status == "NOT_AVAILABLE" and not prop.is_publicly_visible:
+            comp.blocked.append(
+                _blocked(
+                    prop.name,
+                    "already",
+                    f"{prop.name} is already retired.",
+                    ["skip it"],
+                )
+            )
+            continue
+        comp.steps.append(
+            Step(
+                tool="update_property",
+                arguments={
+                    "property_query": str(prop.pk),
+                    "status": "NOT_AVAILABLE",
+                    "is_publicly_visible": "no",
+                },
+                target_label=f"{prop.name} — retire",
+                item_key=str(prop.pk),
+                note="kept with all its history; hidden and marked unavailable",
+            )
+        )
+    return comp
+
+
+def _compose_set_visibility(landlord, props, params) -> Composition:
+    """Publish or hide listings on the public site."""
+    comp = Composition()
+    raw = str(params.get("visible") or "").strip().casefold()
+    if raw not in ("yes", "no", "true", "false", "1", "0"):
+        comp.blocked.append(
+            _blocked(
+                "*",
+                "bad_visible",
+                "visible must be yes or no.",
+                ["pass visible=yes or visible=no"],
+            )
+        )
+        return comp
+    wanted = raw in ("yes", "true", "1")
+
+    for prop in props:
+        if prop.is_publicly_visible == wanted:
+            comp.blocked.append(
+                _blocked(
+                    prop.name,
+                    "already",
+                    f"{prop.name} is already {'visible' if wanted else 'hidden'}.",
+                    ["skip it"],
+                )
+            )
+            continue
+        # Publishing something that can't actually appear is a silent no-op —
+        # say so instead of queueing a step that changes nothing visible.
+        blockers = prop.publish_blockers() if wanted else []
+        if blockers:
+            comp.blocked.append(
+                _blocked(
+                    prop.name,
+                    "not_publishable",
+                    f"{prop.name} can't go public yet: {'; '.join(blockers)}.",
+                    ["fix the blockers first", "skip it"],
+                )
+            )
+            continue
+        comp.steps.append(
+            Step(
+                tool="update_property",
+                arguments={
+                    "property_query": str(prop.pk),
+                    "is_publicly_visible": "yes" if wanted else "no",
+                },
+                target_label=(
+                    f"{prop.name} — {'publish' if wanted else 'hide'}"
+                ),
+                item_key=str(prop.pk),
+            )
+        )
+    return comp
+
+
+def _compose_switch_rental_mode(landlord, units, params) -> Composition:
+    """Change how whole units are rented, one step per unit.
+
+    Unit-scoped rather than listing-scoped: "rent the Wascana floors room by
+    room" is one intent over three physical spaces, and each may be blocked for
+    its own reason. Partitioning here means the landlord sees exactly which
+    ones can move and why the others can't, instead of a half-applied change.
+    """
+    from rentium.properties.models import PropertyUnit
+    from rentium.properties.services import describe_rental_mode_switch
+
+    comp = Composition()
+    raw = str(params.get("new_mode") or "").strip().upper().replace(" ", "_")
+    if raw in ("ROOMS", "ROOM_BY_ROOM", "BY_ROOM"):
+        mode = PropertyUnit.RentalMode.BY_ROOM
+    elif raw in ("WHOLE", "UNIT", "ENTIRE", "WHOLE_UNIT"):
+        mode = PropertyUnit.RentalMode.WHOLE_UNIT
+    else:
+        comp.blocked.append(
+            _blocked(
+                "*",
+                "bad_mode",
+                "new_mode must be WHOLE_UNIT or BY_ROOM.",
+                ["pass new_mode=WHOLE_UNIT or new_mode=BY_ROOM"],
+            )
+        )
+        return comp
+
+    for unit in units:
+        preview = describe_rental_mode_switch(unit, mode)
+        label = f"{unit.name} ({unit.holding.name})"
+        if "error" in preview:
+            comp.blocked.append(
+                _blocked(label, "already", preview["error"], ["skip it"])
+            )
+            continue
+        if preview["blocked_by"]:
+            names = ", ".join(
+                f"{b['lease_number']} ({b['status']})" for b in preview["blocked_by"]
+            )
+            comp.blocked.append(
+                _blocked(
+                    label,
+                    "live_leases",
+                    f"{label} has live leases: {names}. How a unit is rented "
+                    "cannot change underneath a signed or pending agreement.",
+                    ["end those leases first", "skip it"],
+                    leases=preview["blocked_by"],
+                )
+            )
+            continue
+        comp.steps.append(
+            Step(
+                tool="set_unit_rental_mode",
+                arguments={"unit_name": unit.name, "rental_mode": mode},
+                target_label=f"{label} -> {mode}",
+                item_key=str(unit.pk),
+                note=(
+                    f"parks {len(preview['will_park'])} listing(s); "
+                    + (
+                        f"brings back {len(preview['will_reactivate'])}"
+                        if preview["will_reactivate"]
+                        else "a new listing will be needed"
+                    )
+                ),
+            )
+        )
+    return comp
+
+
 PLAYBOOKS = {
     "delete_listings": {
         "compose": _compose_delete_listings,
         "describe": "Delete the matching listings",
+    },
+    "retire_listings": {
+        "compose": _compose_retire_listings,
+        "describe": (
+            "Take the matching listings off the market (NOT_AVAILABLE + hidden) "
+            "while keeping them and all their history"
+        ),
+    },
+    "set_visibility": {
+        "compose": _compose_set_visibility,
+        "describe": "Publish or hide the matching listings (needs visible)",
+    },
+    "switch_rental_mode": {
+        "compose": _compose_switch_rental_mode,
+        "describe": "Change how whole units are rented (needs new_mode)",
+        "targets": "units",
     },
     "terminate_and_delete": {
         "compose": _compose_terminate_and_delete,
@@ -470,19 +701,30 @@ def plan_operation(
     group: str = "",
     name_contains: str = "",
     new_status: str = "",
+    new_mode: str = "",
+    visible: str = "",
+    holding: str = "",
     confirm: str = "",
 ) -> dict:
-    """Build a multi-step PLAN over a set of listings. ALWAYS use this (never a
-    hand-rolled sequence of tools) when the landlord asks for a bulk or
-    multi-step operation. operation: delete_listings | terminate_and_delete
-    (terminate/remove leases first, then delete) | update_status (needs
-    new_status). Scope with include='name, name' OR filters (has_images
-    yes/no, vacant_today, has_lease, listing_status, group, name_contains)
-    plus exclude='name, name'. If an include name matches two listings
-    (duplicates) the result asks which one — re-call with pick=oldest|newest
-    (or put the id in include) to target 'the old one' / 'the new one'.
-    Returns the full plan with any blocked items; the system handles
-    confirmation and execution — show the plan, then stop."""
+    """Build a multi-step PLAN over a set of listings or units. ALWAYS use this
+    (never a hand-rolled sequence of tools) when the landlord asks for a bulk
+    or multi-step operation.
+
+    operation, over LISTINGS: delete_listings | terminate_and_delete
+    (terminate/remove leases first, then delete) | retire_listings (take off
+    the market but keep everything) | update_status (needs new_status) |
+    set_visibility (needs visible=yes|no).
+    operation, over UNITS: switch_rental_mode (needs new_mode=WHOLE_UNIT or
+    BY_ROOM; scope with include='Main Floor, Basement' and holding='950
+    McKenzie Ave').
+
+    Scope listings with include='name, name' OR filters (has_images yes/no,
+    vacant_today, has_lease, listing_status, group, name_contains) plus
+    exclude='name, name'. If an include name matches two listings (duplicates)
+    the result asks which one — re-call with pick=oldest|newest (or put the id
+    in include) to target 'the old one' / 'the new one'. Returns the full plan
+    with any blocked items; the system handles confirmation and execution —
+    show the plan, then stop."""
     op = (operation or "").strip().lower()
     playbook = PLAYBOOKS.get(op)
     if playbook is None:
@@ -492,6 +734,26 @@ def plan_operation(
                 f"One of: {', '.join(sorted(PLAYBOOKS))}."
             )
         }
+
+    # Unit-scoped playbooks enumerate physical spaces, not listings: "rent the
+    # Wascana floors room by room" is one intent over three units.
+    if playbook.get("targets") == "units":
+        units, unresolved, match_rule = _enumerate_unit_targets(
+            landlord, include=include, holding=holding
+        )
+        if not units and not unresolved:
+            return {"result": "No units matched.", "match_rule": match_rule}
+        comp = playbook["compose"](
+            landlord, units, {"new_mode": new_mode, "visible": visible}
+        )
+        comp.blocked = unresolved + comp.blocked
+        n_items = len({s.item_key for s in comp.steps})
+        summary = (
+            f"{playbook['describe']}: {n_items} unit(s), {len(comp.steps)} step(s)"
+            + (f"; {len(comp.blocked)} blocked" if comp.blocked else "")
+            + f". {match_rule}"
+        )
+        return _plan_payload(op, summary, comp)
 
     props, unresolved, ambiguous, match_rule = _enumerate_listing_targets(
         landlord,
@@ -521,7 +783,9 @@ def plan_operation(
     if collision_payload is not None:
         return collision_payload
 
-    comp = playbook["compose"](landlord, props, {"new_status": new_status})
+    comp = playbook["compose"](
+        landlord, props, {"new_status": new_status, "visible": visible}
+    )
     comp.blocked = unresolved + comp.blocked
 
     n_items = len({s.item_key for s in comp.steps})

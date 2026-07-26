@@ -2044,13 +2044,19 @@ def plan_operation(
     group: str = "",
     name_contains: str = "",
     new_status: str = "",
+    new_mode: str = "",
+    visible: str = "",
+    holding: str = "",
     confirm: str = "",
 ) -> dict:
     """Build a multi-step PLAN over a set of listings — ALWAYS use this (never a
     hand-rolled tool sequence) for bulk or multi-step asks like 'delete all X'.
-    operation: delete_listings | terminate_and_delete (end leases first, then
-    delete — use when landlord says delete listings that still have leases) |
-    update_status (needs new_status).
+    operation over LISTINGS: delete_listings | terminate_and_delete (end leases
+    first, then delete — use when landlord says delete listings that still have
+    leases) | retire_listings (take off the market, keep everything) |
+    update_status (needs new_status) | set_visibility (needs visible=yes|no).
+    operation over UNITS: switch_rental_mode (needs new_mode=WHOLE_UNIT|BY_ROOM;
+    scope with include='Main Floor, Basement' and holding='950 McKenzie Ave').
     Scoping: filters (has_images/vacant_today/has_lease/listing_status/group/
     name_contains) select the set; exclude='name' = the items the landlord
     wants to KEEP ('except X / keep X' → exclude='X', NOTHING else changes);
@@ -2068,7 +2074,8 @@ def plan_operation(
         landlord, operation=operation, include=include, pick=pick, exclude=exclude,
         has_images=has_images, vacant_today=vacant_today, has_lease=has_lease,
         listing_status=listing_status, group=group, name_contains=name_contains,
-        new_status=new_status, confirm=confirm,
+        new_status=new_status, new_mode=new_mode, visible=visible,
+        holding=holding, confirm=confirm,
     )
 
 
@@ -2079,18 +2086,20 @@ def plan_move_tenant(
     to_property: str,
     start_date: str = "",
     total_rent: str = "",
+    pick: str = "",
     confirm: str = "",
 ) -> dict:
     """Build a PLAN that moves a tenant to another room: end the current lease
     (own confirmation), then new lease + signing invite + move-in inspection on
     the target room. tenant: name or email. total_rent defaults to the old
-    lease's rent; start_date YYYY-MM-DD (default today). Show the plan, then
+    lease's rent; start_date YYYY-MM-DD (default today). If a room name matches
+    more than one listing, re-call with pick=oldest|newest. Show the plan, then
     STOP — the system confirms and executes."""
     from .playbooks import plan_move_tenant as _fn
     return _fn(
         landlord, tenant=tenant, from_property=from_property,
         to_property=to_property, start_date=start_date, total_rent=total_rent,
-        confirm=confirm,
+        pick=pick, confirm=confirm,
     )
 
 
