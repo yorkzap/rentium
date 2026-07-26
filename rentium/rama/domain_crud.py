@@ -756,6 +756,31 @@ def create_property(
         "created_at"
     )
     if dup_qs.exists() and not _truthy(allow_duplicate_name):
+        # Unlike groups, listings are NOT idempotent by name alone — two real
+        # listings can share a name, and letting that through is what broke the
+        # lease and delete tools. But a same-named listing at the SAME address
+        # of the SAME category is a restatement of one the model just made, not
+        # a second thing. Treat that exact match as already-done rather than
+        # sending the model off to rename or delete something.
+        wanted_cat = (property_category or "ROOM").strip().upper()
+        same = [
+            p
+            for p in dup_qs
+            if (p.address or "").strip().lower() == address.lower()
+            and (p.city or "").strip().lower() == city.lower()
+            and (p.property_category or "").upper() == wanted_cat
+        ]
+        if len(same) == 1:
+            existing = same[0]
+            return {
+                "created": False,
+                "reused": True,
+                "property": _candidate_row(existing),
+                "note": (
+                    f"{existing.name!r} already exists at this address — "
+                    "reusing it, nothing changed."
+                ),
+            }
         return {
             "error": (
                 f"You already have a listing named {name!r}. "
@@ -1518,8 +1543,22 @@ def create_property_group(
     name = (name or "").strip()
     if not name:
         return {"error": "name is required."}
-    if PropertyGroup.objects.filter(landlord=landlord, name__iexact=name).exists():
-        return {"error": f"You already have a group named {name!r}."}
+    # Idempotent by name. 12 of 20 logged failures on this tool were "You
+    # already have a group named X" where the model had created that very group
+    # a step earlier and was re-stating it as part of a longer sequence. A
+    # create whose end state already holds has SUCCEEDED; erroring turns a
+    # harmless restatement into a dead step and pushes the model into
+    # improvising a recovery.
+    existing = PropertyGroup.objects.filter(
+        landlord=landlord, name__iexact=name
+    ).first()
+    if existing is not None:
+        return {
+            "created": False,
+            "reused": True,
+            "group": {"id": str(existing.pk), "name": existing.name},
+            "note": f"{existing.name!r} already exists — reusing it, nothing changed.",
+        }
 
     preview = {"name": name, "description": (description or "")[:300]}
     if not _confirmed(confirm):

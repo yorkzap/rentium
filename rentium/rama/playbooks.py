@@ -542,6 +542,7 @@ def plan_move_tenant(
     to_property: str,
     start_date: str = "",
     total_rent: str = "",
+    pick: str = "",
     confirm: str = "",
 ) -> dict:
     """Build a PLAN that moves a tenant between two of this landlord's rooms:
@@ -553,10 +554,14 @@ def plan_move_tenant(
 
     from .resolve import resolve_property
 
-    src, err = resolve_property(landlord, from_property)
+    # `pick` reaches resolve_property. It was previously absent from the
+    # signature, so the registry dropped it: the model was told "multiple
+    # listings match — pass pick", passed pick=oldest, and got the identical
+    # error back with no way forward.
+    src, err = resolve_property(landlord, from_property, pick=pick)
     if err:
         return {"error": f"from_property: {err}"}
-    dst, err = resolve_property(landlord, to_property)
+    dst, err = resolve_property(landlord, to_property, pick=pick)
     if err:
         return {"error": f"to_property: {err}"}
     if src.pk == dst.pk:

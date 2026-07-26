@@ -1070,9 +1070,26 @@ def test_duplicate_name_guard_blocks_second_listing(landlord):
     r1 = registry.execute("create_property", {"name": "Room G", **base}, landlord=landlord)
     assert r1.get("created")
 
-    # Case-insensitive duplicate is rejected with candidates to disambiguate.
+    # Re-stating the SAME listing (same name, address and category) reuses it.
+    # The invariant this guard exists for — never silently end up with two
+    # listings sharing a name — is what the count assertion pins, and it holds
+    # either way. Reporting it as "already done" rather than as an error is
+    # what changed: the audit log showed the error form sending the model off
+    # to rename or delete a listing it had just correctly created.
     r2 = registry.execute("create_property", {"name": "room g", **base}, landlord=landlord)
-    assert "error" in r2 and r2.get("candidates")
+    assert r2.get("reused") and not r2.get("created")
+    assert Property.objects.filter(landlord=landlord, name__iexact="room g").count() == 1
+
+    # A same-named listing somewhere ELSE is genuinely ambiguous — it may be a
+    # different room in a different house — and is still rejected with
+    # candidates so the landlord decides.
+    r_other = registry.execute(
+        "create_property",
+        {"name": "Room G", "address": "3213 Wascana St", "city": "Victoria",
+         "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert "error" in r_other and r_other.get("candidates")
     assert Property.objects.filter(landlord=landlord, name__iexact="room g").count() == 1
 
     # Explicit override still allows an intentional duplicate.

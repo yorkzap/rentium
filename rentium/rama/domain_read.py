@@ -45,7 +45,42 @@ def _coerce(fs: FieldSpec, raw: str):
     return v  # string / enum / date (Django parses ISO dates for gte/lte/exact)
 
 
-def _parse_filters(filters: str, fmap: dict[str, FieldSpec]):
+# Filter names weak models reach for that aren't fields on the entity, mapped
+# to the ORM lookup they actually mean. Whitelisted one by one — this is not a
+# general "pass any ORM path" escape hatch.
+#
+# Every entry below is a real call from the audit log that failed with
+# "Can't filter on X". Rejecting them taught the model nothing: `name_contains`
+# is the obvious name for a contains filter, and asking for a lease by its
+# property's name is a reasonable thing to want.
+_RELATION_FILTERS = {
+    ("lease", "property_name"): "property__name__icontains",
+    ("lease", "property_query"): "property__name__icontains",
+    ("lease", "tenant_name"): "lease_tenants__tenant__user__name__icontains",
+    ("work_order", "property_name"): "property__name__icontains",
+    ("inventory_item", "property_name"): "property__name__icontains",
+}
+
+
+def _alias_lookup(entity: str, fname: str, fmap: dict[str, FieldSpec]):
+    """Resolve a non-field filter name to an ORM lookup, or None.
+
+    Handles the declared relation filters above plus the generic
+    `<field>_contains` form, which is what a model naturally writes when it
+    wants a substring match and hasn't noticed the `~` operator.
+    """
+    direct = _RELATION_FILTERS.get((entity, fname))
+    if direct:
+        return direct
+    if fname.endswith("_contains"):
+        base = fname[: -len("_contains")]
+        fs = fmap.get(base)
+        if fs is not None and fs.filterable and fs.type in ("string", "enum"):
+            return f"{base}__icontains"
+    return None
+
+
+def _parse_filters(filters: str, fmap: dict[str, FieldSpec], entity: str = ""):
     """Returns (include_kwargs, exclude_kwargs, error)."""
     include: dict = {}
     exclude: dict = {}
@@ -66,6 +101,12 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec]):
         fname = fname.strip()
         fs = fmap.get(fname)
         if fs is None or not fs.filterable:
+            aliased = _alias_lookup(entity, fname, fmap)
+            if aliased is not None:
+                # Aliases are always substring/text lookups, so the raw value
+                # goes through as-is.
+                include[aliased] = raw.strip()
+                continue
             allowed = ", ".join(k for k, f in fmap.items() if f.filterable)
             return None, None, f"Can't filter on {fname!r}. Filterable fields: {allowed}."
         try:
@@ -117,7 +158,7 @@ def read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
     Model = apps.get_model(*spec.model.split("."))
     fmap = spec.field_map()
 
-    include, exclude, ferr = _parse_filters(filters or "", fmap)
+    include, exclude, ferr = _parse_filters(filters or "", fmap, spec.key)
     if ferr:
         return {"error": ferr}
 
