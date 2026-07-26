@@ -77,6 +77,13 @@ class MoveOutRequestSerializer(serializers.ModelSerializer):
     )
     lease_number = serializers.CharField(source="lease.lease_number", read_only=True)
     tenant_name = serializers.SerializerMethodField()
+    settlement_display = serializers.CharField(
+        source="get_deposit_settlement_display", read_only=True
+    )
+    # The 15-day clock: when it starts, when it runs out, and what must happen
+    # before then. Computed server-side so no client has to re-derive a rule
+    # whose penalty is double the deposit.
+    deposit_status = serializers.SerializerMethodField()
 
     class Meta:
         model = MoveOutRequest
@@ -103,12 +110,31 @@ class MoveOutRequestSerializer(serializers.ModelSerializer):
             "landlord_signed",
             "landlord_signed_at",
             "rules_snapshot",
+            "forwarding_address",
+            "forwarding_address_received_on",
+            "deposit_settlement",
+            "settlement_display",
+            "tenant_agreement_signed_on",
+            "rtb_file_number",
+            "deposit_status",
             "created_at",
             "updated_at",
         ]
         read_only_fields = [
-            f for f in fields if f not in ("lease", "requested_end_date", "reason")
+            f
+            for f in fields
+            if f
+            not in (
+                "lease",
+                "requested_end_date",
+                "reason",
+                # Settled through the /settle_deposit/ action, which validates
+                # that the chosen route is actually evidenced.
+            )
         ]
+
+    def get_deposit_status(self, obj):
+        return obj.deposit_status()
 
     def get_tenant_name(self, obj):
         lt = obj.lease_tenant
@@ -423,6 +449,73 @@ class MoveOutViewSet(viewsets.ModelViewSet):
         except DjangoValidationError as e:
             raise ValidationError(serializers.as_serializer_error(e))
         return Response(self.get_serializer(mo).data)
+
+
+    @action(detail=True, methods=["post"], url_path="settle_deposit")
+    def settle_deposit(self, request, pk=None):
+        """Record the forwarding address, and/or how the deposit was settled.
+
+        Deliberately NOT a plain PATCH. Each settlement route has to be
+        evidenced — a written agreement has a date, an RTB application has a
+        file number — because "settled" with nothing behind it is exactly the
+        record that loses a dispute.
+        """
+        move_out = self.get_object()
+        if not hasattr(request.user, "landlord_profile"):
+            raise PermissionDenied("Only the landlord can settle a deposit.")
+
+        fields = ["updated_at"]
+        address = request.data.get("forwarding_address")
+        if address is not None:
+            move_out.forwarding_address = str(address)[:2000]
+            fields.append("forwarding_address")
+        received = request.data.get("forwarding_address_received_on")
+        if received:
+            try:
+                move_out.forwarding_address_received_on = date.fromisoformat(
+                    str(received)[:10]
+                )
+            except ValueError:
+                raise ValidationError(
+                    {"forwarding_address_received_on": "Use YYYY-MM-DD."}
+                )
+            fields.append("forwarding_address_received_on")
+
+        settlement = request.data.get("deposit_settlement")
+        if settlement:
+            valid = {c for c, _ in MoveOutRequest.DepositSettlement.choices}
+            if settlement not in valid:
+                raise ValidationError(
+                    {"deposit_settlement": f"Must be one of {sorted(valid)}."}
+                )
+            if settlement == MoveOutRequest.DepositSettlement.TENANT_AGREED:
+                signed = request.data.get("tenant_agreement_signed_on")
+                if not signed:
+                    raise ValidationError(
+                        {
+                            "tenant_agreement_signed_on": (
+                                "A written agreement needs the date the tenant "
+                                "signed it."
+                            )
+                        }
+                    )
+                move_out.tenant_agreement_signed_on = date.fromisoformat(
+                    str(signed)[:10]
+                )
+                fields.append("tenant_agreement_signed_on")
+            if settlement == MoveOutRequest.DepositSettlement.RTB_APPLIED:
+                file_no = str(request.data.get("rtb_file_number") or "").strip()
+                if not file_no:
+                    raise ValidationError(
+                        {"rtb_file_number": "An RTB application has a file number."}
+                    )
+                move_out.rtb_file_number = file_no[:50]
+                fields.append("rtb_file_number")
+            move_out.deposit_settlement = settlement
+            fields.append("deposit_settlement")
+
+        move_out.save(update_fields=fields)
+        return Response(self.get_serializer(move_out).data)
 
 
 @api_view(["GET"])
