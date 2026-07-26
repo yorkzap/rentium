@@ -9,7 +9,9 @@ from ..models import InventoryItem
 from ..models import Property
 from ..models import PropertyArea
 from ..models import PropertyGroup
+from ..models import PropertyHolding
 from ..models import PropertyImage
+from ..models import PropertyUnit
 from ..models import SharedInventoryItem
 
 
@@ -665,6 +667,18 @@ class PropertyListSerializer(serializers.ModelSerializer):
     property_category_display = serializers.CharField(
         source="get_property_category_display", read_only=True
     )
+    # Which physical space this listing is an offer on, and whether it is the
+    # one currently on the market for it.
+    unit_id = serializers.UUIDField(source="unit.id", read_only=True, allow_null=True)
+    unit_name = serializers.CharField(
+        source="unit.name", read_only=True, allow_null=True
+    )
+    rental_mode = serializers.CharField(
+        source="unit.rental_mode", read_only=True, allow_null=True
+    )
+    holding_name = serializers.CharField(
+        source="holding.name", read_only=True, allow_null=True
+    )
 
     class Meta:
         model = Property
@@ -683,6 +697,11 @@ class PropertyListSerializer(serializers.ModelSerializer):
             "group_name",
             "group_id",
             "area_summary",
+            "unit_id",
+            "unit_name",
+            "rental_mode",
+            "holding_name",
+            "is_active_offering",
         ]
         read_only_fields = [
             "id",
@@ -693,6 +712,11 @@ class PropertyListSerializer(serializers.ModelSerializer):
             "group_id",
             "area_summary",
             "property_category_display",
+            "unit_id",
+            "unit_name",
+            "rental_mode",
+            "holding_name",
+            "is_active_offering",
         ]
 
     def get_type_display(self, obj):
@@ -792,3 +816,151 @@ class PropertyListSerializer(serializers.ModelSerializer):
             processed_area_ids.add(area.id)
 
         return ", ".join(summary) if summary else "No areas defined"
+
+
+# --- Units: the physical space, separate from how it is rented -------------
+class UnitAreaSerializer(serializers.ModelSerializer):
+    """One named space inside a unit.
+
+    `serves` answers "which bedrooms does this bathroom belong to?" — the
+    thing a whole-unit listing could not express before, because under
+    WHOLE_UNIT the bedrooms are areas rather than listings.
+    """
+
+    label = serializers.CharField(read_only=True)
+    area_type_display = serializers.CharField(
+        source="get_area_type_display", read_only=True
+    )
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+    serves = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PropertyArea
+        fields = [
+            "id",
+            "name",
+            "label",
+            "area_type",
+            "area_type_display",
+            "kind",
+            "kind_display",
+            "count",
+            "description",
+            "shared_with_landlord",
+            "is_seeded_default",
+            "serves",
+        ]
+
+    def get_serves(self, obj):
+        return [{"id": a.id, "label": a.label} for a in obj.serves_areas.all()]
+
+
+class UnitOfferingSerializer(serializers.ModelSerializer):
+    """A listing offered on a unit. Parked listings appear too, flagged."""
+
+    property_category_display = serializers.CharField(
+        source="get_property_category_display", read_only=True
+    )
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = Property
+        fields = [
+            "id",
+            "name",
+            "property_category",
+            "property_category_display",
+            "status",
+            "status_display",
+            "is_active_offering",
+            "is_publicly_visible",
+            "bedrooms",
+            "bathrooms",
+            "primary_image",
+        ]
+
+
+class PropertyUnitSerializer(serializers.ModelSerializer):
+    holding_name = serializers.CharField(source="holding.name", read_only=True)
+    rental_mode_display = serializers.CharField(
+        source="get_rental_mode_display", read_only=True
+    )
+    unit_type_display = serializers.CharField(
+        source="get_unit_type_display", read_only=True
+    )
+    offerings = serializers.SerializerMethodField()
+    layout = serializers.SerializerMethodField()
+    layout_summary = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PropertyUnit
+        fields = [
+            "id",
+            "holding",
+            "holding_name",
+            "name",
+            "unit_type",
+            "unit_type_display",
+            "rental_mode",
+            "rental_mode_display",
+            "layout_complete",
+            "missing_layout_notes",
+            "offerings",
+            "layout",
+            "layout_summary",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def _include_inactive(self):
+        request = self.context.get("request")
+        if request is None:
+            return False
+        return str(request.query_params.get("include_inactive", "")).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    def get_offerings(self, obj):
+        qs = obj.offerings.all()
+        if not self._include_inactive():
+            qs = qs.filter(is_active_offering=True)
+        return UnitOfferingSerializer(qs, many=True, context=self.context).data
+
+    def get_layout(self, obj):
+        # Seeded placeholders are scaffolding for maintenance/inspections, not
+        # layout anyone told us about — they'd read as invented facts here.
+        qs = obj.areas.filter(is_seeded_default=False).prefetch_related("serves_areas")
+        return UnitAreaSerializer(qs, many=True, context=self.context).data
+
+    def get_layout_summary(self, obj):
+        """What we actually know about the inside of this unit, and what we
+        don't. `unknown` is deliberately explicit — a blank layout must read as
+        "not recorded", never as "no bedrooms"."""
+        areas = obj.areas.filter(is_seeded_default=False)
+        bedrooms = areas.filter(area_type=PropertyArea.AreaType.BEDROOM).count()
+        bathrooms = areas.filter(area_type=PropertyArea.AreaType.BATHROOM).count()
+        return {
+            "bedrooms": bedrooms if bedrooms else None,
+            "bathrooms": bathrooms if bathrooms else None,
+            "recorded_space_count": areas.count(),
+            "complete": obj.layout_complete,
+            "unknown": obj.missing_layout_notes or "",
+        }
+
+
+class PropertyHoldingHierarchySerializer(serializers.ModelSerializer):
+    """One address, its units, and each unit's live offerings."""
+
+    units = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PropertyHolding
+        fields = ["id", "name", "kind", "address", "city", "units"]
+
+    def get_units(self, obj):
+        return PropertyUnitSerializer(
+            obj.units.all().order_by("name"), many=True, context=self.context
+        ).data

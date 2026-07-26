@@ -19,7 +19,9 @@ from ..models import InventoryItem
 from ..models import Property
 from ..models import PropertyArea
 from ..models import PropertyGroup
+from ..models import PropertyHolding
 from ..models import PropertyImage
+from ..models import PropertyUnit
 from ..models import SharedInventoryItem
 from .serializers import InventoryItemSerializer
 from .serializers import PropertyAreaSerializer
@@ -28,7 +30,9 @@ from .serializers import PropertyGroupSerializer
 from .serializers import PropertyImageSerializer
 from .serializers import PropertyListSerializer
 from .serializers import PropertySerializer
+from .serializers import PropertyHoldingHierarchySerializer
 from .serializers import PropertySummaryForGroupSerializer
+from .serializers import PropertyUnitSerializer
 from .serializers import SharedInventoryItemSerializer
 
 
@@ -103,7 +107,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
             return (
                 accessible
                 .select_related(
-                    "group", "landlord__user"
+                    "group", "landlord__user", "unit", "holding"
                 )  # Select related landlord user for name
                 .prefetch_related(
                     # Prefetch areas owned by the property and the properties sharing them
@@ -126,6 +130,18 @@ class PropertyViewSet(viewsets.ModelViewSet):
                 )
             )
         return Property.objects.none()
+
+    def filter_queryset(self, queryset):
+        queryset = super().filter_queryset(queryset)
+        # Listings parked by a rental-mode switch are history, not inventory —
+        # they would otherwise re-appear as if still on the market. Opt in with
+        # ?include_inactive=true to see them.
+        include_inactive = str(
+            self.request.query_params.get("include_inactive", "")
+        ).lower() in ("1", "true", "yes")
+        if not include_inactive:
+            queryset = queryset.filter(is_active_offering=True)
+        return queryset
 
     def perform_create(self, serializer):
         if not hasattr(self.request.user, "landlord_profile"):
@@ -529,3 +545,131 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
         elif request.method == "DELETE":
             item.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# --- Units -----------------------------------------------------------------
+class PropertyUnitViewSet(viewsets.ModelViewSet):
+    """The physical spaces in a portfolio.
+
+    A unit is the floor/suite itself; the listings offered on it are separate
+    Property rows. Changing HOW a unit is rented never goes through a plain
+    PATCH of `rental_mode` — it runs through the preview/confirm pair below,
+    because a switch has to park listings and refuse while leases are live.
+    """
+
+    serializer_class = PropertyUnitSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        from rentium.users.access import scope_q
+
+        return (
+            PropertyUnit.objects.filter(scope_q(self.request.user))
+            .select_related("holding")
+            .prefetch_related("offerings", "areas__serves_areas")
+            .order_by("holding__name", "name")
+            .distinct()
+        )
+
+    def perform_create(self, serializer):
+        if not hasattr(self.request.user, "landlord_profile"):
+            raise PermissionDenied("Only Landlords can create units.")
+        serializer.save(landlord=self.request.user.landlord_profile)
+
+    def update(self, request, *args, **kwargs):
+        self._reject_direct_mode_change(request)
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        self._reject_direct_mode_change(request)
+        return super().partial_update(request, *args, **kwargs)
+
+    def _reject_direct_mode_change(self, request):
+        """A silent rental_mode PATCH would leave the unit's listings pointing
+        at the wrong mode — the whole floor advertised AND its bedrooms, or
+        neither. Force the guarded path."""
+        incoming = request.data.get("rental_mode")
+        if incoming and incoming != self.get_object().rental_mode:
+            raise ValidationError(
+                {
+                    "rental_mode": (
+                        "Use the rental-mode endpoints so listings are parked "
+                        "and live leases are checked: POST "
+                        "units/<id>/rental_mode_preview/ then "
+                        "units/<id>/set_rental_mode/."
+                    )
+                }
+            )
+
+    @action(detail=True, methods=["post"], url_path="rental_mode_preview")
+    def rental_mode_preview(self, request, pk=None):
+        """What a switch WOULD do. Writes nothing."""
+        from ..services import describe_rental_mode_switch
+
+        unit = self.get_object()
+        preview = describe_rental_mode_switch(
+            unit, request.data.get("rental_mode", "")
+        )
+        if "error" in preview:
+            return Response(preview, status=status.HTTP_400_BAD_REQUEST)
+        return Response(preview)
+
+    @action(detail=True, methods=["post"], url_path="set_rental_mode")
+    def set_rental_mode_action(self, request, pk=None):
+        """Perform the switch. Refuses while any lease is live in the unit."""
+        from ..services import RentalModeError
+        from ..services import set_rental_mode
+
+        unit = self.get_object()
+        try:
+            result = set_rental_mode(unit, request.data.get("rental_mode", ""))
+        except RentalModeError as exc:
+            return Response(
+                {"error": exc.messages[0] if exc.messages else str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(result)
+
+
+class PropertyHierarchyView(viewsets.ViewSet):
+    """GET /api/properties/hierarchy/ — address -> unit -> live offerings.
+
+    The shape the dashboard should show. Reading the flat listing list is what
+    made a 9-unit portfolio look like 14 rooms.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def list(self, request):
+        from rentium.users.access import scope_q
+
+        holdings = (
+            PropertyHolding.objects.filter(scope_q(request.user))
+            .prefetch_related("units__offerings", "units__areas__serves_areas")
+            .order_by("name")
+            .distinct()
+        )
+        data = PropertyHoldingHierarchySerializer(
+            holdings, many=True, context={"request": request}
+        ).data
+
+        # Listings that belong to no unit yet (nothing has claimed them) would
+        # otherwise vanish from a unit-shaped view entirely.
+        from rentium.users.access import accessible_properties
+
+        orphans = accessible_properties(request.user).filter(unit__isnull=True)
+        if not str(request.query_params.get("include_inactive", "")).lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            orphans = orphans.filter(is_active_offering=True)
+
+        return Response(
+            {
+                "holdings": data,
+                "unassigned_listings": PropertyListSerializer(
+                    orphans, many=True, context={"request": request}
+                ).data,
+            }
+        )
