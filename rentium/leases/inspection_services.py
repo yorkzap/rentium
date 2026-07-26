@@ -549,25 +549,50 @@ def approve_suggestion(item: InspectionItem, *, user) -> object:
         raise InspectionError("This item has no pending suggestion.")
 
     inspection = item.inspection
+    lease = inspection.lease
     prop = None
     if item.area_id and getattr(item.area, "property_id", None):
         prop = item.area.property
     if prop is None:
-        lease = inspection.lease
         prop = lease.property or (
             inspection.lease_tenant.room if inspection.lease_tenant else None
         )
+
+    # Damage in SHARED space belongs to the unit, not to whichever room the
+    # lease happens to name. Without this, approving a suggestion on a shared
+    # washroom raised "Couldn't resolve a property" and the damage — already
+    # photographed and recorded — could not become a job at all.
+    unit = None
     if prop is None:
+        unit = getattr(item.area, "unit", None) if item.area_id else None
+        if unit is None and lease.property_id:
+            unit = lease.property.unit
+    if prop is None and unit is None:
         raise InspectionError(
-            "Couldn't resolve a property for the work order — set one manually."
+            "Couldn't resolve a property or unit for the work order — set one "
+            "manually."
         )
+
+    # Who was living there. This is evidence, not a verdict: `tenant_chargeable`
+    # stays False because "damage" versus "fair wear and tear" is the
+    # landlord's judgement, and getting it wrong charges somebody wrongly.
+    responsible = None
+    if inspection.lease_tenant_id and inspection.lease_tenant.tenant_id:
+        responsible = inspection.lease_tenant.tenant
+    elif lease.lease_tenants.filter(tenant__isnull=False).count() == 1:
+        responsible = lease.lease_tenants.filter(tenant__isnull=False).first().tenant
 
     code = item.latest_code()
     code_display = dict(ConditionCode.choices).get(code, code)
     comment = item.move_out_comment or item.move_in_comment
     work_order = WorkOrder.objects.create(
         property=prop,
+        unit=unit,
         area=item.area,
+        # Carried so a damage claim can find the lease whose deposit it may be
+        # claimed against.
+        lease=lease,
+        responsible_tenant=responsible,
         title=f"{item.section}: {item.label} — {code_display}"[:200],
         description=(
             f"From condition inspection {inspection.pk} "

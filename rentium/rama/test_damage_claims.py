@@ -191,20 +191,75 @@ def test_the_position_never_presents_itself_as_a_deduction(landlord, tenancy):
     assert "double" in position["warning"].lower()
 
 
-def test_the_fifteen_day_deadline_is_reported_once_the_tenancy_ends(
+def test_the_deadline_needs_a_forwarding_address_not_just_an_end_date(
     landlord, tenancy
 ):
-    """Missing it loses the claim and costs double, so the date is computed
-    rather than left to the landlord to work out."""
+    """The clock starts on the LATER of the tenancy ending and the forwarding
+    address arriving in writing. Reporting a deadline from the end date alone
+    would name one that has not started — worse than reporting none, because
+    the landlord would act on it."""
     lease = tenancy["lease"]
     lease.move_out_date = date.today()
     lease.save()
 
     position = deposit_position(landlord, lease=lease)
     assert position["tenancy_ended"] == date.today().isoformat()
+    assert position["claim_deadline"] is None
+    assert "forwarding address" in (position["clock_note"] or "")
+
+
+def test_the_deadline_is_computed_once_the_forwarding_address_arrives(
+    landlord, tenancy
+):
+    from rentium.leases.moveout import MoveOutRequest
+
+    lease = tenancy["lease"]
+    lease.move_out_date = date.today() - timedelta(days=2)
+    lease.save()
+    request = MoveOutRequest.objects.create(
+        lease=lease,
+        initiated_by=MoveOutRequest.InitiatedBy.TENANT,
+        kind=MoveOutRequest.Kind.TENANT_NOTICE,
+        requested_end_date=lease.move_out_date,
+        effective_end_date=lease.move_out_date,
+        forwarding_address="12 Elsewhere Rd, Victoria BC",
+        forwarding_address_received_on=date.today(),
+    )
+
+    # Later of (ended 2 days ago, address today) -> today + 15.
+    assert request.deposit_deadline == date.today() + timedelta(days=15)
+    assert request.days_left_to_settle == 15
+    assert request.deposit_status()["overdue"] is False
+
+    position = deposit_position(landlord, lease=lease)
     assert position["claim_deadline"] == (
         date.today() + timedelta(days=15)
     ).isoformat()
+
+
+def test_an_unsettled_deposit_past_the_deadline_reads_as_overdue(
+    landlord, tenancy
+):
+    from rentium.leases.moveout import MoveOutRequest
+
+    lease = tenancy["lease"]
+    ended = date.today() - timedelta(days=30)
+    request = MoveOutRequest.objects.create(
+        lease=lease,
+        initiated_by=MoveOutRequest.InitiatedBy.TENANT,
+        kind=MoveOutRequest.Kind.TENANT_NOTICE,
+        requested_end_date=ended,
+        effective_end_date=ended,
+        forwarding_address_received_on=ended,
+    )
+    status = request.deposit_status()
+
+    assert status["overdue"] is True
+    assert "double" in status["if_missed"].lower()
+
+    request.deposit_settlement = MoveOutRequest.DepositSettlement.RTB_APPLIED
+    request.save()
+    assert request.deposit_status()["overdue"] is False
 
 
 def test_no_deadline_while_the_tenancy_is_running(landlord, tenancy):

@@ -3453,6 +3453,7 @@ def test_tool_meta_covers_every_write_tool():
         # Reports deposit held vs claims. Reads only — it deliberately does
         # not, and must never, move deposit money.
         "deposit_position",
+        "tenant_statement",
         "list_conversations", "list_messages", "list_inspections",
         "list_move_events", "list_inventory", "list_tenants",
             "tenant_history", "list_documents", "business_document_location",

@@ -224,3 +224,23 @@ against.
 Deposits are never netted automatically — see `ledger.services.deposit_position`
 and the RAMA guide for why (BC RTA: written agreement or an RTB application
 within 15 days, else the claim is lost and double the deposit is payable).
+
+### The 15-day deposit clock
+
+`MoveOutRequest` records the forwarding address and its arrival date, because
+the clock starts on the LATER of the tenancy ending and that address arriving
+IN WRITING — and the second date was recorded nowhere, so the deadline could
+not be computed at all.
+
+`deposit_deadline` / `days_left_to_settle` / `deposit_status()` expose it, and
+`attention.service._deposit_deadlines` puts it in front of the landlord: urgent
+inside five days or once passed, and a separate "chase the forwarding address"
+item when the tenancy has ended and no address has arrived. A deadline nobody
+looks at is not a safeguard.
+
+`deposit_position` reports `claim_deadline` only when the clock has genuinely
+started. Deriving one from the end date alone would name a deadline that has
+not begun — worse than reporting none, because the landlord would act on it.
+
+Settlement is explicit: RETURNED_IN_FULL, TENANT_AGREED (written) or
+RTB_APPLIED. Nothing settles a deposit implicitly.

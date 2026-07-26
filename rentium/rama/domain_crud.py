@@ -3623,3 +3623,18 @@ def deposit_position(landlord, *, lease_number: str = "") -> dict:
     out = _position(landlord, lease=lease)
     out["lease"] = lease.lease_number
     return out
+
+
+def tenant_statement(landlord, *, tenant: str, lease_number: str = "") -> dict:
+    """Everything one tenant owes and has paid, in one place."""
+    from rentium.ledger.services import tenant_statement as _statement
+
+    person, err = _resolve_tenant_profile(landlord, tenant)
+    if err:
+        return err
+    lease = None
+    if (lease_number or "").strip():
+        lease, lerr = _resolve_lease(landlord, lease_number=lease_number)
+        if lerr:
+            return _prop_err(lerr)
+    return _statement(landlord, tenant=person, lease=lease)

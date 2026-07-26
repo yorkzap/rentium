@@ -576,9 +576,24 @@ def deposit_position(landlord, *, lease) -> dict:
         )
 
     ended = lease.move_out_date or lease.end_date
+
+    # The real clock starts on the LATER of the tenancy ending and the
+    # forwarding address arriving in writing, so it comes from the move-out
+    # record when one exists. Falling back to the end date alone would report
+    # a deadline that has not actually started — worse than reporting none.
     deadline = None
-    if ended:
-        deadline = ended + timedelta(days=DEPOSIT_CLAIM_WINDOW_DAYS)
+    clock_note = None
+    move_out = getattr(lease, "moveout_requests", None)
+    settlement = move_out.order_by("-created_at").first() if move_out else None
+    if settlement is not None:
+        status = settlement.deposit_status()
+        deadline = status["deadline"]
+        clock_note = status["blocked_on"] or status["what_must_happen"]
+    elif ended:
+        clock_note = (
+            "No move-out record, so the 15-day clock cannot be computed — it "
+            "starts when the tenant's forwarding address arrives in writing."
+        )
 
     return {
         "deposit_held": str(held),
@@ -588,7 +603,8 @@ def deposit_position(landlord, *, lease) -> dict:
         # entitlement — see lawful_routes.
         "returnable_if_all_claims_agreed": str(max(held - outstanding, Decimal("0.00"))),
         "tenancy_ended": ended.isoformat() if ended else None,
-        "claim_deadline": deadline.isoformat() if deadline else None,
+        "claim_deadline": deadline,
+        "clock_note": clock_note,
         "lawful_routes": [
             "the tenant agrees IN WRITING to the amount being kept, or",
             "you apply for RTB dispute resolution within 15 days of the later "
@@ -597,5 +613,90 @@ def deposit_position(landlord, *, lease) -> dict:
         "warning": (
             "Do not deduct unilaterally. Missing the 15-day route means the "
             "claim is lost AND double the deposit becomes payable."
+        ),
+    }
+
+
+def tenant_statement(landlord, *, tenant, lease=None) -> dict:
+    """Everything one tenant owes and has paid, in one place.
+
+    "What does this tenant owe?" spans rent, utilities, damage claims and the
+    deposit, and nothing assembled it — a landlord had to read three screens
+    and add up. Joint charges are included because on a roommate lease each
+    tenant is liable for the whole household charge, not a share of it; the
+    flag says which is which so a conversation about "your rent" is accurate.
+    """
+    from django.db.models import Q, Sum
+
+    scope = Q(landlord=landlord) & (
+        Q(tenant=tenant)
+        # Household charges on a joint lease carry tenant=None.
+        | Q(tenant__isnull=True, lease__lease_tenants__tenant=tenant)
+    )
+    if lease is not None:
+        scope &= Q(lease=lease)
+
+    charges, owed, paid = [], Decimal("0.00"), Decimal("0.00")
+    for entry in (
+        LedgerEntry.objects.with_settlement()
+        .filter(scope, entry_type__in=CHARGE_TYPES, reversed_by__isnull=True)
+        .select_related("work_order", "lease")
+        .order_by("due_date")
+        .distinct()
+    ):
+        outstanding = entry.outstanding or Decimal("0.00")
+        settled = entry.settled_amount or Decimal("0.00")
+        owed += outstanding
+        paid += settled
+        charges.append(
+            {
+                "id": str(entry.id),
+                "type": entry.get_entry_type_display(),
+                "description": entry.description,
+                "due_date": entry.due_date.isoformat() if entry.due_date else None,
+                "amount": str(entry.amount),
+                "outstanding": str(outstanding),
+                "status": entry.charge_status,
+                "is_joint": entry.tenant_id is None,
+                "is_damage": bool(entry.work_order_id),
+                "lease": entry.lease.lease_number if entry.lease_id else None,
+            }
+        )
+
+    deposit = (
+        LedgerEntry.objects.not_voided()
+        .filter(
+            landlord=landlord,
+            tenant=tenant,
+            entry_type=EntryType.PAYMENT,
+            settles__entry_type=EntryType.DEPOSIT_CHARGE,
+        )
+        .aggregate(s=Sum("amount"))["s"]
+        or Decimal("0.00")
+    )
+    returned = (
+        LedgerEntry.objects.not_voided()
+        .filter(landlord=landlord, tenant=tenant, entry_type=EntryType.DEPOSIT_RETURN)
+        .aggregate(s=Sum("amount"))["s"]
+        or Decimal("0.00")
+    )
+
+    damage = sum(
+        (Decimal(c["outstanding"]) for c in charges if c["is_damage"]),
+        Decimal("0.00"),
+    )
+    return {
+        "tenant": tenant.user.name,
+        "owes_now": str(owed),
+        "of_which_damage": str(damage),
+        "paid_to_date": str(paid),
+        "deposit_held": str(deposit - returned),
+        "charges": charges,
+        # Stated explicitly so nobody reads owes_now against deposit_held and
+        # treats the difference as settled. See deposit_position().
+        "note": (
+            "Deposit money is held separately and is NOT netted off what is "
+            "owed. Keeping any of it needs the tenant's written agreement or "
+            "an RTB application within 15 days of the tenancy ending."
         ),
     }

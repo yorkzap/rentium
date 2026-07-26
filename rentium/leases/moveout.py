@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
+from datetime import timedelta
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
@@ -112,6 +113,39 @@ class MoveOutRequest(models.Model):
     # The tenancy_rules payload frozen at submission time — auditability
     # (and the AI controller can read WHY a request auto-accepted).
     rules_snapshot = models.JSONField(default=dict, blank=True)
+
+    # ---- deposit settlement -------------------------------------------
+    # The 15-day clock starts on the LATER of the tenancy ending and the
+    # landlord receiving a forwarding address IN WRITING. That second date is
+    # the one nobody records, and without it the deadline cannot be computed
+    # at all — so the highest-consequence date in the system was invisible.
+    forwarding_address = models.TextField(
+        _("Forwarding Address"),
+        blank=True,
+        help_text=_("Where the deposit is to be sent, as given in writing."),
+    )
+    forwarding_address_received_on = models.DateField(
+        _("Forwarding Address Received"),
+        null=True,
+        blank=True,
+        help_text=_("Starts the 15-day clock, if later than the tenancy end."),
+    )
+
+    class DepositSettlement(models.TextChoices):
+        PENDING = "PENDING", _("Not settled yet")
+        RETURNED_IN_FULL = "RETURNED", _("Returned in full")
+        TENANT_AGREED = "AGREED", _("Tenant agreed in writing to a deduction")
+        RTB_APPLIED = "RTB", _("Applied to the RTB for dispute resolution")
+
+    deposit_settlement = models.CharField(
+        _("Deposit Settlement"),
+        max_length=12,
+        choices=DepositSettlement.choices,
+        default=DepositSettlement.PENDING,
+    )
+    tenant_agreement_signed_on = models.DateField(null=True, blank=True)
+    rtb_file_number = models.CharField(max_length=50, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -119,6 +153,83 @@ class MoveOutRequest(models.Model):
         verbose_name = _("Move-Out Request")
         verbose_name_plural = _("Move-Out Requests")
         ordering = ["-created_at"]
+
+
+    # ------------------------------------------------- deposit deadline
+    DEPOSIT_CLAIM_WINDOW_DAYS = 15
+
+    @property
+    def deposit_clock_starts(self):
+        """The later of the tenancy ending and the forwarding address arriving.
+
+        Returns None while either is unknown — an unknown deadline must read as
+        unknown, never as "no deadline".
+        """
+        ended = self.effective_end_date or self.lease.move_out_date
+        if not ended:
+            return None
+        received = self.forwarding_address_received_on
+        return max(ended, received) if received else None
+
+    @property
+    def deposit_deadline(self):
+        start = self.deposit_clock_starts
+        if start is None:
+            return None
+        return start + timedelta(days=self.DEPOSIT_CLAIM_WINDOW_DAYS)
+
+    @property
+    def days_left_to_settle(self):
+        deadline = self.deposit_deadline
+        if deadline is None:
+            return None
+        return (deadline - date.today()).days
+
+    @property
+    def deposit_settled(self) -> bool:
+        return self.deposit_settlement != self.DepositSettlement.PENDING
+
+    def deposit_status(self) -> dict:
+        """What must happen, by when, and what happens if it doesn't."""
+        deadline = self.deposit_deadline
+        days = self.days_left_to_settle
+        return {
+            "settlement": self.deposit_settlement,
+            "settled": self.deposit_settled,
+            "forwarding_address_received": (
+                self.forwarding_address_received_on.isoformat()
+                if self.forwarding_address_received_on
+                else None
+            ),
+            "clock_starts": (
+                self.deposit_clock_starts.isoformat()
+                if self.deposit_clock_starts
+                else None
+            ),
+            "deadline": deadline.isoformat() if deadline else None,
+            "days_left": days,
+            "overdue": bool(days is not None and days < 0 and not self.deposit_settled),
+            "blocked_on": (
+                None
+                if self.deposit_clock_starts
+                else (
+                    "Waiting for the tenant's forwarding address in writing — "
+                    "the 15-day clock does not start until it arrives."
+                )
+            ),
+            "what_must_happen": (
+                None
+                if self.deposit_settled
+                else (
+                    "Return the deposit in full, OR get the tenant's written "
+                    "agreement to a deduction, OR apply to the RTB — before "
+                    "the deadline."
+                )
+            ),
+            "if_missed": (
+                "The claim is lost AND double the deposit becomes payable."
+            ),
+        }
 
     def __str__(self):
         return (

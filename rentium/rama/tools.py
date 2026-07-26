@@ -990,7 +990,10 @@ def create_expense(
     effective_date: str = "",
     confirm: str = "",
 ) -> dict:
-    """Record a landlord expense. amount e.g. '75.00'. Preview first; confirm=yes."""
+    """Record a landlord expense. amount e.g. '75.00'. property_query is the
+    listing it belongs to, OR the unit when the cost is for SHARED space
+    ('McKenzie Basement') — never pick one of the rooms that share it. Leave
+    blank for a portfolio-wide cost. Preview first; confirm=yes."""
     from .domain_actions import create_expense as _fn
 
     return _fn(
@@ -2328,3 +2331,15 @@ def deposit_position(landlord, lease_number: str = "") -> dict:
     from .domain_crud import deposit_position as _fn
 
     return _fn(landlord, lease_number=lease_number)
+
+
+def tenant_statement(landlord, tenant: str, lease_number: str = "") -> dict:
+    """Everything one tenant owes and has paid: rent, utilities, damage claims
+    and the deposit held, in one place. Answers "what does X owe?" without
+    adding up three screens. Joint (household) charges are included and
+    flagged — on a roommate lease each tenant is liable for the WHOLE
+    household charge, not a share of it. Deposit money is reported separately
+    and is never netted off what is owed."""
+    from .domain_crud import tenant_statement as _fn
+
+    return _fn(landlord, tenant=tenant, lease_number=lease_number)

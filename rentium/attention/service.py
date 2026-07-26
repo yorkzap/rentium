@@ -281,6 +281,80 @@ def _stale_work_orders(landlord) -> list[ActionItem]:
     return items
 
 
+def _deposit_deadlines(landlord) -> list[ActionItem]:
+    """The 15-day deposit clock — the highest-consequence deadline there is.
+
+    Miss it and the claim is lost AND double the deposit becomes payable, so
+    this belongs where the landlord already looks rather than behind a report
+    they would have to think to open. A move-out still waiting on a forwarding
+    address is surfaced too: the clock has not started, but it is about to, and
+    that is the moment to chase the address.
+    """
+    from rentium.leases.moveout import MoveOutRequest
+
+    out: list[ActionItem] = []
+    pending = MoveOutRequest.objects.filter(
+        lease__landlord=landlord,
+        deposit_settlement=MoveOutRequest.DepositSettlement.PENDING,
+    ).select_related("lease", "lease__property")
+
+    for req in pending:
+        place = _place(req.lease)
+        status = req.deposit_status()
+        if status["deadline"] is None:
+            ended = req.effective_end_date or req.lease.move_out_date
+            if not ended or ended > date.today():
+                continue  # tenancy hasn't ended; nothing to chase yet
+            out.append(
+                ActionItem(
+                    key=f"deposit.awaiting_address.moveout:{req.pk}",
+                    severity="soon",
+                    title=f"Ask {place} for a forwarding address in writing",
+                    detail=(
+                        "The tenancy has ended but no forwarding address has "
+                        "been recorded. The 15-day deposit deadline does not "
+                        "start until it arrives — and you cannot lawfully keep "
+                        "any of the deposit before then."
+                    ),
+                    url="/dashboard/tenancy/moving-out",
+                    due_date=None,
+                    source="lease",
+                )
+            )
+            continue
+
+        days = status["days_left"]
+        if days is None or days > 10:
+            continue
+        overdue = days < 0
+        out.append(
+            ActionItem(
+                key=f"deposit.deadline.moveout:{req.pk}",
+                severity="urgent" if (overdue or days <= 5) else "soon",
+                title=(
+                    f"Deposit deadline PASSED for {place}"
+                    if overdue
+                    else f"Deposit deadline in {days} day(s) — {place}"
+                ),
+                detail=(
+                    "Return the deposit in full, get the tenant's written "
+                    "agreement to a deduction, or apply to the RTB. "
+                    + (
+                        "This deadline has passed: the claim is lost and double "
+                        "the deposit may now be payable. Get advice."
+                        if overdue
+                        else "Missing it loses the claim AND makes double the "
+                        "deposit payable."
+                    )
+                ),
+                url="/dashboard/tenancy/moving-out",
+                due_date=date.fromisoformat(status["deadline"]),
+                source="lease",
+            )
+        )
+    return out
+
+
 SOURCES = (
     _missing_move_in_inspections,
     _inspection_delivery_due,
@@ -288,6 +362,7 @@ SOURCES = (
     _expiring_leases,
     _overdue_charges,
     _stale_work_orders,
+    _deposit_deadlines,
 )
 
 

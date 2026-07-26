@@ -2293,11 +2293,15 @@ def create_expense(
     if not desc:
         return {"error": "description is required."}
 
-    prop = None
+    # Reuses the maintenance target resolver so an expense can name a LISTING
+    # or a whole UNIT. Without the unit path, a shared repair could only be
+    # booked against one of the rooms that share the space — which is how the
+    # $19.78 shower knob ended up charged to Room C alone.
+    prop = unit = None
     if property_query:
-        prop, err = _resolve_property(landlord, property_query)
+        prop, unit, _a, err = _resolve_maintenance_target(landlord, property_query)
         if err:
-            return _prop_err(err)
+            return err
 
     day = date.today()
     if effective_date:
@@ -2306,10 +2310,15 @@ def create_expense(
         except ValueError:
             return {"error": f"effective_date must be YYYY-MM-DD, got {effective_date!r}."}
 
+    where = (
+        prop.name
+        if prop is not None
+        else (f"{unit.name} ({unit.holding.name}) — shared" if unit else None)
+    )
     preview = {
         "amount": str(amt),
         "description": desc[:200],
-        "property": prop.name if prop else None,
+        "property": where,
         "effective_date": day.isoformat(),
     }
     if not _confirmed(confirm):
@@ -2325,6 +2334,13 @@ def create_expense(
             description=desc[:255],
             incurred_date=day,
             property=prop,
+            # A shared-space cost has no listing to charge but always has an
+            # address, so it stays attributable instead of landing nowhere.
+            holding=(
+                prop.holding
+                if prop is not None
+                else (unit.holding if unit is not None else None)
+            ),
             vendor="",
             created_by=landlord.user,
         )
@@ -2338,7 +2354,7 @@ def create_expense(
             "id": str(getattr(entry, "pk", "")),
             "amount": str(amt),
             "description": desc[:200],
-            "property": prop.name if prop else None,
+            "property": where,
             "effective_date": day.isoformat(),
         },
     }
