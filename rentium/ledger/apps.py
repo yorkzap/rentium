@@ -7,3 +7,4 @@ class LedgerConfig(AppConfig):
 
     def ready(self):
         from . import handlers  # noqa: F401
+        from . import signals  # noqa: F401
