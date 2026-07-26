@@ -875,3 +875,46 @@ def summary_view(request):
             ),
         }
     )
+
+
+# ------------------------------------------------------- tenant statement
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def tenant_statement_view(request):
+    """
+    GET /api/ledger/tenant-statement/?tenant=<id>[&lease=<id>]
+
+    Everything one tenant owes and has paid, in one place.
+
+    Filtering entries by `tenant=<id>` alone is NOT equivalent and was actively
+    misleading: household charges on a roommate lease carry tenant=None, so a
+    tenant view built that way showed a damage claim and no rent — making
+    someone who owed $2,144 look like they owed $19.78. This assembles both,
+    and flags which charges are joint, because each tenant on a joint lease is
+    liable for the WHOLE household charge rather than a share of it.
+    """
+    from rentium.leases.models import Lease
+    from rentium.users.models import TenantProfile
+
+    from ..services import tenant_statement
+
+    landlord = _landlord(request)
+    tenant_id = request.query_params.get("tenant")
+    if not tenant_id:
+        return Response({"detail": "tenant is required."}, status=400)
+
+    # Scoped: only a tenant who actually holds a lease with this landlord.
+    tenant = TenantProfile.objects.filter(
+        pk=tenant_id, tenant_leases__lease__landlord=landlord
+    ).distinct().first()
+    if tenant is None:
+        return Response({"detail": "No such tenant in your portfolio."}, status=404)
+
+    lease = None
+    lease_id = request.query_params.get("lease")
+    if lease_id:
+        lease = Lease.objects.filter(pk=lease_id, landlord=landlord).first()
+        if lease is None:
+            return Response({"detail": "No such lease."}, status=404)
+
+    return Response(tenant_statement(landlord, tenant=tenant, lease=lease))

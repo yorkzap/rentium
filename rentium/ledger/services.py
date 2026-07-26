@@ -656,7 +656,8 @@ def tenant_statement(landlord, *, tenant, lease=None) -> dict:
                 "due_date": entry.due_date.isoformat() if entry.due_date else None,
                 "amount": str(entry.amount),
                 "outstanding": str(outstanding),
-                "status": entry.charge_status,
+                # charge_status is a method, not a property.
+                "status": entry.charge_status(),
                 "is_joint": entry.tenant_id is None,
                 "is_damage": bool(entry.work_order_id),
                 "lease": entry.lease.lease_number if entry.lease_id else None,

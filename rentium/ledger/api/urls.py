@@ -2,7 +2,12 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from . import import_views
-from .views import LedgerEntryViewSet, summary_view, utility_bill_view
+from .views import (
+    LedgerEntryViewSet,
+    summary_view,
+    tenant_statement_view,
+    utility_bill_view,
+)
 
 app_name = "ledger_api"
 
@@ -11,6 +16,11 @@ router.register("entries", LedgerEntryViewSet, basename="ledger-entry")
 
 urlpatterns = [
     path("summary/", summary_view, name="summary"),
+    path(
+        "tenant-statement/",
+        tenant_statement_view,
+        name="tenant-statement",
+    ),
     path("utility-bills/", utility_bill_view, name="utility-bills"),
     path("import/batches/", import_views.batches_view, name="import-batches"),
     path(
