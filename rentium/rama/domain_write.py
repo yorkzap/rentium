@@ -19,18 +19,61 @@ on ONE instance the landlord owns. Safety is structural and layered:
 
 from __future__ import annotations
 
+import re
+
 from .domain_read import _coerce  # shared type coercion
 from .manifest import MANIFEST, EntitySpec
 
 
-def _parse_change_clauses(changes: str) -> tuple[dict[str, str], dict | None]:
+def _split_change_clauses(changes: str, fields) -> list[str]:
+    """Split "a=1, b=2" into clauses WITHOUT breaking values that contain commas.
+
+    Splitting on every comma first was the single biggest source of RAMA write
+    failures: 32 of 53 logged `update` errors were one call,
+
+        changes='description=1 bedroom, living room, kitchen, private patio'
+
+    which is a correct call. The old parser cut it at each comma, parsed
+    'description=1 bedroom', then rejected 'living room' as a malformed clause.
+    Free text almost always contains commas, so `description`, `name` and
+    `address` were close to unusable.
+
+    So a comma only starts a new clause when what follows is an actual known
+    field name followed by '='. Anything else is part of the current value.
+    Longest names first, so `postal_code` wins over any prefix of it.
+    """
+    text = (changes or "").strip()
+    if not text:
+        return []
+    names = sorted((f for f in fields), key=len, reverse=True)
+    if not names:
+        return [c.strip() for c in text.split(",") if c.strip()]
+    boundary = "|".join(re.escape(n) for n in names)
+    parts = re.split(rf",\s*(?=(?:{boundary})\s*=)", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _clause_error(clause: str, fields) -> dict:
+    """A rejection the model can act on: what it sent, what is editable, and a
+    worked example. A bare "use field=value" told it nothing it didn't know."""
+    listed = ", ".join(sorted(fields)) if fields else "(none)"
+    example = next(iter(sorted(fields)), "name")
+    return {
+        "error": (
+            f"Couldn't read {clause!r} as a change. Use field=value, and "
+            f"separate several changes with commas — a value may itself "
+            f"contain commas."
+        ),
+        "editable_fields": listed,
+        "example": f"changes='{example}=new value'",
+    }
+
+
+def _parse_change_clauses(changes: str, fields=()) -> tuple[dict[str, str], dict | None]:
     parsed = {}
-    for clause in (changes or "").split(","):
-        clause = clause.strip()
-        if not clause:
-            continue
+    for clause in _split_change_clauses(changes, fields):
         if "=" not in clause:
-            return {}, {"error": f"Bad change {clause!r} — use field=value."}
+            return {}, _clause_error(clause, fields)
         fname, raw = clause.split("=", 1)
         parsed[fname.strip()] = raw.strip()
     return parsed, None
@@ -46,15 +89,11 @@ def _route_structured_property_update(
     ``update_property`` so category cleanup, lease guards and full validation
     cannot be bypassed.
     """
-    raw_changes, err = _parse_change_clauses(changes)
-    if err:
-        return err
     aliases = {
         "listing_type": "property_category",
         "property_type": "property_category",
         "category": "property_category",
     }
-    normalized = {aliases.get(k, k): v for k, v in raw_changes.items()}
     structured = {
         "property_category",
         "unit_type",
@@ -64,6 +103,18 @@ def _route_structured_property_update(
         "max_occupancy",
         "square_footage",
     }
+    known = (
+        structured
+        | set(aliases)
+        | {
+            "name", "status", "description", "address", "city", "province",
+            "postal_code", "asking_rent", "is_publicly_visible", "pick",
+        }
+    )
+    raw_changes, err = _parse_change_clauses(changes, known)
+    if err:
+        return err
+    normalized = {aliases.get(k, k): v for k, v in raw_changes.items()}
     if not structured.intersection(normalized):
         return None
 
@@ -173,12 +224,9 @@ def update(landlord, *, entity: str = "", query: str = "", changes: str = "",
             return {"error": reason}
 
     parsed: dict = {}
-    for clause in (changes or "").split(","):
-        clause = clause.strip()
-        if not clause:
-            continue
+    for clause in _split_change_clauses(changes, editable):
         if "=" not in clause:
-            return {"error": f"Bad change {clause!r} — use field=value."}
+            return _clause_error(clause, editable)
         fname, raw = clause.split("=", 1)
         fname = fname.strip()
         fs = editable.get(fname)
