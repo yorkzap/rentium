@@ -59,7 +59,12 @@ def seed_group_areas(sender, instance, created, raw=False, **kwargs):
 @receiver(post_save, sender="properties.Property", dispatch_uid="seed_property_areas")
 def seed_property_areas(sender, instance, created, raw=False, **kwargs):
     """Standalone complete units get their own areas; rooms rely on the
-    group's areas (plus the room itself)."""
+    group's areas (plus the room itself).
+
+    A listing attached to a PropertyUnit seeds the UNIT instead: the physical
+    space owns the layout, and the listing is only an offer on it. Seeding is
+    idempotent, so several listings on one unit converge rather than duplicate.
+    """
     if raw or not created:
         return
     from rentium.properties.models import Property
@@ -69,7 +74,10 @@ def seed_property_areas(sender, instance, created, raw=False, **kwargs):
     try:
         from rentium.properties.areas import seed_default_areas
 
-        seed_default_areas(property=instance)
+        if instance.unit_id:
+            seed_default_areas(unit=instance.unit)
+        else:
+            seed_default_areas(property=instance)
     except Exception:
         logger.exception("seed_default_areas(property=%s) failed", instance.pk)
 

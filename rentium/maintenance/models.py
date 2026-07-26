@@ -32,7 +32,7 @@ from rentium.core.fsm import transition
 from rentium.core.phone import PhoneField
 from rentium.events.registry import publish
 from rentium.leases.models import Lease
-from rentium.properties.areas import Area
+from rentium.properties.models import PropertyArea
 from rentium.properties.models import Property
 
 # House-policy response deadlines by priority (hours). EMERGENCY categories
@@ -95,7 +95,7 @@ class WorkOrder(models.Model):
         Property, on_delete=models.PROTECT, related_name="work_orders"
     )
     area = models.ForeignKey(
-        Area,
+        PropertyArea,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -192,11 +192,23 @@ class WorkOrder(models.Model):
             )
         if self.area:
             area_parent_ok = (
-                self.area.property_id and self.area.property_id == self.property_id
-            ) or (self.area.group_id and self.area.group_id == self.property.group_id)
+                (self.area.property_id and self.area.property_id == self.property_id)
+                or (
+                    self.area.group_id
+                    and self.area.group_id == self.property.group_id
+                )
+                # The unit's internal layout: a whole-unit listing's kitchen is
+                # an area on the unit, not on the listing.
+                or (self.area.unit_id and self.area.unit_id == self.property.unit_id)
+            )
             if not area_parent_ok:
                 raise ValidationError(
-                    {"area": _("Area does not belong to this property or its group.")}
+                    {
+                        "area": _(
+                            "Area does not belong to this property, its unit, or "
+                            "its group."
+                        )
+                    }
                 )
 
     # -------------------------------------------------------------- FSM

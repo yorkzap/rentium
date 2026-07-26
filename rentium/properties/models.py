@@ -103,6 +103,11 @@ class UnitType(models.TextChoices):
     OTHER = "OTHER", _("Other")
 
 
+# PropertyArea has a field literally named `property`, which shadows the
+# builtin inside its class body — so its computed attributes need this alias.
+_py_property = property
+
+
 postal_code_validator = RegexValidator(
     regex=r"^[A-Za-z]\d[A-Za-z][ ]?\d[A-Za-z]\d$",
     message="Enter a Canadian postal code, like V8Z 3T7.",
@@ -908,6 +913,28 @@ class PropertyImage(models.Model):
 
 # --- PropertyArea Model ---
 class PropertyArea(models.Model):
+    """A named space: the canonical model for what is physically inside a unit.
+
+    This is the ONE area model. A second, newer `Area` model briefly existed in
+    properties/areas.py with the maintenance and inspection foreign keys, but it
+    was never seeded (its signals were dead) and held zero rows, while this
+    model holds the real data AND the legally load-bearing fields —
+    `shared_with_landlord` and `shared_by` are what
+    leases/tenancy_rules.landlord_shares_common_areas() reads to decide whether
+    the provincial tenancy act applies. The legal test lives here, so the merge
+    went this way: PropertyArea absorbed Area's structural fields (name, kind,
+    group, exclusive_to) and Area was deleted.
+
+    An area hangs off exactly one parent:
+
+      unit      internal layout of a physical unit — "Master Bedroom", the
+                ensuite, the kitchen. Present regardless of rental mode, which
+                is the point: a floor rented whole still knows it has 3
+                bedrooms.
+      group     shared space belonging to a room-by-room letting.
+      property  a space belonging to one specific listing.
+    """
+
     class AreaType(models.TextChoices):
         KITCHEN = "KITCHEN", _("Kitchen")
         BATHROOM = "BATHROOM", _("Bathroom")
@@ -921,16 +948,85 @@ class PropertyArea(models.Model):
         STORAGE = "STORAGE", _("Storage Area")
         GARAGE = "GARAGE", _("Garage")
         GARDEN = "GARDEN", _("Garden/Yard")
+        # Building systems — landlord's concern, but tenants still see work
+        # orders on the systems that serve their space (carried over from the
+        # retired Area.Kind.SYSTEM).
+        HEATING = "HEATING", _("Heating / Furnace")
+        HOT_WATER = "HOT_WATER", _("Hot Water")
+        ELECTRICAL = "ELECTRICAL", _("Electrical Panel")
+        ROOF = "ROOF", _("Roof / Structure")
         OTHER = "OTHER", _("Other")
 
+    class Kind(models.TextChoices):
+        """WHO may use the space — orthogonal to AreaType, which is WHAT it is.
+
+        A bathroom can be PRIVATE (the master ensuite), COMMON (shared by the
+        household) or EXCLUSIVE (reserved to one room). Keeping the two axes
+        separate is what lets a whole-unit floor record "3 bedrooms, one with
+        an ensuite" without pretending any of them are rentable listings.
+        """
+
+        COMMON = "COMMON", _("Common / Shared")
+        PRIVATE = "PRIVATE", _("Private to one space")
+        EXCLUSIVE = "EXCLUSIVE", _("Exclusive to a Room")
+        SYSTEM = "SYSTEM", _("Building System")
+
+    # --- parent: exactly one of unit / group / property ---------------------
+    unit = models.ForeignKey(
+        "PropertyUnit",
+        on_delete=models.CASCADE,
+        related_name="areas",
+        null=True,
+        blank=True,
+        help_text=_("The physical unit this space is part of."),
+    )
+    group = models.ForeignKey(
+        PropertyGroup,
+        on_delete=models.CASCADE,
+        related_name="areas",
+        null=True,
+        blank=True,
+        help_text=_("The room-rental group this shared space belongs to."),
+    )
     property = models.ForeignKey(
         Property,
         on_delete=models.CASCADE,
         related_name="primary_area_associations",
+        null=True,
+        blank=True,
         help_text=_("The primary property this area belongs to."),
+    )
+    name = models.CharField(
+        _("Name"),
+        max_length=100,
+        blank=True,
+        help_text=_("e.g., Master Bedroom, Ensuite. Falls back to the area type."),
     )
     area_type = models.CharField(
         _("Area Type"), max_length=20, choices=AreaType.choices
+    )
+    kind = models.CharField(
+        _("Kind"), max_length=10, choices=Kind.choices, default=Kind.COMMON
+    )
+    exclusive_to = models.ForeignKey(
+        Property,
+        on_delete=models.SET_NULL,
+        related_name="exclusive_areas",
+        null=True,
+        blank=True,
+        help_text=_("The room this area is reserved for (EXCLUSIVE kind only)."),
+    )
+    # Which bedrooms a shared space actually serves, when it isn't the whole
+    # household — "the second bathroom serves Bedroom 2 and Bedroom 3". Points
+    # at other areas because under WHOLE_UNIT the bedrooms are areas, not
+    # listings, so shared_by (which points at listings) cannot express it.
+    serves_areas = models.ManyToManyField(
+        "self",
+        symmetrical=False,
+        blank=True,
+        related_name="served_by_areas",
+        verbose_name=_("Serves Areas"),
+        help_text=_("The bedrooms/spaces this area serves, if not all of them."),
     )
     count = models.PositiveIntegerField(
         _("Count"), default=1, help_text=_("e.g., Number of identical areas")
@@ -963,13 +1059,44 @@ class PropertyArea(models.Model):
             "synchronized automatically as rooms join, move, or leave."
         ),
     )
+    # True for the generic starter set (Kitchen, Laundry, Roof...) created by
+    # seed_default_areas so maintenance and inspections have something to
+    # reference. These are SCAFFOLDING, not facts a landlord told us — RAMA
+    # must not report them as the unit's recorded layout, or "we know nothing
+    # about this floor" silently becomes "it has a garage and a laundry".
+    is_seeded_default = models.BooleanField(
+        _("Seeded Default"),
+        default=False,
+        db_index=True,
+        help_text=_("Auto-created placeholder, not a recorded layout fact."),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = _("Property Area")
         verbose_name_plural = _("Property Areas")
-        ordering = ["property", "area_type"]
+        ordering = ["kind", "name", "area_type"]
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    models.Q(unit__isnull=False)
+                    | models.Q(group__isnull=False)
+                    | models.Q(property__isnull=False)
+                ),
+                name="area_has_a_parent",
+            ),
+        ]
+
+    @_py_property
+    def label(self) -> str:
+        """The name a landlord gave it, else the area type ("Master Bedroom"
+        vs a bare "Bedroom")."""
+        return self.name or self.get_area_type_display()
+
+    @_py_property
+    def parent(self):
+        return self.unit or self.group or self.property
 
     def __str__(self):
         share_count = self.shared_by.count() if self.pk else 0
@@ -981,11 +1108,34 @@ class PropertyArea(models.Model):
             status = " (Private - not explicitly shared)"
         if self.pk and self.shared_with_landlord:
             status += " [shared with landlord]"
-        return f"{self.get_area_type_display()} ({self.count}) in {self.property.name}{status}"
+        parent = self.parent
+        where = parent.name if parent else "unattached"
+        return f"{self.label} ({self.count}) in {where}{status}"
 
     def clean(self):
         super().clean()
-        if hasattr(self, "property") and self.property:
+        if not (self.unit_id or self.group_id or self.property_id):
+            raise ValidationError(
+                _("An area must belong to a unit, a group, or a property.")
+            )
+        if self.kind == self.Kind.EXCLUSIVE and not self.exclusive_to_id:
+            raise ValidationError(
+                {"exclusive_to": _("Exclusive areas must name their room.")}
+            )
+        if self.kind != self.Kind.EXCLUSIVE and self.exclusive_to_id:
+            raise ValidationError(
+                {
+                    "exclusive_to": _(
+                        "Only EXCLUSIVE areas can be reserved for a room."
+                    )
+                }
+            )
+        if self.exclusive_to_id and self.group_id:
+            if self.exclusive_to.group_id != self.group_id:
+                raise ValidationError(
+                    {"exclusive_to": _("Room is not in this group.")}
+                )
+        if self.property_id and self.property:
             if (
                 self.property.property_category
                 == Property.PropertyCategory.COMPLETE_UNIT
@@ -1096,4 +1246,3 @@ class SharedInventoryItem(models.Model):
         return f"{self.name} (Qty: {self.quantity}) (Shared in {self.group.name})"
 
 
-from .areas import Area  # noqa: E402,F401  (keeps migrations picking Area up)

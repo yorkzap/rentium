@@ -1054,7 +1054,13 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
                 "count": area.count,
                 "description": area.description or None,
             }
-            for area in prop.primary_area_associations.all()
+            # Seeded placeholders are excluded on purpose: they are
+            # scaffolding for maintenance/inspections, not layout the landlord
+            # told us about. Reporting them would turn "unknown" into invented
+            # fact.
+            for area in prop.primary_area_associations.filter(
+                is_seeded_default=False
+            )
         ]
         row = {
             "id": str(prop.pk),

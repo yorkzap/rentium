@@ -72,7 +72,7 @@ def resolve_template(lease: Lease) -> InspectionTemplate:
 
 
 # ------------------------------------------------- section <-> area matching
-# Maps RTB-27 section names to keywords found in Area names (the Areas
+# Maps RTB-27 section names to keywords found in area names (the areas
 # seeded by properties/areas.py: "Kitchen", "Bathroom", "Living Room"...).
 # Matching is best-effort by design: an unmatched section still appears on
 # the report unbound — the paper form doesn't require physical links, we
@@ -162,12 +162,13 @@ def build_inspection(
 
     Scope (decision D3):
       - complete-unit lease  -> lease_tenant=None, all template sections,
-        areas = Area.objects.filter(property=unit)
+        areas = the unit's own layout + anything on the listing
       - room/group lease     -> lease_tenant required; sections limited to
         the tenant's room + the shared areas their room touches, resolved
         by the SAME areas_for_tenant_room() maintenance uses.
     """
-    from rentium.properties.areas import Area, areas_for_tenant_room
+    from rentium.properties.areas import areas_for_tenant_room
+    from rentium.properties.models import PropertyArea
 
     is_room_scope = lease.group_id is not None or (
         lease.property_id and lease.property.property_category == "ROOM"
@@ -192,7 +193,15 @@ def build_inspection(
         else:
             visible_areas = []
     else:
-        visible_areas = list(Area.objects.filter(property=lease.property))
+        # Whole-unit lease: the inspection covers the unit's internal layout
+        # (its named bedrooms, bathrooms, kitchen) as well as anything recorded
+        # against the listing itself.
+        from django.db.models import Q as _Q
+
+        scope = _Q(property=lease.property)
+        if lease.property_id and lease.property.unit_id:
+            scope |= _Q(unit_id=lease.property.unit_id)
+        visible_areas = list(PropertyArea.objects.filter(scope).distinct())
 
     # ---- which template sections apply? ----
     template_items = list(template.items.all().order_by("sort_order"))

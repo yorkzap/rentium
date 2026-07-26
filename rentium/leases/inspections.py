@@ -145,19 +145,19 @@ class AreaConditionState(models.Model):
     manually edited in the property's Condition section).
 
     Deliberately a OneToOne satellite here rather than fields on
-    properties.Area: the properties app stays ignorant of inspections, and
-    an Area with no row simply means "GOOD, never assessed" — nothing is
+    PropertyArea: the properties app stays ignorant of inspections, and
+    an area with no row simply means "GOOD, never assessed" — nothing is
     required at property-creation time.
 
-    NOTE: this targets the NEW Area model (properties/areas.py — the one
-    maintenance work orders link to), not the legacy PropertyArea in
-    properties/models.py. Inventory items need no satellite: InventoryItem
+    NOTE: this targets PropertyArea — the single area model, which absorbed
+    the short-lived properties/areas.py `Area` (see PropertyArea's docstring).
+    Inventory items need no satellite: InventoryItem
     and SharedInventoryItem already carry a `condition` field, which the
     write-back updates directly.
     """
 
     area = models.OneToOneField(
-        "properties.Area", on_delete=models.CASCADE, related_name="condition_state"
+        "properties.PropertyArea", on_delete=models.CASCADE, related_name="condition_state"
     )
     condition = models.CharField(
         _("Condition"),
@@ -412,7 +412,7 @@ class InspectionItem(models.Model):
     # Physical-world links (all optional; the paper form needs none of them,
     # we just prefer them so prefill/write-back/suggestions can work).
     area = models.ForeignKey(
-        "properties.Area",
+        "properties.PropertyArea",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,

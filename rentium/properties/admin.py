@@ -1,6 +1,5 @@
 from django.contrib import admin
 
-from .areas import Area
 from .models import InventoryItem
 from .models import Property
 from .models import PropertyArea
@@ -185,10 +184,13 @@ class PropertyGroupAdmin(admin.ModelAdmin):
 
 @admin.register(PropertyArea)
 class PropertyAreaAdmin(admin.ModelAdmin):
-    list_display = ("area_type", "property", "count", "shared_with_landlord")
-    list_filter = ("area_type", "shared_with_landlord")
-    search_fields = ("property__name",)
-    autocomplete_fields = ["property", "shared_by"]
+    list_display = (
+        "label", "kind", "area_type", "unit", "group", "property",
+        "count", "shared_with_landlord",
+    )
+    list_filter = ("kind", "area_type", "shared_with_landlord")
+    search_fields = ("name", "property__name", "unit__name", "group__name")
+    autocomplete_fields = ["property", "shared_by", "exclusive_to"]
 
 
 @admin.register(InventoryItem)
@@ -205,11 +207,3 @@ class SharedInventoryItemAdmin(admin.ModelAdmin):
     list_filter = ("condition",)
     search_fields = ("name", "group__name")
     autocomplete_fields = ["group"]
-
-
-@admin.register(Area)
-class AreaAdmin(admin.ModelAdmin):
-    list_display = ("name", "kind", "group", "property", "exclusive_to")
-    list_filter = ("kind",)
-    search_fields = ("name",)
-    autocomplete_fields = ["group", "property", "exclusive_to"]

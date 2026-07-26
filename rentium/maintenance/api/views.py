@@ -17,8 +17,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from rentium.leases.models import Lease
-from rentium.properties.areas import Area
 from rentium.properties.areas import areas_for_tenant_room
+from rentium.properties.models import PropertyArea
 from rentium.properties.models import Property
 
 from ..models import WorkOrder
@@ -89,7 +89,7 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                     & Q(room_tenants__tenant=tenant)
                 )
             ).distinct()
-            visible_areas = Area.objects.none()
+            visible_areas = PropertyArea.objects.none()
             for room in rooms:
                 visible_areas = visible_areas | areas_for_tenant_room(room)
 
@@ -231,12 +231,14 @@ def areas_view(request):
         if prop.landlord != user.landlord_profile:
             raise PermissionDenied("Not your property.")
         if prop.group_id:
-            areas = Area.objects.filter(Q(property=prop) | Q(group_id=prop.group_id))
+            areas = PropertyArea.objects.filter(
+                Q(property=prop) | Q(group_id=prop.group_id) | Q(unit_id=prop.unit_id)
+            )
         else:
-            areas = Area.objects.filter(property=prop)
+            areas = PropertyArea.objects.filter(property=prop)
     elif hasattr(user, "tenant_profile"):
         areas = areas_for_tenant_room(prop)
     else:
-        areas = Area.objects.none()
+        areas = PropertyArea.objects.none()
 
     return Response(AreaSerializer(areas.order_by("kind", "name"), many=True).data)

@@ -1,46 +1,31 @@
-# rentium/properties/management/commands/backfill_areas.py
-#
-# Phase A of the area consolidation (standardize on Area, deprecate
-# PropertyArea):
-#
-#   1. SEED: groups and standalone complete units created BEFORE the
-#      seed-on-create signals existed get their default Area set. (This is
-#      why your smoke-test inspection had zero shared sections — the
-#      McKenzie group predates the signal and had no Area rows to match.)
-#
-#   2. CONVERT: every legacy PropertyArea row gets an equivalent Area row:
-#        - on a COMPLETE_UNIT           -> Area(property=unit,  COMMON)
-#        - on a grouped ROOM, shared    -> Area(group=room.group, COMMON)
-#        - on a grouped ROOM, private   -> Area(group=room.group, EXCLUSIVE,
-#                                               exclusive_to=room)
-#        - on a groupless ROOM          -> Area(property=room, COMMON)
-#      count > 1 fans out into numbered rows ("Bathroom", "Bathroom 2"...).
-#      PropertyArea.description has no Area counterpart and is dropped —
-#      it's display prose, not behavior.
-#
-# Idempotent by (target, name) — safe to re-run; already-converted rows are
-# skipped. PropertyArea rows are NOT deleted here (the property UI still
-# reads them until Phase B swaps the serializers to Area); this command just
-# makes Area the complete, authoritative set.
-#
-# Package markers needed if properties/management/ doesn't exist yet:
-#   rentium/properties/management/__init__.py
-#   rentium/properties/management/commands/__init__.py
-#
-# Usage: python manage.py backfill_areas [--dry-run]
+"""Seed default areas wherever the creation signal never fired.
+
+Usage: python manage.py backfill_areas [--dry-run]
+
+This command used to also convert legacy PropertyArea rows into a separate
+`Area` model. That conversion is gone: the two models were merged into
+PropertyArea (which held the real data and the legally load-bearing
+shared_with_landlord/shared_by fields), so there is nothing left to convert —
+only gaps to fill.
+
+The gaps are real. The signals that seed areas on group/unit creation live in
+rentium/ledger/signals.py, which was never imported by LedgerConfig.ready(),
+so every group and complete unit created before that fix has no areas at all.
+That is why a smoke-test inspection came back with zero shared sections. This
+backfills them. Idempotent by (parent, name), so it is safe to re-run.
+"""
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from rentium.properties.areas import Area, seed_default_areas
-from rentium.properties.models import Property, PropertyArea, PropertyGroup
+from rentium.properties.areas import seed_default_areas
+from rentium.properties.models import Property
+from rentium.properties.models import PropertyGroup
+from rentium.properties.models import PropertyUnit
 
 
 class Command(BaseCommand):
-    help = (
-        "Seed default Areas for pre-existing groups/units and convert legacy "
-        "PropertyArea rows into Area rows. Idempotent."
-    )
+    help = "Seed default areas for groups, units and standalone listings. Idempotent."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -52,81 +37,38 @@ class Command(BaseCommand):
     @transaction.atomic
     def handle(self, *args, **options):
         dry = options["dry_run"]
-        seeded_groups = seeded_units = converted = skipped = 0
+        seeded = {"unit": 0, "group": 0, "listing": 0}
 
-        # ---- 1. Seed defaults where the creation signal never fired ------
+        def _seed(label, kwargs, name):
+            if dry:
+                self.stdout.write(f"[dry] would seed defaults for {label} '{name}'")
+            else:
+                created = seed_default_areas(**kwargs)
+                self.stdout.write(
+                    f"Seeded {len(created)} default areas for {label} '{name}'."
+                )
+            seeded[label] += 1
+
+        for unit in PropertyUnit.objects.filter(areas__isnull=True).distinct():
+            _seed("unit", {"unit": unit}, unit.name)
+
         for group in PropertyGroup.objects.filter(areas__isnull=True).distinct():
-            if dry:
-                self.stdout.write(f"[dry] would seed defaults for group {group.name}")
-            else:
-                created = seed_default_areas(group=group)
-                self.stdout.write(
-                    f"Seeded {len(created)} default areas for group '{group.name}'."
-                )
-            seeded_groups += 1
+            _seed("group", {"group": group}, group.name)
 
-        standalone_units = Property.objects.filter(
+        # Standalone complete units: a listing with no unit and no group has
+        # nowhere else for its areas to hang.
+        standalone = Property.objects.filter(
             property_category=Property.PropertyCategory.COMPLETE_UNIT,
-            areas__isnull=True,
+            unit__isnull=True,
+            group__isnull=True,
+            primary_area_associations__isnull=True,
         ).distinct()
-        for unit in standalone_units:
-            if dry:
-                self.stdout.write(f"[dry] would seed defaults for unit {unit.name}")
-            else:
-                created = seed_default_areas(property=unit)
-                self.stdout.write(
-                    f"Seeded {len(created)} default areas for unit '{unit.name}'."
-                )
-            seeded_units += 1
-
-        # ---- 2. Convert legacy PropertyArea rows --------------------------
-        legacy_rows = PropertyArea.objects.select_related(
-            "property__group"
-        ).prefetch_related("shared_by")
-        for pa in legacy_rows:
-            prop = pa.property
-            base_name = pa.get_area_type_display()
-
-            # Resolve target + kind per the mapping above.
-            if prop.property_category == Property.PropertyCategory.COMPLETE_UNIT:
-                target = {"property": prop}
-                kind, exclusive_to = Area.Kind.COMMON, None
-            elif prop.group_id:
-                shared = [p for p in pa.shared_by.all() if p.pk != prop.pk]
-                if shared:
-                    target = {"group": prop.group}
-                    kind, exclusive_to = Area.Kind.COMMON, None
-                else:
-                    target = {"group": prop.group}
-                    kind, exclusive_to = Area.Kind.EXCLUSIVE, prop
-            else:
-                target = {"property": prop}
-                kind, exclusive_to = Area.Kind.COMMON, None
-
-            for n in range(pa.count or 1):
-                name = base_name if n == 0 else f"{base_name} {n + 1}"
-                if dry:
-                    exists = Area.objects.filter(**target, name=name).exists()
-                    verb = "skip (exists)" if exists else "create"
-                    self.stdout.write(
-                        f"[dry] {verb}: Area(name={name!r}, kind={kind}, "
-                        f"target={list(target.values())[0]}, "
-                        f"exclusive_to={exclusive_to})"
-                    )
-                    skipped += int(exists)
-                    converted += int(not exists)
-                    continue
-                _, was_created = Area.objects.get_or_create(
-                    **target,
-                    name=name,
-                    defaults={"kind": kind, "exclusive_to": exclusive_to},
-                )
-                converted += int(was_created)
-                skipped += int(not was_created)
+        for listing in standalone:
+            _seed("listing", {"property": listing}, listing.name)
 
         summary = (
-            f"Groups seeded: {seeded_groups} | Units seeded: {seeded_units} | "
-            f"Legacy rows converted: {converted} | Already present: {skipped}"
+            f"Units seeded: {seeded['unit']} | Groups seeded: {seeded['group']} | "
+            f"Standalone listings seeded: {seeded['listing']}"
         )
         if dry:
             transaction.set_rollback(True)

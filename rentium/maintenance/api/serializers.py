@@ -2,7 +2,7 @@ from django.db.models import Q
 from rest_framework import serializers
 
 from rentium.leases.models import Lease
-from rentium.properties.areas import Area
+from rentium.properties.models import PropertyArea
 from rentium.properties.models import Property
 
 from ..models import WorkOrder, WorkOrderComment, WorkOrderImage
@@ -10,10 +10,15 @@ from ..models import WorkOrder, WorkOrderComment, WorkOrderImage
 
 class AreaSerializer(serializers.ModelSerializer):
     kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+    # The landlord's name for the space, falling back to the area type.
+    label = serializers.CharField(read_only=True)
 
     class Meta:
-        model = Area
-        fields = ["id", "name", "kind", "kind_display", "exclusive_to", "group", "property"]
+        model = PropertyArea
+        fields = [
+            "id", "name", "label", "kind", "kind_display", "area_type",
+            "exclusive_to", "unit", "group", "property",
+        ]
         read_only_fields = fields
 
 
@@ -59,7 +64,7 @@ class WorkOrderSerializer(serializers.ModelSerializer):
         queryset=Property.objects.all(), source="property", write_only=True
     )
     area_id = serializers.PrimaryKeyRelatedField(
-        queryset=Area.objects.all(), source="area", write_only=True, required=False, allow_null=True
+        queryset=PropertyArea.objects.all(), source="area", write_only=True, required=False, allow_null=True
     )
     lease_id = serializers.PrimaryKeyRelatedField(
         queryset=Lease.objects.all(), source="lease", write_only=True, required=False, allow_null=True
