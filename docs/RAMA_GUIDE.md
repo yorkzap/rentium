@@ -201,6 +201,22 @@ Two chain details worth keeping:
   responsible tenant's live lease — otherwise it never appears in the deposit
   position and the gap surfaces at move-out.
 
+### Answer from the record, not from policy
+
+"Who pays for this?" is a question about a work order, not about the
+Constitution. list_work_orders carries `responsible_tenant`,
+`tenant_chargeable` and a plain-sentence `who_pays`, because when none of that
+was in the payload RAMA could not see the answer and proposed a Constitution
+amendment instead.
+
+`amend_constitution` refuses text that says deposit money can be kept or
+deducted without naming what makes that lawful, and offers corrected wording.
+The Constitution is text RAMA reads back as policy and acts on, so a rule
+saying damage "may be deducted from their security deposit after move-out" —
+which RAMA did propose — would have had it repeat that confidently forever, on
+the one topic where being wrong costs double the deposit. The subject is not
+banned; asserting it without the condition is.
+
 ### Capability gaps
 
 `log_capability_gap` dedupes restatements: identical text first, then a

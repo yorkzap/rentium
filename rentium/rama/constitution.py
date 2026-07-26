@@ -21,6 +21,68 @@ SECTION_KEYS = ("balances", "vendors", "tenant-policies", "workflows")
 _VALID_RULE_TYPES = {c for c, _ in RamaConstitutionRule.RuleType.choices}
 
 
+import re
+
+# --------------------------------------------------- unlawful-policy guard
+# The Constitution is free text that RAMA reads back as the landlord's policy,
+# so whatever is written here it will later act on and advise from. That makes
+# one topic dangerous to get wrong.
+#
+# Asked "whose deposit does this come out of?", RAMA proposed writing:
+#     "Tenant-caused damage ... may be deducted from their security deposit
+#      after move-out."
+# Under the BC RTA that is simply not true. A landlord may keep deposit money
+# only with the tenant's WRITTEN agreement or by applying to the RTB within 15
+# days — and getting it wrong loses the claim AND makes double the deposit
+# payable. Enshrining it would have had RAMA confidently repeat it forever.
+#
+# The guard does not ban the subject. It requires that any rule about taking
+# money from a deposit also state the condition that makes it lawful.
+_DEPOSIT_WORDS = re.compile(
+    r"\b(security |pet |damage )?deposit(s)?\b", re.IGNORECASE
+)
+_TAKING_WORDS = re.compile(
+    r"\b(deduct|deducted|deduction|withhold|withheld|retain|retained|keep|"
+    r"kept|apply|applied|offset|take|taken)\b",
+    re.IGNORECASE,
+)
+_SAFEGUARD_WORDS = re.compile(
+    r"(written agreement|agrees? in writing|in writing|rtb|residential "
+    r"tenancy branch|dispute resolution|arbitration|15 day|fifteen day)",
+    re.IGNORECASE,
+)
+
+
+def unlawful_deposit_language(text: str) -> str | None:
+    """Reason to refuse this text, or None.
+
+    Only fires when a passage talks about TAKING money from a deposit without
+    naming the condition that makes it lawful.
+    """
+    body = text or ""
+    if not body.strip():
+        return None
+    for chunk in re.split(r"[\n.;]+", body):
+        if not _DEPOSIT_WORDS.search(chunk):
+            continue
+        if not _TAKING_WORDS.search(chunk):
+            continue
+        if _SAFEGUARD_WORDS.search(chunk):
+            continue
+        return (
+            "This would record that deposit money can be kept or deducted "
+            "without saying what makes that lawful. Under the BC RTA a "
+            "landlord may keep any part of a deposit ONLY with the tenant's "
+            "written agreement, or by applying to the RTB within 15 days of "
+            "the later of the tenancy ending and receiving their forwarding "
+            "address. Missing that loses the claim AND makes double the "
+            "deposit payable — so a policy phrased this way would be acted on "
+            "and would cost the landlord money.\n\n"
+            f"Offending passage: {chunk.strip()[:200]!r}"
+        )
+    return None
+
+
 def active_sections(landlord):
     return RamaConstitutionSection.objects.filter(landlord=landlord, is_active=True)
 

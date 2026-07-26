@@ -2146,7 +2146,7 @@ def amend_constitution(
     "amount":"5000.00"}}, {"action":"remove","rule_id":3}].
     ALWAYS preview first (no confirm) and show the landlord exactly what will
     change; confirm=yes applies. Never amend silently."""
-    from .constitution import amend, parse_rule_changes
+    from .constitution import amend, parse_rule_changes, unlawful_deposit_language
     from .domain_crud import _confirmed, _preview
     from .models import RamaConstitutionSection
 
@@ -2156,6 +2156,23 @@ def amend_constitution(
     changes, err = parse_rule_changes(rule_changes)
     if err:
         return {"error": err}
+
+    # Whatever goes in here, RAMA reads back as policy and acts on later.
+    unlawful = unlawful_deposit_language(f"{title}\n{new_body_md}")
+    if unlawful:
+        return {
+            "error": unlawful,
+            "suggested_wording": (
+                "Tenant-caused damage is charged to the tenant's ledger as a "
+                "claim they owe. It is not taken from their deposit unless "
+                "they agree in writing, or the landlord applies to the RTB "
+                "within 15 days of the tenancy ending."
+            ),
+            "relay_instruction": (
+                "Do NOT amend the Constitution with the original wording. "
+                "Explain why to the landlord and offer suggested_wording."
+            ),
+        }
 
     preview = {
         "section": key_s,

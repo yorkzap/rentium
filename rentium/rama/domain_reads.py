@@ -31,6 +31,36 @@ def _match_property(name: str, query: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _who_pays(wo) -> str:
+    """One plain sentence, so a weak model relays rather than reasons.
+
+    "Who pays for this?" is a question about THIS job's record, not about
+    policy. Answer it from the record.
+    """
+    if wo.tenant_chargeable and wo.responsible_tenant_id:
+        who = wo.responsible_tenant.user.name
+        if wo.cost is None:
+            return (
+                f"{who} — charged to them once a cost is recorded on the job."
+            )
+        return (
+            f"{who} — ${wo.cost} has been charged to their ledger as a claim "
+            "they owe. It is NOT taken from their deposit automatically: that "
+            "needs their written agreement or an RTB application within 15 "
+            "days of the tenancy ending."
+        )
+    if wo.responsible_tenant_id:
+        return (
+            f"{wo.responsible_tenant.user.name} caused it, but it is not marked "
+            "chargeable, so the landlord is paying. Use attribute_work_order "
+            "with chargeable=yes to claim it from them."
+        )
+    return (
+        "The landlord — nobody has been recorded as responsible. If a tenant "
+        "caused it, use attribute_work_order to say who."
+    )
+
+
 def list_work_orders(
     landlord,
     *,
@@ -44,7 +74,8 @@ def list_work_orders(
 
     today = date.today()
     qs = WorkOrder.objects.for_landlord(landlord).select_related(
-        "property", "area", "lease"
+        "property", "unit", "unit__holding", "area", "lease",
+        "responsible_tenant__user",
     )
     if not include_closed:
         qs = qs.exclude(
@@ -85,7 +116,9 @@ def list_work_orders(
                 "id": str(wo.pk),
                 "title": wo.title,
                 "description": (wo.description or "")[:400],
-                "property": wo.property.name if wo.property_id else "",
+                # place_name covers both targets; wo.property is null for a
+                # fault in shared space, which used to render as "".
+                "property": wo.place_name,
                 "area": wo.area.name if wo.area_id else "",
                 "lease_id": str(wo.lease_id) if wo.lease_id else None,
                 "status": wo.status,
@@ -103,6 +136,16 @@ def list_work_orders(
                 if wo.completed_date
                 else None,
                 "cost": str(wo.cost) if wo.cost is not None else None,
+                # WHO PAYS. Asked "who will pay for this?", RAMA could not see
+                # any of this and proposed a Constitution amendment instead of
+                # reading the answer that was already recorded.
+                "responsible_tenant": (
+                    wo.responsible_tenant.user.name
+                    if wo.responsible_tenant_id
+                    else None
+                ),
+                "tenant_chargeable": wo.tenant_chargeable,
+                "who_pays": _who_pays(wo),
                 "contractor_name": wo.contractor_name or "",
                 "contractor_phone": str(wo.contractor_phone or ""),
                 "sla_due_at": wo.sla_due_at.isoformat() if wo.sla_due_at else None,
