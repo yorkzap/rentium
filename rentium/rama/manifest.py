@@ -109,9 +109,13 @@ PROPERTY = EntitySpec(
         FieldSpec("status", "Status", "enum", display="get_status_display",
                   editable=True),
         FieldSpec("property_category", "Category", "enum",
-                  display="get_property_category_display"),
+                  display="get_property_category_display", editable=True),
         FieldSpec("room_type", "Room type", "enum", display="get_room_type_display"),
         FieldSpec("unit_type", "Unit type", "enum", display="get_unit_type_display"),
+        FieldSpec("bedrooms", "Bedrooms", "number"),
+        FieldSpec("bathrooms", "Bathrooms", "number"),
+        FieldSpec("max_occupancy", "Maximum occupancy", "number"),
+        FieldSpec("square_footage", "Square footage", "number"),
         FieldSpec("address", "Address", editable=True),
         FieldSpec("city", "City", editable=True),
         FieldSpec("province", "Province", "enum", editable=True),
@@ -344,11 +348,35 @@ PROPERTY_GROUP = EntitySpec(
     ),
 )
 
+BUSINESS_DOCUMENT = EntitySpec(
+    key="business_document",
+    model="rama.RamaDocument",
+    label="Business document",
+    scope_path="landlord",
+    fields=[
+        FieldSpec("title", "Title"),
+        FieldSpec("original_filename", "Original filename"),
+        FieldSpec("status", "Status", "enum", display="get_status_display"),
+        FieldSpec("kind", "Document type", "enum", display="get_kind_display"),
+        FieldSpec("issuer", "Issuer"),
+        FieldSpec("document_date", "Document date", "date"),
+        FieldSpec("due_date", "Due date", "date"),
+        FieldSpec("canonical_filename", "Canonical filename"),
+    ],
+    links=LinkSpec(
+        page="/dashboard/documents?document={id}",
+        lookup=("id", "title", "original_filename", "canonical_filename"),
+        label_field="title",
+        downloads=("archival PDF/A",),
+    ),
+)
+
 MANIFEST: dict[str, EntitySpec] = {
     e.key: e
     for e in (
         PROPERTY, LEASE, LEASE_TENANT, WORK_ORDER, INQUIRY, APPOINTMENT,
         LEDGER_ENTRY, INSPECTION, INVENTORY, CONVERSATION, PROPERTY_GROUP,
+        BUSINESS_DOCUMENT,
     )
 }
 

@@ -55,6 +55,9 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
     property_name = serializers.CharField(
         source="property.name", read_only=True, allow_null=True
     )
+    holding_name = serializers.CharField(
+        source="holding.name", read_only=True, allow_null=True
+    )
 
     # Context for the Financial UI's expandable rows: which lease a charge
     # belongs to (human-readable number) and what kind of space it's for
@@ -102,6 +105,8 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
             "description",
             "property",
             "property_name",
+            "holding",
+            "holding_name",
             "property_category",
             "lease",
             "lease_number",

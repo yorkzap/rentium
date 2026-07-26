@@ -24,6 +24,14 @@ from .models import ShowcaseSlugHistory
 # and can't be averaged out by repeated requests.
 JITTER_DEGREES = Decimal("0.0025")
 
+# City landing pages intentionally remain available while inventory is empty.
+# Every city linked from the permanent public navigation belongs here; database
+# discovery below adds cities as landlords onboard properties elsewhere.
+EVERGREEN_PUBLIC_CITIES = {
+    ("bc", "saanich"): "Saanich",
+    ("bc", "victoria"): "Victoria",
+}
+
 
 def jittered_coords(prop: Property) -> tuple[float, float] | None:
     """
@@ -154,15 +162,25 @@ def known_city(province_code: str, city_slug: str) -> dict | None:
     city from ANY property we hold there, public or not, and let the page
     render its evergreen content with an empty results grid.
     """
+    province_key = province_code.lower()
+    city_key = city_slug.lower()
     prop = (
         Property.objects.filter(
-            province_code=province_code.lower(), city_slug=city_slug.lower()
+            province_code=province_key, city_slug=city_key
         )
         .only("city", "province_code")
         .first()
     )
     if not prop:
-        return None
+        city_name = EVERGREEN_PUBLIC_CITIES.get((province_key, city_key))
+        if not city_name:
+            return None
+        return {
+            "city": city_name,
+            "city_slug": city_key,
+            "province_code": province_key,
+            "province_name": PROVINCE_NAMES.get(province_key, ""),
+        }
     return {
         "city": prop.city,
         "city_slug": prop.city_slug,
@@ -172,18 +190,34 @@ def known_city(province_code: str, city_slug: str) -> dict | None:
 
 
 def all_public_cities() -> list[dict]:
-    """For the sitemap and the city index."""
+    """For discovery and the sitemap, including evergreen empty markets."""
     rows = (
         Property.objects.public()
         .values("city", "city_slug", "province_code")
         .annotate(count=Count("id"))
         .order_by("province_code", "city")
     )
-    return [
-        {
-            **r,
-            "province_name": PROVINCE_NAMES.get(r["province_code"], ""),
+    cities = {
+        (province, slug): {
+            "city": name,
+            "city_slug": slug,
+            "province_code": province,
+            "province_name": PROVINCE_NAMES.get(province, ""),
+            "count": 0,
         }
-        for r in rows
-        if r["city_slug"] and r["province_code"]
-    ]
+        for (province, slug), name in EVERGREEN_PUBLIC_CITIES.items()
+    }
+    for row in rows:
+        if not row["city_slug"] or not row["province_code"]:
+            continue
+        cities[(row["province_code"], row["city_slug"])] = {
+            **row,
+            "province_name": PROVINCE_NAMES.get(row["province_code"], ""),
+        }
+    return sorted(
+        cities.values(),
+        key=lambda city: (
+            city["province_code"],
+            city["city"].lower(),
+        ),
+    )

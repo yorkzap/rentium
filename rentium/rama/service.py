@@ -19,7 +19,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from django.utils import timezone
 
@@ -1291,6 +1291,308 @@ def _recent_writes_note(landlord, conversation_id, limit: int = 10) -> list[str]
     return deduped[-6:]
 
 
+_REFERENT_WORDS = {
+    "",
+    "it",
+    "this",
+    "that",
+    "this one",
+    "that one",
+    "the property",
+    "that property",
+    "this property",
+    "the listing",
+    "that listing",
+    "this listing",
+    "the unit",
+    "that unit",
+    "this unit",
+    "the suite",
+    "that suite",
+    "this suite",
+    "there",
+}
+
+
+def _conversation_focus(
+    landlord,
+    conversation_id,
+    message: str,
+    live_portfolio: dict,
+) -> dict:
+    """Resolve what short follow-ups such as "it" most likely refer to.
+
+    This is conversation-scoped and grounded in live landlord-owned records.
+    Explicit entity names in the current message win, then recent tool targets,
+    then recent user messages. It is a routing hint, never authority to cross
+    ownership boundaries; every called tool still performs its normal resolver.
+    """
+    listings = live_portfolio.get("listings") or []
+    by_name = {
+        str(row.get("name")).casefold(): row
+        for row in listings
+        if row.get("name")
+    }
+
+    def named_in(text: str):
+        lowered = (text or "").casefold()
+        matches = [
+            (name, row) for name, row in by_name.items() if name and name in lowered
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda item: len(item[0]))[1]
+
+    row = named_in(message)
+    source = "current message" if row else ""
+    recent = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+    ).order_by("-created_at")[:24]
+    if row is None:
+        for audit_row in recent:
+            content = audit_row.content or {}
+            if audit_row.kind == RamaAudit.Kind.TOOL_CALL:
+                args = content.get("arguments") or {}
+                result = content.get("result") or {}
+                candidates = [
+                    args.get("property_query"),
+                    args.get("property_name"),
+                    (result.get("property") or {}).get("name")
+                    if isinstance(result.get("property"), dict)
+                    else result.get("property"),
+                    (result.get("preview") or {}).get("property")
+                    if isinstance(result.get("preview"), dict)
+                    else None,
+                ]
+                for candidate in candidates:
+                    match = by_name.get(str(candidate or "").casefold())
+                    if match:
+                        row = match
+                        source = f"recent {content.get('tool') or 'tool'} target"
+                        break
+            elif audit_row.kind == RamaAudit.Kind.USER_MESSAGE:
+                row = named_in(content.get("text", ""))
+                if row:
+                    source = "recent user message"
+            if row:
+                break
+    if row is None:
+        return {}
+    return {
+        "property": {
+            "name": row.get("name"),
+            "category": row.get("category"),
+            "primary_type": row.get("primary_type"),
+            "group": row.get("group"),
+            "lease_number": row.get("lease_number"),
+        },
+        "source": source,
+        "instruction": (
+            "Resolve it/this/that/the property/the unit/the suite to this property "
+            "unless the landlord explicitly names another entity. Follow-up questions "
+            "inherit the topic but remain read-only."
+        ),
+    }
+
+
+def _contextualize_tool_arguments(
+    tool_name: str, arguments: dict | None, focus: dict
+) -> dict:
+    """Replace pronoun placeholders with the grounded conversation target."""
+    args = dict(arguments or {})
+    prop_name = ((focus.get("property") or {}).get("name") or "").strip()
+    if not prop_name:
+        return args
+
+    def is_referent(value) -> bool:
+        return str(value or "").strip().casefold() in _REFERENT_WORDS
+
+    if "property_query" in args and is_referent(args.get("property_query")):
+        args["property_query"] = prop_name
+    if (
+        tool_name in {"update", "read", "link"}
+        and str(args.get("entity") or "").strip().casefold() == "property"
+        and is_referent(args.get("query"))
+    ):
+        args["query"] = prop_name
+    return args
+
+
+def _conversation_attachment_focus(landlord, conversation_id) -> dict:
+    """Keep an unresolved attachment visible after its original upload turn."""
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.USER_MESSAGE,
+    ).order_by("-created_at")[:12]
+    texts = [str((row.content or {}).get("text") or "") for row in rows]
+    combined = "\n".join(texts)
+    upload_ids = set(
+        re.findall(r"upload_id=([0-9a-fA-F-]{32,36})", combined)
+    )
+    document_ids = set(
+        re.findall(r"Business document ([0-9a-fA-F-]{32,36})", combined)
+    )
+    if upload_ids:
+        from .models import RamaUpload
+
+        upload_ids = {
+            str(pk)
+            for pk in RamaUpload.objects.filter(
+                landlord=landlord,
+                used_at__isnull=True,
+                pk__in=upload_ids,
+            ).values_list("pk", flat=True)
+        }
+    if document_ids:
+        from .models import RamaDocument
+
+        document_ids = {
+            str(pk)
+            for pk in RamaDocument.objects.filter(
+                landlord=landlord,
+                pk__in=document_ids,
+            ).values_list("pk", flat=True)
+        }
+    if not upload_ids and not document_ids:
+        return {}
+    lowered = combined.casefold()
+    business_terms = (
+        "document",
+        "mail",
+        "letter",
+        "receipt",
+        "invoice",
+        "notice",
+        "statement",
+        "paperwork",
+        "scotiabank",
+        "bank",
+    )
+    business_record = any(term in lowered for term in business_terms)
+    issuer = "Scotiabank" if "scotiabank" in lowered else ""
+    document_date = ""
+    for pattern, fmt in (
+        (r"\b([A-Z][a-z]+ \d{1,2} \d{4})\b", "%B %d %Y"),
+        (r"\b(\d{1,2} [A-Z][a-z]+ \d{4})\b", "%d %B %Y"),
+    ):
+        match = re.search(pattern, combined)
+        if not match:
+            continue
+        try:
+            document_date = datetime.strptime(match.group(1), fmt).date().isoformat()
+            break
+        except ValueError:
+            continue
+    return {
+        "unresolved_upload_ids": sorted(upload_ids),
+        "document_ids": sorted(document_ids),
+        "landlord_described_as_business_record": business_record,
+        "issuer": issuer or None,
+        "document_date": document_date or None,
+        "instruction": (
+            "This attachment remains the subject of the conversation. "
+            + (
+                "Treat it as a business document. Use catalog_business_document; "
+                "do not use attach_photo_to_listing."
+                if business_record
+                else "Use the landlord's current words to decide document vs listing photo."
+            )
+        ),
+    }
+
+
+def _address_scope_from_message(message: str, live_portfolio: dict) -> str:
+    """Return one exact known legal address mentioned in the current message."""
+    from .document_services import _normalise_address
+
+    needle = _normalise_address(message or "")
+    addresses = {
+        str(row.get("address") or "").strip()
+        for row in (live_portfolio.get("listings") or [])
+        if row.get("address")
+        and _normalise_address(str(row.get("address"))) in needle
+    }
+    return next(iter(addresses)) if len(addresses) == 1 else ""
+
+
+def _document_preview_reply(result: dict) -> str:
+    preview = result.get("preview") or {}
+    children = preview.get("child_listings") or []
+    parts = [
+        "Ready to store this as a business document for the physical property:",
+        f"• Address: {preview.get('scope')}",
+        "• Individual listing: none",
+    ]
+    if children:
+        parts.append("• Child listings under it: " + ", ".join(children))
+    if preview.get("issuer"):
+        parts.append(f"• Issuer: {preview['issuer']}")
+    if preview.get("document_date"):
+        parts.append(f"• Document date: {preview['document_date']}")
+    if preview.get("convert_photo_to_ocr_document"):
+        parts.append("• Storage: OCR + archival PDF")
+    if preview.get("create_holding"):
+        parts.append("• A physical holding will be created for this exact address")
+    parts.append("Reply yes to apply this filing, or no to cancel.")
+    return "\n".join(parts)
+
+
+def _document_location_request(message: str) -> bool:
+    text = (message or "").casefold()
+    terms = ("directory", "folder", "location", "path", "manually", "manual")
+    return any(term in text for term in terms) or (
+        "where" in text and any(term in text for term in ("document", "file", "stored"))
+    )
+
+
+def _recent_document_id(landlord, conversation_id, message: str) -> str:
+    explicit = re.search(
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,28}\b", message or ""
+    )
+    if explicit:
+        return explicit.group(0)
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+    ).order_by("-created_at")[:20]
+    for row in rows:
+        content = row.content or {}
+        args = content.get("arguments") or {}
+        result = content.get("result") or {}
+        for candidate in (
+            result.get("document_id") if isinstance(result, dict) else None,
+            args.get("document_id") if isinstance(args, dict) else None,
+        ):
+            if candidate:
+                return str(candidate)
+    return ""
+
+
+def _document_location_reply(result: dict) -> str:
+    parts = [
+        f"Document: {result.get('title')}",
+        f"Storage key: {result.get('storage_key')}",
+        f"Manual location: {result.get('manual_location')}",
+    ]
+    if result.get("container_path"):
+        parts.append(f"Container path: {result['container_path']}")
+    else:
+        parts.append(
+            "Container path: none — production stores this file in object storage."
+        )
+    parts.extend(
+        [
+            f"Documents page: {result.get('documents_page')}",
+            "Authenticated download endpoint: "
+            f"{result.get('authenticated_download_path')}",
+        ]
+    )
+    return "\n".join(parts)
+
+
 def _delegate(landlord, tool_name: str, arguments: dict) -> dict:
     """Run a bounded sub-turn for a delegation call from the General.
 
@@ -1428,6 +1730,20 @@ def run_turn(
         "\n\n## LIVE PORTFOLIO (authoritative — overrides chat history)\n"
         + json.dumps(safe_context, indent=None, separators=(",", ":"))
     )
+    focus = _conversation_focus(
+        landlord, conversation_id, message, safe_context
+    )
+    if focus:
+        system += (
+            "\n\n## CONVERSATION FOCUS (deterministic follow-up resolution)\n"
+            + json.dumps(focus, separators=(",", ":"))
+        )
+    attachment_focus = _conversation_attachment_focus(landlord, conversation_id)
+    if attachment_focus:
+        system += (
+            "\n\n## ACTIVE ATTACHMENT FOCUS (persists across follow-ups)\n"
+            + json.dumps(attachment_focus, separators=(",", ":"))
+        )
     if channel in ("telegram", "whatsapp"):
         system += (
             "\n\n## MESSAGING STYLE (you are in a " + channel + " chat)\n"
@@ -1794,6 +2110,88 @@ def run_turn(
                     result.get("error") or result.get("message") or result
                 )
 
+    # Deterministic document routing: weak models repeatedly treated photographed
+    # bank mail as a listing photo. Once intent=document and an exact known legal
+    # address are present, the backend itself creates the holding-level preview.
+    if (
+        deterministic_reply is None
+        and pending_plan is None
+        and attachment_focus.get("landlord_described_as_business_record")
+    ):
+        attachment_ids = (
+            attachment_focus.get("unresolved_upload_ids") or []
+        ) + (attachment_focus.get("document_ids") or [])
+        scope_query = _address_scope_from_message(message, safe_context)
+        if len(attachment_ids) == 1 and scope_query:
+            is_upload = bool(attachment_focus.get("unresolved_upload_ids"))
+            arguments = {
+                "scope_query": scope_query,
+                "issuer": attachment_focus.get("issuer") or "",
+                "document_date": attachment_focus.get("document_date") or "",
+                (
+                    "upload_id" if is_upload else "document_id"
+                ): attachment_ids[0],
+            }
+            result = execute(
+                "catalog_business_document", arguments, landlord=landlord
+            )
+            safe_result = json.loads(json.dumps(result, default=str))
+            tools_used.append("catalog_business_document")
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": "catalog_business_document",
+                    "arguments": arguments,
+                    "result": safe_result,
+                    "deterministic_routing": True,
+                },
+            )
+            if result.get("needs_confirm"):
+                save_single(
+                    landlord,
+                    conversation_id,
+                    "catalog_business_document",
+                    arguments,
+                )
+                deterministic_reply = _document_preview_reply(result)
+            elif result.get("error"):
+                deterministic_reply = str(result["error"])
+        elif len(attachment_ids) == 1 and not scope_query:
+            deterministic_reply = (
+                "Which physical property address does this business document "
+                "belong to? You can also say it applies to the whole portfolio. "
+                "I will file it at the holding level—not against a room or unit."
+            )
+
+    if (
+        deterministic_reply is None
+        and pending_plan is None
+        and _document_location_request(message)
+    ):
+        document_id = _recent_document_id(landlord, conversation_id, message)
+        if document_id:
+            result = execute(
+                "business_document_location",
+                {"document_id": document_id},
+                landlord=landlord,
+            )
+            safe_result = json.loads(json.dumps(result, default=str))
+            tools_used.append("business_document_location")
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": "business_document_location",
+                    "arguments": {"document_id": document_id},
+                    "result": safe_result,
+                    "deterministic_routing": True,
+                },
+            )
+            deterministic_reply = (
+                str(result["error"])
+                if result.get("error")
+                else _document_location_reply(result)
+            )
+
     # Bare yes/no is fully handled above — answer without any provider
     # round-trip, so a weak model can never "narrate" actions that didn't
     # happen or spin up a fresh plan after a cancellation.
@@ -1862,7 +2260,9 @@ def run_turn(
                 }
             )
             for call in turn.tool_calls:
-                effective_arguments = dict(call.arguments or {})
+                effective_arguments = _contextualize_tool_arguments(
+                    call.name, call.arguments, focus
+                )
                 if call.name == "create_group_room":
                     effective_arguments = _enrich_empty_group_room_arguments(
                         landlord,

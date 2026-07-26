@@ -74,6 +74,28 @@ screen.
 **Bottom line:** your Mistral Small key *is* working (it runs the Corporal). A
 smarter decision-layer model is supported by the architecture but not yet
 switch-on-able from the UI.
+# Document intelligence
+
+RAMA can ingest receipts, invoices, tax notices, mortgage correspondence, and
+other business records from the chat attachment control or the dashboard
+Documents page. See `RAMA_DOCUMENT_INTELLIGENCE.md` for the OCR/PDF-A pipeline,
+property-holding hierarchy, filing convention, review boundary, and ledger
+integration.
+
+## Property vocabulary and corrections
+
+RAMA uses three distinct levels:
+
+- **Holding / physical property** — a house or building, such as 950 McKenzie.
+- **Property group / household unit** — room listings sharing common spaces.
+- **Rental listing** — one rentable room or one self-contained complete unit.
+
+When “property” is ambiguous, RAMA reports both physical holdings and rental
+listings. Type and layout corrections use structured fields
+(`property_category`, `unit_type`, bedrooms, bathrooms, and internal areas);
+RAMA never rewrites a listing description to simulate those facts. Questions
+remain read-only, and missing layout facts are reported as not recorded.
+
 ## Routine property operations
 
 High-confidence renames, grouped room listings, dashboard navigation, and room

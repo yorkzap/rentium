@@ -696,6 +696,167 @@ def test_chat_reuses_conversation_history(landlord, settings):
     assert sent[1]["text"] == "Hello!"
 
 
+def test_followup_pronoun_resolves_to_conversation_property(landlord, settings):
+    """'It' in a follow-up is resolved server-side, not left to a weak model."""
+    from rentium.properties.models import Property
+    from rentium.rama.models import RamaAudit, RamaPendingPlan
+
+    _enable_rama(landlord, settings=settings)
+    prop = Property.objects.create(
+        landlord=landlord,
+        name="Garden Suite",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    client = _client_for(landlord)
+    first = _chat(
+        client,
+        ScriptedProvider([Turn(text="Garden Suite is currently a Private Room.")]),
+        {"message": "Tell me about Garden Suite"},
+    ).json()
+
+    second_provider = ScriptedProvider(
+        [
+            Turn(
+                tool_calls=[
+                    ToolCall(
+                        id="u1",
+                        name="update_property",
+                        arguments={
+                            "property_query": "it",
+                            "property_category": "COMPLETE_UNIT",
+                            "unit_type": "GARDEN_SUITE",
+                        },
+                    )
+                ]
+            ),
+            Turn(text="I prepared the structured classification correction."),
+        ]
+    )
+    second = _chat(
+        client,
+        second_provider,
+        {
+            "message": "make it a full unit",
+            "conversation_id": first["conversation_id"],
+        },
+    ).json()
+
+    assert "## CONVERSATION FOCUS" in second_provider.requests[0]["system"]
+    assert '"name":"Garden Suite"' in second_provider.requests[0]["system"]
+    audit = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=second["conversation_id"],
+        kind=RamaAudit.Kind.TOOL_CALL,
+        content__tool="update_property",
+    ).latest("created_at")
+    assert audit.content["arguments"]["property_query"] == "Garden Suite"
+    pending = RamaPendingPlan.objects.get(conversation_id=second["conversation_id"])
+    assert pending.steps.get().arguments["property_query"] == "Garden Suite"
+    prop.refresh_from_db()
+    assert prop.property_category == Property.PropertyCategory.ROOM
+
+
+def test_business_photo_attachment_focus_persists_across_followups(
+    landlord, settings
+):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from rentium.properties.models import Property
+    from rentium.rama.models import RamaUpload
+
+    _enable_rama(landlord, settings=settings)
+    Property.objects.create(
+        landlord=landlord,
+        name="Room C",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    staged = RamaUpload.objects.create(
+        landlord=landlord,
+        image=SimpleUploadedFile("bank-letter.jpg", b"photo"),
+    )
+    client = _client_for(landlord)
+    first_provider = ScriptedProvider([Turn(text="wrong model response")])
+    first = _chat(
+        client,
+        first_provider,
+        {
+            "message": "This document was sent by Scotiabank. Store it carefully.",
+            "upload_ids": [str(staged.pk)],
+        },
+    ).json()
+    assert first_provider.requests == []
+    assert "physical property address" in first["reply"]
+    followup = ScriptedProvider([Turn(text="I will file it at the holding level.")])
+    second = _chat(
+        client,
+        followup,
+        {
+            "message": "Not a listing—the property 950 McKenzie Ave overall.",
+            "conversation_id": first["conversation_id"],
+        },
+    ).json()
+    assert followup.requests == []
+    assert "Address: 950 McKenzie Ave" in second["reply"]
+    assert "Individual listing: none" in second["reply"]
+    assert second["pending_plan"] is not None
+
+
+def test_document_directory_question_is_answered_deterministically(
+    landlord, settings
+):
+    import uuid
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from rentium.rama.document_services import ingest_document
+    from rentium.rama.models import RamaAudit
+
+    _enable_rama(landlord, settings=settings)
+    document, _ = ingest_document(
+        landlord=landlord,
+        upload=SimpleUploadedFile(
+            "notice.pdf", b"%PDF-location", content_type="application/pdf"
+        ),
+    )
+    conversation_id = uuid.uuid4()
+    RamaAudit.objects.create(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+        content={
+            "tool": "catalog_business_document",
+            "arguments": {"document_id": str(document.pk)},
+            "result": {
+                "updated": True,
+                "catalogued": True,
+                "document_id": str(document.pk),
+            },
+        },
+    )
+    provider = ScriptedProvider([Turn(text="I have no directory path.")])
+    body = _chat(
+        _client_for(landlord),
+        provider,
+        {
+            "message": "Tell me the directory/location so I can view it manually",
+            "conversation_id": str(conversation_id),
+        },
+    ).json()
+    assert provider.requests == []
+    assert "Storage key: business_documents/inbox/" in body["reply"]
+    assert "Manual location:" in body["reply"]
+    assert "Container path:" in body["reply"]
+    assert "/dashboard/documents" in body["reply"]
+
+
 def test_chat_gates(landlord, tenant, settings):
     provider = ScriptedProvider([Turn(text="hi")])
     # Tenant never
@@ -2339,6 +2500,31 @@ def test_list_inspections_includes_checklist(landlord, bc_lease, signed_tenant):
 # ---------------------------------------------------------------------------
 
 
+def test_create_property_infers_unit_from_name(landlord):
+    """A 'garden suite' name must not be silently downgraded to a Private Room
+    when the model defaults property_category=ROOM."""
+    from rentium.properties.models import Property
+    from rentium.rama import domain_crud as crud
+
+    crud.create_property(
+        landlord, name="McKenzie Garden Suite - Unit B", address="950 McKenzie Ave",
+        city="Victoria", province="BC", property_category="ROOM",
+        room_type="PRIVATE", asking_rent="2000", confirm="yes",
+    )
+    p = Property.objects.get(landlord=landlord, name="McKenzie Garden Suite - Unit B")
+    assert p.property_category == "COMPLETE_UNIT"
+    assert p.get_unit_type_display() == "Garden Suite"
+
+    # A genuine room is NOT reclassified.
+    crud.create_property(
+        landlord, name="Back Bedroom", address="9 X", city="Victoria",
+        province="BC", property_category="ROOM", confirm="yes",
+    )
+    assert Property.objects.get(
+        landlord=landlord, name="Back Bedroom"
+    ).property_category == "ROOM"
+
+
 def test_create_property_accepts_human_type_values(landlord):
     """Regression: a Garden Suite failed because 'Garden Suite' uppercased to
     'GARDEN SUITE' (space) — not the enum code — and the error was hidden. Now
@@ -2363,6 +2549,163 @@ def test_create_property_accepts_human_type_values(landlord):
         confirm="yes",
     )
     assert "error" in bad and "unit_type must be one of" in bad["error"]
+
+
+def test_update_property_reclassifies_garden_suite_structurally(landlord):
+    from rentium.properties.models import Property
+    from rentium.rama import domain_crud as crud
+
+    prop = Property.objects.create(
+        landlord=landlord,
+        name="Garden Suite",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+        description="Original public copy",
+    )
+
+    preview = crud.update_property(
+        landlord,
+        property_query="Garden Suite",
+        property_category="full unit",
+        unit_type="garden suite",
+        bedrooms="1",
+    )
+    assert preview["needs_confirm"] is True
+    assert preview["preview"]["changes"]["property_category"] == "COMPLETE_UNIT"
+    assert "description" not in preview["preview"]["changes"]
+    assert prop.property_category == Property.PropertyCategory.ROOM
+
+    done = crud.update_property(
+        landlord,
+        property_query="Garden Suite",
+        property_category="complete unit",
+        unit_type="Garden Suite",
+        bedrooms="1",
+        bathrooms="1",
+        confirm="yes",
+    )
+    assert done["updated"] is True
+    prop.refresh_from_db()
+    assert prop.property_category == Property.PropertyCategory.COMPLETE_UNIT
+    assert prop.unit_type == Property.UnitType.GARDEN_SUITE
+    assert prop.room_type is None
+    assert prop.group_id is None
+    assert prop.bedrooms == 1
+    assert prop.bathrooms == Decimal("1")
+    assert prop.description == "Original public copy"
+
+
+def test_generic_update_routes_listing_type_alias_to_structured_update(landlord):
+    """Regression for the real chat failure: a weak model used listing_type
+    through generic update and incorrectly logged a capability gap."""
+    from rentium.properties.models import Property
+    from rentium.rama.domain_write import update
+
+    prop = Property.objects.create(
+        landlord=landlord,
+        name="Garden Suite",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    preview = update(
+        landlord,
+        entity="property",
+        query="Garden Suite",
+        changes="listing_type=Full Unit",
+    )
+    assert preview["needs_confirm"] is True
+    assert preview["action"] == "update_property"
+    assert preview["preview"]["changes"]["property_category"] == "COMPLETE_UNIT"
+    assert preview["preview"]["changes"]["unit_type"] == "GARDEN_SUITE"
+
+    done = update(
+        landlord,
+        entity="property",
+        query="Garden Suite",
+        changes="listing_type=Full Unit",
+        confirm="yes",
+    )
+    assert done["updated"] is True
+    prop.refresh_from_db()
+    assert prop.property_category == Property.PropertyCategory.COMPLETE_UNIT
+    assert prop.unit_type == Property.UnitType.GARDEN_SUITE
+
+
+def test_update_property_blocks_legal_type_change_when_lease_exists(landlord):
+    from rentium.leases.models import Lease
+    from rentium.properties.models import Property
+    from rentium.rama import domain_crud as crud
+
+    prop = Property.objects.create(
+        landlord=landlord,
+        name="Leased Room",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    Lease.objects.create(
+        landlord=landlord,
+        property=prop,
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.DRAFT,
+        start_date=date.today(),
+        is_month_to_month=True,
+        total_rent=Decimal("900"),
+    )
+    out = crud.update_property(
+        landlord,
+        property_query=prop.name,
+        property_category="COMPLETE_UNIT",
+        unit_type="GARDEN_SUITE",
+    )
+    assert "error" in out
+    assert "lease records" in out["error"]
+
+
+def test_property_inventory_distinguishes_holdings_listings_and_layout(landlord):
+    from rentium.properties.models import Property, PropertyArea, PropertyHolding
+    from rentium.rama.union import property_inventory
+
+    holding = PropertyHolding.objects.create(
+        landlord=landlord,
+        name="McKenzie House",
+        address="950 McKenzie Ave",
+        city="Victoria",
+    )
+    suite = Property.objects.create(
+        landlord=landlord,
+        holding=holding,
+        name="Garden Suite",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.COMPLETE_UNIT,
+        unit_type=Property.UnitType.GARDEN_SUITE,
+        bedrooms=1,
+        bathrooms=Decimal("1.0"),
+    )
+    PropertyArea.objects.create(
+        property=suite,
+        area_type=PropertyArea.AreaType.LIVING_ROOM,
+        count=1,
+    )
+
+    inv = property_inventory(landlord)
+    row = next(p for p in inv["complete_units"] if p["name"] == "Garden Suite")
+    assert inv["counts"]["physical_holdings"] == 1
+    assert inv["counts"]["total_listings"] >= 1
+    assert row["holding"] == "McKenzie House"
+    assert row["layout"]["bedrooms"] == 1
+    assert row["layout"]["recorded_internal_area_count"] == 1
+    assert row["layout"]["internal_areas"][0]["type"] == "LIVING_ROOM"
 
 
 def test_create_property_preview_then_confirm(landlord):
@@ -3092,7 +3435,8 @@ def test_tool_meta_covers_every_write_tool():
         "open_work_orders", "list_work_orders", "list_inquiries",
         "list_conversations", "list_messages", "list_inspections",
         "list_move_events", "list_inventory", "list_tenants",
-        "tenant_history", "list_documents", "find_listings", "find_leases",
+            "tenant_history", "list_documents", "business_document_location",
+            "find_listings", "find_leases",
         "read_constitution", "list_vendors", "list_holdings", "list_bank_balances",
         "lease_pdf_info", "list_lease_roster", "crud_capabilities",
         "list_viewing_requests", "get_viewing_availability",

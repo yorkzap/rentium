@@ -66,11 +66,12 @@ def portfolio_snapshot(landlord) -> dict:
 
 
 def list_properties(landlord) -> dict:
-    """Every listing: name, layout group, primary_type (Garden Suite / Private Room),
-    suggested_lease_if_created, occupancy with lease_number when committed.
+    """Physical holdings and their rental listings, with type, layout and occupancy.
 
-    'How many properties' = counts.total_listings (not 1 street address).
-    'Same unit?' = layout.groups (shared rooms) vs standalone complete units."""
+    Use counts.physical_holdings for houses/buildings/addresses and
+    counts.total_listings for rentable rooms/units. Never call each listing a
+    separate physical property. A complete unit also includes recorded bedroom,
+    bathroom and internal-area counts; unknown facts remain null."""
     from .union import property_inventory
 
     return property_inventory(landlord)
@@ -141,7 +142,9 @@ def update(landlord, entity: str = "", query: str = "", changes: str = "",
     name); changes = comma list 'field=value, …' (see data_catalogue for editable
     fields). Locked/active leases are refused. Previews first; confirm=yes to
     apply. Example: entity='lease', query='RMT…', changes='parking_included=true,
-    rent_due_day=1'."""
+    rent_due_day=1'. For property type corrections, property_category=COMPLETE_UNIT
+    is canonical; listing_type/property_type/category aliases are also accepted
+    and safely routed through update_property."""
     from .domain_write import update as _fn
     return _fn(landlord, entity=entity, query=query, changes=changes, confirm=confirm)
 
@@ -643,6 +646,72 @@ def list_documents(
     )
 
 
+@_params(
+    document_id="Business document UUID shown in the attachment note. Pass this OR upload_id.",
+    upload_id="Staged photo UUID when the attachment is photographed mail, receipt, "
+    "invoice, notice, or other paperwork. Pass this OR document_id.",
+    scope_query="Physical holding name or exact legal street address, e.g. "
+    "'950 McKenzie Ave'. This is NOT a listing query.",
+    issuer="Optional sender/issuer, e.g. Scotiabank.",
+    document_date="Optional document/received date in YYYY-MM-DD.",
+    confirm="Leave empty to preview; pass yes only after landlord approval.",
+)
+def catalog_business_document(
+    landlord,
+    scope_query: str,
+    document_id: str = "",
+    upload_id: str = "",
+    issuer: str = "",
+    document_date: str = "",
+    confirm: str = "",
+) -> dict:
+    """Store an uploaded business record against a PHYSICAL PROPERTY/HOLDING.
+    Use when the landlord says an address overall, whole property, house, or
+    building—not a rental listing. If no holding exists but listings share the
+    exact legal address, this proposes creating it and linking those child
+    rooms/units. Distinct apartment addresses stay separate. Never force a
+    child listing choice."""
+    from .document_services import catalog_document_scope
+    from .document_services import catalog_staged_photo_as_document
+
+    parsed_date = None
+    if document_date.strip():
+        try:
+            parsed_date = date.fromisoformat(document_date.strip())
+        except ValueError:
+            return {"error": "document_date must be YYYY-MM-DD."}
+    common = {
+        "landlord": landlord,
+        "scope_query": scope_query,
+        "actor": getattr(landlord, "user", None),
+        "issuer": issuer,
+        "document_date": parsed_date,
+        "confirm": str(confirm).strip().lower() in {"yes", "y", "true", "1"},
+    }
+    if upload_id.strip():
+        return catalog_staged_photo_as_document(
+            upload_id=upload_id.strip(),
+            **common,
+        )
+    if not document_id.strip():
+        return {"error": "Pass document_id or upload_id."}
+    return catalog_document_scope(
+        document_id=document_id.strip(),
+        **common,
+    )
+
+
+def business_document_location(landlord, document_id: str) -> dict:
+    """Return the exact durable location of a RAMA business document: canonical
+    storage key, local container filesystem path when one exists, production
+    object-storage URI, Documents-page URL, and authenticated download path.
+    Use for 'where is it?', 'what directory?', 'show the path', or manual access.
+    Never say there is no directory/location without calling this tool."""
+    from .document_services import document_location
+
+    return document_location(landlord, document_id)
+
+
 # ---------------------------------------------------------------------------
 # Write actions (require confirm=yes)
 # ---------------------------------------------------------------------------
@@ -1109,8 +1178,13 @@ def create_property(
     confirm: str = "",
 ) -> dict:
     """Create a property listing (same rules as Properties UI).
-    property_category: ROOM or COMPLETE_UNIT. Rooms need room_type; units need unit_type.
-    Optional group_name for rooms only.
+    CLASSIFY IT RIGHT: a self-contained home is a COMPLETE_UNIT — pass
+    property_category=COMPLETE_UNIT and unit_type = one of: garden suite,
+    basement, main floor, apartment, other. A 'garden suite', 'basement suite',
+    'laneway', 'in-law/secondary suite', 'apartment', 'whole unit' → COMPLETE_UNIT
+    (NOT a room). Only a single bedroom rented inside a shared home is
+    property_category=ROOM (room_type: private/shared). Passing a unit_type makes
+    it a COMPLETE_UNIT automatically. Optional group_name for rooms only.
     inventory_items: if landlord names furniture (e.g. 'Single bed, Mattress'), pass it
     so 'What's in it' is not empty.
     Refuses exact-name duplicates unless allow_duplicate_name=yes.
@@ -1400,8 +1474,14 @@ def create_group_room(
     city="New city.",
     province="New province code (e.g. BC).",
     asking_rent="New asking rent, e.g. '850.00'.",
+    property_category="Structured classification: ROOM or COMPLETE_UNIT. Use this "
+    "for 'make it a full suite/unit'; NEVER alter description as a substitute.",
     unit_type="COMPLETE_UNIT listings only: new unit_type.",
     room_type="ROOM listings only: new room_type.",
+    bedrooms="COMPLETE_UNIT only: bedroom count, or blank to clear.",
+    bathrooms="COMPLETE_UNIT only: bathroom count, or blank to clear.",
+    max_occupancy="COMPLETE_UNIT only: maximum occupants, or blank to clear.",
+    square_footage="COMPLETE_UNIT only: square footage, or blank to clear.",
     is_publicly_visible="yes/no — whether the listing shows publicly.",
     pick="If property_query matches MORE THAN ONE listing, choose which: "
     "oldest|first|1 (the older/earlier one) | newest|last|2 (the newer one). "
@@ -1418,15 +1498,24 @@ def update_property(
     city: str = "",
     province: str = "",
     asking_rent: str = "",
+    property_category: str = "",
     unit_type: str = "",
     room_type: str = "",
+    bedrooms: str = "",
+    bathrooms: str = "",
+    max_occupancy: str = "",
+    square_footage: str = "",
     is_publicly_visible: str = "",
     pick: str = "",
     confirm: str = "",
 ) -> dict:
     """Update (edit) an existing listing's fields — this includes RENAMING it:
     to rename a listing, call update_property with name=<the new name>. Also
-    sets status/description/address/city/province/asking_rent/visibility.
+    sets status/description/address/city/province/asking_rent/visibility and
+    structured category/layout fields. For "full suite/unit", set
+    property_category=COMPLETE_UNIT (and unit_type when known); do not rewrite
+    the description. Questions such as "how many rooms?" are read-only and must
+    use list_properties, not this tool.
     Renaming works even if the listing has a signed lease (the name is just a
     label; nothing about the tenancy changes). If the name/id matches two
     listings (duplicates), add pick=oldest|newest|1|2. Preview first, then
@@ -1435,7 +1524,10 @@ def update_property(
     return _fn(
         landlord, property_query=property_query, name=name, status=status,
         description=description, address=address, city=city, province=province,
-        asking_rent=asking_rent, unit_type=unit_type, room_type=room_type,
+        asking_rent=asking_rent, property_category=property_category,
+        unit_type=unit_type, room_type=room_type, bedrooms=bedrooms,
+        bathrooms=bathrooms, max_occupancy=max_occupancy,
+        square_footage=square_footage,
         is_publicly_visible=is_publicly_visible, pick=pick, confirm=confirm,
     )
 

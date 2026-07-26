@@ -390,7 +390,8 @@ def crud_capabilities(landlord) -> dict:
     return {
         "properties": {
             "create": "create_property — name, address, city, ROOM|COMPLETE_UNIT",
-            "update": "update_property — name/status/description/address/city",
+            "update": "update_property — structured listing fields, including "
+            "ROOM↔COMPLETE_UNIT classification and unit layout facts",
             "delete": "delete_property — blocked if any lease exists (PROTECT)",
             "group": "create_property_group, assign_property_to_group (rooms only)",
             "holding": "create_holding, assign_property_to_holding (any category — "
@@ -804,6 +805,26 @@ def create_property(
             "error": "room_type must be one of: "
             + ", ".join(str(l) for _, l in Property.RoomType.choices)
         }
+    # Safety net for a mis-classified category. Unambiguous "complete home"
+    # phrases in the name (or an explicit unit_type) mean COMPLETE_UNIT — so a
+    # "garden suite" is never silently downgraded to a Private Room even when the
+    # model defaulted property_category=ROOM. (room_type can't be trusted here: the
+    # wrapper always sends a default, so its presence isn't a real ROOM signal.)
+    name_l = name.lower()
+    _name_unit_type = {
+        "garden suite": Property.UnitType.GARDEN_SUITE,
+        "basement suite": Property.UnitType.BASEMENT,
+        "basement unit": Property.UnitType.BASEMENT,
+        "main floor": Property.UnitType.MAIN_FLOOR,
+        "apartment": Property.UnitType.APARTMENT,
+        "laneway": Property.UnitType.OTHER,
+        "in-law suite": Property.UnitType.OTHER,
+        "secondary suite": Property.UnitType.OTHER,
+    }
+    inferred_ut = next((v for k, v in _name_unit_type.items() if k in name_l), None)
+    if (ut is not None or inferred_ut) and cat == Property.PropertyCategory.ROOM:
+        cat = Property.PropertyCategory.COMPLETE_UNIT
+        ut = ut or inferred_ut
     if cat == Property.PropertyCategory.COMPLETE_UNIT:
         ut = ut or Property.UnitType.OTHER
         rt = None
@@ -1205,8 +1226,13 @@ def update_property(
     city: str = "",
     province: str = "",
     asking_rent: str = "",
+    property_category: str = "",
     unit_type: str = "",
     room_type: str = "",
+    bedrooms: str = "",
+    bathrooms: str = "",
+    max_occupancy: str = "",
+    square_footage: str = "",
     is_publicly_visible: str = "",
     pick: str = "",
     confirm: str = "",
@@ -1259,6 +1285,32 @@ def update_property(
         if prov not in Province.values:
             return {"error": f"Invalid province {province!r}."}
         changes["province"] = prov
+    target_category = prop.property_category
+    if property_category.strip():
+        category_input = property_category.strip().lower().replace("_", " ")
+        if category_input in {"full unit", "full suite", "entire unit", "suite"}:
+            target_category = Property.PropertyCategory.COMPLETE_UNIT
+        else:
+            target_category = _choice_code(
+                Property.PropertyCategory.choices, property_category
+            )
+        if target_category is None:
+            return {
+                "error": "property_category must be one of: "
+                + ", ".join(
+                    str(label) for _, label in Property.PropertyCategory.choices
+                )
+            }
+        if target_category != prop.property_category and prop.leases.exists():
+            return {
+                "error": (
+                    f"Cannot reclassify {prop.name} while lease records reference it. "
+                    "Its room/unit classification affects the legal agreement. "
+                    "Correct the lease history first or create a new listing."
+                )
+            }
+        changes["property_category"] = target_category
+
     if unit_type.strip():
         ut = _choice_code(Property.UnitType.choices, unit_type)
         if ut is None:
@@ -1266,7 +1318,7 @@ def update_property(
                 "error": "unit_type must be one of: "
                 + ", ".join(str(l) for _, l in Property.UnitType.choices)
             }
-        if prop.property_category != Property.PropertyCategory.COMPLETE_UNIT:
+        if target_category != Property.PropertyCategory.COMPLETE_UNIT:
             return {"error": "unit_type only applies to COMPLETE_UNIT listings."}
         changes["unit_type"] = ut
     if room_type.strip():
@@ -1276,9 +1328,58 @@ def update_property(
                 "error": "room_type must be one of: "
                 + ", ".join(str(l) for _, l in Property.RoomType.choices)
             }
-        if prop.property_category != Property.PropertyCategory.ROOM:
+        if target_category != Property.PropertyCategory.ROOM:
             return {"error": "room_type only applies to ROOM listings."}
         changes["room_type"] = rt
+
+    if target_category == Property.PropertyCategory.COMPLETE_UNIT:
+        changes.setdefault(
+            "unit_type",
+            prop.unit_type
+            or (
+                Property.UnitType.GARDEN_SUITE
+                if "garden suite" in prop.name.lower()
+                else Property.UnitType.OTHER
+            ),
+        )
+        if prop.property_category != target_category:
+            changes.update({"room_type": None, "group": None})
+        numeric_fields = {
+            "bedrooms": (bedrooms, int),
+            "bathrooms": (bathrooms, Decimal),
+            "max_occupancy": (max_occupancy, int),
+            "square_footage": (square_footage, int),
+        }
+        for field, (raw, caster) in numeric_fields.items():
+            if raw == "":
+                continue
+            try:
+                value = None if not raw.strip() else caster(raw)
+            except (ValueError, InvalidOperation):
+                return {"error": f"{field} must be a number or blank."}
+            if value is not None and value < 0:
+                return {"error": f"{field} cannot be negative."}
+            changes[field] = value
+    else:
+        if any(v != "" for v in (bedrooms, bathrooms, max_occupancy, square_footage)):
+            return {
+                "error": "bedrooms/bathrooms/max_occupancy/square_footage "
+                "only apply to COMPLETE_UNIT listings."
+            }
+        if prop.property_category != target_category:
+            changes.update(
+                {
+                    "unit_type": None,
+                    "bedrooms": None,
+                    "bathrooms": None,
+                    "max_occupancy": None,
+                    "square_footage": None,
+                    "building_amenities": [],
+                    "room_type": _choice_code(
+                        Property.RoomType.choices, room_type or "PRIVATE"
+                    ),
+                }
+            )
     if asking_rent != "":
         if asking_rent.strip() == "":
             changes["asking_rent"] = None
@@ -1300,8 +1401,13 @@ def update_property(
             city,
             province,
             asking_rent,
+            property_category,
             unit_type,
             room_type,
+            bedrooms,
+            bathrooms,
+            max_occupancy,
+            square_footage,
             is_publicly_visible,
         )
     )
@@ -1312,7 +1418,10 @@ def update_property(
             "message": f"No change needed — {prop.name} already has those values.",
         }
     if not changes:
-        return {"error": "No fields to update. Pass name/status/description/…"}
+        return {
+            "error": "No fields to update. Pass a structured field; never change "
+            "description as a substitute for property type or layout."
+        }
 
     preview = {
         "property": prop.name,
@@ -1347,6 +1456,14 @@ def update_property(
             "status": prop.status,
             "address": prop.address,
             "city": prop.city,
+            "property_category": prop.property_category,
+            "primary_type": (
+                prop.get_room_type_display()
+                if prop.property_category == Property.PropertyCategory.ROOM
+                else prop.get_unit_type_display()
+            ),
+            "bedrooms": prop.bedrooms,
+            "bathrooms": str(prop.bathrooms) if prop.bathrooms is not None else None,
         },
         "applied": list(changes.keys()),
         "previous_name": previous_name,

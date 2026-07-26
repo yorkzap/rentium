@@ -40,6 +40,9 @@ def post_entry(**fields) -> tuple[LedgerEntry, bool]:
     submission is a successful no-op, never an error and never a double-post.
     """
     key = fields.get("idempotency_key")
+    prop = fields.get("property")
+    if prop is not None and fields.get("holding") is None:
+        fields["holding"] = prop.holding
     existing = _get_by_idempotency_key(key)
     if existing:
         return existing, False
@@ -65,6 +68,7 @@ def post_charge(
     entry_type=EntryType.OTHER_CHARGE,
     lease=None,
     property=None,
+    holding=None,
     description="",
     idempotency_key=None,
     created_by=None,
@@ -80,6 +84,7 @@ def post_charge(
     entry, created = post_entry(
         landlord=landlord,
         property=property or (lease.property if lease and lease.property_id else None),
+        holding=holding,
         lease=lease,
         tenant=tenant,
         entry_type=entry_type,
@@ -232,6 +237,7 @@ def post_expense(
     description,
     incurred_date=None,
     property=None,
+    holding=None,
     vendor="",
     work_order=None,
     idempotency_key=None,
@@ -251,6 +257,7 @@ def post_expense(
     entry, created = post_entry(
         landlord=landlord,
         property=property,
+        holding=holding,
         entry_type=EntryType.EXPENSE,
         amount=Decimal(amount),
         effective_date=incurred_date or date.today(),
@@ -342,6 +349,7 @@ def void_entry(entry: LedgerEntry, *, reason, created_by=None) -> LedgerEntry:
         reversal = LedgerEntry(
             landlord=entry.landlord,
             property=entry.property,
+            holding=entry.holding,
             lease=entry.lease,
             tenant=entry.tenant,
             entry_type=EntryType.REVERSAL,
@@ -376,6 +384,7 @@ def correct_entry(
         data = {
             "landlord": entry.landlord,
             "property": entry.property,
+            "holding": entry.holding,
             "lease": entry.lease,
             "tenant": entry.tenant,
             "entry_type": entry.entry_type,

@@ -18,6 +18,7 @@ from .views import address_search
 from .views import public_cities_index
 from .views import public_city
 from .views import public_inquiry
+from .views import public_listings
 from .views import public_property_detail
 from .views import public_showcase
 from .views import sitemap_data
@@ -28,6 +29,7 @@ app_name = "showcase"
 public_urlpatterns = [
     path("cities/", public_cities_index, name="cities-index"),
     path("cities/<str:province>/<str:city>/", public_city, name="city"),
+    path("listings/", public_listings, name="listings"),
     path("l/<slug:slug>/", public_showcase, name="showcase"),
     path("listings/<slug:slug>/", public_property_detail, name="property"),
     path("inquiries/", public_inquiry, name="inquiry"),

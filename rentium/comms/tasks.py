@@ -78,9 +78,12 @@ def _stage_telegram_photo(landlord, file_id: str) -> str:
         return ""
     return (
         f"\n\n[The landlord attached a photo, upload_id={upload.pk}]\n"
-        "To put it on a listing, use attach_photo_to_listing with that upload_id "
-        "(hand it to the ops agent if you don't have that tool yourself). Ask "
-        "which listing if they didn't say."
+        "Determine intent from the caption/message. If this is a document, mail, "
+        "letter, receipt, invoice, notice, statement, or paperwork, it is NOT a "
+        "listing photo: use catalog_business_document with this upload_id. If the "
+        "landlord later gives a street address/property overall, file it against "
+        "that physical holding and never ask them to choose a room or unit. Use "
+        "attach_photo_to_listing only for actual property/inspection photos."
     )
 
 
@@ -107,9 +110,9 @@ def handle_telegram_message(
 
     landlord = acting_landlord(landlord.user) or landlord
 
-    # A photo the landlord sent to the bot: download it, stage it as a RamaUpload
-    # (landlord-scoped), and tell RAMA it's attached — the same note the web
-    # paperclip adds — so it can attach_photo_to_listing it.
+    # A Telegram photo can be either property media OR photographed paperwork.
+    # Stage it once; the shared turn engine deterministically routes business
+    # records into OCR/holding storage from the landlord's words.
     if photo_file_id:
         note = _stage_telegram_photo(landlord, photo_file_id)
         if note:

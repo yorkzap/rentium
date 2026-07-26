@@ -177,6 +177,75 @@ def test_handle_telegram_photo_stages_upload(landlord, settings):
     assert RamaUpload.objects.filter(landlord=landlord).count() == 1
 
 
+def test_telegram_bank_document_routes_to_physical_holding_not_listing(
+    landlord, settings
+):
+    from rentium.properties.models import Property
+    from rentium.rama.models import RamaPendingPlan, RamaPreferences
+    from rentium.rama.providers import Turn
+    from rentium.rama.tests import ScriptedProvider
+
+    prefs = RamaPreferences.for_landlord(landlord)
+    prefs.enabled = True
+    prefs.provider = "xai"
+    prefs.api_key = "xai-test"
+    prefs.save()
+    Property.objects.create(
+        landlord=landlord,
+        name="Room C",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    Property.objects.create(
+        landlord=landlord,
+        name="Garden Suite",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.COMPLETE_UNIT,
+        unit_type=Property.UnitType.GARDEN_SUITE,
+    )
+    from rentium.comms.tasks import handle_telegram_message, telegram_conversation_id
+
+    provider = ScriptedProvider([Turn(text="wrong: choose a listing")])
+    with mock.patch(
+        "rentium.comms.telegram.get_file_bytes",
+        return_value=(b"photo-bytes", "scotiabank.jpg"),
+    ), mock.patch(
+        "rentium.rama.service.get_provider", return_value=provider
+    ), mock.patch(
+        "rentium.comms.telegram.send_message"
+    ) as sent:
+        handle_telegram_message(
+            str(landlord.pk),
+            "42",
+            "This doc was sent by Scotiabank on June 02 2026. Store it carefully.",
+            photo_file_id="BIG",
+        )
+        assert "physical property address" in sent.call_args.args[1]
+        handle_telegram_message(
+            str(landlord.pk),
+            "42",
+            "950 McKenzie Ave address/property",
+        )
+        reply = sent.call_args.args[1]
+
+    assert provider.requests == []
+    assert "Address: 950 McKenzie Ave" in reply
+    assert "Individual listing: none" in reply
+    assert "Room C, Garden Suite" in reply or "Garden Suite, Room C" in reply
+    plan = RamaPendingPlan.objects.get(
+        conversation_id=telegram_conversation_id("42")
+    )
+    step = plan.steps.get()
+    assert step.tool == "catalog_business_document"
+    assert step.arguments["scope_query"] == "950 McKenzie Ave"
+    assert "upload_id" in step.arguments
+
+
 def test_telegram_conversation_id_is_stable_per_chat():
     from rentium.comms.tasks import telegram_conversation_id
 

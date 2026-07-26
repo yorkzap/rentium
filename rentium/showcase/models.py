@@ -55,6 +55,7 @@ RESERVED_SLUGS = {
     "pricing",
     "privacy",
     "public",
+    "rentals",
     "rentium",
     "settings",
     "signup",

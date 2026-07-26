@@ -1,6 +1,49 @@
 from django.contrib import admin
 
-from .models import RamaAudit, RamaCapabilityGap, RamaPreferences
+from .models import (
+    RamaAudit,
+    RamaCapabilityGap,
+    RamaDocument,
+    RamaDocumentEvent,
+    RamaPreferences,
+)
+
+
+@admin.register(RamaDocument)
+class RamaDocumentAdmin(admin.ModelAdmin):
+    list_display = (
+        "created_at",
+        "title",
+        "landlord",
+        "holding",
+        "kind",
+        "status",
+        "payment_state",
+    )
+    list_filter = ("status", "kind", "payment_state")
+    search_fields = (
+        "title",
+        "issuer",
+        "reference_number",
+        "original_filename",
+        "ocr_text",
+    )
+    readonly_fields = ("sha256", "created_at", "updated_at", "filed_at")
+
+
+@admin.register(RamaDocumentEvent)
+class RamaDocumentEventAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "document", "kind", "actor")
+    readonly_fields = ("document", "kind", "actor", "detail", "created_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(RamaCapabilityGap)

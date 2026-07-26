@@ -27,6 +27,12 @@ ALLOWED_HOSTS = env.list(
     ],
 )
 
+# This local service is the public origin while exposed by the named
+# Cloudflare Tunnel. Honour cloudflared's scheme and host headers so absolute
+# media URLs remain HTTPS on public pages.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+USE_X_FORWARDED_HOST = True
+
 # Required for cross-origin POSTs from the Vercel frontend (Django 4+).
 CSRF_TRUSTED_ORIGINS = env.list(
     "CSRF_TRUSTED_ORIGINS",

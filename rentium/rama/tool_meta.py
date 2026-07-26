@@ -55,6 +55,7 @@ TOOL_META: dict[str, ToolMeta] = {
     "set_viewing_availability": ToolMeta(risk="low"),
     # ------------------------------------------------------------ money
     "create_expense": ToolMeta(risk="medium"),
+    "catalog_business_document": ToolMeta(risk="low"),
     # -------------------------------------------------------- inventory
     "bulk_add_inventory": ToolMeta(risk="low"),
     "create_inventory_item": ToolMeta(risk="low"),

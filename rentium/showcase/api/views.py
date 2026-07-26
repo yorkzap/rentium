@@ -151,6 +151,67 @@ def public_cities_index(request):
     return Response({"cities": services.all_public_cities()})
 
 
+@api_view(["GET"])
+@permission_classes([AllowAny])
+@throttle_classes([PublicReadThrottle])
+def public_listings(request):
+    """Latest public inventory with coarse, privacy-safe discovery filters."""
+    qs = (
+        Property.objects.public()
+        .select_related("landlord__user", "landlord__showcase")
+        .prefetch_related("property_images")
+        .order_by("-updated_at")
+    )
+
+    province = str(request.query_params.get("province") or "").lower()
+    city = str(request.query_params.get("city") or "").lower()
+    if province:
+        qs = qs.filter(province_code=province)
+    if city:
+        qs = qs.filter(city_slug=city)
+
+    kind = request.query_params.get("type")
+    if kind == "private_room":
+        qs = qs.filter(
+            property_category=Property.PropertyCategory.ROOM,
+            room_type=Property.RoomType.PRIVATE,
+        )
+    elif kind == "shared_room":
+        qs = qs.filter(
+            property_category=Property.PropertyCategory.ROOM,
+            room_type=Property.RoomType.SHARED,
+        )
+    elif kind == "full_suite":
+        qs = qs.filter(property_category=Property.PropertyCategory.COMPLETE_UNIT)
+
+    if request.query_params.get("furnished") in ("1", "true", "yes"):
+        qs = qs.filter(is_furnished=True)
+
+    for param, lookup in (
+        ("min_rent", "asking_rent__gte"),
+        ("max_rent", "asking_rent__lte"),
+    ):
+        raw = request.query_params.get(param)
+        if raw:
+            try:
+                qs = qs.filter(**{lookup: float(raw)})
+            except ValueError:
+                raise ValidationError({param: "Must be a number."})
+
+    total = qs.count()
+    return Response(
+        {
+            "total": total,
+            "areas": services.all_public_cities(),
+            "results": PublicPropertyCardSerializer(
+                qs[:48],
+                many=True,
+                context={"request": request},
+            ).data,
+        }
+    )
+
+
 # ---------------------------------------------------------------- showcases
 @api_view(["GET"])
 @permission_classes([AllowAny])

@@ -175,6 +175,17 @@ class LedgerEntry(models.Model):
             "The ledger this entry belongs to. NULL = portfolio-wide (e.g. accountant fees)."
         ),
     )
+    holding = models.ForeignKey(
+        "properties.PropertyHolding",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="ledger_entries",
+        help_text=_(
+            "Physical/legal property scope. Set directly for holding-wide costs "
+            "such as tax or mortgage; otherwise derived from property."
+        ),
+    )
     lease = models.ForeignKey(
         Lease,
         on_delete=models.PROTECT,
@@ -327,6 +338,10 @@ class LedgerEntry(models.Model):
         indexes = [
             models.Index(fields=["landlord", "entry_type", "effective_date"]),
             models.Index(fields=["lease", "entry_type", "due_date"]),
+            models.Index(
+                fields=["landlord", "holding", "effective_date"],
+                name="ledger_holding_date_idx",
+            ),
         ]
         constraints = [
             models.CheckConstraint(
@@ -370,6 +385,18 @@ class LedgerEntry(models.Model):
         if self.property and self.property.landlord_id != self.landlord_id:
             raise ValidationError(
                 {"property": _("Property belongs to a different landlord.")}
+            )
+        if self.holding and self.holding.landlord_id != self.landlord_id:
+            raise ValidationError(
+                {"holding": _("Holding belongs to a different landlord.")}
+            )
+        if (
+            self.property
+            and self.holding
+            and self.property.holding_id != self.holding_id
+        ):
+            raise ValidationError(
+                {"holding": _("Holding does not contain the selected listing.")}
             )
 
         if et in CHARGE_TYPES:

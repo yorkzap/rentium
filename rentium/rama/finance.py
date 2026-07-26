@@ -39,7 +39,11 @@ def ledger_drift_since(landlord, holding, since: date) -> Decimal:
     from rentium.ledger.models import EntryType, LedgerEntry
 
     props = _properties_for_holding(landlord, holding)
-    prop_filter = Q(property__in=props) if holding is not None else Q(landlord=landlord)
+    prop_filter = (
+        Q(property__in=props) | Q(holding=holding)
+        if holding is not None
+        else Q(landlord=landlord)
+    )
 
     inflow = (
         LedgerEntry.objects.filter(

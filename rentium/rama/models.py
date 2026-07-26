@@ -10,6 +10,7 @@ RAMA models.
 import uuid
 
 from django.db import models
+from django.core.validators import MinValueValidator
 
 
 class RamaPreferences(models.Model):
@@ -409,3 +410,206 @@ class RamaUpload(models.Model):
 
     def __str__(self):
         return f"RamaUpload {self.pk} for {self.landlord_id}"
+
+
+class RamaDocument(models.Model):
+    """A durable, searchable business record ingested by RAMA.
+
+    The original is retained byte-for-byte for evidentiary purposes.  A PDF
+    archival rendition is stored beside it for a uniform, human-browsable
+    filing cabinet.  Extracted text and classification are metadata; neither
+    mutates the source document.
+    """
+
+    class Kind(models.TextChoices):
+        EXPENSE = "EXPENSE", "Expense / payable"
+        NOTICE = "NOTICE", "Notice"
+        MORTGAGE = "MORTGAGE", "Mortgage / financing"
+        INSURANCE = "INSURANCE", "Insurance"
+        LEASE = "LEASE", "Lease / tenancy"
+        TAX = "TAX", "Tax record"
+        MAINTENANCE = "MAINTENANCE", "Maintenance"
+        OTHER = "OTHER", "Other document"
+
+    class PaymentState(models.TextChoices):
+        NOT_APPLICABLE = "NOT_APPLICABLE", "Not applicable"
+        PAID = "PAID", "Paid"
+        UNPAID = "UNPAID", "Unpaid / not yet cleared"
+        UNKNOWN = "UNKNOWN", "Needs confirmation"
+
+    class Status(models.TextChoices):
+        QUEUED = "QUEUED", "Queued"
+        PROCESSING = "PROCESSING", "Processing"
+        NEEDS_REVIEW = "NEEDS_REVIEW", "Needs review"
+        READY = "READY", "Ready to file"
+        FILED = "FILED", "Filed"
+        FAILED = "FAILED", "Processing failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.PROTECT,
+        related_name="rama_documents",
+    )
+    holding = models.ForeignKey(
+        "properties.PropertyHolding",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="documents",
+        help_text="Physical/legal property this record concerns.",
+    )
+    property = models.ForeignKey(
+        "properties.Property",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="documents",
+        help_text="Optional rentable room/unit; holding is the normal filing scope.",
+    )
+    portfolio_wide = models.BooleanField(
+        default=False,
+        help_text="True only when the record genuinely concerns the whole portfolio.",
+    )
+    ledger_entry = models.OneToOneField(
+        "ledger.LedgerEntry",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="source_document",
+    )
+    original_file = models.FileField(
+        upload_to="business_documents/inbox/%Y/%m/", max_length=500
+    )
+    archival_pdf = models.FileField(
+        upload_to="", blank=True, default="", max_length=500
+    )
+    original_filename = models.CharField(max_length=255)
+    canonical_filename = models.CharField(max_length=255, blank=True, default="")
+    media_type = models.CharField(max_length=100, blank=True, default="")
+    byte_size = models.PositiveBigIntegerField(default=0)
+    sha256 = models.CharField(max_length=64, db_index=True)
+    kind = models.CharField(max_length=20, choices=Kind.choices, default=Kind.OTHER)
+    expense_category = models.CharField(max_length=20, blank=True, default="")
+    payment_state = models.CharField(
+        max_length=20,
+        choices=PaymentState.choices,
+        default=PaymentState.NOT_APPLICABLE,
+    )
+    title = models.CharField(max_length=255, blank=True, default="")
+    issuer = models.CharField(max_length=200, blank=True, default="")
+    reference_number = models.CharField(max_length=120, blank=True, default="")
+    document_date = models.DateField(null=True, blank=True, db_index=True)
+    due_date = models.DateField(null=True, blank=True)
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(0)],
+    )
+    currency = models.CharField(max_length=3, default="CAD")
+    ocr_text = models.TextField(blank=True, default="")
+    extracted_data = models.JSONField(default=dict, blank=True)
+    classification_confidence = models.DecimalField(
+        max_digits=5, decimal_places=4, default=0
+    )
+    match_confidence = models.DecimalField(max_digits=5, decimal_places=4, default=0)
+    clarification_question = models.TextField(blank=True, default="")
+    clarification_answer = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.QUEUED, db_index=True
+    )
+    failure_reason = models.TextField(blank=True, default="")
+    created_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="rama_documents_created",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    filed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["landlord", "sha256"],
+                name="rama_document_landlord_sha256_unique",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["landlord", "status", "-created_at"],
+                name="rama_doc_status_idx",
+            ),
+            models.Index(
+                fields=["landlord", "holding", "document_date"],
+                name="rama_doc_holding_idx",
+            ),
+        ]
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+
+        super().clean()
+        if self.holding and self.holding.landlord_id != self.landlord_id:
+            raise ValidationError({"holding": "Holding belongs to another landlord."})
+        if self.property and self.property.landlord_id != self.landlord_id:
+            raise ValidationError({"property": "Listing belongs to another landlord."})
+        if (
+            self.property
+            and self.holding
+            and self.property.holding_id != self.holding_id
+        ):
+            raise ValidationError(
+                {"property": "Listing is not part of the selected holding."}
+            )
+        if self.portfolio_wide and (self.holding_id or self.property_id):
+            raise ValidationError(
+                {"portfolio_wide": "Portfolio-wide records cannot name a property."}
+            )
+
+    def __str__(self):
+        return self.title or self.original_filename
+
+
+class RamaDocumentEvent(models.Model):
+    """Append-only chain of custody for an ingested business document."""
+
+    class Kind(models.TextChoices):
+        UPLOADED = "UPLOADED", "Uploaded"
+        OCR_COMPLETED = "OCR_COMPLETED", "OCR completed"
+        CLASSIFIED = "CLASSIFIED", "Classified"
+        CLARIFIED = "CLARIFIED", "Clarified"
+        FILED = "FILED", "Filed"
+        EXPENSE_POSTED = "EXPENSE_POSTED", "Expense posted"
+        FAILED = "FAILED", "Failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    document = models.ForeignKey(
+        RamaDocument, on_delete=models.PROTECT, related_name="events"
+    )
+    kind = models.CharField(max_length=24, choices=Kind.choices)
+    actor = models.ForeignKey(
+        "users.User", on_delete=models.SET_NULL, null=True, blank=True
+    )
+    detail = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            from django.core.exceptions import ValidationError
+
+            raise ValidationError("Document events are append-only.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        from django.core.exceptions import ValidationError
+
+        raise ValidationError("Document events are append-only.")

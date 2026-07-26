@@ -23,6 +23,78 @@ from .domain_read import _coerce  # shared type coercion
 from .manifest import MANIFEST, EntitySpec
 
 
+def _parse_change_clauses(changes: str) -> tuple[dict[str, str], dict | None]:
+    parsed = {}
+    for clause in (changes or "").split(","):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if "=" not in clause:
+            return {}, {"error": f"Bad change {clause!r} — use field=value."}
+        fname, raw = clause.split("=", 1)
+        parsed[fname.strip()] = raw.strip()
+    return parsed, None
+
+
+def _route_structured_property_update(
+    landlord, *, query: str, changes: str, confirm: str
+) -> dict | None:
+    """Keep property type/layout edits on the domain-aware update path.
+
+    Weak models sometimes call the generic editor with UI vocabulary such as
+    ``listing_type=Full Unit``. Accept those aliases, but execute through
+    ``update_property`` so category cleanup, lease guards and full validation
+    cannot be bypassed.
+    """
+    raw_changes, err = _parse_change_clauses(changes)
+    if err:
+        return err
+    aliases = {
+        "listing_type": "property_category",
+        "property_type": "property_category",
+        "category": "property_category",
+    }
+    normalized = {aliases.get(k, k): v for k, v in raw_changes.items()}
+    structured = {
+        "property_category",
+        "unit_type",
+        "room_type",
+        "bedrooms",
+        "bathrooms",
+        "max_occupancy",
+        "square_footage",
+    }
+    if not structured.intersection(normalized):
+        return None
+
+    supported = structured | {
+        "name",
+        "status",
+        "description",
+        "address",
+        "city",
+        "province",
+        "asking_rent",
+        "is_publicly_visible",
+        "pick",
+    }
+    unsupported = sorted(set(normalized) - supported)
+    if unsupported:
+        return {
+            "error": "This structured property correction also included unsupported "
+            f"fields: {', '.join(unsupported)}."
+        }
+
+    from .domain_crud import update_property
+
+    return update_property(
+        landlord,
+        property_query=query,
+        confirm=confirm,
+        **normalized,
+    )
+
+
 def _preview(action, preview, how):
     from .domain_crud import _preview as _p
     return _p(action, preview, how)
@@ -81,6 +153,12 @@ def update(landlord, *, entity: str = "", query: str = "", changes: str = "",
     if spec is None:
         editable = [k for k, s in MANIFEST.items() if s.editable_map()]
         return {"error": f"Unknown entity {entity!r}.", "editable_entities": editable}
+    if spec.key == "property":
+        routed = _route_structured_property_update(
+            landlord, query=query, changes=changes, confirm=confirm
+        )
+        if routed is not None:
+            return routed
     editable = spec.editable_map()
     if not editable:
         return {"error": f"{spec.key} has no fields RAMA can edit."}

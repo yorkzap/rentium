@@ -52,6 +52,14 @@ _KIND_BRIEF = {
 }
 
 
+@app.task(bind=True, autoretry_for=(OSError,), retry_backoff=True, max_retries=2)
+def process_rama_document(self, document_id: str) -> None:
+    """Build the PDF/A copy, OCR it, and propose filing/accounting metadata."""
+    from .document_services import process_document
+
+    process_document(document_id)
+
+
 def _fact_pack(event_type: str, payload: dict) -> str:
     title, template = _KIND_BRIEF.get(
         event_type, (event_type, "Facts: {facts}")

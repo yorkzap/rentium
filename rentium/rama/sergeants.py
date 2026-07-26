@@ -314,7 +314,7 @@ def detect_expense_anomalies() -> dict:
 def compute_surplus() -> dict:
     """Reported balance − upcoming committed expenses (30 days) − a safety
     buffer. Flags real, meaningful surplus only (floor, not noise)."""
-    from django.db.models import Sum
+    from django.db.models import Q, Sum
 
     from rentium.ledger.models import EntryType, LedgerEntry, PropertyBankBalance
 
@@ -327,10 +327,16 @@ def compute_surplus() -> dict:
         prop_ids = Property.objects.filter(landlord=row.landlord, **props_filter).values_list(
             "pk", flat=True
         )
+        scope = (
+            Q(property_id__in=list(prop_ids)) | Q(holding_id=row.holding_id)
+            if row.holding_id
+            else Q(landlord=row.landlord)
+        )
         committed = (
             LedgerEntry.objects.not_voided()
             .filter(
-                landlord=row.landlord, property_id__in=list(prop_ids),
+                scope,
+                landlord=row.landlord,
                 entry_type=EntryType.EXPENSE, paid_on__isnull=True,
                 effective_date__lte=horizon,
             )

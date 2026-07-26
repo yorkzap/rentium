@@ -1,0 +1,311 @@
+from datetime import date
+from unittest.mock import patch
+
+import pytest
+from django.core.files.uploadedfile import SimpleUploadedFile
+
+from rentium.ledger.models import EntryType
+from rentium.ledger.models import ExpenseCategory
+from rentium.ledger.models import LedgerEntry
+from rentium.properties.models import PropertyHolding
+from rentium.properties.models import Property
+from rentium.rama.document_services import file_document
+from rentium.rama.document_services import ingest_document
+from rentium.rama.document_services import process_document
+from rentium.rama.document_services import catalog_document_scope
+from rentium.rama.document_services import catalog_staged_photo_as_document
+from rentium.rama.document_services import document_location
+from rentium.rama.models import RamaDocument
+from rentium.rama.models import RamaUpload
+
+pytestmark = pytest.mark.django_db
+
+
+def _holding(landlord):
+    return PropertyHolding.objects.create(
+        landlord=landlord,
+        name="McKenzie House",
+        address="950 McKenzie Ave",
+        city="Victoria",
+    )
+
+
+def test_duplicate_upload_is_idempotent(landlord):
+    first = SimpleUploadedFile(
+        "notice.pdf", b"%PDF-test", content_type="application/pdf"
+    )
+    second = SimpleUploadedFile(
+        "copy.pdf", b"%PDF-test", content_type="application/pdf"
+    )
+    document, created = ingest_document(landlord=landlord, upload=first)
+    duplicate, duplicate_created = ingest_document(landlord=landlord, upload=second)
+    assert created is True
+    assert duplicate_created is False
+    assert duplicate.pk == document.pk
+
+
+def test_ocr_classifies_and_matches_holding(landlord):
+    holding = _holding(landlord)
+    upload = SimpleUploadedFile("tax.jpg", b"image", content_type="image/jpeg")
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    text = (
+        "2026 PROPERTY TAX NOTICE\n950 McKenzie Avenue\n"
+        "AMOUNT DUE $4,321.00\nDUE DATE JULY 2"
+    )
+    with patch(
+        "rentium.rama.document_services._pdf_and_text",
+        return_value=(b"%PDF-archival", text),
+    ):
+        process_document(document.pk)
+    document.refresh_from_db()
+    assert document.holding == holding
+    assert document.kind == RamaDocument.Kind.TAX
+    assert document.expense_category == ExpenseCategory.PROPERTY_TAX
+    assert document.payment_state == RamaDocument.PaymentState.UNPAID
+    assert document.amount == 4321
+    assert document.status == RamaDocument.Status.READY, document.failure_reason
+
+
+def test_review_posts_holding_expense_without_marking_invoice_paid(landlord):
+    holding = _holding(landlord)
+    upload = SimpleUploadedFile("tax.pdf", b"%PDF-test", content_type="application/pdf")
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.holding = holding
+    document.kind = RamaDocument.Kind.TAX
+    document.title = "Property Tax Notice 2026"
+    document.amount = "4321.00"
+    document.expense_category = ExpenseCategory.PROPERTY_TAX
+    document.payment_state = RamaDocument.PaymentState.UNPAID
+    document.status = RamaDocument.Status.READY
+    document.archival_pdf.save(
+        "pending.pdf", SimpleUploadedFile("pending.pdf", b"%PDF")
+    )
+    document.save()
+
+    file_document(
+        document,
+        actor=landlord.user,
+        holding=holding,
+        document_date=date(2026, 6, 1),
+    )
+    expense = LedgerEntry.objects.get(entry_type=EntryType.EXPENSE)
+    assert expense.holding == holding
+    assert expense.property is None
+    assert expense.paid_on is None
+    assert expense.source_document == document
+    assert document.status == RamaDocument.Status.FILED
+    assert document.archival_pdf.name.startswith(
+        f"business_documents/{landlord.pk}/mckenzie-house/2026/"
+    )
+
+
+def test_address_scope_creates_holding_above_all_child_listings(landlord):
+    children = []
+    for name, category in [
+        ("Room C", Property.PropertyCategory.ROOM),
+        ("Room D", Property.PropertyCategory.ROOM),
+        ("Garden Suite", Property.PropertyCategory.COMPLETE_UNIT),
+    ]:
+        children.append(
+            Property.objects.create(
+                landlord=landlord,
+                name=name,
+                address="950 McKenzie Ave",
+                city="Victoria",
+                province="bc",
+                property_category=category,
+                room_type=(
+                    Property.RoomType.PRIVATE
+                    if category == Property.PropertyCategory.ROOM
+                    else None
+                ),
+                unit_type=(
+                    Property.UnitType.GARDEN_SUITE
+                    if category == Property.PropertyCategory.COMPLETE_UNIT
+                    else None
+                ),
+            )
+        )
+    upload = SimpleUploadedFile(
+        "scotiabank-notice.pdf", b"%PDF-test", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+
+    preview = catalog_document_scope(
+        landlord,
+        document_id=str(document.pk),
+        scope_query="950 McKenzie Avenue",
+        actor=landlord.user,
+        issuer="Scotiabank",
+        document_date=date(2026, 6, 2),
+    )
+    assert preview["needs_confirm"] is True
+    assert preview["preview"]["scope_kind"] == "physical_property_holding"
+    assert preview["preview"]["create_holding"] is True
+    assert set(preview["preview"]["child_listings"]) == {
+        "Room C",
+        "Room D",
+        "Garden Suite",
+    }
+
+    done = catalog_document_scope(
+        landlord,
+        document_id=str(document.pk),
+        scope_query="950 McKenzie Ave",
+        actor=landlord.user,
+        issuer="Scotiabank",
+        document_date=date(2026, 6, 2),
+        confirm=True,
+    )
+    assert done["catalogued"] is True
+    assert done["property"] is None
+    holding = PropertyHolding.objects.get(
+        landlord=landlord, address="950 McKenzie Ave"
+    )
+    assert set(holding.listings.values_list("name", flat=True)) == {
+        "Room C",
+        "Room D",
+        "Garden Suite",
+    }
+    document.refresh_from_db()
+    assert document.holding == holding
+    assert document.property is None
+    assert document.issuer == "Scotiabank"
+    assert document.document_date == date(2026, 6, 2)
+    assert document.extracted_data["user_scope_locked"] is True
+
+
+def test_locked_landlord_scope_survives_later_ocr(landlord):
+    holding = _holding(landlord)
+    upload = SimpleUploadedFile("notice.jpg", b"image", content_type="image/jpeg")
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.holding = holding
+    document.extracted_data = {"user_scope_locked": True}
+    document.save(update_fields=["holding", "extracted_data", "updated_at"])
+
+    with patch(
+        "rentium.rama.document_services._pdf_and_text",
+        return_value=(b"%PDF-archival", "Scotiabank general correspondence"),
+    ):
+        process_document(document.pk)
+    document.refresh_from_db()
+    assert document.holding == holding
+    assert document.match_confidence == 1
+
+
+def test_photographed_mail_is_promoted_and_scoped_to_holding(landlord):
+    Property.objects.create(
+        landlord=landlord,
+        name="Room C",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    Property.objects.create(
+        landlord=landlord,
+        name="Garden Suite",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.COMPLETE_UNIT,
+        unit_type=Property.UnitType.GARDEN_SUITE,
+    )
+    staged = RamaUpload.objects.create(
+        landlord=landlord,
+        image=SimpleUploadedFile("scotiabank-letter.jpg", b"photo-bytes"),
+    )
+
+    preview = catalog_staged_photo_as_document(
+        landlord,
+        upload_id=str(staged.pk),
+        scope_query="950 McKenzie Ave",
+        actor=landlord.user,
+        issuer="Scotiabank",
+        document_date=date(2026, 6, 2),
+    )
+    assert preview["needs_confirm"] is True
+    assert preview["preview"]["convert_photo_to_ocr_document"] is True
+    assert set(preview["preview"]["child_listings"]) == {"Room C", "Garden Suite"}
+
+    done = catalog_staged_photo_as_document(
+        landlord,
+        upload_id=str(staged.pk),
+        scope_query="950 McKenzie Ave",
+        actor=landlord.user,
+        issuer="Scotiabank",
+        document_date=date(2026, 6, 2),
+        confirm=True,
+    )
+    assert done["catalogued"] is True
+    assert done["ocr_enqueued"] is True
+    document = RamaDocument.objects.get(pk=done["document_id"])
+    assert document.holding.address == "950 McKenzie Ave"
+    assert document.property is None
+    assert document.issuer == "Scotiabank"
+    staged.refresh_from_db()
+    assert staged.used_at is not None
+
+
+def test_document_location_returns_manual_container_path_and_links(landlord):
+    holding = _holding(landlord)
+    upload = SimpleUploadedFile(
+        "notice.pdf", b"%PDF-original", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.holding = holding
+    document.title = "Scotiabank Notice"
+    document.document_date = date(2026, 6, 2)
+    document.canonical_filename = (
+        "2026-06-02_mckenzie-house_scotiabank-notice_test.pdf"
+    )
+    document.archival_pdf.save(
+        (
+            f"business_documents/{landlord.pk}/mckenzie-house/2026/"
+            f"notice/{document.canonical_filename}"
+        ),
+        SimpleUploadedFile("archive.pdf", b"%PDF-archival"),
+    )
+    document.save()
+
+    result = document_location(landlord, str(document.pk))
+    assert result["storage_kind"] == "container_filesystem"
+    assert result["storage_key"].startswith(
+        f"business_documents/{landlord.pk}/mckenzie-house/2026/notice/"
+    )
+    assert result["container_path"].endswith(result["storage_key"])
+    assert result["manual_location"] == result["container_path"]
+    assert result["documents_page"].endswith(
+        f"/dashboard/documents?document={document.pk}"
+    )
+    assert result["authenticated_download_path"] == (
+        f"/api/rama/documents/{document.pk}/download/"
+    )
+
+
+@pytest.mark.django_db
+def test_generic_link_resolves_business_document_uuid(landlord):
+    from rentium.rama.domain_read import link
+
+    document, _ = ingest_document(
+        landlord=landlord,
+        upload=SimpleUploadedFile(
+            "bank-letter.pdf",
+            b"%PDF-original",
+            content_type="application/pdf",
+        ),
+    )
+    document.title = "Scotiabank renewal letter"
+    document.save(update_fields=["title", "updated_at"])
+
+    result = link(
+        landlord,
+        entity="business_document",
+        query=str(document.pk),
+    )
+
+    assert result["entity"] == "business_document"
+    assert result["link"].endswith(
+        f"/dashboard/documents?document={document.pk}"
+    )

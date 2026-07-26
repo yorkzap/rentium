@@ -38,6 +38,7 @@ def _serialize_expense(entry) -> dict:
         "vendor": entry.vendor or "",
         "property": prop_name,
         "property_id": str(entry.property_id) if entry.property_id else None,
+        "holding_id": str(entry.holding_id) if entry.holding_id else None,
         "effective_date": entry.effective_date.isoformat()
         if entry.effective_date
         else None,
@@ -671,9 +672,12 @@ def live_context(landlord) -> dict:
         listings_brief.append(
             {
                 "name": row.get("name"),
+                "address": row.get("address"),
+                "holding": row.get("holding"),
                 "primary_type": row.get("primary_type"),
                 "group": row.get("group"),
                 "category": row.get("category"),
+                "layout": row.get("layout"),
                 "listing_status": row.get("listing_status") or row.get("status"),
                 "has_images": row.get("has_images"),
                 "image_count": row.get("image_count"),
@@ -721,6 +725,15 @@ def live_context(landlord) -> dict:
         "as_of": snap.get("as_of"),
         "dashboard_truth": snap.get("dashboard_truth"),
         "layout": snap.get("layout"),
+        "property_structure": {
+            "counts": inv.get("counts") or {},
+            "holdings": inv.get("holdings") or [],
+            "unassigned_listings": inv.get("unassigned_listings") or [],
+            "rule": (
+                "A holding is a physical house/building. A listing is a rentable "
+                "room or complete unit inside it. Never use the words interchangeably."
+            ),
+        },
         "listings": listings_brief,
         "rented_or_committed_listings": snap.get("rented_listings") or [],
         "draft_leases": draft_leases,
@@ -776,6 +789,9 @@ def live_context(landlord) -> dict:
             "different unit → No vs D/E. "
             "Property type questions: answer primary_type (Garden Suite / "
             "Private Room), not only category COMPLETE_UNIT. "
+            "For follow-up layout questions, use each listing's layout object. "
+            "Null means not recorded; never infer it from the name or description. "
+            "property_structure distinguishes physical holdings from rental listings. "
             "Expenses: quote description + amount + property; do not override "
             "a clear description (Telus) with a mismatched vendor field. "
             "domain_digest has counts for work orders, inquiries, messages, "
@@ -903,9 +919,9 @@ def property_layout(landlord) -> dict:
     return {
         "total_listings": total,
         "count_rule": (
-            "Answer 'how many properties/listings' with total_listings "
-            f"({total}): each room and each complete unit counts as one listing. "
-            "Do NOT collapse to 1 because they share a street address."
+            f"There are {total} rentable listings. Do not call each listing a "
+            "physical property: use property_inventory counts.physical_containers "
+            "for houses/buildings and explain both counts when 'properties' is ambiguous."
         ),
         "same_address_rule": (
             "Same street address can hold multiple independent units "
@@ -919,7 +935,7 @@ def property_layout(landlord) -> dict:
 
 
 def property_inventory(landlord, *, limit: int = 100) -> dict:
-    """List every property (room or complete unit) for this landlord.
+    """List physical holdings and every rentable listing within them.
 
     Each listing includes marketing ``listing_status`` (Available/Occupied/…),
     full type fields (Garden Suite / Room / …), suggested lease if none yet,
@@ -931,6 +947,7 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
     qs = list(
         Property.objects.filter(landlord=landlord)
         .select_related("group", "holding")
+        .prefetch_related("primary_area_associations")
         # Grounds has_images/image_count without an N+1; Property helpers
         # (gallery_image_count etc.) honour this annotation.
         .annotate(_gallery_count=Count("property_images", distinct=True))
@@ -1030,6 +1047,15 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             }
 
         type_payload = _property_type_payload(prop)
+        internal_areas = [
+            {
+                "type": area.area_type,
+                "type_display": area.get_area_type_display(),
+                "count": area.count,
+                "description": area.description or None,
+            }
+            for area in prop.primary_area_associations.all()
+        ]
         row = {
             "id": str(prop.pk),
             "name": prop.name,
@@ -1046,6 +1072,23 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             "image_count": prop.image_count,
             "has_images": prop.image_count > 0,
             "publish_blockers": prop.publish_blockers(),
+            "layout": {
+                "bedrooms": prop.bedrooms,
+                "bathrooms": (
+                    str(prop.bathrooms) if prop.bathrooms is not None else None
+                ),
+                "max_occupancy": prop.max_occupancy,
+                "square_footage": prop.square_footage,
+                "internal_areas": internal_areas,
+                "recorded_internal_area_count": sum(
+                    area["count"] for area in internal_areas
+                ),
+                "room_count_guidance": (
+                    "For a complete unit, 'rooms' can mean bedrooms or all internal "
+                    "spaces. Report both recorded values; if absent, say unknown and "
+                    "ask which count the landlord means. Never infer or edit."
+                ),
+            },
             **type_payload,
         }
         if prop.property_category == Property.PropertyCategory.ROOM:
@@ -1063,6 +1106,29 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
     ).count()
 
     layout = property_layout(landlord)
+    holdings = []
+    assigned_ids: set = set()
+    for holding in landlord.property_holdings.prefetch_related("listings").all():
+        members = [p for p in qs if p.holding_id == holding.pk]
+        assigned_ids.update(p.pk for p in members)
+        holdings.append(
+            {
+                "id": str(holding.pk),
+                "name": holding.name,
+                "kind": holding.kind,
+                "address": holding.address,
+                "city": holding.city,
+                "listing_count": len(members),
+                "listings": [p.name for p in members],
+            }
+        )
+    unassigned = [p for p in qs if p.pk not in assigned_ids]
+    unassigned_addresses = {
+        ((p.address or "").strip().casefold(), (p.city or "").strip().casefold())
+        for p in unassigned
+        if (p.address or "").strip()
+    }
+    physical_container_count = len(holdings) + len(unassigned_addresses)
     room_hierarchy: list[dict] = []
     hierarchy_index: dict[tuple[str, str, str], dict] = {}
     for room in rooms:
@@ -1107,12 +1173,15 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
                 "Never use it alone to decide vacant vs rented."
             ),
             "question_routing": (
-                "'how many properties?' → counts.total_listings / layout.total_listings. "
+                "'how many properties?' is ambiguous: answer with both "
+                "counts.physical_containers and counts.total_listings, clearly named. "
                 "'are rooms in one unit?' → layout.groups vs layout.standalone_units. "
                 "'which rooms are rented / occupied now?' → occupancy.occupied_today / vacant_today. "
                 "'which have leases / are committed?' → has_lease_commitment / phase leased_future. "
                 "'rented this month / next month?' → occupancy_as_of tool or lease dates. "
                 "'what type of property?' → primary_type / unit_type_display / kind_summary. "
+                "'how many rooms does a complete unit have?' → its layout bedrooms "
+                "and internal_areas; null means not recorded, never a reason to write. "
                 "'what lease would it have?' → suggested_lease_if_created.agreement_type."
             ),
             "no_invention": (
@@ -1121,6 +1190,9 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             ),
         },
         "counts": {
+            "physical_holdings": len(holdings),
+            "physical_containers": physical_container_count,
+            "unassigned_address_containers": len(unassigned_addresses),
             "total_listings": total,
             "rooms": room_total,
             "complete_units": unit_total,
@@ -1136,6 +1208,8 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             "physical property."
         ),
         "complete_units": units,
+        "holdings": holdings,
+        "unassigned_listings": [p.name for p in unassigned],
         "truncated": total > len(rooms) + len(units),
     }
 

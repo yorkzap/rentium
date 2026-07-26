@@ -50,6 +50,10 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
   # psycopg dependencies
   libpq-dev  \
   postgresql-client \
+  ghostscript \
+  tesseract-ocr \
+  tesseract-ocr-eng \
+  tesseract-ocr-fra \
   # Translations dependencies
   gettext \
   # cleaning up unused files

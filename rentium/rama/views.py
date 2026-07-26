@@ -9,6 +9,8 @@ call the exact same code path.
 """
 
 import uuid
+from datetime import date
+from django.http import FileResponse
 
 from rest_framework import status as http_status
 from rest_framework.decorators import api_view, permission_classes
@@ -332,8 +334,44 @@ def _attachment_note(request, landlord) -> str:
         return ""
     tags = " ".join(f"[The landlord attached a photo, upload_id={u}]" for u in valid)
     return (
-        f"\n\n{tags}\nUse attach_photo_to_listing with the upload_id to add the "
-        "photo to a listing (ask which listing if they didn't say)."
+        f"\n\n{tags}\nFirst determine intent from the landlord's words. If this is "
+        "a property marketing/inspection photo, use attach_photo_to_listing. If "
+        "they call it a document, mail, letter, receipt, invoice, notice, statement, "
+        "or paperwork, use catalog_business_document with upload_id so it enters "
+        "OCR/archive storage. For an address/property overall, set scope_query to "
+        "that address and NEVER ask them to choose a child listing."
+    )
+
+
+def _document_attachment_note(request, landlord) -> str:
+    from .models import RamaDocument
+
+    raw = request.data.get("document_ids") or []
+    ids = raw if isinstance(raw, (list, tuple)) else [raw]
+    rows = RamaDocument.objects.filter(landlord=landlord, pk__in=ids)
+    notes = []
+    for row in rows:
+        note = (
+            f"[Business document {row.pk}: status={row.status}, "
+            f"type={row.kind}, title={row.title or row.original_filename}"
+        )
+        if row.holding_id:
+            note += f", property holding={row.holding.name}"
+        if row.amount is not None:
+            note += f", amount={row.currency} {row.amount}, payment={row.payment_state}"
+        if row.clarification_question:
+            note += f", clarification needed={row.clarification_question}"
+        notes.append(note + "]")
+    if not notes:
+        return ""
+    return (
+        "\n\n"
+        + "\n".join(notes)
+        + "\nThis is a business-record ingestion, NOT a listing photo. Explain "
+        "the current result. If the landlord names a street address/property "
+        "overall, call catalog_business_document; never force a room/unit choice. "
+        "If it needs review, ask the clarification question and direct the landlord "
+        "to Documents to confirm before any financial entry is posted."
     )
 
 
@@ -369,7 +407,10 @@ def chat_view(request):
 
     # If the landlord attached photo(s) in the chat, tell the model so it can
     # attach_photo_to_listing them (the image itself is staged server-side).
-    message = f"{message}{_attachment_note(request, landlord)}"
+    message = (
+        f"{message}{_attachment_note(request, landlord)}"
+        f"{_document_attachment_note(request, landlord)}"
+    )
 
     result = run_turn(
         landlord, message, conversation_id, role="corporal", channel="web"
@@ -437,6 +478,203 @@ def holdings_view(request):
     from .domain_crud import list_holdings
 
     return Response(list_holdings(_landlord(request)))
+
+
+def _document_payload(document, request=None):
+    def file_url(field):
+        if not field:
+            return None
+        url = field.url
+        return request.build_absolute_uri(url) if request else url
+
+    return {
+        "id": str(document.pk),
+        "status": document.status,
+        "kind": document.kind,
+        "kind_display": document.get_kind_display(),
+        "title": document.title,
+        "issuer": document.issuer,
+        "reference_number": document.reference_number,
+        "document_date": str(document.document_date) if document.document_date else None,
+        "due_date": str(document.due_date) if document.due_date else None,
+        "amount": str(document.amount) if document.amount is not None else None,
+        "currency": document.currency,
+        "expense_category": document.expense_category,
+        "payment_state": document.payment_state,
+        "holding_id": str(document.holding_id) if document.holding_id else None,
+        "holding_name": document.holding.name if document.holding_id else None,
+        "property_id": document.property_id,
+        "property_name": document.property.name if document.property_id else None,
+        "portfolio_wide": document.portfolio_wide,
+        "classification_confidence": str(document.classification_confidence),
+        "match_confidence": str(document.match_confidence),
+        "clarification_question": document.clarification_question,
+        "clarification_answer": document.clarification_answer,
+        "original_filename": document.original_filename,
+        "canonical_filename": document.canonical_filename,
+        "original_file": file_url(document.original_file),
+        "archival_pdf": file_url(document.archival_pdf),
+        "ledger_entry_id": str(document.ledger_entry_id) if document.ledger_entry_id else None,
+        "failure_reason": document.failure_reason,
+        "created_at": document.created_at.isoformat(),
+        "filed_at": document.filed_at.isoformat() if document.filed_at else None,
+    }
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def documents_view(request):
+    """Upload or list the acting landlord's OCR-backed business records."""
+    from .document_services import DocumentError, ingest_document
+    from .models import RamaDocument
+    from .tasks import process_rama_document
+
+    landlord = _landlord(request)
+    if request.method == "GET":
+        queryset = (
+            RamaDocument.objects.filter(landlord=landlord)
+            .select_related("holding", "property", "ledger_entry")[:200]
+        )
+        status_filter = str(request.query_params.get("status") or "").upper()
+        if status_filter:
+            queryset = (
+                RamaDocument.objects.filter(
+                    landlord=landlord, status=status_filter
+                )
+                .select_related("holding", "property", "ledger_entry")[:200]
+            )
+        return Response({"documents": [_document_payload(row, request) for row in queryset]})
+
+    upload = request.FILES.get("file") or request.FILES.get("document")
+    if not upload:
+        return Response(
+            {"detail": "A file is required."},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        document, created = ingest_document(
+            landlord=landlord, upload=upload, created_by=request.user
+        )
+    except DocumentError as exc:
+        return Response(
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST
+        )
+    if created:
+        process_rama_document.delay(str(document.pk))
+    return Response(
+        {**_document_payload(document, request), "duplicate": not created},
+        status=http_status.HTTP_201_CREATED if created else http_status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def document_detail_view(request, document_id):
+    """Inspect OCR results or confirm/correct the proposed filing."""
+    from rentium.properties.models import Property, PropertyHolding
+
+    from .document_services import DocumentError, file_document
+    from .models import RamaDocument
+
+    landlord = _landlord(request)
+    document = (
+        RamaDocument.objects.filter(pk=document_id, landlord=landlord)
+        .select_related("holding", "property", "ledger_entry")
+        .first()
+    )
+    if document is None:
+        return Response(
+            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND
+        )
+    if request.method == "GET":
+        payload = _document_payload(document, request)
+        payload["ocr_text"] = document.ocr_text
+        payload["events"] = [
+            {
+                "kind": event.kind,
+                "detail": event.detail,
+                "created_at": event.created_at.isoformat(),
+            }
+            for event in document.events.all()
+        ]
+        return Response(payload)
+
+    data = request.data or {}
+    holding = None
+    property_obj = None
+    if data.get("holding_id"):
+        holding = PropertyHolding.objects.filter(
+            pk=data["holding_id"], landlord=landlord
+        ).first()
+        if holding is None:
+            return Response(
+                {"detail": "No such holding."}, status=http_status.HTTP_400_BAD_REQUEST
+            )
+    if data.get("property_id"):
+        property_obj = Property.objects.filter(
+            pk=data["property_id"], landlord=landlord
+        ).first()
+        if property_obj is None:
+            return Response(
+                {"detail": "No such listing."}, status=http_status.HTTP_400_BAD_REQUEST
+            )
+
+    def parsed_date(key):
+        raw = data.get(key)
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(str(raw))
+        except ValueError as exc:
+            raise DocumentError(f"{key} must be YYYY-MM-DD.") from exc
+
+    try:
+        file_document(
+            document,
+            actor=request.user,
+            holding=holding,
+            property=property_obj,
+            kind=data.get("kind"),
+            title=data.get("title"),
+            amount=data.get("amount"),
+            expense_category=data.get("expense_category"),
+            payment_state=data.get("payment_state"),
+            document_date=parsed_date("document_date"),
+            due_date=parsed_date("due_date"),
+            issuer=data.get("issuer"),
+            reference_number=data.get("reference_number"),
+            clarification_answer=str(data.get("clarification_answer") or ""),
+            portfolio_wide=data.get("portfolio_wide", False),
+        )
+    except (DocumentError, ValueError) as exc:
+        return Response(
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST
+        )
+    document.refresh_from_db()
+    return Response(_document_payload(document, request))
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def document_download_view(request, document_id):
+    """Authenticated download; private records are never exposed by a public URL."""
+    from .models import RamaDocument
+
+    document = RamaDocument.objects.filter(
+        pk=document_id, landlord=_landlord(request)
+    ).first()
+    if document is None:
+        return Response(
+            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND
+        )
+    field = document.archival_pdf or document.original_file
+    field.open("rb")
+    return FileResponse(
+        field,
+        as_attachment=True,
+        filename=document.canonical_filename or document.original_filename,
+        content_type="application/pdf" if document.archival_pdf else document.media_type,
+    )
 
 
 @api_view(["GET", "POST"])

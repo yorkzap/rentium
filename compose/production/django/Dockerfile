@@ -51,6 +51,10 @@ RUN addgroup --system django \
 RUN apt-get update && apt-get install --no-install-recommends -y \
   # psycopg dependencies
   libpq-dev \
+  ghostscript \
+  tesseract-ocr \
+  tesseract-ocr-eng \
+  tesseract-ocr-fra \
   # Translations dependencies
   gettext \
   # entrypoint
