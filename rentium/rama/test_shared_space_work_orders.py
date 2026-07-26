@@ -199,3 +199,123 @@ def test_the_briefing_reports_where_it_is_switched_on(landlord):
 
     assert out["morning_briefing"]["enabled_on"] == ["TELEGRAM"]
     assert "On for TELEGRAM" in out["morning_briefing"]["status"]
+
+
+# ------------------------------------------------- the job it couldn't close
+# Follow-up from the same landlord, one day later:
+#
+#     landlord: I fixed it by buying and putting a new knob
+#     RAMA:     Should I mark it as completed since you fixed it?
+#     landlord: Yes ... the amount was 19.78
+#     RAMA:     Created 84ab93ba-...
+#     landlord: i see 0 work orders
+#
+# The ticket existed. Three things hid it and stopped it closing.
+
+def test_a_shared_space_job_is_visible_to_its_landlord(landlord, basement):
+    """It was filed, then invisible: every landlord query scoped work orders
+    through `property__landlord`, and a shared-space job has no property."""
+    _create(landlord, property_query="McKenzie Basement", confirm="yes")
+
+    assert WorkOrder.objects.for_landlord(landlord).count() == 1
+
+
+def test_scoping_still_excludes_other_landlords(landlord, basement):
+    from rentium.users.models import LandlordProfile
+    from rentium.users.tests.factories import UserFactory
+
+    _create(landlord, property_query="McKenzie Basement", confirm="yes")
+    stranger = LandlordProfile.objects.create(user=UserFactory())
+
+    assert WorkOrder.objects.for_landlord(stranger).count() == 0
+
+
+def test_a_shared_space_job_can_be_found_again_to_complete_it(landlord, basement):
+    """"Mark it completed" silently did nothing because _resolve_work_order
+    filtered on property__landlord and could never find the job RAMA had just
+    created."""
+    created = _create(
+        landlord, property_query="McKenzie Basement", confirm="yes"
+    )
+    wo_id = created["work_order"]["id"]
+
+    result = registry.execute(
+        "complete_work_order",
+        {"work_order_id": wo_id, "cost": "19.78", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert result.get("completed"), result
+
+    wo = WorkOrder.objects.get()
+    assert wo.status == WorkOrder.Status.COMPLETED
+    assert str(wo.cost) == "19.78"
+
+
+def test_a_job_the_landlord_already_fixed_can_be_closed_directly(
+    landlord, basement
+):
+    """NEW -> COMPLETED. The commonest small repair is "it broke and I fixed
+    it myself", logged after the fact; requiring SCHEDULED first left finished
+    repairs sitting open forever."""
+    created = _create(
+        landlord, property_query="McKenzie Basement", confirm="yes"
+    )
+    wo = WorkOrder.objects.get(pk=created["work_order"]["id"])
+    assert wo.status == WorkOrder.Status.NEW
+
+    wo.transition_to(WorkOrder.Status.COMPLETED)
+    assert wo.status == WorkOrder.Status.COMPLETED
+
+
+def test_completed_is_still_terminal(landlord, basement):
+    """Relaxing the entry into COMPLETED must not make it reopenable."""
+    from django.core.exceptions import ValidationError
+
+    created = _create(
+        landlord, property_query="McKenzie Basement", confirm="yes"
+    )
+    wo = WorkOrder.objects.get(pk=created["work_order"]["id"])
+    wo.transition_to(WorkOrder.Status.COMPLETED)
+
+    with pytest.raises(ValidationError):
+        wo.transition_to(WorkOrder.Status.IN_PROGRESS)
+
+
+def test_a_shared_space_expense_is_booked_against_the_address(
+    landlord, basement
+):
+    """No listing to charge, but there IS an address. Without the holding the
+    expense lands nowhere and cannot be attributed to the house."""
+    from rentium.ledger.models import LedgerEntry
+
+    created = _create(
+        landlord, property_query="McKenzie Basement", confirm="yes"
+    )
+    registry.execute(
+        "complete_work_order",
+        {"work_order_id": created["work_order"]["id"], "cost": "19.78",
+         "post_expense": "1", "confirm": "yes"},
+        landlord=landlord,
+    )
+
+    expense = LedgerEntry.objects.get(entry_type="EXPENSE")
+    assert expense.property is None, "not charged to one of the shared rooms"
+    assert expense.holding == basement["unit"].holding
+    assert expense.work_order_id is not None, "linked back to the job"
+
+
+def test_completing_twice_does_not_double_post_the_expense(landlord, basement):
+    """The idempotency key is what stops a $19.78 repair becoming $39.56."""
+    from rentium.ledger.models import LedgerEntry
+
+    created = _create(
+        landlord, property_query="McKenzie Basement", confirm="yes"
+    )
+    args = {
+        "work_order_id": created["work_order"]["id"], "cost": "19.78",
+        "post_expense": "1", "confirm": "yes",
+    }
+    registry.execute("complete_work_order", args, landlord=landlord)
+    registry.execute("complete_work_order", args, landlord=landlord)
+
+    assert LedgerEntry.objects.filter(entry_type="EXPENSE").count() == 1

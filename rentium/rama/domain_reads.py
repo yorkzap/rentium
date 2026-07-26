@@ -43,7 +43,7 @@ def list_work_orders(
     from rentium.maintenance.models import WorkOrder
 
     today = date.today()
-    qs = WorkOrder.objects.filter(property__landlord=landlord).select_related(
+    qs = WorkOrder.objects.for_landlord(landlord).select_related(
         "property", "area", "lease"
     )
     if not include_closed:
@@ -114,7 +114,7 @@ def list_work_orders(
         )
 
     # Portfolio open counts (not limited by include_closed filter alone)
-    base = WorkOrder.objects.filter(property__landlord=landlord)
+    base = WorkOrder.objects.for_landlord(landlord)
     counts = {
         "returned": len(rows),
         "open_in_portfolio": base.exclude(
@@ -1220,7 +1220,7 @@ def domain_digest(landlord) -> dict:
 
     today = date.today()
     open_qs = (
-        WorkOrder.objects.filter(property__landlord=landlord)
+        WorkOrder.objects.for_landlord(landlord)
         .exclude(
             status__in=[WorkOrder.Status.COMPLETED, WorkOrder.Status.CANCELLED]
         )

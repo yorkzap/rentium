@@ -58,17 +58,31 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         base = WorkOrder.objects.select_related(
-            "property", "area", "reported_by"
+            "property", "unit", "unit__holding", "area", "reported_by"
         ).prefetch_related("images", "comments__author")
 
         if hasattr(user, "landlord_profile"):
-            from rentium.users.access import scope_q
+            from rentium.users.access import accessible_properties, scope_q
 
-            # WorkOrder has no landlord FK — scope purely by property/lease.
-            return base.filter(
-                scope_q(user, landlord_field=None, property_field="property",
-                        lease_field="lease")
-            ).distinct()
+            # WorkOrder has no landlord FK, so it is scoped through what it
+            # points at. A job in SHARED space points at a unit and has no
+            # listing at all — scoping only by property/lease made those
+            # invisible to the landlord who filed them (the ticket existed,
+            # the dashboard said "No work orders yet").
+            scope = scope_q(
+                user,
+                landlord_field=None,
+                property_field="property",
+                lease_field="lease",
+            )
+            # The unit's own owner, plus whole-portfolio grants — the same
+            # listing-or-unit rule WorkOrder.objects.for_landlord encodes,
+            # expressed through scope_q so co-landlord grants still apply.
+            scope |= scope_q(user, landlord_field="unit__landlord")
+            # A property-scoped co-landlord sees shared-space jobs on the unit
+            # their granted listing belongs to.
+            scope |= Q(unit__offerings__in=accessible_properties(user))
+            return base.filter(scope).distinct()
 
         if hasattr(user, "tenant_profile"):
             tenant = user.tenant_profile

@@ -1427,7 +1427,7 @@ def state_of_the_union(landlord) -> dict:
     overdue_count = open_charges.filter(due_date__lt=today).count()
 
     open_work = (
-        WorkOrder.objects.filter(property__landlord=landlord)
+        WorkOrder.objects.for_landlord(landlord)
         .exclude(status__in=[WorkOrder.Status.COMPLETED, WorkOrder.Status.CANCELLED])
         .count()
     )

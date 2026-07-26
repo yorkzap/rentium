@@ -281,14 +281,16 @@ def transition_work_order(
     wo = None
     if work_order_id:
         try:
-            wo = WorkOrder.objects.select_related("property").get(
-                pk=work_order_id, property__landlord=landlord
+            wo = (
+                WorkOrder.objects.for_landlord(landlord)
+                .select_related("property", "unit")
+                .get(pk=work_order_id)
             )
         except (WorkOrder.DoesNotExist, ValueError):
             return {"error": f"No work order {work_order_id!r}."}
     elif title_query:
-        qs = WorkOrder.objects.filter(
-            property__landlord=landlord, title__icontains=title_query.strip()
+        qs = WorkOrder.objects.for_landlord(landlord).filter(
+            title__icontains=title_query.strip()
         ).exclude(
             status__in=[WorkOrder.Status.COMPLETED, WorkOrder.Status.CANCELLED]
         )

@@ -46,6 +46,24 @@ DEFAULT_SLA_HOURS = {
 RTA_EMERGENCY_CATEGORIES = {"PLUMBING", "HEATING_COOLING", "ELECTRICAL", "SAFETY"}
 
 
+class WorkOrderQuerySet(models.QuerySet):
+    def for_landlord(self, landlord):
+        """THE landlord scoping rule for work orders. Nothing is allowed to
+        reimplement it.
+
+        A work order has no landlord FK, so it is reached through what it points
+        at — and it may point at a LISTING or, for a fault in shared space, at a
+        UNIT with no listing at all. Six places had each written
+        `filter(property__landlord=...)` by hand, so the day `property` became
+        nullable every one of them silently stopped seeing shared-space jobs:
+        the dashboard said "No work orders yet" for a ticket that existed, and
+        "mark it completed" failed to find the job it had just created.
+        """
+        return self.filter(
+            models.Q(property__landlord=landlord) | models.Q(unit__landlord=landlord)
+        )
+
+
 class WorkOrder(models.Model):
     class Category(models.TextChoices):
         PLUMBING = "PLUMBING", _("Plumbing")
@@ -77,7 +95,22 @@ class WorkOrder(models.Model):
 
     # Legal lifecycle. COMPLETED/CANCELLED are terminal (reopen = new order).
     TRANSITIONS = {
-        Status.NEW: {Status.SCHEDULED, Status.IN_PROGRESS, Status.CANCELLED},
+        # NEW -> COMPLETED is legal on purpose. The FSM originally required a
+        # job to be SCHEDULED or IN_PROGRESS first, which assumes every repair
+        # is arranged in advance — but the commonest small job is "it broke and
+        # I fixed it myself", logged after the fact. Forbidding it meant the
+        # landlord could file the job and then not close it, so a finished
+        # repair sat open forever.
+        #
+        # Routing it through a fake IN_PROGRESS would be worse: it would invent
+        # a scheduling history that never happened, in a record that feeds the
+        # property's maintenance history.
+        Status.NEW: {
+            Status.SCHEDULED,
+            Status.IN_PROGRESS,
+            Status.COMPLETED,
+            Status.CANCELLED,
+        },
         Status.SCHEDULED: {
             Status.IN_PROGRESS,
             Status.COMPLETED,
@@ -163,6 +196,8 @@ class WorkOrder(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = WorkOrderQuerySet.as_manager()
 
     class Meta:
         ordering = ["-created_at"]

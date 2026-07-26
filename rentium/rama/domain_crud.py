@@ -2661,15 +2661,17 @@ def _resolve_work_order(landlord, *, work_order_id: str = "", title_query: str =
 
     if work_order_id:
         try:
-            wo = WorkOrder.objects.select_related("property").get(
-                pk=work_order_id, property__landlord=landlord
+            wo = (
+                WorkOrder.objects.for_landlord(landlord)
+                .select_related("property", "unit")
+                .get(pk=work_order_id)
             )
             return wo, None
         except (WorkOrder.DoesNotExist, ValueError):
             return None, f"No work order {work_order_id!r}."
     if title_query:
-        qs = WorkOrder.objects.filter(
-            property__landlord=landlord, title__icontains=title_query.strip()
+        qs = WorkOrder.objects.for_landlord(landlord).filter(
+            title__icontains=title_query.strip()
         )
         if qs.count() != 1:
             return None, (
@@ -2802,7 +2804,9 @@ def complete_work_order(
     preview = {
         "id": str(wo.pk),
         "title": wo.title,
-        "property": wo.property.name,
+        # place_name covers both targets — a shared-space job has no listing,
+        # and reading .property.name here crashed the whole completion.
+        "property": wo.place_name,
         "from_status": wo.status,
         "to_status": WorkOrder.Status.COMPLETED,
         "cost": str(cost_dec) if cost_dec is not None else None,
@@ -2831,12 +2835,21 @@ def complete_work_order(
     if will_expense and cost_dec is not None:
         from rentium.ledger.services import post_expense
 
+        # A shared-space repair has no listing to charge, but it DOES have an
+        # address. Passing the unit's holding keeps the expense attributable
+        # instead of landing nowhere — and stops it being charged to whichever
+        # single room happened to be mentioned.
         entry, _created = post_expense(
             landlord=landlord,
             property=wo.property,
+            holding=(
+                wo.property.holding
+                if wo.property_id
+                else (wo.unit.holding if wo.unit_id else None)
+            ),
             amount=cost_dec,
             category="MAINTENANCE",
-            description=f"Work order: {wo.title}",
+            description=f"Work order: {wo.title} ({wo.place_name})",
             vendor=vendor or wo.contractor_name,
             work_order=wo,
             idempotency_key=f"woexp:{wo.pk}",
