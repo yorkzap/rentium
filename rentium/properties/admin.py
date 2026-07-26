@@ -5,7 +5,9 @@ from .models import InventoryItem
 from .models import Property
 from .models import PropertyArea
 from .models import PropertyGroup
+from .models import PropertyHolding
 from .models import PropertyImage
+from .models import PropertyUnit
 from .models import SharedInventoryItem
 
 
@@ -145,17 +147,40 @@ class PropertyImageAdmin(admin.ModelAdmin):
     ordering = ("property", "order", "created_at")
 
 
+@admin.register(PropertyHolding)
+class PropertyHoldingAdmin(admin.ModelAdmin):
+    list_display = ("name", "landlord", "kind", "address", "city")
+    list_filter = ("kind",)
+    search_fields = ("name", "address", "city", "landlord__user__name")
+    autocomplete_fields = ["landlord"]
+
+
+@admin.register(PropertyUnit)
+class PropertyUnitAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "holding",
+        "unit_type",
+        "rental_mode",
+        "layout_complete",
+    )
+    list_filter = ("rental_mode", "layout_complete", "unit_type")
+    search_fields = ("name", "holding__name", "landlord__user__name")
+    autocomplete_fields = ["landlord", "holding"]
+
+
 @admin.register(PropertyGroup)
 class PropertyGroupAdmin(admin.ModelAdmin):
     list_display = (
         "name",
         "landlord",
+        "unit",
         "total_occupancy",
         "current_occupancy",
         "occupancy_percentage",
     )
     search_fields = ("name", "landlord__user__name")
-    autocomplete_fields = ["landlord"]
+    autocomplete_fields = ["landlord", "unit"]
 
 
 @admin.register(PropertyArea)

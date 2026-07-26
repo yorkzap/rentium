@@ -87,6 +87,22 @@ class Province(models.TextChoices):
     YT = "yt", "Yukon"
 
 
+class UnitType(models.TextChoices):
+    """What kind of self-contained space this is.
+
+    Module-level because both PropertyUnit (the physical space) and Property
+    (the listing offered on it) need it, and PropertyUnit is defined first.
+    Property.UnitType stays as an alias — it is referenced widely across the
+    API, RAMA and the frontend serializers.
+    """
+
+    BASEMENT = "BASEMENT", _("Basement")
+    GARDEN_SUITE = "GARDEN_SUITE", _("Garden Suite")
+    MAIN_FLOOR = "MAIN_FLOOR", _("Main Floor")
+    APARTMENT = "APARTMENT", _("Apartment")
+    OTHER = "OTHER", _("Other")
+
+
 postal_code_validator = RegexValidator(
     regex=r"^[A-Za-z]\d[A-Za-z][ ]?\d[A-Za-z]\d$",
     message="Enter a Canadian postal code, like V8Z 3T7.",
@@ -154,10 +170,130 @@ class PropertyHolding(models.Model):
         return f"{self.name} (Landlord: {self.landlord.user.name})"
 
 
+class PropertyUnit(models.Model):
+    """One physical, self-contained space inside a Holding — a floor, a suite,
+    a household. "McCaughey Main Floor" is ONE unit that happens to contain
+    three bedrooms.
+
+    This is the level the old model was missing, and its absence is what made
+    the portfolio unreadable: a floor rented whole and a floor rented room-by-
+    room were both stored as a PropertyGroup full of room listings, so nothing
+    could tell "a 3-bedroom floor let to one family" from "3 rooms let to 3
+    strangers".
+
+    Three ideas that used to be one, now deliberately separate:
+
+      PropertyUnit   the physical space. Knows its full internal layout (via
+                     PropertyArea) no matter how it is currently rented.
+      rental_mode    how it is OFFERED right now. Exactly one mode is live at
+                     a time; switching is reversible and never destructive
+                     (see properties/services.py).
+      lease scope    what a given lease actually COVERS. This — not
+                     rental_mode — decides the legal regime; see
+                     leases/tenancy_rules.py. A BY_ROOM unit where one party
+                     holds every room is a whole-unit tenancy in law.
+
+    The listings a landlord actually rents stay Property rows pointing here:
+    one COMPLETE_UNIT listing under WHOLE_UNIT, or N ROOM listings under
+    BY_ROOM. Listings for the inactive mode are kept (is_active_offering=False)
+    so switching back reuses them instead of recreating them.
+    """
+
+    # Same alias as Property.UnitType, so callers reach it from whichever
+    # model they already hold.
+    UnitType = UnitType
+
+    class RentalMode(models.TextChoices):
+        WHOLE_UNIT = "WHOLE_UNIT", _("Rented as one whole unit")
+        BY_ROOM = "BY_ROOM", _("Rented room by room")
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        LandlordProfile, on_delete=models.CASCADE, related_name="property_units"
+    )
+    holding = models.ForeignKey(
+        PropertyHolding,
+        on_delete=models.CASCADE,
+        related_name="units",
+        verbose_name=_("Holding"),
+        help_text=_("The address this unit is part of."),
+    )
+    name = models.CharField(
+        _("Unit Name"),
+        max_length=100,
+        help_text=_("e.g., Main Floor, Basement, Upstairs, Garden Suite"),
+    )
+    unit_type = models.CharField(
+        _("Unit Type"),
+        max_length=20,
+        choices=UnitType.choices,
+        blank=True,
+    )
+    rental_mode = models.CharField(
+        _("Rental Mode"),
+        max_length=20,
+        choices=RentalMode.choices,
+        default=RentalMode.WHOLE_UNIT,
+        db_index=True,
+        help_text=_("Whether this unit is currently offered whole or room by room."),
+    )
+    # A unit whose layout we only partly know is still USABLE — it is created
+    # and flagged, never blocked and never invented. RAMA sets this when a
+    # landlord describes a floor without saying how many bathrooms it has.
+    layout_complete = models.BooleanField(
+        _("Layout Complete"),
+        default=False,
+        help_text=_("False when we know some rooms/bathrooms are still unrecorded."),
+    )
+    missing_layout_notes = models.TextField(
+        _("Missing Layout Notes"),
+        blank=True,
+        help_text=_("What is known to be missing, in the landlord's own words."),
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = _("Property Unit")
+        verbose_name_plural = _("Property Units")
+        ordering = ["holding", "name"]
+        unique_together = ("holding", "name")
+
+    def __str__(self):
+        return f"{self.name} ({self.holding.name})"
+
+    @property
+    def is_whole_unit(self) -> bool:
+        return self.rental_mode == self.RentalMode.WHOLE_UNIT
+
+    def active_offerings(self):
+        """The listings currently on the market for this unit."""
+        return self.offerings.filter(is_active_offering=True)
+
+
 class PropertyGroup(models.Model):
+    """Room-by-room tenancy for ONE unit: the shared-space membership that a
+    set of room listings belong to.
+
+    Since PropertyUnit exists, a group is no longer "whatever the landlord
+    lumped together" — it expresses exactly one thing, that a unit is being
+    let room by room. Hence the one-to-one back to its unit.
+    """
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     landlord = models.ForeignKey(
         LandlordProfile, on_delete=models.CASCADE, related_name="property_groups"
+    )
+    # Nullable while the portfolio is migrated; the backfill attaches every
+    # existing group to the unit it turned out to describe.
+    unit = models.OneToOneField(
+        PropertyUnit,
+        on_delete=models.SET_NULL,
+        related_name="room_group",
+        null=True,
+        blank=True,
+        verbose_name=_("Unit"),
+        help_text=_("The physical unit these rooms make up."),
     )
     name = models.CharField(
         _("Group Name"),
@@ -232,13 +368,16 @@ class PropertyQuerySet(models.QuerySet):
         THE visibility rule. Nothing anywhere in the codebase is allowed to
         reimplement it — the public city pages, the landlord showcase pages,
         the property detail page, the sitemap, and the appointments teaser all
-        go through here. Three conditions, ALL required:
+        go through here. Four conditions, ALL required:
 
           1. The landlord opted in         (Showcase.is_public — default FALSE)
           2. This property isn't hidden    (is_publicly_visible — default TRUE)
           3. The property is AVAILABLE     (status automation keeps this true;
                                             OCCUPIED / MAINTENANCE / NOT_AVAILABLE
                                             self-clean out of the public site)
+          4. It's the unit's live offering (is_active_offering — the three
+                                            rooms of a floor now rented whole
+                                            must not still be advertised)
 
         A landlord who has never opened Settings is invisible. That's the point.
         """
@@ -246,6 +385,7 @@ class PropertyQuerySet(models.QuerySet):
             landlord__showcase__is_public=True,
             is_publicly_visible=True,
             status=Property.PropertyStatus.AVAILABLE,
+            is_active_offering=True,
         )
 
 
@@ -255,12 +395,10 @@ class Property(models.Model):
         COMPLETE_UNIT = "COMPLETE_UNIT", _("Complete Unit")
         ROOM = "ROOM", _("Room")
 
-    class UnitType(models.TextChoices):
-        BASEMENT = "BASEMENT", _("Basement")
-        GARDEN_SUITE = "GARDEN_SUITE", _("Garden Suite")
-        MAIN_FLOOR = "MAIN_FLOOR", _("Main Floor")
-        APARTMENT = "APARTMENT", _("Apartment")
-        OTHER = "OTHER", _("Other")
+    # Alias of the module-level UnitType (hoisted so PropertyUnit can use it
+    # too). Kept because Property.UnitType is referenced across the API, RAMA
+    # and the serializers.
+    UnitType = UnitType
 
     class RoomType(models.TextChoices):
         PRIVATE = "PRIVATE", _("Private Room")
@@ -408,6 +546,29 @@ class Property(models.Model):
         blank=True,
         verbose_name=_("Holding"),
         help_text=_("The house/building this listing belongs to (one bank account)."),
+    )
+    # The physical space this listing offers — see PropertyUnit. A listing is
+    # an OFFER on a unit, not the unit itself: one COMPLETE_UNIT listing under
+    # WHOLE_UNIT mode, or one per bedroom under BY_ROOM.
+    unit = models.ForeignKey(
+        PropertyUnit,
+        on_delete=models.SET_NULL,
+        related_name="offerings",
+        null=True,
+        blank=True,
+        verbose_name=_("Unit"),
+        help_text=_("The physical floor/suite this listing rents out."),
+    )
+    # False for listings belonging to the mode this unit is NOT currently in.
+    # They are kept, not deleted, so switching rental mode back reuses the
+    # original listing (with its photos, description and history) instead of
+    # creating a duplicate. Maintained by properties/services.py — never edit
+    # directly. Inactive offerings stay reachable via ?include_inactive=true.
+    is_active_offering = models.BooleanField(
+        _("Active Offering"),
+        default=True,
+        db_index=True,
+        help_text=_("False for listings parked by a rental-mode switch."),
     )
 
     # ---------------------------------------------------------------- public
