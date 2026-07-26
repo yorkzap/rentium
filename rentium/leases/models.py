@@ -300,6 +300,7 @@ class Lease(AgreementTerms):
                     "Leases linked to a Property Group must be a Roommate agreement type."
                 )
             )
+        self._validate_no_cross_scope_overlap()
         # Ensure landlord consistency
         if self.property and self.property.landlord != self.landlord:
             raise ValidationError(
@@ -363,6 +364,64 @@ class Lease(AgreementTerms):
         # Validate bills_included structure if provided
         if self.bills_included:
             self._validate_bills_included()
+
+    def _validate_no_cross_scope_overlap(self):
+        """A unit cannot be let whole and by the room at the same time.
+
+        The two scopes describe the same physical space, so overlapping them
+        double-lets it: a family renting the whole floor and a roommate renting
+        Bedroom 2 both hold a valid agreement to the same bedroom. Checked here
+        (rather than only at mode-switch time) because a lease can be created
+        long after a switch, and re-checked on activation.
+
+        Only live leases conflict — terminated and expired ones are history.
+        """
+        from rentium.properties.models import Property
+
+        live = ("DRAFT", "PENDING", "ACTIVE")
+        if self.status not in live:
+            return
+
+        unit_id = None
+        if self.property_id and self.property.unit_id:
+            unit_id = self.property.unit_id
+        elif self.group_id and getattr(self.group, "unit_id", None):
+            unit_id = self.group.unit_id
+        if unit_id is None:
+            return
+
+        covers_whole = bool(
+            self.property_id
+            and self.property.property_category
+            == Property.PropertyCategory.COMPLETE_UNIT
+        )
+
+        others = Lease.objects.filter(status__in=live).exclude(pk=self.pk)
+        others = others.filter(
+            models.Q(property__unit_id=unit_id) | models.Q(group__unit_id=unit_id)
+        )
+        for other in others.select_related("property"):
+            other_covers_whole = bool(
+                other.property_id
+                and other.property.property_category
+                == Property.PropertyCategory.COMPLETE_UNIT
+            )
+            if covers_whole != other_covers_whole:
+                whole, room = (
+                    (self, other) if covers_whole else (other, self)
+                )
+                raise ValidationError(
+                    _(
+                        "This unit already has a live %(kind)s lease (%(number)s). "
+                        "A unit cannot be rented whole and by the room at the "
+                        "same time — end that lease first, or change what this "
+                        "one covers."
+                    )
+                    % {
+                        "kind": "whole-unit" if other_covers_whole else "room",
+                        "number": other.lease_number,
+                    }
+                )
 
     def _validate_bills_included(self):
         """Validate the structure and values in the bills_included field."""

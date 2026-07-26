@@ -16,6 +16,7 @@ from django.db import transaction
 from .models import Property
 from .models import PropertyArea
 from .models import PropertyGroup
+from .models import PropertyUnit
 
 AREA_ALIASES = {
     "kitchen": PropertyArea.AreaType.KITCHEN,
@@ -293,3 +294,152 @@ def update_group_common_area(
     area.save()
     sync_group_common_areas(group)
     return area
+
+
+# --------------------------------------------------------------- rental mode
+# Switching how a unit is rented is reversible and never destructive. The rule
+# is simple and absolute: nothing is deleted. Listings belonging to the mode a
+# unit is leaving are PARKED (is_active_offering=False), keeping their photos,
+# description, inventory and lease history, so switching back reuses the
+# original rather than creating a near-duplicate.
+#
+# A switch is blocked outright while any lease is live anywhere in the unit.
+# Re-shaping what is on offer underneath a signed or half-signed agreement is
+# how you end up with a tenancy pointing at a listing that no longer means what
+# it meant when it was signed.
+
+class RentalModeError(ValidationError):
+    """Raised when a rental-mode switch is not safe to perform."""
+
+
+# DRAFT and PENDING count: a draft is paperwork someone is mid-way through, and
+# a pending lease is already out for signature.
+BLOCKING_LEASE_STATUSES = ("DRAFT", "PENDING", "ACTIVE")
+
+
+def _unit_listings(unit: PropertyUnit):
+    return Property.objects.filter(unit=unit)
+
+
+def blocking_leases_for_unit(unit: PropertyUnit) -> list:
+    """Every live lease anywhere in this unit — on any of its listings, or on
+    its room-group. Empty list = the unit is free to be restructured."""
+    from django.db.models import Q
+
+    from rentium.leases.models import Lease
+
+    scope = Q(property__unit=unit)
+    group = getattr(unit, "room_group", None)
+    if group is not None:
+        scope |= Q(group=group)
+    return list(
+        Lease.objects.filter(scope, status__in=BLOCKING_LEASE_STATUSES)
+        .select_related("property")
+        .distinct()
+    )
+
+
+def describe_rental_mode_switch(unit: PropertyUnit, new_mode: str) -> dict:
+    """What WOULD happen, without touching anything.
+
+    Returned verbatim to the landlord (and to RAMA as a preview) so a switch is
+    always shown before it is run.
+    """
+    new_mode = (new_mode or "").strip().upper()
+    valid = {m for m, _label in PropertyUnit.RentalMode.choices}
+    if new_mode not in valid:
+        return {
+            "ok": False,
+            "error": f"rental_mode must be one of {sorted(valid)} (got {new_mode!r}).",
+        }
+
+    blockers = blocking_leases_for_unit(unit)
+    if new_mode == unit.rental_mode:
+        return {
+            "ok": False,
+            "error": f"{unit.name} is already rented {unit.get_rental_mode_display().lower()}.",
+        }
+
+    to_park = list(_unit_listings(unit).filter(is_active_offering=True))
+    wanted_category = (
+        Property.PropertyCategory.COMPLETE_UNIT
+        if new_mode == PropertyUnit.RentalMode.WHOLE_UNIT
+        else Property.PropertyCategory.ROOM
+    )
+    to_revive = list(
+        _unit_listings(unit).filter(
+            is_active_offering=False, property_category=wanted_category
+        )
+    )
+
+    return {
+        "ok": not blockers,
+        "unit": unit.name,
+        "from_mode": unit.rental_mode,
+        "to_mode": new_mode,
+        "blocked_by": [
+            {
+                "lease_number": lease.lease_number,
+                "status": lease.status,
+                "listing": lease.property.name if lease.property_id else None,
+            }
+            for lease in blockers
+        ],
+        "will_park": [p.name for p in to_park],
+        "will_reactivate": [p.name for p in to_revive],
+        "needs_new_listing": not to_revive,
+        "note": (
+            "Nothing is deleted. Parked listings keep their photos, inventory "
+            "and history, and come back if you switch this unit back."
+        ),
+    }
+
+
+@transaction.atomic
+def set_rental_mode(unit: PropertyUnit, new_mode: str) -> dict:
+    """Switch how a unit is rented. Raises RentalModeError if not safe.
+
+    Idempotent in the sense that matters: it refuses a no-op switch rather
+    than silently re-parking listings.
+    """
+    preview = describe_rental_mode_switch(unit, new_mode)
+    if "error" in preview:
+        raise RentalModeError(preview["error"])
+    if preview["blocked_by"]:
+        names = ", ".join(
+            f"{b['lease_number']} ({b['status']})" for b in preview["blocked_by"]
+        )
+        raise RentalModeError(
+            f"{unit.name} has live leases and cannot be restructured: {names}. "
+            "End or complete them first."
+        )
+
+    new_mode = preview["to_mode"]
+
+    # Park the outgoing offerings — never delete.
+    _unit_listings(unit).filter(is_active_offering=True).update(
+        is_active_offering=False
+    )
+    # Bring back whatever this unit used to offer in the mode it is entering.
+    wanted_category = (
+        Property.PropertyCategory.COMPLETE_UNIT
+        if new_mode == PropertyUnit.RentalMode.WHOLE_UNIT
+        else Property.PropertyCategory.ROOM
+    )
+    reactivated = _unit_listings(unit).filter(
+        is_active_offering=False, property_category=wanted_category
+    )
+    reactivated_names = [p.name for p in reactivated]
+    reactivated.update(is_active_offering=True)
+
+    unit.rental_mode = new_mode
+    unit.save(update_fields=["rental_mode", "updated_at"])
+
+    return {
+        "ok": True,
+        "unit": unit.name,
+        "rental_mode": new_mode,
+        "parked": preview["will_park"],
+        "reactivated": reactivated_names,
+        "needs_new_listing": not reactivated_names,
+    }
