@@ -22,21 +22,90 @@ remain useful for implementation detail.
 
 ## Property hierarchy
 
-The current hierarchy is:
-
 ```text
 PropertyHolding (physical/legal/financial address)
-└── PropertyGroup (household or shared unit)
-    ├── Property (rentable room or complete unit)
+└── PropertyUnit (a floor, suite or household — the physical space)
+    ├── Property (the OFFERING: one complete-unit listing, or one per room)
     │   └── InventoryItem (private listing inventory)
-    └── PropertyArea (group common area shared by member listings)
+    ├── PropertyArea (the unit's internal layout — bedrooms, bathrooms, kitchen)
+    └── PropertyGroup (present only when the unit is let room by room)
 ```
 
-`Property` remains the rentable listing consumed by leases and showcase APIs.
-A holding groups listings at one real-world asset for expenses, documents, and
-bank/ledger reporting. A property group represents rooms that share household
-space. `properties.services` is the shared implementation for REST and RAMA
-group-area operations.
+Three ideas that used to be one, and are now deliberately separate:
+
+| Concept | Question it answers |
+| --- | --- |
+| `PropertyUnit` | What physically exists? |
+| `PropertyUnit.rental_mode` | How is it being offered right now? |
+| lease scope (`Lease.property` / `Lease.group`) | What does a given tenancy cover? |
+
+Before `PropertyUnit` existed there was no level between the address and the
+listing, so a floor let as one home and a floor let room by room were both
+stored as a `PropertyGroup` full of room listings. Nothing could distinguish
+"a 3-bedroom floor let to one family" from "3 rooms let to 3 strangers", and a
+9-unit portfolio reported as 14 rooms.
+
+**A bedroom inside a unit is layout, not an offering.** `PropertyArea` records
+it regardless of rental mode; only a `BY_ROOM` unit turns bedrooms into
+`Property` rows.
+
+`Property.is_active_offering` is false for listings belonging to the mode a
+unit is *not* currently in. They are parked, never deleted, so switching back
+reuses the original listing with its photos, inventory and history.
+`PropertyQuerySet.public()` — the single visibility choke point — excludes
+them, and the listing API hides them unless `?include_inactive=true`.
+
+`properties.services` owns rental-mode switching for both REST and RAMA:
+`describe_rental_mode_switch` previews without writing, and `set_rental_mode`
+refuses while any DRAFT, PENDING or ACTIVE lease exists anywhere in the unit.
+`Lease._validate_no_cross_scope_overlap` blocks the other direction, so a unit
+can never be let whole and by the room at the same time.
+
+### Areas
+
+`PropertyArea` is the single area model. A second `Area` model briefly existed
+in `properties/areas.py` holding the maintenance and inspection foreign keys;
+it never held a row (its seeding signals were never connected) while
+PropertyArea held the real data *and* the legally load-bearing
+`shared_with_landlord` / `shared_by` fields. The two were merged into
+PropertyArea and `Area` was deleted.
+
+An area hangs off exactly one parent — `unit`, `group`, or `property` — enforced
+by a check constraint. `serves_areas` records which bedrooms a bathroom is for,
+which `shared_by` cannot express because it points at listings.
+
+`is_seeded_default` marks the generic starter set created by
+`seed_default_areas` so maintenance and inspections have something to
+reference. It is scaffolding, not a fact a landlord stated, and RAMA's layout
+reporting excludes it — otherwise "we know nothing about this floor" silently
+becomes "it has a garage and a laundry".
+
+## Legal regime follows lease scope
+
+`leases/tenancy_rules.py` resolves how a tenancy legally behaves. The deciding
+facts are what the lease **covers** and whether the landlord shares — never how
+the unit is currently marketed.
+
+- `lease_covers_whole_unit()` — a COMPLETE_UNIT listing, a group lease whose
+  tenants between them hold every room, or a group lease with no per-room
+  assignment. A by-room floor where one party takes every room is a whole-unit
+  tenancy in law.
+- `landlord_shares_common_areas()` reads areas on the listing, its unit and its
+  room-group. The unit lookup matters: once layout lives on `PropertyUnit`, a
+  landlord-shared kitchen recorded there would otherwise be invisible, and an
+  invisible sharing flag means the RTA s.4(c) exemption silently stops being
+  applied.
+- `TenancyRules` exposes `covers_whole_unit` and `landlord_shares` so the two
+  facts that drove the answer are auditable in API responses and in the
+  move-out `rules_snapshot`.
+- `_jurisdiction()` falls back to the property's province. Every new room lease
+  uses the one `GENERIC_ROOMMATE` agreement regardless of province, so a BC
+  room tenancy would otherwise fall through to GENERIC and be offered a generic
+  mutual-agreement form instead of RTB-8.
+
+"Whole self-contained unit, but the owner shares the kitchen" is unrepresentable
+by construction: `Lease.clean` restricts `common_space_shared_with` to roommate
+agreement types, and a COMPLETE_UNIT listing may only use a residential type.
 
 Group common areas carry an explicit `is_group_common` marker and a
 `shared_with_landlord` legal classification. Joining a room to a group attaches

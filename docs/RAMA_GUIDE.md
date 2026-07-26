@@ -135,6 +135,60 @@ transaction. An empty group does not require a disposable “first room” as a
 workaround: the operation can bootstrap directly from one exact existing
 holding/address plus any missing city/province, all shown in the preview.
 
+### Units: bedrooms are layout, not listings
+
+`create_property_structure`, `update_unit_layout` and `set_unit_rental_mode`
+replace `create_house_layout` for anything new. The rule they encode is the one
+the old tool got wrong: **a bedroom described inside a floor is internal layout,
+not something on the market.** `create_house_layout` turned every described
+bedroom into a rentable ROOM listing and every floor name into a PropertyGroup,
+so "McCaughey Main Floor is one complete unit, and inside it there are these
+rooms" produced three separate room listings and no way to say they were one
+home. It stays registered for existing room-by-room houses, with a docstring
+that says plainly when not to use it.
+
+What is *offered* is a separate decision — the unit's `rental_mode`. When the
+landlord has not made it clear, `_rental_mode_from_text` returns `None` and the
+tool asks exactly one question rather than defaulting. This is deliberate:
+guessing is what produced three listings for one home, and the landlord could
+not see that it had guessed. Missing facts produce a usable unit flagged
+`layout_complete=False` with a note, never an invented bathroom count.
+
+`set_unit_rental_mode` is `own_confirm=True` — it reshapes what is on the
+market, so it pauses for its own confirmation inside a multi-step plan even
+though it deletes nothing. It refuses outright while any lease is live in the
+unit.
+
+### Playbooks
+
+`plan_operation` covers listing-scoped work (`delete_listings`,
+`terminate_and_delete`, `retire_listings`, `update_status`, `set_visibility`)
+and unit-scoped work (`switch_rental_mode`). Unit scope matters because "rent
+the Wascana floors room by room" is one intent over three physical spaces, each
+of which may be blocked for its own reason.
+
+Registered tools are thin wrappers in `tools.py`, and **the registry builds each
+tool's JSON schema from the wrapper's signature**, silently dropping any
+argument the model sends that is not in it. A parameter added to an
+implementation but not its wrapper is therefore unreachable — the model passes
+it, it vanishes, and the tool behaves as if it were never sent. This bit twice
+(`plan_move_tenant` told the model to pass `pick`, then discarded it).
+`test_wrapper_exposes_every_argument_the_implementation_accepts` now fails on
+that drift.
+
+### Capability gaps
+
+`log_capability_gap` dedupes restatements: identical text first, then a
+word-set comparison, because consecutive rewordings differ by an inserted email
+address or trailing clause — barely a change in meaning but a long way in
+character similarity. A restatement keeps the fuller detail and can raise
+priority but never lowers it. A gap already BUILT or DISMISSED that comes back
+is new information and opens a fresh row. `triage_capability_gap` and
+`GET/PATCH /api/rama/capability-gaps/` make the backlog workable from outside a
+chat; neither builds anything.
+
+### Legacy
+
 `create_house_layout` is the composite boundary for a landlord describing a
 whole hierarchy at once: physical house, property groups, rooms, private areas,
 and exact shared-area access. RAMA keeps the understood hierarchy as a draft,
