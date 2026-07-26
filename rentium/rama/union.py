@@ -885,7 +885,7 @@ def property_layout(landlord) -> dict:
 
     standalone = []
     for prop in (
-        Property.objects.filter(landlord=landlord)
+        Property.objects.filter(landlord=landlord, is_active_offering=True)
         .exclude(pk__in=grouped_ids)
         .order_by("name")
     ):
@@ -915,7 +915,9 @@ def property_layout(landlord) -> dict:
             }
         )
 
-    total = Property.objects.filter(landlord=landlord).count()
+    total = Property.objects.filter(
+        landlord=landlord, is_active_offering=True
+    ).count()
     return {
         "total_listings": total,
         "count_rule": (
@@ -944,9 +946,16 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
     from rentium.properties.models import Property
 
     today = date.today()
+    # Listings parked by a rental-mode switch are history, not inventory. They
+    # are kept so a switch back reuses them, but counting them here is how
+    # "what do I have?" came back as 21 listings for a 12-listing portfolio —
+    # and, worse, as 14 rooms for a portfolio with 5.
+    parked_total = Property.objects.filter(
+        landlord=landlord, is_active_offering=False
+    ).count()
     qs = list(
-        Property.objects.filter(landlord=landlord)
-        .select_related("group", "holding")
+        Property.objects.filter(landlord=landlord, is_active_offering=True)
+        .select_related("group", "holding", "unit", "unit__holding")
         .prefetch_related("primary_area_associations")
         # Grounds has_images/image_count without an N+1; Property helpers
         # (gallery_image_count etc.) honour this annotation.
@@ -1072,6 +1081,10 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             "city": prop.city,
             "group": prop.group.name if prop.group_id else None,
             "holding": prop.holding.name if prop.holding_id else None,
+            # The physical space this listing offers. Several listings on one
+            # unit are ONE place being rented, not several properties.
+            "unit": prop.unit.name if prop.unit_id else None,
+            "rental_mode": prop.unit.rental_mode if prop.unit_id else None,
             "occupancy": occupancy,
             # Photos — computed in Python, never for the model to infer.
             "has_primary_image": bool(prop.primary_image),
@@ -1102,12 +1115,15 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
         else:
             units.append(row)
 
-    total = Property.objects.filter(landlord=landlord).count()
-    room_total = Property.objects.filter(
-        landlord=landlord, property_category=Property.PropertyCategory.ROOM
+    # Live offerings only — parked listings are reported separately as
+    # parked_listings so they can be mentioned when asked about, and never
+    # counted as things currently on the market.
+    live = Property.objects.filter(landlord=landlord, is_active_offering=True)
+    total = live.count()
+    room_total = live.filter(
+        property_category=Property.PropertyCategory.ROOM
     ).count()
-    unit_total = Property.objects.filter(
-        landlord=landlord,
+    unit_total = live.filter(
         property_category=Property.PropertyCategory.COMPLETE_UNIT,
     ).count()
 
@@ -1135,6 +1151,36 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
         if (p.address or "").strip()
     }
     physical_container_count = len(holdings) + len(unassigned_addresses)
+    # The physical layer: what actually exists, independent of how many
+    # listings currently sit on it.
+    from rentium.properties.models import PropertyUnit
+
+    unit_rows = []
+    for u in (
+        PropertyUnit.objects.filter(landlord=landlord)
+        .select_related("holding")
+        .prefetch_related("offerings", "areas")
+        .order_by("holding__name", "name")
+    ):
+        recorded = u.areas.filter(is_seeded_default=False)
+        beds = recorded.filter(area_type="BEDROOM").count()
+        baths = recorded.filter(area_type="BATHROOM").count()
+        unit_rows.append(
+            {
+                "name": u.name,
+                "holding": u.holding.name,
+                "rented": u.rental_mode,
+                # null = never recorded. NOT zero, and never a reason to write.
+                "bedrooms": beds or None,
+                "bathrooms": baths or None,
+                "layout_complete": u.layout_complete,
+                "not_recorded": u.missing_layout_notes or None,
+                "listings": [
+                    o.name for o in u.offerings.all() if o.is_active_offering
+                ],
+            }
+        )
+
     room_hierarchy: list[dict] = []
     hierarchy_index: dict[tuple[str, str, str], dict] = {}
     for room in rooms:
@@ -1179,8 +1225,11 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
                 "Never use it alone to decide vacant vs rented."
             ),
             "question_routing": (
-                "'how many properties?' is ambiguous: answer with both "
-                "counts.physical_containers and counts.total_listings, clearly named. "
+                "'how many properties?' is ambiguous: answer with "
+                "counts.physical_units (the floors/suites that physically exist) "
+                "and counts.total_listings (what is on the market), clearly named. "
+                "counts.parked_listings are NOT on the market — mention them only "
+                "if asked about past arrangements. "
                 "'are rooms in one unit?' → layout.groups vs layout.standalone_units. "
                 "'which rooms are rented / occupied now?' → occupancy.occupied_today / vacant_today. "
                 "'which have leases / are committed?' → has_lease_commitment / phase leased_future. "
@@ -1195,11 +1244,20 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
                 "Copy amounts from expense_lines / dashboard_truth / this_month exactly."
             ),
         },
+        "units": unit_rows,
+        "unit_display_rule": (
+            "A UNIT is one physical floor/suite. A unit rented whole has ONE "
+            "listing; a unit rented by the room has one per bedroom. Answer "
+            "'how many places do I have?' with counts.physical_units, and never "
+            "present the bedrooms of a whole-unit floor as separate properties."
+        ),
         "counts": {
             "physical_holdings": len(holdings),
+            "physical_units": len(unit_rows),
             "physical_containers": physical_container_count,
             "unassigned_address_containers": len(unassigned_addresses),
             "total_listings": total,
+            "parked_listings": parked_total,
             "rooms": room_total,
             "complete_units": unit_total,
             "by_listing_status": status_counts,
@@ -1236,8 +1294,10 @@ def occupancy_as_of(landlord, on_date: str = "") -> dict:
 
     from rentium.properties.models import Property
 
+    # Parked listings would otherwise report as vacant and inflate the
+    # vacancy picture with places that aren't being offered.
     props = list(
-        Property.objects.filter(landlord=landlord)
+        Property.objects.filter(landlord=landlord, is_active_offering=True)
         .select_related("group")
         .order_by("name")
     )

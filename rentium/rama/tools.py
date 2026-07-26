@@ -1981,6 +1981,7 @@ def find_listings(
     group: str = "",
     name_contains: str = "",
     exclude: str = "",
+    include_parked: str = "",
 ) -> dict:
     """Find listings matching filters — USE THIS whenever the landlord scopes a
     request over a set ('all/every listing that/without …'). Never enumerate or
@@ -1994,6 +1995,7 @@ def find_listings(
         landlord, has_images=has_images, vacant_today=vacant_today,
         has_lease=has_lease, listing_status=listing_status, group=group,
         name_contains=name_contains, exclude=exclude,
+        include_parked=include_parked,
     )
 
 

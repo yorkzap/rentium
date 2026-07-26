@@ -1391,6 +1391,7 @@ def find_listings(
     group: str = "",
     name_contains: str = "",
     exclude: str = "",
+    include_parked: str = "",
 ) -> dict:
     """Find listings matching filters. Returns the COMPLETE matching set —
     relay every row; never enumerate or filter listings yourself.
@@ -1398,7 +1399,9 @@ def find_listings(
     has_lease yes/no (ANY lease incl. drafts/ended — these block deletion),
     listing_status AVAILABLE|OCCUPIED|MAINTENANCE|NOT_AVAILABLE,
     group <name>, name_contains <text>,
-    exclude 'name or id, name or id' (kept OUT of the result, echoed back)."""
+    exclude 'name or id, name or id' (kept OUT of the result, echoed back),
+    include_parked yes to also return listings parked by a rental-mode switch
+    (off by default — they are not on the market)."""
     from datetime import date as _date
 
     from rentium.properties.models import Property
@@ -1406,8 +1409,15 @@ def find_listings(
     from .union import _active_leases_by_property, _serialize_lease_brief
 
     today = _date.today()
+    # Parked listings are excluded by default. This is the finder the PLAYBOOKS
+    # enumerate bulk-operation targets through, so including them would let
+    # "delete every listing with no images" reach into listings the landlord
+    # took off the market by switching a unit's rental mode.
+    base = Property.objects.filter(landlord=landlord)
+    if str(include_parked or "").strip().lower() not in ("1", "true", "yes", "y"):
+        base = base.filter(is_active_offering=True)
     qs = list(
-        Property.objects.filter(landlord=landlord)
+        base
         .select_related("group")
         .annotate(
             _gallery_count=Count("property_images", distinct=True),
