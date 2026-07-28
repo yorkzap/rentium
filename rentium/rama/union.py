@@ -1431,15 +1431,18 @@ def state_of_the_union(landlord) -> dict:
         ).count(),
     }
 
-    open_charges = LedgerEntry.objects.with_settlement().filter(
-        landlord=landlord,
-        entry_type__in=INCOME_CHARGE_TYPES,
-        reversed_by__isnull=True,
-        due_date__lte=today,
-        outstanding__gt=0,
-    )
+    # Same partition as ledger/api/summary_view, via the same queryset methods.
+    # If RAMA kept reporting income-only outstanding while the dashboard tile
+    # showed every charge type, the contradiction this fixes would simply
+    # reappear one layer up — RAMA telling the landlord $19.78 while the page
+    # in front of them said $444.78.
+    open_all = LedgerEntry.objects.filter(landlord=landlord).open_charges(as_of=today)
+    open_charges = open_all.income_charges()
     agg = open_charges.aggregate(total=Sum("outstanding"), count=Count("id"))
     overdue_count = open_charges.filter(due_date__lt=today).count()
+    owed_agg = open_all.aggregate(total=Sum("outstanding"), count=Count("id"))
+    owed_overdue_count = open_all.filter(due_date__lt=today).count()
+    deposits_owed = open_all.deposit_charges().aggregate(t=Sum("outstanding"))["t"]
 
     open_work = (
         WorkOrder.objects.for_landlord(landlord)
@@ -1518,6 +1521,13 @@ def state_of_the_union(landlord) -> dict:
         "outstanding_total": str(agg["total"] or Decimal("0.00")),
         "outstanding_count": agg["count"] or 0,
         "overdue_count": overdue_count,
+        # Every charge type, matching the Financial page's tiles. Deposits are
+        # owed but refundable, so they are reported here and never folded into
+        # income.
+        "owed_total": str(owed_agg["total"] or Decimal("0.00")),
+        "owed_count": owed_agg["count"] or 0,
+        "owed_overdue_count": owed_overdue_count,
+        "deposits_outstanding": str(deposits_owed or Decimal("0.00")),
         "active_leases": lease_counts["active"],
         "draft_leases": draft_count,
         "next_charge": next_ch,

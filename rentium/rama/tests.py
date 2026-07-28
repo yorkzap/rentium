@@ -4748,6 +4748,13 @@ def test_run_all_never_raises_with_empty_portfolio(landlord):
     assert set(report) == {
         "min_balances", "deposit_deadlines", "late_patterns",
         "expense_anomalies", "surplus",
+        # Finance watchers — a new sergeant that isn't in run_all() is a
+        # function nobody ever calls, so this set is deliberately exact.
+        "mortgage_renewals", "valuation_staleness", "spend_drift",
+        # Watches the ledger's own invariants rather than the money in it:
+        # abandoned voids, one work order paid twice at two scopes, a
+        # receivable balance annotated onto something that isn't a receivable.
+        "ledger_integrity",
     }
     assert all(not v.get("error") for v in report.values())
 

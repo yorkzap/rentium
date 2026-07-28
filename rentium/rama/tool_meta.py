@@ -177,40 +177,72 @@ TOOL_META: dict[str, ToolMeta] = {
     # Attributing damage to a person decides who pays; a wrong name costs
     # somebody money, so it confirms on its own inside a plan.
     "attribute_work_order": ToolMeta(risk="high", own_confirm=True),
-    "add_work_order_comment": ToolMeta(risk="low"),
+    # Renders on the work order the TENANT sees (WorkOrderComment has no
+    # is_internal flag), so it is outbound, not a private note.
+    "add_work_order_comment": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
     # ------------------------------------------------------ communication
+    # Flips the lead to REPLIED via mark_replied(); the tool exposes no way to
+    # set a status back, so there is no inverse to declare. Confirms until a
+    # reopen path exists.
     "mark_inquiry_replied": ToolMeta(risk="low"),
-    "send_tenant_message": ToolMeta(risk="medium"),
+    # Outbound to a human. Unsendable.
+    "send_tenant_message": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
     "mark_messages_read": ToolMeta(risk="low"),
-    "schedule_viewing": ToolMeta(risk="low"),
-    "respond_to_viewing_request": ToolMeta(risk="low"),
+    # Publishes appointment.scheduled / appointment.tenant_review — emails the
+    # viewer and asks the sitting tenant for consent. Irreversible outbound.
+    "schedule_viewing": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
+    "respond_to_viewing_request": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
     "set_viewing_availability": ToolMeta(risk="low"),
     # ------------------------------------------------------------ money
-    "create_expense": ToolMeta(risk="medium"),
-    "catalog_business_document": ToolMeta(risk="low"),
+    # Two expenses on one address are two separate costs, not a chain.
+    "create_expense": ToolMeta(risk="medium", independent_writes=True),
+    # Voids a posted expense and re-posts it elsewhere. Never autonomous: the
+    # landlord decides where a cost belongs, and the whole reason this tool
+    # exists is that guessing produced a mis-scoped charge to a tenant.
+    "reallocate_expense": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
+    # Can post an immutable ledger expense.
+    "catalog_business_document": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
     # -------------------------------------------------------- inventory
     "bulk_add_inventory": ToolMeta(risk="low"),
-    "create_inventory_item": ToolMeta(risk="low"),
-    "update_inventory_item": ToolMeta(risk="low"),
-    "delete_inventory_item": ToolMeta(risk="low"),
+    # Flips property.is_furnished, which shows on the public listing — a
+    # public side-effect of an otherwise private register.
+    "create_inventory_item": ToolMeta(risk="low", autonomy=Autonomy.NEVER),
+    "update_inventory_item": ToolMeta(
+        risk="low",
+        autonomy=Autonomy.OPT_IN,
+        auto_category="inventory",
+        undo=_undo_update_inventory_item,
+    ),
+    # Hard delete. No soft-delete, no recovery path.
+    "delete_inventory_item": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
     "create_shared_inventory_item": ToolMeta(risk="low"),
-    "delete_shared_inventory_item": ToolMeta(risk="low"),
+    "delete_shared_inventory_item": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
     # ------------------------------------------------------- properties
-    "create_property": ToolMeta(risk="low"),
-    "duplicate_listing": ToolMeta(risk="low"),
-    "attach_photo_to_listing": ToolMeta(risk="low"),
-    # Logging a capability gap is frictionless (no confirm) — we WANT RAMA to
-    # record what it can't do rather than fail silently.
+    # Creates a PUBLIC listing, and delete_property is blocked once anything
+    # attaches to it — so "create it and remove it later" is not available.
+    "create_property": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    "duplicate_listing": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    # Changes what the public sees and consumes a single-use RamaUpload.
+    "attach_photo_to_listing": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    # Takes no confirm at all, so it is already frictionless and never reaches
+    # the autonomy gate — we WANT RAMA to record what it can't do rather than
+    # fail silently.
     "log_capability_gap": ToolMeta(risk="low"),
-    "list_capability_gaps": ToolMeta(risk="low"),
     "update_property": ToolMeta(risk="low"),
     "update": ToolMeta(risk="medium"),  # generic manifest write (previewed)
     "delete_property": ToolMeta(
         risk="high", blockers=delete_property_blockers
     ),
     "create_property_group": ToolMeta(risk="low"),
-    # Records a decision about the backlog; touches no landlord data.
-    "triage_capability_gap": ToolMeta(risk="low"),
+    # Records a decision about the backlog; touches no landlord data, and the
+    # preview carries from_status so the inverse is exact.
+    "triage_capability_gap": ToolMeta(
+        risk="low",
+        autonomy=Autonomy.OPT_IN,
+        auto_category="admin",
+        undo=_undo_triage_capability_gap,
+        auto_guard=_guard_triage_capability_gap,
+    ),
     "assign_property_to_group": ToolMeta(risk="low"),
     "create_holding": ToolMeta(risk="low"),
     "assign_property_to_holding": ToolMeta(risk="low"),

@@ -132,12 +132,81 @@ class LedgerEntryQuerySet(models.QuerySet):
     def income_charges(self):
         return self.filter(entry_type__in=INCOME_CHARGE_TYPES)
 
+    def damage_claims(self):
+        """Charges recovering the cost of damage from a tenant.
+
+        A FEE_CHARGE covers two unrelated things: a late fee (ordinary income,
+        collectible alongside rent) and a damage-recovery claim raised off a
+        work order. Only the damage claim carries a work_order — billing.py
+        never sets one on a late fee — so the two are already distinguishable
+        without a new entry type.
+        """
+        return self.filter(
+            entry_type=EntryType.FEE_CHARGE, work_order__isnull=False
+        )
+
+    def deposit_charges(self):
+        """The mirror of income_charges().
+
+        A deposit is a refundable liability, never income — which is why it is
+        excluded from expected/collected/outstanding. But it is still genuinely
+        OWED, and dropping it from every bucket meant a $425 deposit could sit
+        in the ledger badged "overdue" while the Outstanding tile above it read
+        $19.78 and the Overdue tile read 1. Deposits get their own bucket so
+        they can be disclosed without being misfiled as income.
+        """
+        return self.filter(entry_type=EntryType.DEPOSIT_CHARGE)
+
+    def open_charges(self, *, as_of=None):
+        """Charges that are due and not yet settled — the shape the summary,
+        RAMA's snapshot and the attention feed each used to spell out longhand.
+
+        Chain the cheap classifiers onto the result (.income_charges(),
+        .deposit_charges(), .damage_claims(), .expected_income()) so every
+        caller partitions the same set rather than re-deriving "what is owed".
+        """
+        from datetime import date as _date
+
+        qs = self if "outstanding" in self.query.annotations else self.with_settlement()
+        return qs.filter(
+            reversed_by__isnull=True,
+            due_date__lte=as_of or _date.today(),
+            outstanding__gt=0,
+        )
+
+    def expected_income(self):
+        """Income the landlord can actually expect to collect this period.
+
+        Damage claims are excluded deliberately. They are contested by nature
+        and can only be kept lawfully at the end of the tenancy — with the
+        tenant's written agreement, or via an RTB application inside the
+        statutory window (see services.deposit_position, which reports them as
+        claims against the deposit alongside those routes). Counting one as
+        expected rent overstates the month and invites treating a disputed
+        claim as money already earned. It is reported separately, never hidden.
+        """
+        return self.income_charges().exclude(
+            entry_type=EntryType.FEE_CHARGE, work_order__isnull=False
+        )
+
     def with_settlement(self):
         """
         Annotate charges with settled_amount / outstanding / is_voided in a
         single query. Voided settlements do not count (rule 1 + 2 together:
         void a payment and the charge reopens automatically).
+
+        Both money annotations are NULL for non-charge types. Only a charge is
+        a receivable, so only a charge can have a balance: nothing ever points
+        at an EXPENSE / PAYMENT / CREDIT / DEPOSIT_RETURN / REVERSAL via
+        `settles`, which used to leave them annotated `amount - 0 == amount`.
+        Every consumer read that as "still owed" — the Financial feed rendered
+        a settled expense as "Paid … $31.45 left", and a REVERSAL as a live
+        $19.78 balance next to the entry it had just voided. `charge_status`
+        (api/views.py) has always null-guarded on CHARGE_TYPES; this is the
+        matching half, so the serializer's documented contract — "charges only;
+        null otherwise" — is now true of the queryset that feeds it.
         """
+        money = DecimalField(max_digits=12, decimal_places=2)
         active_settlements = Coalesce(
             Sum(
                 "settlements__amount",
@@ -145,14 +214,23 @@ class LedgerEntryQuerySet(models.QuerySet):
                 & Q(settlements__reversed_by__isnull=True),
             ),
             Value(Decimal("0.00")),
-            output_field=DecimalField(max_digits=12, decimal_places=2),
+            output_field=money,
         )
-        return self.annotate(
-            settled_amount=active_settlements,
+        # Two passes: a Case cannot reference an aggregate declared in the same
+        # annotate() call, so the Sum lands first and the Cases read it by F().
+        return self.annotate(_settled=active_settlements).annotate(
+            settled_amount=Case(
+                When(entry_type__in=CHARGE_TYPES, then=F("_settled")),
+                default=Value(None, output_field=money),
+                output_field=money,
+            ),
             outstanding=Case(
+                # Non-charges first: a voided EXPENSE is still not a receivable,
+                # so it must fall through to NULL rather than to 0.00 below.
+                When(~Q(entry_type__in=CHARGE_TYPES), then=Value(None, output_field=money)),
                 When(reversed_by__isnull=False, then=Value(Decimal("0.00"))),
-                default=F("amount") - F("settled_amount"),
-                output_field=DecimalField(max_digits=12, decimal_places=2),
+                default=F("amount") - F("_settled"),
+                output_field=money,
             ),
             is_voided=Exists(LedgerEntry.objects.filter(reverses=OuterRef("pk"))),
         )

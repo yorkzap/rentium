@@ -5,10 +5,11 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
+from django.db.models import Sum
 from rest_framework.test import APIClient
 
 from . import services
-from .models import EntryType
+from .models import INCOME_CHARGE_TYPES, EntryType
 
 pytestmark = pytest.mark.django_db
 
@@ -164,3 +165,318 @@ def test_a_damage_claim_is_still_a_claim_against_the_deposit(
     assert Decimal(position["claimed"]) >= Decimal("19.78")
     assert position["claims"]
     assert position["lawful_routes"]
+
+
+# ---------------------------------------------------------------------------
+# The annotation contract: only a charge is a receivable, so only a charge has
+# a balance. api/views.py has always documented "charges only; null otherwise"
+# for settled_amount / outstanding; nothing tested it, and with_settlement()
+# quietly annotated every row — so the Financial feed showed a settled expense
+# as "Paid … $31.45 left" and a REVERSAL as a live $19.78 balance beside the
+# entry it had just voided. These tests are what keep the docstring true.
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_outstanding_is_null_on_every_non_charge_type(landlord, bc_lease, bc_property):
+    from rentium.ledger.models import CHARGE_TYPES, LedgerEntry
+
+    charge, _ = services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=bc_lease,
+        property=bc_property,
+        amount="850.00",
+        due_date=date.today(),
+        entry_type=EntryType.RENT_CHARGE,
+        description="Monthly rent",
+    )
+    services.record_payment(charge=charge, amount="100.00", payment_method="ETRANSFER")
+    expense, _ = services.post_expense(
+        landlord=landlord,
+        amount="19.78",
+        category="MAINTENANCE",
+        description="Hot water knob replacement",
+        property=bc_property,
+    )
+    services.void_entry(expense, reason="Shared-space repair — belongs to the address")
+
+    rows = LedgerEntry.objects.filter(landlord=landlord).with_settlement()
+    non_charges = [r for r in rows if r.entry_type not in CHARGE_TYPES]
+
+    # PAYMENT, EXPENSE and REVERSAL are all present, and none of them owes anything.
+    assert {r.entry_type for r in non_charges} == {
+        EntryType.PAYMENT,
+        EntryType.EXPENSE,
+        EntryType.REVERSAL,
+    }
+    for row in non_charges:
+        assert row.outstanding is None, f"{row.entry_type} reported a balance"
+        assert row.settled_amount is None, f"{row.entry_type} reported a settlement"
+
+
+@pytest.mark.django_db
+def test_charges_still_report_their_balance(landlord, bc_lease, bc_property):
+    """The guard must not cost charges the annotation they exist for."""
+    from rentium.ledger.models import LedgerEntry
+
+    charge, _ = services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=bc_lease,
+        property=bc_property,
+        amount="850.00",
+        due_date=date.today(),
+        entry_type=EntryType.RENT_CHARGE,
+        description="Monthly rent",
+    )
+    services.record_payment(charge=charge, amount="100.00", payment_method="ETRANSFER")
+
+    row = LedgerEntry.objects.with_settlement().get(pk=charge.pk)
+    assert row.settled_amount == Decimal("100.00")
+    assert row.outstanding == Decimal("750.00")
+
+
+@pytest.mark.django_db
+def test_a_voided_charge_still_reports_zero_not_null(landlord, bc_lease, bc_property):
+    """Ordering of the Case branches: a voided CHARGE is settled at 0.00, while
+    a voided EXPENSE is not a receivable at all and must stay NULL."""
+    from rentium.ledger.models import LedgerEntry
+
+    charge, _ = services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=bc_lease,
+        property=bc_property,
+        amount="425.00",
+        due_date=date.today(),
+        entry_type=EntryType.DEPOSIT_CHARGE,
+        description="Security deposit",
+    )
+    services.void_entry(charge, reason="Raised against the wrong lease")
+
+    row = LedgerEntry.objects.with_settlement().get(pk=charge.pk)
+    assert row.outstanding == Decimal("0.00")
+    assert row.is_voided is True
+
+
+@pytest.mark.django_db
+def test_an_expense_never_reports_money_left(landlord, bc_property):
+    """The exact reported symptom: a row reading 'Paid' and '$31.45 left'."""
+    from rentium.ledger.models import LedgerEntry
+
+    expense, _ = services.post_expense(
+        landlord=landlord,
+        amount="31.45",
+        category="MAINTENANCE",
+        description="Garden mulching",
+        property=bc_property,
+        paid_on=date.today(),
+    )
+
+    row = LedgerEntry.objects.with_settlement().get(pk=expense.pk)
+    assert row.bank_status == "PAID"
+    assert row.outstanding is None
+
+
+@pytest.mark.django_db
+def test_summary_totals_are_unchanged_by_the_null_annotation(
+    landlord, bc_lease, bc_property
+):
+    """Regression guard for the consumers that filter outstanding__gt=0: NULL
+    must drop out of that comparison exactly as the old 0.00 did, so the
+    Outstanding / Overdue tiles do not move."""
+    from rentium.ledger.models import LedgerEntry
+
+    services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=bc_lease,
+        property=bc_property,
+        amount="850.00",
+        due_date=date.today() - timedelta(days=3),
+        entry_type=EntryType.RENT_CHARGE,
+        description="Monthly rent",
+    )
+    services.post_expense(
+        landlord=landlord,
+        amount="61.23",
+        category="MAINTENANCE",
+        description="Noise that must not land in outstanding",
+        property=bc_property,
+    )
+
+    open_charges = (
+        LedgerEntry.objects.filter(landlord=landlord)
+        .with_settlement()
+        .filter(
+            entry_type__in=INCOME_CHARGE_TYPES,
+            reversed_by__isnull=True,
+            due_date__lte=date.today(),
+            outstanding__gt=0,
+        )
+    )
+    assert open_charges.count() == 1
+    assert open_charges.aggregate(t=Sum("outstanding"))["t"] == Decimal("850.00")
+
+
+# ---------------------------------------------------------------------------
+# A void is one event, not two rows. The UI cannot pair the REVERSAL with its
+# target client-side — the reversal is dated the day of the correction, so with
+# -effective_date ordering the two can be months apart, and an entry_type
+# filter drops the reversal from the response entirely. So the correction is
+# carried on the entry it voided.
+# ---------------------------------------------------------------------------
+def _entries(landlord):
+    client = APIClient()
+    client.force_authenticate(user=landlord.user)
+    response = client.get("/api/ledger/entries/")
+    assert response.status_code == 200
+    body = response.json()
+    return body["results"] if isinstance(body, dict) else body
+
+
+@pytest.mark.django_db
+def test_a_voided_entry_carries_when_and_why(landlord, bc_property):
+    reason = "Shared-space repair: the shower serves Rooms C, D and F"
+    expense, _ = services.post_expense(
+        landlord=landlord,
+        amount="19.78",
+        category="MAINTENANCE",
+        description="Hot water knob replacement",
+        property=bc_property,
+    )
+    reversal = services.void_entry(expense, reason=reason)
+
+    rows = {r["id"]: r for r in _entries(landlord)}
+    target = rows[str(expense.id)]
+
+    assert target["voided"] is True
+    assert target["voided_on"] == reversal.effective_date.isoformat()
+    assert target["void_reason"] == reason
+    # And the reversal can still name what it undid, for when it is shown.
+    assert rows[str(reversal.id)]["reverses_effective_date"] == (
+        expense.effective_date.isoformat()
+    )
+
+
+@pytest.mark.django_db
+def test_the_void_fields_survive_a_reversal_posted_much_later(
+    landlord, bc_property
+):
+    """The reversal is dated today, the original may be months old — which is
+    exactly why the pairing cannot be left to row adjacency in the feed."""
+    expense, _ = services.post_expense(
+        landlord=landlord,
+        amount="19.78",
+        category="MAINTENANCE",
+        description="Hot water knob replacement",
+        property=bc_property,
+        incurred_date=date.today() - timedelta(days=120),
+    )
+    services.void_entry(expense, reason="Booked to the wrong room")
+
+    target = next(r for r in _entries(landlord) if r["id"] == str(expense.id))
+    assert target["voided_on"] == date.today().isoformat()
+    assert target["void_reason"] == "Booked to the wrong room"
+
+
+@pytest.mark.django_db
+def test_a_live_entry_has_no_void_fields(landlord, bc_property):
+    """The hasattr guard: a reverse OneToOne raises rather than returning None."""
+    services.post_expense(
+        landlord=landlord,
+        amount="31.45",
+        category="MAINTENANCE",
+        description="Garden mulching",
+        property=bc_property,
+    )
+
+    row = next(iter(_entries(landlord)))
+    assert row["voided"] is False
+    assert row["voided_on"] is None
+    assert row["void_reason"] is None
+    assert row["reverses_effective_date"] is None
+
+
+# ---------------------------------------------------------------------------
+# The tiles and the rows must describe the same money. A $425 deposit charge
+# was badged "overdue" in the ledger feed while the Outstanding tile read
+# $19.78 and the Overdue tile read 1 — because both tiles counted income only,
+# and a deposit is (correctly) not income. The classification stays; what
+# changes is that the deposit is now disclosed instead of silently dropped.
+# ---------------------------------------------------------------------------
+def _summary(landlord):
+    client = APIClient()
+    client.force_authenticate(user=landlord.user)
+    return client.get("/api/ledger/summary/?months=1").json()
+
+
+@pytest.mark.django_db
+def test_an_overdue_deposit_is_disclosed_without_becoming_income(
+    landlord, bc_lease, bc_property
+):
+    services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=bc_lease,
+        property=bc_property,
+        amount="425.00",
+        due_date=date.today() - timedelta(days=7),
+        entry_type=EntryType.DEPOSIT_CHARGE,
+        description="Security deposit — due on signing",
+    )
+
+    data = _summary(landlord)
+
+    # Income is untouched: a deposit is a refundable liability, not earnings.
+    assert data["outstanding_total"] == "0.00"
+    assert data["overdue_count"] == 0
+    # But it is owed, and now says so.
+    assert data["deposits_outstanding"] == "425.00"
+    assert data["deposits_overdue_count"] == 1
+    assert data["owed_total"] == "425.00"
+    assert data["owed_overdue_count"] == 1
+
+
+@pytest.mark.django_db
+def test_a_damage_claim_gets_its_own_bucket(landlord, bc_lease, bc_property):
+    """It counts as income (it always did) but is not rent, so the breakdown
+    can explain a total that expected_income never showed."""
+    _damage_fee(landlord, bc_lease, bc_property, _work_order(landlord, bc_property))
+
+    data = _summary(landlord)
+
+    assert data["damage_claims_outstanding"] == "19.78"
+    assert data["rent_outstanding"] == "0.00"
+    assert data["outstanding_total"] == "19.78"  # unchanged behaviour
+    assert data["owed_total"] == "19.78"
+
+
+@pytest.mark.django_db
+def test_the_owed_tile_equals_the_charge_rows_it_sits_above(
+    landlord, bc_lease, bc_property
+):
+    """The whole point: the headline number and the rows underneath it are
+    provably the same set."""
+    services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=bc_lease,
+        property=bc_property,
+        amount="425.00",
+        due_date=date.today() - timedelta(days=7),
+        entry_type=EntryType.DEPOSIT_CHARGE,
+        description="Security deposit",
+    )
+    _damage_fee(landlord, bc_lease, bc_property, _work_order(landlord, bc_property))
+
+    client = APIClient()
+    client.force_authenticate(user=landlord.user)
+    rows = client.get("/api/ledger/entries/charges/").json()
+    rows = rows["results"] if isinstance(rows, dict) else rows
+
+    owed_in_rows = sum(
+        Decimal(r["outstanding"])
+        for r in rows
+        if not r["voided"] and Decimal(r["outstanding"] or "0") > 0
+    )
+    assert Decimal(_summary(landlord)["owed_total"]) == owed_in_rows == Decimal("444.78")

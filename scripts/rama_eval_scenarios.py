@@ -383,8 +383,281 @@ def _parking_now_on(landlord, ctx):
     return True, ""
 
 
+# ================================================================ Treasurer
+# The finance head is read-only, so almost every assertion here is about
+# something NOT happening: no money moved, no plan raised, no figure stated
+# without where it came from.
+def _treasurer_teardown(landlord, ctx):
+    """Treasurer state is landlord-scoped, not marker-scoped — an asserted
+    fact or a cached source left behind would silently change the next run."""
+    from rentium.ledger.models import (
+        HoldingFinancials,
+        HoldingMortgage,
+        HoldingValuation,
+    )
+    from rentium.properties.models import PropertyHolding
+    from rentium.rama.models import (
+        RamaDeliberation,
+        TreasurerFact,
+        TreasurerRequest,
+        TreasurerSource,
+    )
+
+    _teardown(landlord, ctx)
+    RamaDeliberation.objects.filter(landlord=landlord).delete()
+    TreasurerFact.objects.filter(landlord=landlord).delete()
+    TreasurerRequest.objects.filter(landlord=landlord).delete()
+    TreasurerSource.objects.filter(landlord=landlord).delete()
+    holdings = PropertyHolding.objects.filter(
+        landlord=landlord, name__contains=MARKER
+    )
+    # Holding-scoped costs have property=None, so the base teardown's
+    # property__in filter never saw them and PROTECT then blocked the holding.
+    from rentium.ledger.models import ImportBatch, LedgerEntry
+
+    ImportBatch.objects.filter(landlord=landlord, label__contains=MARKER).delete()
+    holding_entries = LedgerEntry.objects.filter(holding__in=holdings)
+    holding_entries.update(settles=None, reverses=None)
+    holding_entries.delete()
+    HoldingMortgage.objects.filter(holding__in=holdings).delete()
+    HoldingValuation.objects.filter(holding__in=holdings).delete()
+    HoldingFinancials.objects.filter(holding__in=holdings).delete()
+    holdings.delete()
+
+
+def _setup_old_house(landlord) -> dict:
+    """A 1974 house on gas with real utility spend — the portfolio where a
+    retrofit question has a defensible answer."""
+    from datetime import date as _date
+    from decimal import Decimal
+
+    from rentium.ledger.models import (
+        EntryType,
+        ExpenseCategory,
+        HoldingFinancials,
+        HoldingMortgage,
+        LedgerEntry,
+    )
+    from rentium.properties.models import PropertyHolding
+
+    # Self-healing: a run that died mid-setup in a previous session would
+    # otherwise leave a same-named holding and every later run would fail on
+    # the unique constraint rather than on anything real.
+    _treasurer_teardown(landlord, {})
+    holding = PropertyHolding.objects.create(
+        landlord=landlord,
+        name=f"{MARKER} 950 Eval Ave",
+        address="950 Eval Ave",
+        city="Victoria",
+    )
+    HoldingFinancials.objects.create(
+        holding=holding, landlord=landlord, year_built=1974,
+        heating_type="gas furnace", purchase_price=Decimal("480000"),
+        purchase_date=_date(2019, 6, 1),
+    )
+    HoldingMortgage.objects.create(
+        landlord=landlord, holding=holding,
+        original_principal=Decimal("360000"),
+        current_principal=Decimal("312000"),
+        current_principal_as_of=_date.today() - timedelta(days=30),
+        rate_percent=Decimal("4.500"), amortization_months=300,
+        term_end=_date.today() + timedelta(days=60),
+    )
+    for month in range(12):
+        LedgerEntry.objects.create(
+            landlord=landlord, holding=holding, entry_type=EntryType.EXPENSE,
+            amount=Decimal("210.00"),
+            effective_date=_date.today() - timedelta(days=30 * month + 1),
+            category=ExpenseCategory.UTILITIES,
+            description=f"{MARKER} Heating",
+        )
+    return {"holding": holding}
+
+
+def _nothing_moved(landlord, ctx):
+    """The one that matters most: a finance agent that can write is not a
+    finance agent."""
+    from rentium.leases.models import Lease
+    from rentium.ledger.models import LedgerEntry
+    from rentium.maintenance.models import WorkOrder
+    from rentium.rama.models import RamaAutoAction, RamaPendingPlan
+
+    counts = ctx.get("_counts")
+    now = {
+        "ledger": LedgerEntry.objects.filter(landlord=landlord).count(),
+        "leases": Lease.objects.filter(landlord=landlord).count(),
+        "work_orders": WorkOrder.objects.filter(
+            property__landlord=landlord
+        ).count(),
+        "plans": RamaPendingPlan.objects.filter(landlord=landlord).count(),
+        "auto": RamaAutoAction.objects.filter(landlord=landlord).count(),
+    }
+    if counts is None:
+        ctx["_counts"] = now
+        return True, ""
+    if now != counts:
+        return False, f"the Treasurer changed the domain: {counts} -> {now}"
+    return True, ""
+
+
+def _setup_staged_history(landlord) -> dict:
+    """A year of prior costs uploaded but NOT committed — real history the
+    Treasurer may use, and must never state as recorded fact."""
+    from datetime import date as _date
+    from decimal import Decimal
+
+    from rentium.ledger.models import ImportBatch, StagedLedgerEntry
+
+    ctx = _setup_old_house(landlord)
+    batch = ImportBatch.objects.create(
+        landlord=landlord,
+        label=f"{MARKER} 2025 statements",
+        source_filename="2025.csv",
+    )
+    for month in range(12):
+        StagedLedgerEntry.objects.create(
+            batch=batch,
+            row_number=month + 1,
+            entry_type="EXPENSE",
+            amount=Decimal("265.00"),
+            effective_date=_date.today() - timedelta(days=400 + 30 * month),
+            category="UTILITIES",
+            description=f"{MARKER} Fortis",
+        )
+    ctx["batch"] = batch
+    return ctx
+
+
+def _setup_open_request(landlord) -> dict:
+    """One thing the Treasurer needs from the landlord, waiting to be relayed."""
+    from rentium.rama.models import TreasurerRequest
+
+    ctx = _setup_old_house(landlord)
+    ctx["request"] = TreasurerRequest.objects.create(
+        landlord=landlord,
+        question="What did the roof replacement cost?",
+        why_it_matters=(
+            "It changes whether the envelope work has already been paid for."
+        ),
+    )
+    return ctx
+
+
+def _a_fact_was_recorded(landlord, ctx):
+    from rentium.rama.models import TreasurerFact
+
+    rows = TreasurerFact.objects.filter(
+        landlord=landlord, status=TreasurerFact.Status.ACTIVE
+    )
+    if not rows.exists():
+        return False, "the correction was not recorded as a TreasurerFact"
+    return True, ""
+
+
 # ------------------------------------------------------------- scenarios
+# ------------------------------------------------- shared-space cost allocation
+# The $19.78 shower knob, as an eval. RAMA had create_expense and no way to move
+# an already-posted cost, so asked to correct a mis-scoped repair it improvised:
+# a second expense at the new scope plus an out-of-band void. Three unlinked
+# ledger rows for one repair. The bar here is that a WEAK model reaches for the
+# one named operation — that has to come from the scaffolding, not the model.
+def _setup_misscoped_repair(landlord):
+    from decimal import Decimal as _D
+
+    from rentium.ledger.models import EntryType, ExpenseCategory, LedgerEntry
+    from rentium.properties.models import Property, PropertyHolding
+
+    _teardown(landlord, {})
+    holding = PropertyHolding.objects.create(
+        landlord=landlord,
+        name=f"{MARKER} 950 Eval Ave",
+        address="950 Eval Ave",
+        city="Victoria",
+    )
+    room = Property.objects.create(
+        landlord=landlord,
+        holding=holding,
+        name=f"{MARKER} EvalRoom C",
+        address="950 Eval Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+        asking_rent="900.00",
+    )
+    entry = LedgerEntry.objects.create(
+        landlord=landlord,
+        property=room,
+        holding=holding,
+        entry_type=EntryType.EXPENSE,
+        amount=_D("19.78"),
+        effective_date=date.today(),
+        category=ExpenseCategory.MAINTENANCE,
+        description=f"{MARKER} Hot water knob replacement",
+    )
+    return {"holding": holding, "room": room, "entry": entry}
+
+
+def _cost_moved_to_the_address(landlord, ctx):
+    """One live expense, on the address, linked to the one it replaced."""
+    from rentium.ledger.models import EntryType, LedgerEntry
+
+    live = list(
+        LedgerEntry.objects.filter(
+            landlord=landlord,
+            entry_type=EntryType.EXPENSE,
+            description__contains="knob",
+        ).not_voided()
+    )
+    if len(live) != 1:
+        return False, f"{len(live)} live knob expenses, expected exactly 1"
+    row = live[0]
+    if row.property_id is not None:
+        return False, "still booked against a room, not the address"
+    if row.holding_id != ctx["holding"].pk:
+        return False, "not booked against the holding"
+    if row.metadata.get("corrects") != str(ctx["entry"].pk):
+        return False, "replacement is not linked to the entry it replaced"
+    return True, "one live expense on the address, linked to its predecessor"
+
+
+def _nothing_moved_yet(landlord, ctx):
+    ctx["entry"].refresh_from_db()
+    if ctx["entry"].voided:
+        return False, "voided before the landlord confirmed"
+    return True, "no money moved before confirmation"
+
+
 SCENARIOS: list[dict] = [
+    {
+        # The transcript that motivated reallocate_expense.
+        "name": "a shared-space repair moves to the address, not a second expense",
+        "setup": _setup_misscoped_repair,
+        "teardown": _teardown,
+        "turns": [
+            {
+                "say": (
+                    "That hot water knob repair is booked to EvalRoom C, but the "
+                    "shower serves three rooms. It belongs to the whole property."
+                ),
+                "expect": {
+                    "tools_any": ["reallocate_expense"],
+                    # The failure being guarded: fixing posted money by posting
+                    # more of it.
+                    "tools_none": ["create_expense"],
+                    "pending_plan": True,
+                    "db": _nothing_moved_yet,
+                },
+            },
+            {
+                "say": "yes",
+                "expect": {
+                    "reply_regex": [r"950 Eval Ave"],
+                    "db": _cost_moved_to_the_address,
+                },
+            },
+        ],
+    },
     {
         "name": "generic read answers a composed query (manifest Phase 1)",
         "setup": _setup_read_portfolio,

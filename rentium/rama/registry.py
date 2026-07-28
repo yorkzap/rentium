@@ -99,6 +99,7 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.lease_pdf_info,
     tool_functions.bulk_add_inventory,
     tool_functions.create_expense,
+    tool_functions.reallocate_expense,
     tool_functions.invite_tenant_to_lease,
     tool_functions.resend_lease_invite,
     tool_functions.cancel_lease_invite,

@@ -375,6 +375,7 @@ def run_all() -> dict:
         ("mortgage_renewals", check_mortgage_renewals),
         ("valuation_staleness", check_valuation_staleness),
         ("spend_drift", check_spend_drift),
+        ("ledger_integrity", check_ledger_integrity),
     ):
         try:
             report[name] = fn()
@@ -515,3 +516,129 @@ def check_spend_drift() -> dict:
             ):
                 found += 1
     return {"findings_published": found}
+
+
+# ---------------------------------------------------------- ledger integrity
+# The other Sergeants watch the landlord's money. This one watches the ledger
+# ITSELF, because the defects that produced the July 2026 Financial page were
+# not bad numbers — the arithmetic was right the whole time — but rows that
+# contradicted each other, and nothing in the system noticed. A landlord had to.
+#
+# Each invariant below is a real defect that shipped, expressed as a check that
+# would have caught it on the next nightly run:
+#   - an expense voided and never re-posted anywhere (an abandoned correction),
+#   - the same work order paid for twice at two different scopes,
+#   - a receivable balance annotated onto something that is not a receivable.
+ORPHANED_VOID_AFTER_DAYS = 2  # let a same-session void→re-post settle first
+
+
+def check_ledger_integrity() -> dict:
+    """Assert the ledger's own invariants. Deterministic, $0, dedupe-safe."""
+    from django.db.models import Count
+
+    from rentium.ledger.models import CHARGE_TYPES, EntryType, LedgerEntry
+
+    today = date.today()
+    published = 0
+
+    # 1. A voided expense with no replacement. correct_entry/reallocate_entry
+    #    both stamp metadata["corrects"], so a void with nothing pointing back
+    #    at it is a correction someone started and never finished.
+    cutoff = today - timedelta(days=ORPHANED_VOID_AFTER_DAYS)
+    voided = (
+        LedgerEntry.objects.filter(
+            entry_type=EntryType.EXPENSE, reversed_by__isnull=False
+        )
+        .filter(reversed_by__effective_date__lte=cutoff)
+        .select_related("landlord", "property", "holding", "reversed_by")
+    )
+    for entry in voided:
+        successor = LedgerEntry.objects.filter(
+            landlord_id=entry.landlord_id, metadata__corrects=str(entry.pk)
+        ).exists()
+        if successor:
+            continue
+        if _publish_finding(
+            "rama.sentinel.orphaned_void",
+            f"orphanvoid:{entry.pk}",
+            entry.landlord,
+            {
+                "entry_id": str(entry.pk),
+                "amount": str(entry.amount),
+                "description": entry.description[:120],
+                "voided_on": entry.reversed_by.effective_date.isoformat(),
+                "reason": (entry.reversed_by.metadata or {}).get("reason", ""),
+                "severity": "INFO",
+            },
+            property_id=entry.property_id,
+        ):
+            published += 1
+
+    # 2. One work order, two live expenses at different scopes — the signature
+    #    of a mis-scoped cost "fixed" by posting a second one instead of
+    #    reallocating the first. This is the exact $19.78 shower-knob shape.
+    wo_rows = (
+        LedgerEntry.objects.not_voided()
+        .filter(entry_type=EntryType.EXPENSE, work_order__isnull=False)
+        .values("work_order_id", "landlord_id")
+        .annotate(n=Count("id"), scopes=Count("property_id", distinct=True))
+        .filter(n__gt=1)
+    )
+    for row in wo_rows:
+        entries = list(
+            LedgerEntry.objects.not_voided()
+            .filter(
+                entry_type=EntryType.EXPENSE, work_order_id=row["work_order_id"]
+            )
+            .select_related("landlord", "property", "holding")
+        )
+        scopes = {(e.property_id, e.holding_id) for e in entries}
+        if len(scopes) < 2:
+            continue  # genuinely two costs on one job, same place — fine
+        landlord = entries[0].landlord
+        if _publish_finding(
+            "rama.sentinel.duplicate_work_order_expense",
+            f"wodupe:{row['work_order_id']}",
+            landlord,
+            {
+                "work_order_id": str(row["work_order_id"]),
+                "count": len(entries),
+                "total": str(sum(e.amount for e in entries)),
+                "places": sorted(
+                    {
+                        (
+                            e.property.name
+                            if e.property_id
+                            else (e.holding.name if e.holding_id else "portfolio-wide")
+                        )
+                        for e in entries
+                    }
+                ),
+                "severity": "WARN",
+            },
+        ):
+            published += 1
+
+    # 3. The annotation contract, checked in production rather than by eye. A
+    #    non-charge with a balance is what rendered "Paid … $31.45 left".
+    leaked = (
+        LedgerEntry.objects.with_settlement()
+        .exclude(entry_type__in=CHARGE_TYPES)
+        .filter(outstanding__isnull=False)
+        .select_related("landlord")[:1]
+    )
+    for entry in leaked:
+        if _publish_finding(
+            "rama.sentinel.ledger_contract_violation",
+            f"contract:outstanding:{today.strftime('%Y-%m-%d')}",
+            entry.landlord,
+            {
+                "invariant": "outstanding is NULL for non-charge entries",
+                "example_entry_id": str(entry.pk),
+                "entry_type": entry.entry_type,
+                "severity": "WARN",
+            },
+        ):
+            published += 1
+
+    return {"findings_published": published}

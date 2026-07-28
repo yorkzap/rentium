@@ -8,6 +8,7 @@ from decimal import InvalidOperation
 from django.db.models import Count
 from django.db.models import Q
 from django.db.models import Sum
+from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from rest_framework import serializers
@@ -25,6 +26,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from rentium.leases.models import Lease
+from rentium.properties.models import Property
+from rentium.properties.models import PropertyHolding
 
 from .. import services
 from ..billing import lease_is_joint
@@ -85,6 +88,19 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
     charge_status = serializers.SerializerMethodField()
     voided = serializers.SerializerMethodField()
 
+    # A void is two rows — the original and its REVERSAL — but it is one event,
+    # and a landlord reading "why is this struck through?" needs the answer on
+    # the row they are looking at. These carry the correction onto its target so
+    # the UI never has to pair the two client-side: the reversal's
+    # effective_date is the day it was voided (not the original's date), so with
+    # -effective_date ordering the pair can be months apart, and under a type
+    # filter like "Expenses out" the REVERSAL is not in the response at all.
+    voided_on = serializers.SerializerMethodField()
+    void_reason = serializers.SerializerMethodField()
+    # On a REVERSAL row: the date of the entry it voids, so a correction shown
+    # on its own can still say what it undid.
+    reverses_effective_date = serializers.SerializerMethodField()
+
     # Expenses only: has this actually left the landlord's bank account?
     # `paid_on` is the one column on this model that can change after posting
     # (see LedgerEntry.save()); `bank_status` is the derived label the UI reads
@@ -127,6 +143,9 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
             "outstanding",
             "charge_status",
             "voided",
+            "voided_on",
+            "void_reason",
+            "reverses_effective_date",
             "metadata",
             "attachments",
             "created_at",
@@ -153,6 +172,26 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
     def get_voided(self, obj):
         annotated = getattr(obj, "is_voided", None)
         return annotated if annotated is not None else obj.voided
+
+    @staticmethod
+    def _reversal(obj):
+        """The REVERSAL that voided this entry, or None.
+
+        A reverse OneToOne raises RelatedObjectDoesNotExist on plain attribute
+        access, so guard it the same way LedgerEntry.voided does.
+        """
+        return getattr(obj, "reversed_by", None) if hasattr(obj, "reversed_by") else None
+
+    def get_voided_on(self, obj):
+        reversal = self._reversal(obj)
+        return reversal.effective_date if reversal else None
+
+    def get_void_reason(self, obj):
+        reversal = self._reversal(obj)
+        return (reversal.metadata or {}).get("reason") if reversal else None
+
+    def get_reverses_effective_date(self, obj):
+        return obj.reverses.effective_date if obj.reverses_id else None
 
     def get_charge_status(self, obj):
         if obj.entry_type not in CHARGE_TYPES:
@@ -263,7 +302,12 @@ class LedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         user = self.request.user
         qs = (
-            LedgerEntry.objects.select_related("property", "tenant", "lease")
+            # reversed_by/reverses feed voided_on / void_reason /
+            # reverses_effective_date. The ledger is unpaginated, so without
+            # these two the void fields are an N+1 across the whole feed.
+            LedgerEntry.objects.select_related(
+                "property", "tenant", "lease", "holding", "reversed_by", "reverses"
+            )
             .prefetch_related("attachments")
             .with_settlement()
         )
@@ -432,6 +476,58 @@ class LedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
                 created_by=request.user,
                 reason=request.data.get("reason", "Correction"),
                 **changes,
+            )
+        except services.LedgerError as exc:
+            raise ValidationError({"detail": str(exc)})
+
+        return Response(
+            LedgerEntrySerializer(replacement).data, status=status.HTTP_201_CREATED
+        )
+
+    @action(detail=True, methods=["post"])
+    def reallocate(self, request, pk=None):
+        """
+        Move a posted expense to the scope it belongs to. Body:
+        {property?, holding?, reason}.
+
+        Deliberately a separate verb from `correct`: fixing a typo and moving a
+        cost from one property to another are different facts, and a tax summary
+        or a dispute needs to tell them apart. `correct` also whitelists its
+        editable fields and scope is not among them — which is precisely why
+        this had to be improvised out of void + a fresh post before.
+        """
+        landlord = _landlord(request)
+        entry = self.get_object()
+
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            raise ValidationError(
+                {"reason": "A reason is required — it goes on the audit trail."}
+            )
+
+        scope = {}
+        # Resolved against this landlord's own rows, so a foreign id 404s here
+        # rather than surfacing as a confusing validation error from clean().
+        if "property" in request.data:
+            pid = request.data["property"]
+            scope["property"] = (
+                get_object_or_404(Property, pk=pid, landlord=landlord) if pid else None
+            )
+        if "holding" in request.data:
+            hid = request.data["holding"]
+            scope["holding"] = (
+                get_object_or_404(PropertyHolding, pk=hid, landlord=landlord)
+                if hid
+                else None
+            )
+        if not scope:
+            raise ValidationError(
+                {"detail": "Name the property or holding it should move to."}
+            )
+
+        try:
+            replacement = services.reallocate_entry(
+                entry, reason=reason, created_by=request.user, **scope
             )
         except services.LedgerError as exc:
             raise ValidationError({"detail": str(exc)})
@@ -840,17 +936,29 @@ def summary_view(request):
                 "expenses": str(spent),
                 "net": str(collected - spent),
                 "deposits_collected": str(deposits_in),
+                "damage_claimed": str(damage_claimed),
             }
         )
 
-    open_charges = entries.with_settlement().filter(
-        entry_type__in=INCOME_CHARGE_TYPES,
-        reversed_by__isnull=True,
-        due_date__lte=today,
-        outstanding__gt=0,
-    )
-    agg = open_charges.aggregate(total=Sum("outstanding"), count=Count("id"))
-    overdue_count = open_charges.filter(due_date__lt=today).count()
+    # One set of open charges, partitioned — rather than four ad-hoc filters
+    # that can drift apart. `outstanding_total` stays income-only and
+    # byte-identical to what attention/, agenda/ and daily.py already read;
+    # the new buckets are what let the UI stop hiding money that is owed.
+    open_all = entries.open_charges(as_of=today)
+
+    def _owed(qs):
+        agg = qs.aggregate(total=Sum("outstanding"), count=Count("id"))
+        return {
+            "total": str(agg["total"] or Decimal("0.00")),
+            "count": agg["count"] or 0,
+            "overdue_count": qs.filter(due_date__lt=today).count(),
+        }
+
+    income = _owed(open_all.income_charges())
+    deposits = _owed(open_all.deposit_charges())
+    damage = _owed(open_all.damage_claims())
+    rent = _owed(open_all.expected_income())
+    owed = _owed(open_all)
 
     # Recorded, but the money hasn't actually gone yet. Not the same as "spent",
     # and a landlord reconciling against a bank statement needs both numbers.
@@ -868,9 +976,25 @@ def summary_view(request):
     return Response(
         {
             "monthly": monthly,
-            "outstanding_total": str(agg["total"] or Decimal("0.00")),
-            "outstanding_count": agg["count"] or 0,
-            "overdue_count": overdue_count,
+            # Income only — unchanged contract, existing consumers depend on it.
+            "outstanding_total": income["total"],
+            "outstanding_count": income["count"],
+            "overdue_count": income["overdue_count"],
+            # Every charge type, i.e. exactly what the ledger feed and the
+            # Charges tab badge. This is what the tiles show, so the headline
+            # number and the rows underneath it can no longer disagree.
+            "owed_total": owed["total"],
+            "owed_count": owed["count"],
+            "owed_overdue_count": owed["overdue_count"],
+            # The parts, so the tile can say what the total is made of and why
+            # deposits are not counted as income.
+            "rent_outstanding": rent["total"],
+            "rent_outstanding_count": rent["count"],
+            "damage_claims_outstanding": damage["total"],
+            "damage_claims_outstanding_count": damage["count"],
+            "deposits_outstanding": deposits["total"],
+            "deposits_outstanding_count": deposits["count"],
+            "deposits_overdue_count": deposits["overdue_count"],
             "deposits_held": str(services.deposits_held(landlord)),
             "expenses_not_yet_paid": str(unsettled["total"] or Decimal("0.00")),
             "expenses_not_yet_paid_count": unsettled["count"] or 0,

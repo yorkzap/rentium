@@ -119,6 +119,254 @@ def _resolve_maintenance_target(landlord, query: str):
     return None, None, None, _prop_err(err)
 
 
+def _resolve_expense_scope(landlord, query: str, holding_name: str = ""):
+    """(property, unit, holding, error) for "what does this cost belong to?".
+
+    Expenses have a scope work orders do not: the WHOLE physical property. A
+    roof, a tax bill or a load of mulch belongs to the holding, not to any one
+    listing or unit inside it — and `ledger.LedgerEntry.holding` exists exactly
+    for that.
+
+    Kept separate from _resolve_maintenance_target rather than widening it,
+    because a work order is always raised against a place someone can be sent
+    to; there is no "fix the whole holding".
+
+    Order matters. A holding is tried BEFORE the token-based unit fallback,
+    which is what fixes the reported bug: asked for "950 McKenzie Ave", the
+    token fallback matched every unit in that holding (each token hit
+    holding__name__icontains), found exactly one, and returned it as though
+    the landlord had named it — silently overriding an explicit "not the
+    garden suite, the whole property". A second unit in the holding would have
+    turned the same request into an error instead.
+    """
+    from rentium.properties.models import PropertyUnit
+
+    from .domain_crud import _holding_for_location, _resolve_holding
+
+    if (holding_name or "").strip():
+        holding, err = _resolve_holding(landlord, holding_name)
+        if err:
+            return None, None, None, {"error": err}
+        return None, None, holding, None
+
+    q = (query or "").strip()
+    if not q:
+        # Portfolio-wide: a cost that belongs to the business, not a place.
+        return None, None, None, None
+
+    # A listing name is the most specific thing, so try it first.
+    prop, err = _resolve_property(landlord, q)
+    if not err:
+        return prop, None, None, None
+
+    # Then an exactly-named unit ("Basement").
+    named_units = list(
+        PropertyUnit.objects.filter(landlord=landlord)
+        .select_related("holding")
+        .filter(name__icontains=q)[:6]
+    )
+    if len(named_units) == 1:
+        return None, named_units[0], None, None
+    if len(named_units) > 1:
+        return None, None, None, {
+            "error": f"Several units match {q!r} — which one?",
+            "candidates": [f"{u.name} ({u.holding.name})" for u in named_units],
+        }
+
+    # Then the whole holding, by name or by address. This is the branch that
+    # did not exist.
+    holding, holding_err = _resolve_holding(landlord, q)
+    if holding is None and not holding_err:
+        holding, holding_err = _holding_for_location(landlord, q)
+    if holding_err:
+        return None, None, None, {"error": holding_err}
+    if holding is not None:
+        return None, None, holding, None
+
+    # Finally "McKenzie Basement" — holding and unit named together.
+    tokens = [t for t in q.replace(",", " ").split() if t]
+    candidates = PropertyUnit.objects.filter(landlord=landlord).select_related("holding")
+    for token in tokens:
+        from django.db.models import Q as _Q
+
+        candidates = candidates.filter(
+            _Q(name__icontains=token) | _Q(holding__name__icontains=token)
+        )
+    units = list(candidates[:6])
+    if len(units) == 1:
+        return None, units[0], None, None
+    if len(units) > 1:
+        return None, None, None, {
+            "error": (
+                f"{q!r} could mean the whole property or one unit in it — "
+                f"which did you mean?"
+            ),
+            "candidates": [f"{u.name} ({u.holding.name})" for u in units],
+        }
+    return None, None, None, _prop_err(err)
+
+
+def _expense_scope_label(prop, unit, holding) -> str | None:
+    """What the landlord is shown, and what lands in the plan's target_label."""
+    if prop is not None:
+        return prop.name
+    if unit is not None:
+        # Mirror create_work_order: say which of the two readings we took,
+        # rather than hardcoding "shared" for a unit let as a whole home.
+        from rentium.properties.models import PropertyUnit as _PU
+
+        qualifier = (
+            "whole unit" if unit.rental_mode == _PU.RentalMode.WHOLE_UNIT else "shared"
+        )
+        return f"{unit.name} ({unit.holding.name}) — {qualifier}"
+    if holding is not None:
+        return f"{holding.name} — whole property"
+    return None
+
+
+def _resolve_expense_entry(landlord, query: str, amount: str = ""):
+    """(entry, error) for "which expense do you mean?".
+
+    Ambiguity returns candidates rather than a guess. Picking the wrong row
+    here voids the wrong money, and unlike a mis-scoped expense that is not
+    something a second correction tidies up.
+    """
+    from rentium.ledger.models import EntryType, LedgerEntry
+
+    q = (query or "").strip()
+    if not q and not (amount or "").strip():
+        return None, {"error": "Which expense? Name it, or give its amount."}
+
+    qs = LedgerEntry.objects.filter(
+        landlord=landlord, entry_type=EntryType.EXPENSE
+    ).not_voided()
+    if q:
+        qs = qs.filter(description__icontains=q)
+    if (amount or "").strip():
+        try:
+            qs = qs.filter(
+                amount=Decimal(str(amount).replace("$", "").replace(",", "").strip())
+            )
+        except (InvalidOperation, ValueError):
+            return None, {"error": f"Invalid amount {amount!r}."}
+
+    matches = list(qs.select_related("property", "holding").order_by("-effective_date")[:6])
+    if not matches:
+        return None, {"error": f"No live expense matches {q or amount!r}."}
+    if len(matches) > 1:
+        return None, {
+            "error": (
+                f"{q or amount!r} matches {len(matches)} expenses — which one?"
+            ),
+            "candidates": [
+                {
+                    "id": str(m.pk),
+                    "amount": str(m.amount),
+                    "description": m.description[:80],
+                    "where": (
+                        m.property.name
+                        if m.property_id
+                        else (m.holding.name if m.holding_id else "portfolio-wide")
+                    ),
+                    "date": m.effective_date.isoformat(),
+                }
+                for m in matches
+            ],
+        }
+    return matches[0], None
+
+
+def reallocate_expense(
+    landlord,
+    *,
+    expense_query: str = "",
+    amount: str = "",
+    property_query: str = "",
+    holding_name: str = "",
+    reason: str = "",
+    confirm: str = "",
+) -> dict:
+    """Move a posted expense to the place it actually belongs.
+
+    The capability this closes: there was no void tool and no reallocation
+    helper, so a cost booked against the wrong place could only be "fixed" by
+    posting a second expense somewhere else and voiding the first through a
+    different API — leaving two unlinked rows and no recorded reason. Composing
+    primitives is how a $19.78 shower knob ended up occupying three ledger
+    lines.
+    """
+    from rentium.ledger import services as ledger_services
+
+    if not (reason or "").strip():
+        return {"error": "A reason is required — it goes on the audit trail."}
+
+    entry, err = _resolve_expense_entry(landlord, expense_query, amount)
+    if err:
+        return err
+
+    if not property_query and not holding_name:
+        return {
+            "error": (
+                "Where should it go instead? Name a listing, or the address for "
+                "a cost that belongs to the whole property."
+            )
+        }
+
+    prop, unit, holding, err = _resolve_expense_scope(
+        landlord, property_query, holding_name
+    )
+    if err:
+        return err
+
+    target_holding = (
+        prop.holding if prop is not None else (unit.holding if unit else holding)
+    )
+    where = _expense_scope_label(prop, unit, holding)
+    was = (
+        entry.property.name
+        if entry.property_id
+        else (entry.holding.name if entry.holding_id else "portfolio-wide")
+    )
+
+    preview = {
+        "amount": str(entry.amount),
+        "description": entry.description[:200],
+        "from": was,
+        "to": where or "portfolio-wide",
+        "reason": reason.strip()[:200],
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "reallocate_expense",
+            preview,
+            "Voids the expense and re-posts it against the new scope, linked to "
+            "the entry it replaces.",
+        )
+
+    try:
+        replacement = ledger_services.reallocate_entry(
+            entry,
+            property=prop,
+            holding=target_holding,
+            reason=reason.strip()[:200],
+            created_by=landlord.user,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Could not reallocate expense: {exc}"}
+
+    return {
+        "created": True,
+        "expense": {
+            "id": str(replacement.pk),
+            "amount": str(replacement.amount),
+            "description": replacement.description[:200],
+            "scope": where or "portfolio-wide",
+            "previous_scope": was,
+            "replaces": str(entry.pk),
+        },
+    }
+
+
 def _resolve_area(landlord, target_property, target_unit, area_query: str):
     """A named space on the target, or (None, error)."""
     from django.db.models import Q

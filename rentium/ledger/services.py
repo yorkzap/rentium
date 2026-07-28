@@ -413,6 +413,106 @@ def correct_entry(
     return replacement
 
 
+_UNSET = object()
+
+
+def reallocate_entry(
+    entry: LedgerEntry,
+    *,
+    property=_UNSET,
+    holding=_UNSET,
+    reason,
+    created_by=None,
+) -> LedgerEntry:
+    """
+    Move a posted expense to the place it actually belongs — atomically, and
+    linked to what it replaces.
+
+    This exists because the alternative is improvisation. A shared-space repair
+    booked against one room (the shower serving Rooms C, D and F) used to be
+    "fixed" by voiding through one API and posting a fresh expense through
+    another: three unrelated rows, nothing tying the replacement to the entry it
+    replaced, and nothing stopping a fourth posting. correct_entry already does
+    void-and-repost in one transaction, but it copies property/holding verbatim,
+    so it could never express "same cost, different place".
+
+    Two things make this more than a keyword argument on correct_entry:
+
+    - It normalizes the scope PAIR. LedgerEntry.clean() rejects a property whose
+      holding_id disagrees with the holding, so moving a room-scoped expense to
+      the address has to null the property, and moving back has to re-derive the
+      holding from the listing. Callers get that wrong; this doesn't.
+    - It records that a reallocation happened, and from where — a typo fix and a
+      cost moving between properties are different facts, and next year's tax
+      summary needs to tell them apart.
+
+    Append-only throughout: nothing is mutated, nothing is deleted, and the
+    original plus its REVERSAL stay exactly where they are.
+    """
+    if entry.entry_type != EntryType.EXPENSE:
+        raise LedgerError(
+            "Only an expense can be reallocated. A charge's scope follows its "
+            "lease — move the lease, or void the charge and raise a new one."
+        )
+    if entry.voided:
+        raise LedgerError("That expense has already been voided.")
+
+    new_property = entry.property if property is _UNSET else property
+    new_holding = entry.holding if holding is _UNSET else holding
+
+    # A listing implies its holding; the address alone means no listing.
+    if new_property is not None:
+        new_holding = new_property.holding
+    if new_property is None and new_holding is None and holding is _UNSET:
+        new_holding = None
+
+    same_property = getattr(new_property, "pk", None) == entry.property_id
+    same_holding = getattr(new_holding, "pk", None) == entry.holding_id
+    if same_property and same_holding:
+        raise LedgerError(
+            "That expense is already booked there — nothing to reallocate."
+        )
+
+    def _scope(prop, hold):
+        return {
+            "property_id": str(prop.pk) if prop else None,
+            "property_name": prop.name if prop else None,
+            "holding_id": str(hold.pk) if hold else None,
+            "holding_name": hold.name if hold else None,
+        }
+
+    replacement = correct_entry(
+        entry,
+        created_by=created_by,
+        reason=reason,
+        property=new_property,
+        holding=new_holding,
+        metadata={
+            **entry.metadata,
+            "corrects": str(entry.id),
+            "reallocated": {
+                "from": _scope(entry.property, entry.holding),
+                "to": _scope(new_property, new_holding),
+                "reason": reason,
+                "on": date.today().isoformat(),
+            },
+        },
+    )
+
+    publish(
+        "ledger.entry_reallocated",
+        {
+            "from_entry_id": str(entry.id),
+            "to_entry_id": str(replacement.id),
+            "from_scope": _scope(entry.property, entry.holding),
+            "to_scope": _scope(new_property, new_holding),
+            "reason": reason,
+        },
+        property_id=replacement.property_id,
+    )
+    return replacement
+
+
 def post_deposit_return(
     *,
     landlord,

@@ -28,6 +28,24 @@ def supported_tool_for_request(request: str) -> str | None:
         text,
     ):
         tool = "create_work_order"
+    # Money already on the books, booked in the wrong place. This one is here
+    # for the opposite reason to the rest: the others stop RAMA denying a
+    # feature it has, this stops it IMPROVISING one it didn't. Asked to move a
+    # shared-space repair off a single room, RAMA had create_expense but no
+    # reallocation tool, so it composed a fresh expense with an out-of-band
+    # void — three unlinked ledger rows for one $19.78 repair, and no recorded
+    # reason. A correction to posted money is one named operation or it is a
+    # gap; it is never assembled out of parts.
+    elif re.search(
+        r"\b(expense|cost|bill|charge|repair|invoice)\b.*"
+        r"\b(wrong|mis-?scoped|misfiled|shouldn'?t be|should not be|belongs?)\b"
+        r"|\b(move|reallocate|re-?assign|rebook|re-?book|shift|transfer)\b.*"
+        r"\b(expense|cost|bill|repair|invoice)\b"
+        r"|\b(expense|cost|bill|repair)\b.*\b(to the (address|house|building|property)|"
+        r"off (of )?(the )?room)\b",
+        text,
+    ):
+        tool = "reallocate_expense"
     elif re.search(r"\brename\b.+\bto\b", text):
         tool = "update_property"
     elif (

@@ -284,7 +284,14 @@ adding inventory before OR after creating the lease is fine — never claim item
 
 OTHER: mark_inquiry_replied, send_tenant_message, mark_messages_read, \
 schedule_viewing (SHOWINGS ONLY), create_condition_inspection (move-in/out reports), \
-create_expense — all confirm-first.
+create_expense, reallocate_expense — all confirm-first.
+
+Money already posted: NEVER fix a mis-scoped expense by posting a second one. \
+Use reallocate_expense — it voids the original and links the replacement to it, \
+so the ledger keeps one live line. A repair to space several rooms share (a \
+shower, a roof, the yard) belongs to the ADDRESS (holding_name), not to whichever \
+tenant's room you were told about. If you cannot do what was asked with one tool, \
+log_capability_gap — do not assemble it out of others.
 
 Inspections: create_condition_inspection uses build_inspection (Condition Inspections panel). \
 schedule_viewing is ONLY for prospective showings under Appointments. \

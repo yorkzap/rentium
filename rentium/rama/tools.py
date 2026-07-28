@@ -1013,7 +1013,46 @@ def create_expense(
         amount=amount,
         description=description,
         property_query=property_query,
+        holding_name=holding_name,
         effective_date=effective_date,
+        confirm=confirm,
+    )
+
+
+@_params(
+    expense_query="Words from the expense's description, e.g. 'hot water knob'.",
+    amount="Its amount, to narrow the match when the wording is ambiguous.",
+    property_query="The LISTING it should be booked against instead. Leave blank "
+    "when the cost belongs to the whole property.",
+    holding_name="The whole physical property it should be booked against — use "
+    "this when a repair serves space shared by several rooms (a shower, a roof, "
+    "the yard), so the cost sits on the address rather than on one tenant's room.",
+    reason="Why it is moving. This goes on the permanent audit trail.",
+)
+def reallocate_expense(
+    landlord,
+    expense_query: str = "",
+    amount: str = "",
+    property_query: str = "",
+    holding_name: str = "",
+    reason: str = "",
+    confirm: str = "",
+) -> dict:
+    """Move an already-recorded expense to the scope it belongs to. Use this —
+    never post a second expense — when a cost was booked against the wrong
+    place: a shared-space repair charged to one room, a building cost charged
+    to a listing. The original is voided and the new entry is linked to it, so
+    the ledger keeps ONE live line and the correction stays auditable.
+    Preview first; confirm=yes."""
+    from .domain_actions import reallocate_expense as _fn
+
+    return _fn(
+        landlord,
+        expense_query=expense_query,
+        amount=amount,
+        property_query=property_query,
+        holding_name=holding_name,
+        reason=reason,
         confirm=confirm,
     )
 
