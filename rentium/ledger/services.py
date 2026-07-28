@@ -12,6 +12,7 @@ Consequences live in handlers.py, downstream of the outbox.
 from datetime import date
 from datetime import timedelta
 from decimal import Decimal
+from decimal import InvalidOperation
 
 from django.db import IntegrityError
 from django.db import transaction
@@ -701,3 +702,92 @@ def tenant_statement(landlord, *, tenant, lease=None) -> dict:
             "an RTB application within 15 days of the tenancy ending."
         ),
     }
+
+
+# --------------------------------------------------------- duplicate guard
+# How far apart two records of the same cost can plausibly be. A receipt is
+# usually photographed within a couple of weeks of the spend being mentioned,
+# and a statement line can lag the purchase date by about that much.
+DUPLICATE_WINDOW_DAYS = 14
+
+
+def find_duplicate_expense_candidates(
+    landlord,
+    *,
+    amount,
+    on_date=None,
+    property=None,
+    holding=None,
+    exclude_entry_id=None,
+    window_days: int = DUPLICATE_WINDOW_DAYS,
+) -> list[dict]:
+    """Existing expenses that might already be this same cost.
+
+    Two paths can record one expense and neither could see the other: the chat
+    path (rama.create_expense) writes with no idempotency key, and the document
+    path (rama.document_services.file_document) keys only on its own document
+    id. The sha256 check on upload catches the same FILE twice — it cannot
+    catch the same COST arriving once by message and once by receipt.
+
+    Deliberately advisory: this returns candidates for a human to judge and
+    never blocks or merges on its own. Matching on an exact amount inside a
+    window is narrow enough to stay quiet on genuinely repeated costs of
+    different sizes, and a same-amount recurring cost (a monthly fee) is
+    exactly the case where a person should confirm rather than a heuristic.
+    """
+    from datetime import timedelta
+
+    from .models import EntryType, LedgerEntry
+
+    try:
+        amt = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return []
+
+    day = on_date or date.today()
+    qs = (
+        LedgerEntry.objects.not_voided()
+        .filter(
+            landlord=landlord,
+            entry_type=EntryType.EXPENSE,
+            amount=amt,
+            effective_date__gte=day - timedelta(days=window_days),
+            effective_date__lte=day + timedelta(days=window_days),
+        )
+        .select_related("property", "holding")
+        .order_by("-effective_date")
+    )
+    if exclude_entry_id:
+        qs = qs.exclude(pk=exclude_entry_id)
+
+    out = []
+    for entry in qs[:5]:
+        # Same scope is a stronger signal, but a mismatch is not a reason to
+        # stay silent: recording a cost portfolio-wide and then filing its
+        # receipt against the holding is a common way to double up.
+        same_scope = (
+            (property is not None and entry.property_id == property.pk)
+            or (holding is not None and entry.holding_id == holding.pk)
+            or (property is None and holding is None)
+        )
+        out.append(
+            {
+                "id": str(entry.pk),
+                "amount": str(entry.amount),
+                "description": entry.description,
+                "effective_date": entry.effective_date.isoformat()
+                if entry.effective_date
+                else None,
+                "scope": (
+                    entry.property.name
+                    if entry.property_id
+                    else (entry.holding.name if entry.holding_id else "portfolio-wide")
+                ),
+                "same_scope": same_scope,
+                "has_document": hasattr(entry, "source_document"),
+                "days_apart": abs((entry.effective_date - day).days)
+                if entry.effective_date
+                else None,
+            }
+        )
+    return out

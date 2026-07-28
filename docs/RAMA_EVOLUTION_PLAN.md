@@ -125,8 +125,58 @@ code in production. That is arbitrary code execution and is off the table.
 |---|---|---|
 | 1 | Capability-gap capture + "learn now" | ✅ Done (model, tools, persona, admin, test) |
 | 1b | Landlord-facing "what RAMA is learning" screen | ⬜ Optional polish |
-| 2 | Smarter-General model picker in Settings | ⬜ To build (fields exist; needs serializer + UI + your model choice) |
+| 2 | Per-role model pickers in Settings | ✅ Done July 2026 (data-driven cards from `RAMA_ROLES`, all four roles) |
 | 3 | LLM-drafted playbooks with human review + tests | ⬜ To build (deliberate, later) |
+| 4 | Autonomy tier — pre-authorised routine actions | ✅ Done July 2026 (`rama/autonomy.py`, `rama/tool_meta.py`) |
+| 5 | Durable cross-conversation memory | ✅ Done July 2026 (`rama/memory.py`) |
+| 6 | Treasurer — read-only finance head + deliberation engine | ✅ Done July 2026 (see `RAMA_TREASURER.md`) |
+| 6b | Constitution / Memory / Auto-actions / Treasurer settings panels | ⬜ To build (backend endpoints exist; UI not written) |
+
+---
+
+## Evaluated and declined: Hermes Agent as the orchestrator (July 2026)
+
+We considered replacing RAMA's turn engine with
+[NousResearch/hermes-agent](https://github.com/nousresearch/hermes-agent), one
+instance per landlord, to get its orchestrator, memory, background execution
+and multi-platform gateway.
+
+**Declined.** The full reasoning lives in
+`rentium-frontend-app/docs/rama-architecture.md` §3, but the short version is
+that its defining feature — an agent that writes and registers its own skills —
+is precisely what the hard rules above forbid, and its terminal-backend
+execution model would replace multi-tenant isolation-by-construction
+(`landlord` injected in `registry.execute`, invisible in every tool schema)
+with isolation-by-sandbox-configuration on a database holding every tenant's
+payment history. It also has no analogue of the confirm invariant, and
+per-landlord instances would move agent state outside Postgres, breaking both
+`RamaAudit` as the complete record and the eval harness.
+
+The diagnosis behind the question was still right, and Parts 4 and 5 above are
+the answer to it: RAMA needed autonomy and memory, not a different loop. The
+agent loop was never the bottleneck — `rama/` is ~33k lines and the loop is
+about 60 of them. Note also that Hermes's skill system is essentially Part 3
+with the human gate removed; Part 3 remains the right shape for us.
 
 **Recommended order:** use Part 1 now → build Part 2 (quick win, makes the
 decision layer real) → then Part 3 as a focused project.
+
+---
+
+## Part 6 — The Treasurer (July 2026) ✅ DONE
+
+A fourth role whose job is to net more money, built on the same weak-model-first
+premise: **smartness from deterministic scaffolding, never from a model
+upgrade.** It is the clearest demonstration of that principle so far — the model
+in a Treasurer deliberation never decides what to think about, what the options
+are, what the arithmetic is, or what the ranking is. It fills one narrow slot
+per call. Change the provider and only the prose changes; the advice is
+byte-identical, and there are CI-gate tests that fail if that stops being true.
+
+It also forced a security fix that shipped first, alone: `role_tool_schemas`
+fell through to the **full write surface** for any unrecognised role, and the
+seven deterministic write routers in `service.py` bypassed the role tool list
+entirely. Read-only was a property of a tool list, not of a turn. Both are now
+fail-closed and asserted.
+
+Full design, invariants and operational notes: `RAMA_TREASURER.md`.

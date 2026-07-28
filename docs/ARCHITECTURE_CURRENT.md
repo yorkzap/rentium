@@ -149,6 +149,31 @@ group-wide areas. Missing location and landlord-use facts produce one
 state-backed clarification; the completed hierarchy then receives one preview
 and one transaction.
 
+### Roles
+
+Four roles, dispatched from one table in `rama/roles.py`. `ROLE_TOOLS` is
+**fail-closed** — an unrecognised role raises rather than falling through to
+the full write surface — and `role_allows_tool` gates the deterministic write
+routers in `service.py`, which call `registry.execute` directly and would
+otherwise bypass the role's tool list entirely.
+
+| Role | Writes | Reachable |
+|---|---|---|
+| Corporal | Yes, always behind a confirmation | Chat |
+| General | Plans and policy; delegates execution | Chat |
+| FSA | No (`READ_ONLY_ROLES`) | Delegation only |
+| Treasurer | No (`READ_ONLY_ROLES`) | Chat, delegation, weekly beat |
+
+The two read-only roles are read-only by construction: no tool on their lists
+takes a `confirm` argument, so `pending_specs` is provably always empty and no
+plan can originate from them. Asserted by test, not by convention.
+
+The Treasurer additionally runs a nine-stage deliberation engine
+(`rama/deliberation.py`) in which only GATHER, CHALLENGE and RECOMMEND cost a
+model call; enumeration, scoring, ranking and every published figure are
+Python, which is what makes its output provider-neutral. See
+`RAMA_TREASURER.md`.
+
 RAMA links come from `rentium.rama.links`, never from model-generated prose.
 Registered collection routes include dashboard home, properties, property
 groups, documents, leases, finances, maintenance, and settings. Entity routes

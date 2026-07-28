@@ -345,6 +345,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "rentium.comms.tasks.send_morning_briefings",
         "schedule": crontab(hour=7, minute=0),
     },
+    # One analysis a week, not one a day: a background agent that produces
+    # something every morning trains people to stop reading it.
+    "rama-treasurer-weekly": {
+        "task": "rentium.rama.tasks.run_weekly_deliberation",
+        "schedule": crontab(day_of_week=1, hour=7, minute=30),
+    },
     # Let stale viewing negotiations die so they stop nagging the landlord and
     # free the per-property open-request cap. Overnight, off-peak.
     "appointments-expire-stale-viewings": {
@@ -501,6 +507,12 @@ ACCOUNT_EMAIL_CONFIRMATION_ANONYMOUS_REDIRECT_URL = f"{FRONTEND_URL}/auth/login"
 # when set (see rentium.rama.runtime.get_active_config). Staff can still
 # override provider/model per chat request; whatever ran is stamped on
 # every RamaAudit row.
+# Web research for the Treasurer. `none` (the default) means it simply does
+# not research — an unconfigured provider is a safe no-op, never an error.
+# `fake` serves fixtures so evals are deterministic and CI needs no network.
+RAMA_RESEARCH_BACKEND = env("RAMA_RESEARCH_BACKEND", default="none")
+FIRECRAWL_API_KEY = env("FIRECRAWL_API_KEY", default="")
+
 RAMA_ENABLED = env.bool("RAMA_ENABLED", default=True)
 RAMA_PROVIDER = env("RAMA_PROVIDER", default="xai")
 # grok-4-1-fast-* were retired by xAI on 2026-05-15; grok-4.3 is the current

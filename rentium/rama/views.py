@@ -10,7 +10,11 @@ call the exact same code path.
 
 import uuid
 from datetime import date
+from decimal import Decimal, InvalidOperation
+
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.http import FileResponse
+from django.utils import timezone
 
 from rest_framework import status as http_status
 from rest_framework.decorators import api_view, permission_classes
@@ -33,7 +37,13 @@ __all__ = [
     "chat_view",
     "upload_view",
     "general_chat_view",
+    "treasurer_chat_view",
+    "treasurer_view",
     "constitution_view",
+    "memory_view",
+    "memory_delete_view",
+    "auto_actions_view",
+    "auto_action_undo_view",
     "insights_view",
     "insight_detail_view",
     "holdings_view",
@@ -91,6 +101,11 @@ def _settings_payload(landlord, prefs: RamaPreferences | None = None) -> dict:
             "provider": prefs.fsa_provider,
             "model": prefs.fsa_model,
             "has_key": bool((prefs.fsa_api_key or "").strip()),
+        },
+        "treasurer": {
+            "provider": prefs.treasurer_provider,
+            "model": prefs.treasurer_model,
+            "has_key": bool((prefs.treasurer_api_key or "").strip()),
         },
     }
 
@@ -212,7 +227,7 @@ def settings_view(request):
         prefs.api_key = ""
 
     # Optional per-role (decision-layer / analysis) model config.
-    for role in ("general", "fsa"):
+    for role in ("general", "fsa", "treasurer"):
         role_err = _apply_role_prefs(prefs, data, role)
         if role_err:
             return Response(
@@ -269,6 +284,7 @@ def _chat_response(result) -> Response:
             "model": result.model,
             "tools_used": result.tools_used,
             "pending_plan": result.pending_plan,
+            "auto_executed": result.auto_executed,
         }
     )
 
@@ -573,7 +589,7 @@ def document_detail_view(request, document_id):
     """Inspect OCR results or confirm/correct the proposed filing."""
     from rentium.properties.models import Property, PropertyHolding
 
-    from .document_services import DocumentError, file_document
+    from .document_services import DocumentError, DuplicateExpenseError, file_document
     from .models import RamaDocument
 
     landlord = _landlord(request)
@@ -645,6 +661,23 @@ def document_detail_view(request, document_id):
             reference_number=data.get("reference_number"),
             clarification_answer=str(data.get("clarification_answer") or ""),
             portfolio_wide=data.get("portfolio_wide", False),
+            duplicate_resolution=str(data.get("duplicate_resolution") or ""),
+        )
+    except DuplicateExpenseError as exc:
+        # 409, not 400: the request is well-formed, it just collides with an
+        # expense already on the books. The candidates travel with it so the
+        # UI can offer "attach to that one" rather than only "post anyway".
+        return Response(
+            {
+                "detail": str(exc),
+                "code": "DUPLICATE_EXPENSE",
+                "candidates": exc.candidates,
+                "resolutions": {
+                    "link": "duplicate_resolution=link:<entry_id>",
+                    "separate": "duplicate_resolution=new",
+                },
+            },
+            status=http_status.HTTP_409_CONFLICT,
         )
     except (DocumentError, ValueError) as exc:
         return Response(
@@ -767,6 +800,46 @@ def general_chat_view(request):
     return _chat_response(result)
 
 
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def treasurer_chat_view(request):
+    """POST /api/rama/treasurer/chat/ — the Treasurer (finance head).
+
+    Directly reachable as well as via the General's ask_treasurer, because a
+    quick "what's my equity?" should not have to round-trip through a relay.
+    Read-only over the domain: its tool list contains nothing that takes a
+    `confirm` argument (asserted in test_treasurer), so no plan can originate
+    here.
+    """
+    landlord = _landlord(request)
+    cfg = get_landlord_config(landlord)
+    if not cfg.enabled:
+        return Response(
+            {"detail": "RAMA is turned off for your account."},
+            status=http_status.HTTP_403_FORBIDDEN,
+        )
+    role_cfg = get_role_config(landlord, "treasurer")
+    if not role_cfg.api_key:
+        return Response(
+            {
+                "detail": (
+                    "No API key available for the Treasurer's provider "
+                    f"({role_cfg.provider}). Set one under Settings → RAMA."
+                )
+            },
+            status=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    message, conversation_id, err = _validated_chat_input(request)
+    if err is not None:
+        return err
+
+    result = run_turn(
+        landlord, message, conversation_id, role="treasurer", channel="web"
+    )
+    return _chat_response(result)
+
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def constitution_view(request):
@@ -883,3 +956,270 @@ def capability_gaps_view(request):
             ],
         }
     )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def auto_actions_view(request):
+    """GET /api/rama/auto-actions/ — what RAMA did without asking.
+
+    An unattended write the landlord can't see is indistinguishable from a bug,
+    so this is the receipt drawer behind the "Done automatically · Undo" strip.
+    Scoped to the acting landlord like every other RAMA surface.
+    """
+    from .autonomy import AUTO_UNDO_TTL
+    from .models import RamaAutoAction
+
+    landlord = _landlord(request)
+    try:
+        limit = max(1, min(int(request.query_params.get("limit") or 50), 200))
+    except (TypeError, ValueError):
+        limit = 50
+
+    cutoff = timezone.now() - AUTO_UNDO_TTL
+    rows = RamaAutoAction.objects.filter(landlord=landlord)[:limit]
+    return Response(
+        {
+            "auto_actions": [
+                {
+                    "id": str(row.pk),
+                    "tool": row.tool,
+                    "target": row.target_label,
+                    "status": row.status,
+                    "conversation_id": str(row.conversation_id),
+                    # Reported at read time rather than stored, so no job has to
+                    # keep the flag honest.
+                    "undoable": (
+                        row.status == RamaAutoAction.Status.DONE
+                        and bool(row.undo_tool)
+                        and row.created_at >= cutoff
+                    ),
+                    "created_at": row.created_at.isoformat(),
+                    "undone_at": row.undone_at.isoformat() if row.undone_at else None,
+                }
+                for row in rows
+            ]
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def auto_action_undo_view(request, action_id):
+    """POST /api/rama/auto-actions/<id>/undo/ — reverse one auto-executed action.
+
+    The inverse runs through the normal plan runner, so this endpoint gains no
+    privilege the chat path doesn't already have.
+    """
+    from .autonomy import undo_action
+    from .models import RamaAudit, RamaAutoAction
+
+    landlord = _landlord(request)
+    action = RamaAutoAction.objects.filter(landlord=landlord, pk=action_id).first()
+    if action is None:
+        return Response({"error": "Unknown action."}, status=404)
+
+    def _audit(content):
+        RamaAudit.objects.create(
+            landlord=landlord,
+            conversation_id=action.conversation_id,
+            kind=RamaAudit.Kind.TOOL_CALL,
+            content={**content, "undo_of": str(action.pk), "via": "api"},
+        )
+
+    outcome = undo_action(action, landlord, audit=_audit)
+    if outcome.get("error"):
+        return Response(outcome, status=http_status.HTTP_400_BAD_REQUEST)
+    return Response(outcome)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def memory_view(request):
+    """GET /api/rama/memory/ — the durable preferences RAMA holds for this
+    landlord. Also serves as the data-portability export for them."""
+    from .memory import payload
+
+    return Response(payload(_landlord(request), request.query_params.get("q") or ""))
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def memory_delete_view(request, memory_id):
+    """DELETE /api/rama/memory/<id>/ — erase one memory outright.
+
+    Genuine erasure, not a status flag: a privacy request has to actually
+    remove the text. The audit row records the key and the fact of deletion and
+    deliberately NEVER the body — otherwise "erasing" a memory would just move
+    the personal data into the append-only audit trail, which is worse than not
+    deleting at all. What survives is proof that something was removed and when.
+    """
+    from .models import RamaAudit, RamaMemory
+
+    landlord = _landlord(request)
+    row = RamaMemory.objects.filter(landlord=landlord, pk=memory_id).first()
+    if row is None:
+        return Response({"error": "Unknown memory."}, status=404)
+
+    key = row.key
+    row.delete()
+    RamaAudit.objects.create(
+        landlord=landlord,
+        conversation_id=row.origin_conversation or uuid.uuid4(),
+        kind=RamaAudit.Kind.TOOL_CALL,
+        content={"tool": "_memory_erased", "arguments": {"key": key}, "result": {"deleted": True}},
+    )
+    return Response({"deleted": True, "subject": key})
+
+
+@api_view(["GET", "PATCH"])
+@permission_classes([IsAuthenticated])
+def treasurer_view(request):
+    """GET/PATCH /api/rama/treasurer/ — the Treasurer's own settings page.
+
+    Four things a landlord needs to see about a background finance agent:
+    what it is allowed to know about them (consent), what it is still waiting
+    on (open requests), what it has concluded (deliberations), and where the
+    portfolio data it reasons over is missing.
+
+    PATCH only ever writes the consent gate and the personal fields behind it.
+    Holding financials, valuations and mortgages are written by the General
+    through the normal confirm-previewed tools — deliberately, because the
+    agent that concludes "your equity looks strong" must not be the one that
+    types in the valuation.
+    """
+    from django.utils import timezone
+
+    from .models import (
+        LandlordFinancialProfile,
+        RamaDeliberation,
+        TreasurerRequest,
+    )
+
+    landlord = _landlord(request)
+    profile, _ = LandlordFinancialProfile.objects.get_or_create(landlord=landlord)
+
+    if request.method == "PATCH":
+        data = request.data or {}
+        if "consented" in data:
+            # Withdrawing consent takes effect immediately and blanks nothing:
+            # the fields stay, they simply stop being readable. Deleting them
+            # would make re-consenting mean re-typing everything.
+            profile.consented_at = timezone.now() if data["consented"] else None
+        for field in (
+            "occupation",
+            "employment_income_band",
+            "other_income_band",
+            "filing_situation",
+            "tax_province",
+        ):
+            if field in data:
+                setattr(profile, field, data[field] or "")
+        if "self_reported_marginal_rate" in data:
+            raw = data["self_reported_marginal_rate"]
+            if raw in (None, ""):
+                profile.self_reported_marginal_rate = None
+            else:
+                try:
+                    profile.self_reported_marginal_rate = Decimal(str(raw))
+                except (InvalidOperation, TypeError):
+                    return Response(
+                        {"error": "invalid", "detail": "Marginal rate must be a number."},
+                        status=http_status.HTTP_400_BAD_REQUEST,
+                    )
+        try:
+            profile.full_clean()
+        except DjangoValidationError as exc:
+            return Response(
+                {"error": "invalid", "detail": exc.message_dict},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        profile.save()
+
+    from .deliberation import open_requests
+
+    deliberations = (
+        RamaDeliberation.objects.filter(landlord=landlord)
+        .order_by("-created_at")
+        .select_related("holding")[:20]
+    )
+    return Response(
+        {
+            "profile": {
+                "consented": profile.usable,
+                "consent_scope": profile.consent_scope,
+                "occupation": profile.occupation,
+                "employment_income_band": profile.employment_income_band,
+                "other_income_band": profile.other_income_band,
+                "filing_situation": profile.filing_situation,
+                "tax_province": profile.tax_province,
+                "self_reported_marginal_rate": (
+                    str(profile.self_reported_marginal_rate)
+                    if profile.self_reported_marginal_rate is not None
+                    else None
+                ),
+            },
+            "choices": {
+                "income_bands": [
+                    {"value": v, "label": label}
+                    for v, label in LandlordFinancialProfile.IncomeBand.choices
+                ],
+                "filing_situations": [
+                    {"value": v, "label": label}
+                    for v, label in LandlordFinancialProfile.Filing.choices
+                ],
+            },
+            "requests": [
+                {
+                    "id": str(r.pk),
+                    "question": r.question,
+                    "why_it_matters": r.why_it_matters,
+                    "blocking": r.blocking,
+                    "status": r.status,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in open_requests(landlord)
+            ],
+            "deliberations": [
+                {
+                    "id": str(d.pk),
+                    "topic": d.topic,
+                    "question": d.question,
+                    "status": d.status,
+                    "trigger": d.trigger,
+                    "holding": d.holding.name if d.holding_id else None,
+                    "created_at": d.created_at.isoformat(),
+                }
+                for d in deliberations
+            ],
+            "data_gaps": _treasurer_data_gaps(landlord),
+        }
+    )
+
+
+def _treasurer_data_gaps(landlord) -> list[dict]:
+    """What the Treasurer cannot work out yet, and why.
+
+    Stated as concrete missing facts rather than a percentage, because "62%
+    complete" tells a landlord nothing about what to go and do.
+    """
+    from rentium.ledger.models import HoldingFinancials, HoldingMortgage
+    from rentium.properties.models import PropertyHolding
+
+    gaps = []
+    for holding in PropertyHolding.objects.filter(landlord=landlord):
+        missing = []
+        financials = HoldingFinancials.objects.filter(holding=holding).first()
+        if financials is None or not financials.purchase_price:
+            missing.append("what you paid for it")
+        if financials is None or not financials.year_built:
+            missing.append("the year it was built")
+        if not holding.valuations.exists():
+            missing.append("a recent valuation")
+        if not HoldingMortgage.objects.filter(
+            holding=holding, status=HoldingMortgage.Status.ACTIVE
+        ).exists():
+            missing.append("the mortgage on it")
+        if missing:
+            gaps.append({"holding": holding.name, "missing": missing})
+    return gaps

@@ -49,6 +49,24 @@ _KIND_BRIEF = {
         "({buffer}), balance {balance} as of {as_of}. Suggest what to do "
         "with it.",
     ),
+    "rama.sentinel.mortgage_renewal": (
+        "Mortgage renewal coming up",
+        "The mortgage on {holding} renews in {days_to_renewal} days at "
+        "{term_end} (currently {rate_percent}%). Say what the landlord should "
+        "do BEFORE that date, and what it would cost to do nothing.",
+    ),
+    "rama.sentinel.valuation_stale": (
+        "Property value is out of date",
+        "{holding} was last valued at {amount} on {last_valued} ({basis}). "
+        "Equity and return figures rest on it. Say what a fresh figure would "
+        "change and the cheapest way to get one.",
+    ),
+    "rama.sentinel.spend_drift": (
+        "Spending has crept up",
+        "{category} cost {this_year} over the last year against {last_year} "
+        "the year before — up {increase}. Say what is most likely behind it "
+        "and what to check first.",
+    )
 }
 
 
@@ -153,3 +171,57 @@ def analyze_finding(self, event_id: str) -> None:
         property_id=event.property_id,
         lease_id=event.lease_id,
     )
+
+
+@app.task
+def run_weekly_deliberation() -> dict:
+    """One Treasurer analysis per landlord per week.
+
+    Deliberately not per-holding and not daily. A background agent that
+    produces something every morning trains people to stop reading it, and the
+    topics rotate so a quiet week on energy still surfaces something on
+    financing or revenue.
+    """
+    from datetime import date
+
+    from django.db.models import Count
+
+    from rentium.properties.models import PropertyHolding
+    from rentium.users.models import LandlordProfile
+
+    from . import deliberation
+    from .interventions import TOPIC_ROTATION
+    from .models import RamaDeliberation, RamaPreferences
+
+    week = date.today().isocalendar()
+    topic = TOPIC_ROTATION[week.week % len(TOPIC_ROTATION)]
+    started = 0
+
+    for landlord in LandlordProfile.objects.all():
+        prefs = RamaPreferences.objects.filter(landlord=landlord).first()
+        if prefs is None or not prefs.enabled:
+            continue
+
+        # The holding with the most spend is where the money is; analysing the
+        # quietest one weekly would be busywork.
+        holding = (
+            PropertyHolding.objects.filter(landlord=landlord)
+            .annotate(n=Count("ledger_entries"))
+            .order_by("-n")
+            .first()
+        )
+        dedupe = f"delib:{landlord.pk}:{topic}:{holding.pk if holding else 'all'}:{week.year}-{week.week}"
+        if RamaDeliberation.objects.filter(dedupe_key=dedupe).exists():
+            continue
+
+        try:
+            # Stamped at creation, not afterwards: a run that takes minutes
+            # must not leave a window where a second beat starts a duplicate.
+            deliberation.run(
+                landlord, topic=topic, holding=holding, trigger="beat",
+                dedupe_key=dedupe,
+            )
+            started += 1
+        except Exception:  # noqa: BLE001 — one landlord must not sink the run
+            logger.exception("Weekly deliberation failed for %s", landlord.pk)
+    return {"deliberations": started, "topic": topic}

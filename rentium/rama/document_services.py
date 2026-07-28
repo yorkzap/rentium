@@ -19,6 +19,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 
 from rentium.ledger.models import ExpenseCategory
+from rentium.ledger import services as ledger_services
 from rentium.ledger.services import post_expense
 from rentium.properties.models import PropertyHolding
 
@@ -40,6 +41,53 @@ ALLOWED_MEDIA_TYPES = {
 
 class DocumentError(ValueError):
     pass
+
+
+class DuplicateExpenseError(DocumentError):
+    """This receipt may document a cost that is already on the books.
+
+    Carries the candidates so the caller can offer "attach to that one" instead
+    of only "post it anyway" — linking is almost always the right answer, and a
+    dialog that offers no way to say so trains people to click through.
+    """
+
+    def __init__(self, message, *, candidates=None):
+        super().__init__(message)
+        self.candidates = candidates or []
+
+
+def _link_to_existing_expense(document, entry_id: str, actor):
+    """Attach this document to an expense already on the books.
+
+    Posts nothing. The receipt becomes the evidence for an entry that was
+    recorded from a message, which is the outcome someone actually wants when
+    they photograph a receipt for a cost they already mentioned.
+    """
+    from rentium.ledger.models import EntryType, LedgerEntry
+
+    entry = LedgerEntry.objects.filter(
+        landlord=document.landlord, pk=entry_id, entry_type=EntryType.EXPENSE
+    ).first()
+    if entry is None:
+        raise DocumentError(f"No expense {entry_id!r} on this portfolio to attach to.")
+    existing = getattr(entry, "source_document", None)
+    if existing is not None and existing.pk != document.pk:
+        raise DocumentError(
+            f"That expense already has {existing.original_filename!r} attached."
+        )
+    if document.amount and entry.amount != document.amount:
+        # Not fatal — a receipt total can legitimately differ from what was
+        # entered — but it must be said rather than silently accepted.
+        _event(
+            document,
+            RamaDocumentEvent.Kind.CLARIFIED,
+            actor=actor,
+            note=(
+                f"Linked to an expense of {entry.amount} while this document "
+                f"reads {document.amount}."
+            ),
+        )
+    return entry
 
 
 def _event(document, kind, *, actor=None, **detail):
@@ -577,6 +625,17 @@ def _first_money(text: str) -> Decimal | None:
 def _classify(text: str, filename: str) -> dict:
     value = f"{filename}\n{text}".casefold()
     rules = [
+        # First, because a statement contains most of the words below — the
+        # word "invoice" on page 3 of a bank statement must not make it one.
+        (
+            (
+                "account statement", "bank statement", "statement of account",
+                "opening balance", "closing balance", "transaction history",
+                "credit card statement",
+            ),
+            RamaDocument.Kind.BANK_STATEMENT,
+            "",
+        ),
         (
             ("property tax", "tax notice", "property assessment"),
             RamaDocument.Kind.TAX,
@@ -642,6 +701,7 @@ def _classify(text: str, filename: str) -> dict:
         RamaDocument.Kind.EXPENSE: "Expense Document",
         RamaDocument.Kind.MAINTENANCE: "Maintenance Document",
         RamaDocument.Kind.LEASE: "Lease Document",
+        RamaDocument.Kind.BANK_STATEMENT: "Bank Statement",
     }.get(kind, "Business Document")
     return {
         "kind": kind,
@@ -649,7 +709,13 @@ def _classify(text: str, filename: str) -> dict:
         "confidence": confidence,
         "payment_state": payment_state,
         "title": title,
-        "amount": _first_money(text),
+        # A statement's first money figure is an opening balance, not a cost.
+        # Showing it as the document's amount invites someone to file it.
+        "amount": (
+            None
+            if kind == RamaDocument.Kind.BANK_STATEMENT
+            else _first_money(text)
+        ),
     }
 
 
@@ -776,8 +842,22 @@ def file_document(
     reference_number=None,
     clarification_answer="",
     portfolio_wide=False,
+    duplicate_resolution="",
 ) -> RamaDocument:
-    """Apply human review, file the record, and post an expense if applicable."""
+    """Apply human review, file the record, and post an expense if applicable.
+
+    `duplicate_resolution` answers "have I already recorded this cost?":
+
+    - ""              decide for me — refuse with candidates if any look like
+                      this same cost (the default, so nothing doubles silently)
+    - "new"           post it anyway; it is a genuinely separate cost
+    - "link:<id>"     this receipt documents an expense already on the books —
+                      attach the file to that entry and post nothing
+
+    The sha256 check on upload only catches the same FILE twice. It cannot see
+    that a cost was already entered by message and is now arriving as a photo,
+    which is the way these actually double up.
+    """
     if document.status == RamaDocument.Status.FILED:
         return document
     document.portfolio_wide = bool(portfolio_wide)
@@ -817,28 +897,57 @@ def file_document(
             raise DocumentError("Choose an expense category.")
         if document.payment_state == RamaDocument.PaymentState.UNKNOWN:
             raise DocumentError("Confirm whether this expense has left the bank.")
-        entry, _ = post_expense(
-            landlord=document.landlord,
-            property=document.property,
-            holding=document.holding,
-            amount=document.amount,
-            category=document.expense_category,
-            description=document.title,
-            incurred_date=document.document_date or date.today(),
-            vendor=document.issuer,
-            paid_on=(
-                document.document_date or date.today()
-                if document.payment_state == RamaDocument.PaymentState.PAID
-                else None
-            ),
-            idempotency_key=f"rama-document:{document.pk}",
-            created_by=actor,
-            metadata={
-                "source_document_id": str(document.pk),
-                "holding_id": str(document.holding_id) if document.holding_id else None,
-                "due_date": str(document.due_date) if document.due_date else None,
-            },
-        )
+
+        incurred = document.document_date or date.today()
+        if duplicate_resolution.startswith("link:"):
+            entry = _link_to_existing_expense(
+                document, duplicate_resolution.split(":", 1)[1].strip(), actor
+            )
+        else:
+            if not duplicate_resolution:
+                candidates = ledger_services.find_duplicate_expense_candidates(
+                    document.landlord,
+                    amount=document.amount,
+                    on_date=incurred,
+                    property=document.property,
+                    holding=document.holding,
+                )
+                if candidates:
+                    raise DuplicateExpenseError(
+                        "This may already be recorded. "
+                        + "; ".join(
+                            f"{c['description']} (${c['amount']}, "
+                            f"{c['effective_date']}, {c['scope']})"
+                            for c in candidates
+                        )
+                        + ". Attach this receipt to that entry, or confirm it "
+                        "is a separate cost.",
+                        candidates=candidates,
+                    )
+            entry, _ = post_expense(
+                landlord=document.landlord,
+                property=document.property,
+                holding=document.holding,
+                amount=document.amount,
+                category=document.expense_category,
+                description=document.title,
+                incurred_date=incurred,
+                vendor=document.issuer,
+                paid_on=(
+                    incurred
+                    if document.payment_state == RamaDocument.PaymentState.PAID
+                    else None
+                ),
+                idempotency_key=f"rama-document:{document.pk}",
+                created_by=actor,
+                metadata={
+                    "source_document_id": str(document.pk),
+                    "holding_id": str(document.holding_id)
+                    if document.holding_id
+                    else None,
+                    "due_date": str(document.due_date) if document.due_date else None,
+                },
+            )
         document.ledger_entry = entry
         _event(
             document,

@@ -60,6 +60,15 @@ def build_briefing_text(landlord, *, phrase: bool = False) -> str:
                 f"({a.get('kind', '')})"
             )
 
+    # What the Treasurer needs from the landlord. $0 — no model involved, and
+    # the briefing is the one place they reliably read every morning.
+    from .deliberation import briefing_section
+
+    treasurer_lines = briefing_section(landlord)
+    if treasurer_lines:
+        lines.append("")
+        lines.extend(treasurer_lines)
+
     text = "\n".join(lines)
     if phrase:
         text = _phrase(landlord, text)

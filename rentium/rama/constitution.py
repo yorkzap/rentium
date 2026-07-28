@@ -166,7 +166,51 @@ def parse_rule_changes(rule_changes: str) -> tuple[list[dict], str | None]:
             )
         if action in ("remove", "update") and not ch.get("rule_id"):
             return [], f"rule_changes[{i}] needs rule_id."
+        if ch.get("rule_type") == RamaConstitutionRule.RuleType.AUTONOMY:
+            err = _invalid_autonomy_params(ch.get("params") or {})
+            if err:
+                return [], f"rule_changes[{i}]: {err}"
     return changes, None
+
+
+def _invalid_autonomy_params(params: dict) -> str | None:
+    """Reason an AUTONOMY rule is unacceptable, or None.
+
+    Deliberately strict: a rule that grants RAMA permission to act unattended
+    must fail loudly on a typo rather than being half-applied. Silently
+    dropping an unrecognised category here would let "inventry" read as a
+    granted permission in the UI while granting nothing — or worse, invite a
+    later reader to "fix" it by accepting unknown values.
+    """
+    from .tool_meta import AUTO_CATEGORIES
+
+    if not isinstance(params, dict):
+        return "params must be an object."
+    categories = params.get("categories")
+    if not isinstance(categories, list) or not categories:
+        return (
+            "categories must be a non-empty list, e.g. "
+            f"{sorted(AUTO_CATEGORIES)}."
+        )
+    unknown = [
+        str(c) for c in categories if str(c).strip().lower() not in AUTO_CATEGORIES
+    ]
+    if unknown:
+        return (
+            f"unknown categories {unknown} — must be from "
+            f"{sorted(AUTO_CATEGORIES)}."
+        )
+    channels = params.get("channels", ["web"])
+    if not isinstance(channels, list) or not channels:
+        return "channels must be a non-empty list, e.g. [\"web\"]."
+    for cap in ("max_per_turn", "max_per_day"):
+        if cap in params:
+            try:
+                if int(params[cap]) < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return f"{cap} must be a positive whole number."
+    return None
 
 
 @transaction.atomic

@@ -801,8 +801,14 @@ def summary_view(request):
     for start in month_starts(months_back):
         end = next_month(start)
 
-        expected = live.filter(
-            entry_type__in=INCOME_CHARGE_TYPES, due_date__gte=start, due_date__lt=end
+        expected = live.expected_income().filter(
+            due_date__gte=start, due_date__lt=end
+        ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+
+        # Reported beside expected income, never folded into it: a damage claim
+        # is contested and settles at move-out, not on this month's rent run.
+        damage_claimed = live.damage_claims().filter(
+            due_date__gte=start, due_date__lt=end
         ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
 
         collected = live.filter(

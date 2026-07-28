@@ -3062,11 +3062,16 @@ def update_inventory_item(
     if not _confirmed(confirm):
         return _preview("update_inventory_item", preview, "Updates private inventory.")
 
+    # Captured BEFORE the write so the autonomy tier can offer an exact undo
+    # (tool_meta._undo_update_inventory_item). Only the fields actually being
+    # overwritten are recorded.
+    previous = {k: getattr(item, k) for k in changes}
     for k, v in changes.items():
         setattr(item, k, v)
     item.save()
     return {
         "updated": True,
+        "previous": previous,
         "item": {
             "id": str(item.pk),
             "name": item.name,

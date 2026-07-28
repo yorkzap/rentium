@@ -73,6 +73,14 @@ class RamaPreferences(models.Model):
     )
     fsa_model = models.CharField(max_length=100, blank=True, default="")
     fsa_api_key = models.CharField(max_length=512, blank=True, default="")
+    # The Treasurer is the one role with a provider opinion of its own
+    # (runtime.ROLE_PREFERRED_PROVIDERS) — blank here means "use Gemini if the
+    # platform can call it", not "use the corporal's model".
+    treasurer_provider = models.CharField(
+        max_length=40, blank=True, default="", choices=Provider.choices
+    )
+    treasurer_model = models.CharField(max_length=100, blank=True, default="")
+    treasurer_api_key = models.CharField(max_length=512, blank=True, default="")
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -264,6 +272,15 @@ class RamaConstitutionRule(models.Model):
     - VENDOR_PREFERENCE:  {"trade": "plumbing", "name": "...", "phone": "...",
                            "priority": 1}
     - AUTO_RECORD_PAYMENT:{"confidence": "propose"|"auto"}
+    - AUTONOMY:           {"categories": ["inventory", "admin", "memory"],
+                           "channels": ["web"], "max_per_turn": 3,
+                           "max_per_day": 20}
+
+    AUTONOMY is what lets RAMA act without asking. It lives here rather than in
+    RamaPreferences on purpose: amending the Constitution is itself an
+    own_confirm write, so the model cannot grant itself autonomy without the
+    landlord confirming a policy amendment in its own dedicated step. Absent
+    rule = nothing ever auto-runs.
     """
 
     class RuleType(models.TextChoices):
@@ -272,6 +289,7 @@ class RamaConstitutionRule(models.Model):
         LATE_FEE = "LATE_FEE", "Late fee"
         VENDOR_PREFERENCE = "VENDOR_PREFERENCE", "Preferred vendor"
         AUTO_RECORD_PAYMENT = "AUTO_RECORD_PAYMENT", "Auto-record payments"
+        AUTONOMY = "AUTONOMY", "Act without asking (per category)"
 
     landlord = models.ForeignKey(
         "users.LandlordProfile",
@@ -429,6 +447,10 @@ class RamaDocument(models.Model):
         LEASE = "LEASE", "Lease / tenancy"
         TAX = "TAX", "Tax record"
         MAINTENANCE = "MAINTENANCE", "Maintenance"
+        # Deliberately NOT expense-like: a statement is a LIST of transactions,
+        # so filing it as one expense posts a single invented charge for the
+        # closing balance. It routes to the staging importer instead.
+        BANK_STATEMENT = "BANK_STATEMENT", "Bank / card statement"
         OTHER = "OTHER", "Other document"
 
     class PaymentState(models.TextChoices):
@@ -613,3 +635,709 @@ class RamaDocumentEvent(models.Model):
         from django.core.exceptions import ValidationError
 
         raise ValidationError("Document events are append-only.")
+
+
+class RamaAutoAction(models.Model):
+    """Receipt for something RAMA did without asking.
+
+    Needed because neither existing store can answer "what did it just do, and
+    can I take it back?": RamaPendingPlan is deleted the moment a plan finishes
+    (plan_runner.run_plan), and RamaAudit is append-only JSON that cannot be
+    marked as reversed.
+
+    Every row carries its own inverse, captured at execution time from
+    tool_meta's `undo` callable. Undo replays that inverse through the normal
+    plan runner, so the invariant that only run_plan() may inject confirm=yes
+    survives undo too.
+    """
+
+    class Status(models.TextChoices):
+        DONE = "DONE", "Done"
+        UNDONE = "UNDONE", "Undone"
+        UNDO_FAILED = "UNDO_FAILED", "Undo failed"
+        EXPIRED = "EXPIRED", "Too old to undo"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_auto_actions",
+    )
+    conversation_id = models.UUIDField(db_index=True)
+    tool = models.CharField(max_length=100)
+    arguments = models.JSONField(default=dict, blank=True)
+    target_label = models.CharField(max_length=200, blank=True, default="")
+    result = models.JSONField(default=dict, blank=True)
+    # Which Constitution rule authorised this, so a landlord reviewing a
+    # surprising action can see exactly what permission produced it.
+    policy_rule_id = models.IntegerField(null=True, blank=True)
+    undo_tool = models.CharField(max_length=100, blank=True, default="")
+    undo_arguments = models.JSONField(default=dict, blank=True)
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.DONE, db_index=True
+    )
+    undone_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["landlord", "status", "-created_at"])]
+
+    def __str__(self):
+        return f"{self.tool} {self.target_label} ({self.status})"
+
+    @property
+    def is_undoable(self) -> bool:
+        from django.utils import timezone
+
+        from .autonomy import AUTO_UNDO_TTL
+
+        return (
+            self.status == self.Status.DONE
+            and bool(self.undo_tool)
+            and (timezone.now() - self.created_at) <= AUTO_UNDO_TTL
+        )
+
+
+class RamaMemory(models.Model):
+    """Durable per-landlord preferences that survive the conversation.
+
+    Scope, deliberately narrow:
+
+    - IN: preferences and standing directives the landlord stated. "Invoices go
+      to my bookkeeper Dana." "Never viewings on Sundays." "Call the basement
+      suite the Garden."
+    - OUT, portfolio state. live_context() recomputes rents, counts, balances
+      and statuses every single turn and is authoritative. A stored "Room C is
+      $900" is a bug with a long fuse — it cannot be kept in sync, and it would
+      compete with the truth.
+    - OUT, conversation summaries. A summary of a turn where the model was
+      wrong becomes *durable* wrongness. Within-conversation recall is already
+      handled by service._tool_facts_note, and its dying at the end of the
+      conversation is a feature.
+
+    Append-only by supersession, like RamaConstitutionSection. The partial
+    unique constraint on (landlord, key) WHERE status=ACTIVE is what makes that
+    structural rather than conventional: two contradictory active memories
+    cannot exist, and a write to an existing key MUST supersede.
+
+    Precedence, stated in the prompt and tested:
+        LIVE PORTFOLIO > THE CONSTITUTION > LANDLORD MEMORY > chat history
+    """
+
+    class Scope(models.TextChoices):
+        PORTFOLIO = "PORTFOLIO", "Always relevant"
+        ENTITY = "ENTITY", "Relevant to one property or lease"
+
+    class Source(models.TextChoices):
+        LANDLORD_EXPLICIT = "LANDLORD_EXPLICIT", "Landlord said to remember it"
+        # Recorded but NEVER injected: nothing reaches the prompt that the
+        # landlord did not explicitly say.
+        LANDLORD_IMPLIED = "LANDLORD_IMPLIED", "Inferred (recorded, not used)"
+
+    class Status(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        SUPERSEDED = "SUPERSEDED", "Superseded"
+        FORGOTTEN = "FORGOTTEN", "Forgotten"
+        EXPIRED = "EXPIRED", "Expired"
+
+    MAX_BODY_CHARS = 400
+    MAX_ACTIVE_PER_LANDLORD = 200
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_memories",
+    )
+    key = models.SlugField(max_length=80)
+    body = models.TextField()
+    scope = models.CharField(
+        max_length=12, choices=Scope.choices, default=Scope.PORTFOLIO
+    )
+    entity_key = models.CharField(max_length=120, blank=True, default="")
+    source = models.CharField(
+        max_length=20, choices=Source.choices, default=Source.LANDLORD_EXPLICIT
+    )
+    origin_conversation = models.UUIDField(null=True, blank=True)
+    supersedes = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.ACTIVE, db_index=True
+    )
+    # Set at write time by memory.personal_data_present(). Flags rows that a
+    # tenant-erasure request would need to reach — see the rama_forget_subject
+    # management command.
+    contains_personal_data = models.BooleanField(default=False)
+    pinned = models.BooleanField(default=False)
+    use_count = models.PositiveIntegerField(default=0)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "RAMA memory"
+        verbose_name_plural = "RAMA memories"
+        ordering = ["-pinned", "-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["landlord", "key"],
+                condition=models.Q(status="ACTIVE"),
+                name="rama_memory_active_key_unique",
+            )
+        ]
+        indexes = [models.Index(fields=["landlord", "status", "-updated_at"])]
+
+    def __str__(self):
+        return f"{self.key} ({self.status}) for {self.landlord_id}"
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+
+        if len(self.body or "") > self.MAX_BODY_CHARS:
+            raise ValidationError(
+                f"A memory must be one short statement "
+                f"(max {self.MAX_BODY_CHARS} characters)."
+            )
+
+
+class LandlordFinancialProfile(models.Model):
+    """What the Treasurer may know about the landlord personally.
+
+    Rental income is taxed on top of employment income, so a marginal rate is
+    what turns "this deduction saves you money" into a number. But occupation
+    and exact salary are among the most sensitive things this app could hold,
+    and they are NOT what the calculation needs.
+
+    So: bands rather than dollars, and `self_reported_marginal_rate` as the
+    preferred input — it is both less revealing and more accurate than
+    inferring a rate from a salary, and it is the number an accountant would
+    hand over anyway.
+
+    Nothing here is read unless `consented_at` is set. Absent consent the
+    Treasurer omits every tax figure rather than guessing, and says why.
+    """
+
+    class IncomeBand(models.TextChoices):
+        UNDER_50K = "UNDER_50K", "Under $50,000"
+        B50_100K = "B50_100K", "$50,000 – $100,000"
+        B100_150K = "B100_150K", "$100,000 – $150,000"
+        B150_250K = "B150_250K", "$150,000 – $250,000"
+        OVER_250K = "OVER_250K", "Over $250,000"
+        PREFER_NOT_TO_SAY = "PREFER_NOT_TO_SAY", "Prefer not to say"
+
+    class Filing(models.TextChoices):
+        SINGLE = "SINGLE", "Single"
+        COUPLE_ONE_INCOME = "COUPLE_ONE_INCOME", "Couple, one income"
+        COUPLE_TWO_INCOMES = "COUPLE_TWO_INCOMES", "Couple, two incomes"
+        CORPORATION = "CORPORATION", "Held in a corporation"
+        PARTNERSHIP = "PARTNERSHIP", "Partnership"
+
+    landlord = models.OneToOneField(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="financial_profile",
+        primary_key=True,
+    )
+    # The gate. Null means every field below is ignored, whatever it holds.
+    consented_at = models.DateTimeField(null=True, blank=True)
+    consent_scope = models.CharField(max_length=32, default="TAX_ESTIMATES_ONLY")
+    occupation = models.CharField(max_length=120, blank=True, default="")
+    employment_income_band = models.CharField(
+        max_length=20, choices=IncomeBand.choices, blank=True, default=""
+    )
+    other_income_band = models.CharField(
+        max_length=20, choices=IncomeBand.choices, blank=True, default=""
+    )
+    filing_situation = models.CharField(
+        max_length=20, choices=Filing.choices, blank=True, default=""
+    )
+    # Blank falls back to LandlordProfile.province.
+    tax_province = models.CharField(max_length=2, blank=True, default="")
+    # The preferred input: one number, less sensitive than the three above.
+    self_reported_marginal_rate = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "landlord financial profile"
+        verbose_name_plural = "landlord financial profiles"
+
+    def __str__(self):
+        state = "consented" if self.consented_at else "no consent"
+        return f"Financial profile for {self.landlord_id} ({state})"
+
+    @property
+    def usable(self) -> bool:
+        return self.consented_at is not None
+
+
+class TaxRateTable(models.Model):
+    """Dated tax rates, loaded by a human.
+
+    Deliberately data rather than code: brackets change every year, and a rate
+    hardcoded in a prompt or a constant goes stale silently — the worst
+    failure mode, because the arithmetic still looks right.
+
+    `tax.marginal_rate_estimate` refuses to fall back to a previous year. A
+    missing table means the Treasurer says it cannot estimate tax for that
+    year, which is recoverable; quoting last year's brackets as this year's is
+    not.
+    """
+
+    class Kind(models.TextChoices):
+        PERSONAL_INCOME_BRACKETS = "PERSONAL_INCOME_BRACKETS", "Personal income brackets"
+        CCA_CLASSES = "CCA_CLASSES", "Capital cost allowance classes"
+        GST_HST_RATE = "GST_HST_RATE", "GST/HST rate"
+        CAPITAL_GAINS_INCLUSION = "CAPITAL_GAINS_INCLUSION", "Capital gains inclusion"
+
+    jurisdiction = models.CharField(max_length=10)  # "CA-FED" | "CA-BC"
+    tax_year = models.PositiveIntegerField()
+    kind = models.CharField(max_length=32, choices=Kind.choices)
+    payload = models.JSONField(default=dict)
+    source_url = models.URLField(max_length=500, blank=True, default="")
+    source_fetched_at = models.DateTimeField(null=True, blank=True)
+    effective_from = models.DateField(null=True, blank=True)
+    effective_to = models.DateField(null=True, blank=True)
+    # Who vouched for these numbers. A rate table with no human behind it is
+    # exactly what this model exists to prevent.
+    loaded_by = models.ForeignKey(
+        "users.User", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-tax_year", "jurisdiction"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["jurisdiction", "tax_year", "kind"],
+                name="tax_rate_table_unique_per_year",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.jurisdiction} {self.tax_year} {self.kind}"
+
+
+class TreasurerFact(models.Model):
+    """A financial fact the ledger does not have.
+
+    "You're missing that we took $2,000 rent from another tenant for a year"
+    is true, material, and unrecorded. It cannot go in RamaMemory — that store
+    REFUSES money, dates and counts on purpose, because its rows are injected
+    into every prompt for every role forever with no as-of date and no way to
+    reconcile them. A number living there is a liability with a long fuse.
+
+    A financial assertion is the opposite shape: scoped, dated, reconciled
+    against the ledger at write time, and injected only into the analysis that
+    needs it. Different lifecycle, different store.
+
+    Corrections supersede rather than edit — the partial unique constraint on
+    (landlord, key) WHERE status=ACTIVE makes two contradictory active facts
+    structurally impossible, and `supersedes` keeps the chain so "what did it
+    believe before, and why did it change?" stays answerable.
+    """
+
+    class Kind(models.TextChoices):
+        LANDLORD_ASSERTED = "LANDLORD_ASSERTED", "The landlord told us"
+        RESEARCHED = "RESEARCHED", "Researched, with a source"
+        DERIVED = "DERIVED", "Computed from other facts"
+        ESTIMATE = "ESTIMATE", "Estimated under stated assumptions"
+        TAX_ASSUMPTION = "TAX_ASSUMPTION", "Tax assumption"
+
+    class Confidence(models.TextChoices):
+        STATED = "STATED", "Stated as fact"
+        RESEARCHED = "RESEARCHED", "Verified against a source"
+        ESTIMATED = "ESTIMATED", "Estimated"
+        UNVERIFIED = "UNVERIFIED", "Unverified — excluded from totals"
+
+    class Status(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        SUPERSEDED = "SUPERSEDED", "Superseded by a correction"
+        RETRACTED = "RETRACTED", "Retracted"
+        EXPIRED = "EXPIRED", "Expired"
+
+    class Direction(models.TextChoices):
+        """Which side of the books this belongs to.
+
+        Reconciliation is undefined without it: $2,000/month means something
+        different as income than as a cost.
+        """
+
+        INCOME = "INCOME", "Money in"
+        EXPENSE = "EXPENSE", "Money out"
+        NEUTRAL = "NEUTRAL", "Neither (a rate, a value, a count)"
+
+    class Period(models.TextChoices):
+        ONE_TIME = "ONE_TIME", "One time"
+        MONTHLY = "MONTHLY", "Per month"
+        ANNUAL = "ANNUAL", "Per year"
+
+    MAX_STATEMENT_CHARS = 400
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="treasurer_facts",
+    )
+    key = models.SlugField(max_length=120)
+    subject = models.CharField(max_length=200)
+    statement = models.TextField()
+
+    kind = models.CharField(max_length=20, choices=Kind.choices)
+    confidence = models.CharField(max_length=12, choices=Confidence.choices)
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.ACTIVE, db_index=True
+    )
+    direction = models.CharField(
+        max_length=8, choices=Direction.choices, default=Direction.NEUTRAL
+    )
+
+    value_numeric = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True
+    )
+    value_unit = models.CharField(max_length=20, default="CAD")
+    period = models.CharField(
+        max_length=12, choices=Period.choices, default=Period.ONE_TIME
+    )
+    effective_from = models.DateField(null=True, blank=True)
+    effective_to = models.DateField(null=True, blank=True)
+
+    # Scope mirrors LedgerEntry's shape so reconciliation is a direct join
+    # rather than a translation layer that can drift.
+    holding = models.ForeignKey(
+        "properties.PropertyHolding",
+        null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    property = models.ForeignKey(
+        "properties.Property",
+        null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    lease = models.ForeignKey(
+        "leases.Lease",
+        null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    category = models.CharField(max_length=30, blank=True, default="")
+
+    source_type = models.CharField(max_length=20, default="LANDLORD")
+    source_conversation = models.UUIDField(null=True, blank=True)
+    source_document = models.ForeignKey(
+        "rama.RamaDocument",
+        null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    asserted_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+
+    # Computed by treasurer_facts.reconcile() at write time. This is what stops
+    # a correction becoming a double-count: if the ledger already holds most of
+    # what was asserted, the fact is SHOWN but excluded from totals.
+    ledger_overlap_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True
+    )
+    double_count_risk = models.BooleanField(default=False)
+    reconciled_at = models.DateTimeField(null=True, blank=True)
+
+    supersedes = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_by_role = models.CharField(max_length=20, default="landlord")
+    contains_personal_data = models.BooleanField(default=False)
+
+    class Meta:
+        verbose_name = "treasurer fact"
+        verbose_name_plural = "treasurer facts"
+        ordering = ["-asserted_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["landlord", "key"],
+                condition=models.Q(status="ACTIVE"),
+                name="treasurer_fact_active_key_unique",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["landlord", "status", "-asserted_at"]),
+            models.Index(fields=["landlord", "holding", "effective_from"]),
+        ]
+
+    def __str__(self):
+        return f"{self.key} ({self.status}) for {self.landlord_id}"
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+
+        if len(self.statement or "") > self.MAX_STATEMENT_CHARS:
+            raise ValidationError(
+                f"A fact must be one statement (max {self.MAX_STATEMENT_CHARS} chars)."
+            )
+
+
+class RamaDeliberation(models.Model):
+    """One structured analysis, start to finish.
+
+    Persisted rather than computed on the fly for three reasons: a landlord
+    asking "why did it recommend that?" gets the whole chain, a run that
+    pauses for information can resume, and a correction can re-run the parts
+    that changed instead of everything.
+    """
+
+    class Status(models.TextChoices):
+        RUNNING = "RUNNING", "Running"
+        AWAITING_INFO = "AWAITING_INFO", "Waiting on the landlord"
+        DONE = "DONE", "Done"
+        FAILED = "FAILED", "Failed"
+        SUPERSEDED = "SUPERSEDED", "Superseded by a re-run"
+        ABORTED_BUDGET = "ABORTED_BUDGET", "Stopped at its budget"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_deliberations",
+    )
+    topic = models.CharField(max_length=60)
+    question = models.TextField()
+    trigger = models.CharField(max_length=60, default="landlord_ask")
+    holding = models.ForeignKey(
+        "properties.PropertyHolding",
+        null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.RUNNING, db_index=True
+    )
+    # Where to resume. Stages before it are settled.
+    stage_cursor = models.PositiveIntegerField(default=0)
+    calls_used = models.PositiveIntegerField(default=0)
+    supersedes = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    insight = models.ForeignKey(
+        "rama.RamaInsight",
+        null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    # Same trick the sergeants use: one analysis per topic per scope per week.
+    dedupe_key = models.CharField(max_length=160, blank=True, default="", db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["landlord", "status", "-created_at"])]
+
+    def __str__(self):
+        return f"{self.topic} ({self.status}) for {self.landlord_id}"
+
+
+class RamaDeliberationStage(models.Model):
+    """One step of the analysis, with what went in and what came out.
+
+    `conversation_id` is the evidence that a stage really was its own bounded
+    sub-turn rather than part of one long generation — which is what stops a
+    weak model collapsing the sequence.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        DONE = "DONE", "Done"
+        RETRIED = "RETRIED", "Retried"
+        FAILED = "FAILED", "Failed"
+        SKIPPED = "SKIPPED", "Skipped"
+
+    deliberation = models.ForeignKey(
+        RamaDeliberation, on_delete=models.CASCADE, related_name="stages"
+    )
+    order = models.PositiveIntegerField()
+    stage = models.CharField(max_length=20)
+    option_key = models.CharField(max_length=60, blank=True, default="")
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.PENDING
+    )
+    conversation_id = models.UUIDField(null=True, blank=True)
+    provider = models.CharField(max_length=40, blank=True, default="")
+    model = models.CharField(max_length=100, blank=True, default="")
+    input_artifact = models.JSONField(default=dict, blank=True)
+    output_artifact = models.JSONField(default=dict, blank=True)
+    raw_reply = models.TextField(blank=True, default="")
+    # Contract failures: a missing required slot, an unverified web figure, a
+    # figure token that resolves to nothing.
+    violations = models.JSONField(default=list, blank=True)
+    retries = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["deliberation", "order"], name="rama_stage_unique_order"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.stage}#{self.order} ({self.status})"
+
+
+class RamaOption(models.Model):
+    """One candidate course of action, and what we know about it."""
+
+    class Status(models.TextChoices):
+        CANDIDATE = "CANDIDATE", "Candidate"
+        GATHERED = "GATHERED", "Facts gathered"
+        SCORED = "SCORED", "Scored"
+        BLOCKED = "BLOCKED", "Blocked"
+        EXCLUDED = "EXCLUDED", "Excluded"
+
+    deliberation = models.ForeignKey(
+        RamaDeliberation, on_delete=models.CASCADE, related_name="options"
+    )
+    catalogue_key = models.CharField(max_length=60)
+    label = models.CharField(max_length=200)
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.CANDIDATE
+    )
+    excluded_reason = models.CharField(max_length=200, blank=True, default="")
+    facts = models.JSONField(default=dict, blank=True)
+    scores = models.JSONField(default=dict, blank=True)
+    rank = models.IntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["rank", "catalogue_key"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["deliberation", "catalogue_key"],
+                name="rama_option_unique_per_deliberation",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.catalogue_key} ({self.status})"
+
+
+class TreasurerSource(models.Model):
+    """A web page the Treasurer read, cached with its fetch date.
+
+    Kept per landlord rather than globally so an erasure request can reach it,
+    and because a cached page is evidence for a figure that landlord acted on.
+
+    `excerpt` is what `research.verify_in_source` checks a number against. A
+    figure that does not appear verbatim in the fetched text is downgraded and
+    excluded from scoring — which is the single strongest guard against a
+    confidently invented rebate amount.
+    """
+
+    class Status(models.TextChoices):
+        FRESH = "FRESH", "Fresh"
+        STALE = "STALE", "Past its expiry"
+        DEAD = "DEAD", "Could not be fetched"
+        BLOCKED = "BLOCKED", "Refused before fetching"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="treasurer_sources",
+    )
+    topic = models.CharField(max_length=60, db_index=True)
+    query = models.CharField(max_length=300, blank=True, default="")
+    url = models.URLField(max_length=500)
+    title = models.CharField(max_length=300, blank=True, default="")
+    domain = models.CharField(max_length=120, db_index=True)
+    content_hash = models.CharField(max_length=64, blank=True, default="")
+    excerpt = models.TextField(blank=True, default="")
+    fetched_at = models.DateTimeField()
+    expires_at = models.DateTimeField()
+    http_status = models.PositiveIntegerField(default=0)
+    status = models.CharField(
+        max_length=8, choices=Status.choices, default=Status.FRESH, db_index=True
+    )
+
+    class Meta:
+        ordering = ["-fetched_at"]
+        indexes = [models.Index(fields=["landlord", "topic", "-fetched_at"])]
+
+    def __str__(self):
+        return f"{self.domain} ({self.topic})"
+
+    @property
+    def is_fresh(self) -> bool:
+        from django.utils import timezone
+
+        return self.status == self.Status.FRESH and self.expires_at > timezone.now()
+
+
+class TreasurerRequest(models.Model):
+    """Something the Treasurer needs from the landlord to finish an analysis.
+
+    Created by PYTHON, never by the model — an unfilled required slot becomes
+    a request. That matters: a model asked to "say what you need" will invent
+    plausible-sounding needs, whereas a slot that a strict parser found empty
+    is a fact.
+
+    `why_it_matters` is generated from the sensitivity result, so it always
+    states the real consequence ("this decides whether windows or the heat
+    pump comes first") rather than a generic plea for more information.
+
+    Relayed by the General verbatim as "Treasurer request: …". The Treasurer
+    has no channel of its own; the chain of command is the point.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "OPEN", "Open"
+        RELAYED = "RELAYED", "Passed to the landlord"
+        ANSWERED = "ANSWERED", "Answered"
+        DECLINED = "DECLINED", "Declined"
+        EXPIRED = "EXPIRED", "Expired"
+
+    MAX_OPEN_PER_LANDLORD = 3
+    TTL_DAYS = 14
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="treasurer_requests",
+    )
+    deliberation = models.ForeignKey(
+        "rama.RamaDeliberation",
+        null=True, blank=True, on_delete=models.CASCADE, related_name="requests",
+    )
+    # The TreasurerFact key this answer will fill, so an answer routes back
+    # without the landlord having to say what it was for.
+    fact_key = models.SlugField(max_length=120, blank=True, default="")
+    question = models.TextField()
+    why_it_matters = models.TextField(blank=True, default="")
+    expected_unit = models.CharField(max_length=20, blank=True, default="")
+    expected_period = models.CharField(max_length=12, blank=True, default="")
+    # Does the analysis stop until this is answered, or continue provisionally?
+    blocking = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True
+    )
+    relayed_at = models.DateTimeField(null=True, blank=True)
+    answer_text = models.TextField(blank=True, default="")
+    answered_at = models.DateTimeField(null=True, blank=True)
+    resulting_fact = models.ForeignKey(
+        "rama.TreasurerFact",
+        null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    expires_at = models.DateTimeField(null=True, blank=True)
+    # Never ask the same thing twice.
+    dedupe_key = models.CharField(max_length=180, blank=True, default="", db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-blocking", "created_at"]
+        indexes = [models.Index(fields=["landlord", "status", "created_at"])]
+
+    def __str__(self):
+        return f"{self.question[:60]} ({self.status})"
+
+    @property
+    def is_live(self) -> bool:
+        from django.utils import timezone
+
+        if self.status not in (self.Status.OPEN, self.Status.RELAYED):
+            return False
+        return self.expires_at is None or self.expires_at > timezone.now()

@@ -19,7 +19,21 @@ urlpatterns = [
         name="document-download",
     ),
     path("general/chat/", views.general_chat_view, name="general-chat"),
+    path("treasurer/chat/", views.treasurer_chat_view, name="treasurer-chat"),
     path("constitution/", views.constitution_view, name="constitution"),
+    path("auto-actions/", views.auto_actions_view, name="auto-actions"),
+    path(
+        "auto-actions/<uuid:action_id>/undo/",
+        views.auto_action_undo_view,
+        name="auto-action-undo",
+    ),
+    path("treasurer/", views.treasurer_view, name="treasurer"),
+    path("memory/", views.memory_view, name="memory"),
+    path(
+        "memory/<uuid:memory_id>/",
+        views.memory_delete_view,
+        name="memory-delete",
+    ),
     path("insights/", views.insights_view, name="insights"),
     path(
         "capability-gaps/",

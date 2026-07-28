@@ -44,7 +44,14 @@ services:
   redis:
     image: docker.io/redis:6
     container_name: rentium_local_redis
-    
+    # Locally, Redis is ONLY the Celery broker/result backend — config/settings/
+    # local.py overrides CACHES to LocMemCache, so nothing here is worth keeping
+    # across a restart. Persisting it is pure downside: an unclean shutdown once
+    # left a NUL-filled dump.rdb behind, and Redis refused to boot ("Wrong
+    # signature trying to load DB from file"), which took the whole stack with
+    # it via the service_healthy dependency. A broker with no memory cannot fail
+    # that way.
+    command: redis-server --save "" --appendonly no
     volumes:
       - rentium_local_redis_data:/data
     healthcheck:

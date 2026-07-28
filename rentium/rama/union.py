@@ -64,8 +64,14 @@ def month_money(landlord, start: date, end: date, *, property_id=None) -> dict:
     if property_id:
         live = live.filter(property_id=property_id)
 
-    expected = live.filter(
-        entry_type__in=INCOME_CHARGE_TYPES, due_date__gte=start, due_date__lt=end
+    expected = live.expected_income().filter(
+        due_date__gte=start, due_date__lt=end
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+
+    # Kept out of `expected` and surfaced on its own so RAMA states it as a
+    # claim to be settled at move-out, not as rent it is waiting on.
+    damage_claimed = live.damage_claims().filter(
+        due_date__gte=start, due_date__lt=end
     ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
 
     collected = live.filter(
@@ -113,6 +119,15 @@ def month_money(landlord, start: date, end: date, *, property_id=None) -> dict:
         "expense_lines": expense_rows,
         "net": str(collected - spent),
         "deposits_collected": str(deposits_in),
+        "damage_claimed": str(damage_claimed),
+        "damage_claimed_note": (
+            "Damage recovery claimed from a tenant this month. NOT part of "
+            "expected income — it is a claim, settled at move-out either by "
+            "the tenant's written agreement or an RTB application in the "
+            "statutory window. Never describe it as rent owed or expected."
+        )
+        if damage_claimed
+        else "",
     }
 
 

@@ -105,10 +105,24 @@ def get_token(user) -> str:
     return token.key
 
 
-def chat(token: str, message: str, conversation_id: str) -> dict:
+# Which endpoint each role answers on. A scenario names a role; nothing here
+# branches on role names, so a fifth role is one row.
+ROLE_PATHS = {
+    "corporal": "/api/rama/chat/",
+    "general": "/api/rama/general/chat/",
+    "treasurer": "/api/rama/treasurer/chat/",
+}
+
+
+def chat(
+    token: str, message: str, conversation_id: str, role: str = "corporal"
+) -> dict:
+    path = ROLE_PATHS.get(role)
+    if path is None:
+        return {"status": 0, "detail": f"No chat endpoint for role {role!r}."}
     body = json.dumps({"message": message, "conversation_id": conversation_id})
     req = urllib.request.Request(
-        f"{BASE_URL}/api/rama/chat/",
+        f"{BASE_URL}{path}",
         data=body.encode("utf-8"),
         headers={
             "Authorization": f"Token {token}",
@@ -158,6 +172,12 @@ def grade(expect: dict, response: dict, landlord, ctx) -> list[str]:
                 f"pending_plan is {'present' if plan else 'absent'}, "
                 f"expected {'present' if expect['pending_plan'] else 'absent'}"
             )
+    if "auto_executed" in expect:
+        got = len(response.get("auto_executed") or [])
+        if got != expect["auto_executed"]:
+            problems.append(
+                f"auto_executed={got}, expected {expect['auto_executed']}"
+            )
     if "awaiting_step" in expect and plan is not None:
         if bool(plan.get("awaiting_own_confirm")) is not expect["awaiting_step"]:
             problems.append(
@@ -173,14 +193,26 @@ def grade(expect: dict, response: dict, landlord, ctx) -> list[str]:
 
 
 def run_scenario(scenario: dict, token: str, landlord) -> tuple[bool, list[str]]:
-    ctx = scenario["setup"](landlord)
     conv = str(uuid.uuid4())
+    # A scenario can pin a role; a turn can override it (e.g. ask the General
+    # something, then check the Treasurer's own answer).
+    scenario_role = scenario.get("role", "corporal")
     failures: list[str] = []
+    # Setup is INSIDE the try: a fixture that half-builds and then raises used
+    # to skip teardown entirely, and the leftover rows poisoned every later run.
+    ctx: dict = {}
     try:
+        ctx = scenario["setup"](landlord)
         if DRY:
             return True, ["(dry run — fixtures only)"]
         for i, turn in enumerate(scenario["turns"], start=1):
-            response = chat(token, turn["say"], conv)
+            if turn.get("new_conversation"):
+                # Cross-conversation memory is untestable in a single
+                # conversation: the point is that the NEXT one still knows.
+                conv = str(uuid.uuid4())
+            response = chat(
+                token, turn["say"], conv, turn.get("role", scenario_role)
+            )
             problems = grade(turn.get("expect") or {}, response, landlord, ctx)
             if problems:
                 failures.append(

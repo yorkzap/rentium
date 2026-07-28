@@ -37,14 +37,15 @@ never delete ledger entries, etc.).
 
 RAMA is deliberately built to run on **cheap, weak models** — the intelligence
 comes from deterministic Python scaffolding (planning, grounding, confirmation),
-not a big model. But it has a **command structure** of three roles, and each can
+not a big model. But it has a **command structure** of four roles, and each can
 run a *different* model, so you can put a smarter model where it helps most:
 
 | Role | What it does | Model it uses |
 |---|---|---|
-| **Corporal** | The ops agent — does the actual CRUD (create/duplicate/invite/…). | Your **main** RAMA model (Settings → Account & RAMA: provider + model + key). |
-| **General** | Your "chief of staff" — routing, the Constitution, delegating to the Corporal. This is the natural home for a **smarter** model. | `general_*` config → falls back to your main model. |
-| **FSA** | Reasons over facts (the Insights/analysis layer). | `fsa_*` config → falls back to your main model. |
+| **Corporal** (Ops) | The ops agent — does the actual CRUD (create/duplicate/invite/…). | Your **main** RAMA model (Settings → Account & RAMA: provider + model + key). |
+| **General** | Your "chief of staff" — routing, the Constitution, delegating, and relaying what the other roles need from you. This is the natural home for a **smarter** model. | `general_*` config → falls back to your main model. |
+| **FSA** (Analyst) | Reasons over facts (the Insights/analysis layer). **Read-only**, and not reachable directly — it only ever answers a background finding. | `fsa_*` config → falls back to your main model. |
+| **Treasurer** | The finance head: where money is being lost, where it could be made, financing, tax. **Read-only** — anything it recommends comes back to you as a plan from the General. Defaults to **Gemini**. See `RAMA_TREASURER.md`. | `treasurer_*` config → falls back to your main model. |
 
 **How the model for a role is resolved** (`rama/runtime.py:get_role_config`):
 
@@ -55,25 +56,22 @@ run a *different* model, so you can put a smarter model where it helps most:
 **same provider** as your main one. If a role uses a *different* provider, RAMA
 uses the platform's key for that provider.
 
-### Are the smarter models "working"? What you're seeing
+### Setting a role's model
 
-Today the **Settings UI only exposes your main model** (the Mistral Small +
-API-key box you saw). That model drives the **Corporal**. The **General and
-FSA currently fall back to that same main model** unless their per-role config
-is set — and there is **no UI yet** to set the per-role (`general_model`,
-`fsa_model`) values. So out of the box, everything runs on your one model; the
-layered architecture is wired, but the per-role knobs aren't surfaced.
+**Settings → Account & RAMA → Roles.** Each role that can have its own model
+gets a card: tick it, pick a provider and model, and paste a key if it uses a
+different provider than your main one. Leave a card off and that role uses your
+main model — which is the honest default, since RAMA is built to work that way.
 
-**To actually run a smarter model for the General** you currently need to set
-its per-role fields on your `RamaPreferences` (e.g. via the API/admin):
-`general_provider`, `general_model` (and optionally a key if it's a different
-provider). A settings UI for this — a "smarter model for the General" picker —
-is a small, planned addition; ask and it'll be built so you can do it from the
-screen.
+**How the resolution works** (`rama/runtime.py:get_role_config`): your per-role
+preference → the platform's `RAMA_<ROLE>_*` setting → your main chat provider
+with that role's default tier. A role absent from `_ROLE_DEFAULTS` silently
+falls back to the Corporal's cheap chat tier, so every role has an entry.
 
-**Bottom line:** your Mistral Small key *is* working (it runs the Corporal). A
-smarter decision-layer model is supported by the architecture but not yet
-switch-on-able from the UI.
+**BYOK keys:** the key you enter applies to any role using the **same
+provider** as your main one. A role on a different provider needs its own key,
+or the platform's if one is configured — the card warns you when it doesn't
+have one and would fall back.
 # Document intelligence
 
 RAMA can ingest receipts, invoices, tax notices, mortgage correspondence, and
@@ -243,3 +241,92 @@ RAMA emits dashboard links only from the registered link map and canonical
 frontend origin. “Show my dashboard properties” therefore resolves to
 `https://www.rentium.ca/dashboard/properties`; legacy `app.rentium.ca` links
 are never generated.
+
+---
+
+## Letting RAMA act without asking
+
+By default RAMA asks before every change. That is the right default, and it
+stays the default: nothing below happens unless you turn it on.
+
+For a few routine, reversible things, the confirmation is pure friction. You
+can pre-authorise those by category in your Constitution:
+
+```json
+{"categories": ["inventory", "admin", "memory"],
+ "channels": ["web"], "max_per_turn": 3, "max_per_day": 20}
+```
+
+Categories available today:
+
+| Category | What it covers |
+|---|---|
+| `inventory` | Updating an inventory item's details |
+| `admin` | Triaging a logged capability gap |
+| `memory` | Remembering / forgetting a preference (below) |
+
+**What can never be pre-authorised**, no matter what you put in the rule:
+
+- anything that reaches another person — tenant messages, viewing invitations,
+  lease invites. You cannot unsend an email.
+- anything that deletes. Inventory deletion, listing deletion, lease
+  termination.
+- anything touching money, deposits, lease status, or signatures.
+- anything that changes what the public sees on a listing.
+- bulk operations across several properties.
+
+The rule for admission is simple and enforced by a test rather than by
+judgement: **a tool may only run unattended if someone has written its exact
+inverse.** If it cannot be undone, it asks.
+
+Turning autonomy on is itself a Constitution amendment, so it gets its own
+explicit confirmation. RAMA cannot grant itself permission.
+
+### Seeing and undoing what it did
+
+Anything RAMA does on its own is reported immediately, with an undo offer.
+Say **"undo"** in the chat, or use the Done automatically strip, any time
+within 24 hours. Every auto-action is also listed at
+`/api/rama/auto-actions/`, along with which Constitution rule authorised it.
+
+Chat channels (Telegram, WhatsApp) are excluded by default — a mis-parsed text
+message that quietly changes something is the worst case, so autonomy starts
+web-only. Add `"channels": ["web", "telegram"]` deliberately if you want it.
+
+Background analysis (the 06:45 sentinel run) **never** writes. It reports; you
+decide.
+
+---
+
+## What RAMA remembers about how you work
+
+RAMA keeps your standing preferences between conversations, so you only have
+to say them once:
+
+> "Never do viewings on Sundays."
+> "Invoices go to my bookkeeper Dana."
+> "Call the basement suite the Garden."
+
+Say **"remember that …"** or **"from now on …"** to record one, and
+**"forget that …"** to drop it. Restating a preference replaces the old one
+rather than adding a second, contradictory copy. Ask *"what do you remember?"*
+to see the list, or manage it at `/api/rama/memory/`.
+
+### What it will refuse to remember, and why
+
+**Anything from your portfolio** — rents, balances, dates, counts, who is
+where. RAMA reads all of that live, every single time you ask. A stored copy
+would be correct for a week and wrong forever after, and you would have no way
+to tell which. Ask for those numbers instead; they are always current.
+
+**Anyone's health, background, or personal circumstances.** A standing record
+of a tenant's disability, immigration status, religion, or record is a privacy
+liability under PIPEDA / BC PIPA — and RAMA would repeat it back, unprompted,
+for as long as it existed. If something like that affects how you run a
+tenancy, record the accommodation you are providing, not the reason for it.
+
+Contact details for tradespeople are fine and are kept, but flagged, so they
+can be found and erased on request.
+
+Memory never outranks live data: if a remembered note and your actual
+portfolio disagree, the portfolio wins.

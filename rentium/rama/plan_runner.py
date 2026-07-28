@@ -216,13 +216,21 @@ def save_batch(
         # Chained operations on one property share an item key.  If its rename
         # fails, its later group assignment is skipped while unrelated items
         # can still proceed and be reported honestly.
-        entity_key = (
-            arguments.get("property_query")
-            or arguments.get("lease_number")
-            or arguments.get("room_name")
-            or arguments.get("name")
-            or f"step-{len(steps)}"
-        )
+        #
+        # Tools that only ever ADD a record are exempt: they share a property
+        # merely as scope, never as a dependency, so grouping them would make
+        # one failed expense silently swallow the next.
+        if meta_for(spec["tool"]).independent_writes:
+            entity_key = f"{spec['tool']}#{len(steps)}"
+        else:
+            entity_key = (
+                arguments.get("property_query")
+                or arguments.get("holding_name")
+                or arguments.get("lease_number")
+                or arguments.get("room_name")
+                or arguments.get("name")
+                or f"step-{len(steps)}"
+            )
         steps.append(
             {
                 "tool": spec["tool"],
@@ -319,6 +327,10 @@ def _step_outcome(step: RamaPlanStep) -> dict:
     return {
         "n": step.order + 1,
         "tool": step.tool,
+        # The plan row is deleted as soon as execution finishes, so anything a
+        # caller needs afterwards (autonomy.record_auto_actions builds each
+        # receipt's inverse from these) has to travel out with the outcome.
+        "arguments": step.arguments,
         "target": step.target_label,
         "result": step.result,
     }

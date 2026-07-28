@@ -24,6 +24,8 @@ from datetime import datetime, timedelta
 from django.utils import timezone
 
 from .models import RamaAudit, RamaPendingPlan
+from . import autonomy as autonomy_policy
+from . import memory
 from .plan_runner import (
     PENDING_PLAN_TTL_SECONDS,
     clear_plan,
@@ -33,6 +35,7 @@ from .plan_runner import (
     save_batch,
     save_plan,
     save_single,
+    validate_plan,
 )
 from .plan_runner import plan_to_payload
 from .providers import ProviderError, Turn, get_provider
@@ -41,6 +44,7 @@ from .roles import (
     DELEGATION_TOOL_NAMES,
     ROLE_PROMPTS,
     SUB_TURN_MAX_ROUNDS,
+    role_allows_tool,
     role_context,
     role_tool_schemas,
 )
@@ -104,6 +108,105 @@ def _is_negative(text: str) -> bool:
     return _norm_affirm(text) in _NEGATIVE_EXACT
 
 
+# "Undo" reverses something RAMA already did on its own. Deterministic for the
+# same reason yes/no is: reversing a write must never depend on a weak model
+# choosing to call the right tool with the right arguments.
+_UNDO_EXACT = {
+    "undo", "undo that", "undo it", "revert", "revert that", "revert it",
+    "put it back", "put that back", "unde that", "roll that back", "roll back",
+    "take that back", "reverse that", "undo the last one", "undo last",
+}
+
+
+def _is_undo_request(text: str) -> bool:
+    return _norm_affirm(text) in _UNDO_EXACT
+
+
+# "Remember that X" / "from now on X" — routed without asking the model,
+# for the same reason the rename and house-layout intents are: a weak model
+# picking `remember` out of a 100-tool schema is exactly the coin-flip the
+# deterministic layer exists to remove. Only explicit imperatives match; an
+# offhand "I never do Sundays" is left to the model.
+_MEMORY_LEAD = re.compile(
+    r"^(?:please\s+)?(?:remember|note|keep in mind|don'?t forget)\s+"
+    r"(?:that\s+|this[:,]?\s+)?(?P<fact>.+)$",
+    re.IGNORECASE,
+)
+_MEMORY_STANDING = re.compile(
+    r"^(?P<fact>(?:from now on|going forward|as a rule)\b.+)$", re.IGNORECASE
+)
+_MEMORY_FORGET = re.compile(
+    r"^(?:please\s+)?forget\s+(?:that\s+|about\s+|the\s+)?(?P<subject>.+)$",
+    re.IGNORECASE,
+)
+# Words that make a sentence a lookup, not a preference — "remember what the
+# rent is?" must stay a question.
+_MEMORY_QUESTION = re.compile(
+    r"^(what|which|who|when|where|why|how|do you|did you|can you|could you)\b",
+    re.IGNORECASE,
+)
+
+_STOPWORDS = {
+    "the", "a", "an", "my", "our", "your", "their", "his", "her", "its",
+    "i", "we", "you", "they", "he", "she", "it", "me", "us", "them",
+    "is", "are", "was", "were", "be", "been", "am", "do", "does", "did",
+    "to", "for", "of", "on", "in", "at", "by", "with", "from", "and", "or",
+    "that", "this", "these", "those", "not", "never", "always", "prefer",
+    "prefers", "want", "wants", "like", "likes", "should", "must", "will",
+    "would", "can", "could", "go", "goes", "get", "gets", "have", "has",
+}
+
+
+def _memory_subject(fact: str) -> str:
+    """A stable one-or-two-word label for what a preference is about.
+
+    Deterministic so the SAME topic stated twice supersedes rather than
+    accumulating two contradictory memories — the DB constraint enforces one
+    active row per subject, and this is what makes the subject repeatable.
+    """
+    words = [w for w in re.findall(r"[a-z0-9']+", (fact or "").casefold())]
+    salient = [w for w in words if w not in _STOPWORDS and len(w) > 2]
+    return "-".join(salient[:2]) if salient else "-".join(words[:2])
+
+
+def _memory_intent(message: str) -> dict | None:
+    """(tool, arguments) for an explicit remember/forget instruction, or None."""
+    text = (message or "").strip().rstrip(".!")
+    if not text or _MEMORY_QUESTION.match(text) or text.endswith("?"):
+        return None
+
+    forget_match = _MEMORY_FORGET.match(text)
+    if forget_match:
+        subject = forget_match.group("subject").strip()
+        # "forget it" is a cancellation, handled by _is_negative — not a memory
+        # operation. _is_negative runs first, but be explicit.
+        if subject.casefold() in {"it", "that", "this"}:
+            return None
+        return {"tool": "forget", "arguments": {"subject": subject}}
+
+    match = _MEMORY_LEAD.match(text) or _MEMORY_STANDING.match(text)
+    if not match:
+        return None
+    fact = match.group("fact").strip()
+    if len(fact) < 4:
+        return None
+    return {
+        "tool": "remember",
+        "arguments": {"subject": _memory_subject(fact), "fact": fact},
+    }
+
+
+def _undo_hint(auto_executed: list[dict]) -> str:
+    """The line that makes an unattended action recoverable.
+
+    An auto-executed write with no visible way back is the failure mode that
+    would make the whole tier feel unsafe, so this is not optional decoration.
+    """
+    if not any(item.get("undoable") for item in auto_executed):
+        return ""
+    return "\n\n(I did that automatically under your Constitution — say \"undo\" to reverse it.)"
+
+
 def _recent_confirmed_reply(landlord, conversation_id) -> str:
     """Return the just-completed plan reply for a duplicate bare ``yes``.
 
@@ -151,10 +254,16 @@ def _recent_confirmed_reply(landlord, conversation_id) -> str:
 
 
 def _write_label(result: dict) -> str:
-    for key in ("property", "lease", "group", "work_order"):
+    for key in ("property", "lease", "group", "work_order", "expense"):
         obj = result.get(key)
         if isinstance(obj, dict):
-            return str(obj.get("name") or obj.get("lease_number") or obj.get("id") or "").strip()
+            return str(
+                obj.get("name")
+                or obj.get("lease_number")
+                or obj.get("scope")
+                or obj.get("id")
+                or ""
+            ).strip()
     return ""
 
 
@@ -1419,6 +1528,38 @@ def _contextualize_tool_arguments(
     return args
 
 
+# An attached photo arrives with routing guidance appended to the landlord's
+# message (comms/tasks.py, views.py). That guidance necessarily NAMES the words
+# we scan for — "document, mail, letter, receipt, invoice, notice, statement, or
+# paperwork" — so scanning the raw stored text made every attachment look like a
+# business record, whatever the landlord actually said. Everything from the
+# marker onwards is ours, not theirs.
+_ATTACHMENT_MARKER = re.compile(r"\[The landlord attached a photo", re.IGNORECASE)
+
+
+def _landlord_words(text: str) -> str:
+    """The part of a stored message the landlord actually typed."""
+    return _ATTACHMENT_MARKER.split(text or "", maxsplit=1)[0]
+
+
+# "these are NOT business documents" / "it isn't a receipt". Without this the
+# keyword scan below matched the very noun the landlord was ruling out.
+_DENIES_BUSINESS_RECORD = re.compile(
+    r"\b(not|isn'?t|aren'?t|no)\b[^.!?]{0,40}?\b"
+    r"(business|document|documents|receipt|receipts|invoice|invoices|"
+    r"statement|statements|mail|letter|paperwork|notice)\b",
+    re.IGNORECASE,
+)
+
+# The positive form: the landlord saying where the photos should actually go.
+_CLAIMS_LISTING_PHOTO = re.compile(
+    r"\b(gallery|listing photo|listing photos|listing image|listing images|"
+    r"property photo|property photos|main photo|primary photo|cover photo|"
+    r"just (?:some )?(?:images|photos|pics|pictures))\b",
+    re.IGNORECASE,
+)
+
+
 def _conversation_attachment_focus(landlord, conversation_id) -> dict:
     """Keep an unresolved attachment visible after its original upload turn."""
     rows = RamaAudit.objects.filter(
@@ -1426,25 +1567,29 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         conversation_id=conversation_id,
         kind=RamaAudit.Kind.USER_MESSAGE,
     ).order_by("-created_at")[:12]
-    texts = [str((row.content or {}).get("text") or "") for row in rows]
-    combined = "\n".join(texts)
-    upload_ids = set(
-        re.findall(r"upload_id=([0-9a-fA-F-]{32,36})", combined)
-    )
+    raw_texts = [str((row.content or {}).get("text") or "") for row in rows]
+    # Ids are extracted from the RAW text (the marker is where they live);
+    # intent is read only from what the landlord wrote.
     document_ids = set(
-        re.findall(r"Business document ([0-9a-fA-F-]{32,36})", combined)
+        re.findall(r"Business document ([0-9a-fA-F-]{32,36})", "\n".join(raw_texts))
     )
-    if upload_ids:
-        from .models import RamaUpload
+    texts = [_landlord_words(t) for t in raw_texts]
+    combined = "\n".join(texts)
+    # The DB is the source of truth for what is still attachable, not the
+    # transcript. Scraping ids out of the last N messages meant a burst of
+    # photos scrolled out of the window as the conversation continued, so 12
+    # attachments were offered to the model as 2, then 1 — while all 12 sat
+    # unused in the table. Anything the landlord uploaded and has not spent is
+    # still theirs to place.
+    from .models import RamaUpload
 
-        upload_ids = {
-            str(pk)
-            for pk in RamaUpload.objects.filter(
-                landlord=landlord,
-                used_at__isnull=True,
-                pk__in=upload_ids,
-            ).values_list("pk", flat=True)
-        }
+    pending = list(
+        RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True)
+        .order_by("created_at")
+        .values_list("pk", flat=True)[:60]
+    )
+    upload_ids = {str(pk) for pk in pending}
+
     if document_ids:
         from .models import RamaDocument
 
@@ -1471,6 +1616,16 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         "bank",
     )
     business_record = any(term in lowered for term in business_terms)
+    # A bare substring test read "these are NOT business documents" as a
+    # business document, because it matched "document" and never looked at the
+    # word in front of it. Correcting RAMA therefore reinforced the mistake it
+    # was being corrected for. Both overrides below are checked against the
+    # LATEST message only — the landlord's most recent words win.
+    latest = (texts[0] if texts else "").casefold()
+    if _DENIES_BUSINESS_RECORD.search(latest):
+        business_record = False
+    elif _CLAIMS_LISTING_PHOTO.search(latest):
+        business_record = False
     issuer = "Scotiabank" if "scotiabank" in lowered else ""
     document_date = ""
     for pattern, fmt in (
@@ -1489,15 +1644,25 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         "unresolved_upload_ids": sorted(upload_ids),
         "document_ids": sorted(document_ids),
         "landlord_described_as_business_record": business_record,
+        # Stated explicitly because the model was guessing at how many photos
+        # it had and consistently guessing low.
+        "pending_photo_count": len(upload_ids),
         "issuer": issuer or None,
         "document_date": document_date or None,
         "instruction": (
-            "This attachment remains the subject of the conversation. "
+            f"The landlord has {len(upload_ids)} attached photo(s) not yet "
+            f"placed. "
             + (
-                "Treat it as a business document. Use catalog_business_document; "
-                "do not use attach_photo_to_listing."
+                "Treat them as business documents. Use "
+                "catalog_business_document; do not use attach_photo_to_listing."
                 if business_record
-                else "Use the landlord's current words to decide document vs listing photo."
+                else (
+                    "To put them on a listing call attach_photo_to_listing "
+                    "ONCE and leave upload_id BLANK — that attaches every "
+                    "pending photo in one step. Never call it once per photo, "
+                    "and never pass a subset unless the landlord named "
+                    "particular ones."
+                )
             )
         ),
     }
@@ -1601,7 +1766,9 @@ def _delegate(landlord, tool_name: str, arguments: dict) -> dict:
     the GENERAL's conversation, so the landlord's next "yes" runs it through
     the same deterministic confirm machine.
     """
-    sub_role = "fsa" if tool_name == "ask_fsa" else "corporal"
+    sub_role = {"ask_fsa": "fsa", "ask_treasurer": "treasurer"}.get(
+        tool_name, "corporal"
+    )
     instruction = str(
         (arguments or {}).get("instruction")
         or (arguments or {}).get("question")
@@ -1618,6 +1785,16 @@ def _delegate(landlord, tool_name: str, arguments: dict) -> dict:
         return {"error": f"{sub_role} unavailable: {sub.error['detail']}"}
 
     out: dict = {"role": sub_role, "answer": sub.reply, "tools_used": sub.tools_used}
+    if sub.auto_executed:
+        # A sub-turn that auto-ran leaves no plan to re-home, so the delegating
+        # turn has to carry the receipts out itself or the landlord would never
+        # be told (or offered the undo).
+        out["auto_executed"] = sub.auto_executed
+        out["instruction"] = (
+            f"The {sub_role} already ran these — they were pre-authorised in "
+            "the landlord's Constitution. Report them as done, not as a "
+            "proposal, and mention they can be undone."
+        )
     plan_row = load_fresh_plan(landlord, sub_cid)
     if plan_row is not None:
         payload = plan_to_payload(plan_row)
@@ -1644,6 +1821,10 @@ class TurnResult:
     # photos). The web ignores these; Telegram/WhatsApp turn them into real
     # attachments. Each is the tool's `_attachment` marker.
     attachments: list[dict] = field(default_factory=list)
+    # Actions this turn ran without asking, under the landlord's Constitution
+    # autonomy rule. Each is {"id", "tool", "target", "undoable"} — the UI
+    # renders them as a "Done automatically · Undo" strip.
+    auto_executed: list[dict] = field(default_factory=list)
     # Set instead of raising: {"detail": str, "code": str, "status_hint": int}
     error: dict | None = None
 
@@ -1771,6 +1952,20 @@ def run_turn(
             "(subordinate to LIVE PORTFOLIO — if they disagree, LIVE "
             "PORTFOLIO is right)\n- " + "\n- ".join(fact_lines)
         )
+    # The only part of the prompt that survives between conversations. Bounded,
+    # deterministic, and explicitly subordinate to the live portfolio card —
+    # see rama/memory.py for why it may never hold portfolio state.
+    memory_block = memory.render_for_prompt(landlord, message, focus)
+    if memory_block:
+        system += "\n\n" + memory_block
+        audit(
+            RamaAudit.Kind.TOOL_CALL,
+            {
+                "tool": "_memory",
+                "arguments": {},
+                "result": {"injected": memory_block.count("\n- ") or 0},
+            },
+        )
     audit(
         RamaAudit.Kind.TOOL_CALL,
         {
@@ -1783,10 +1978,25 @@ def run_turn(
     schemas = role_tool_schemas(role, depth)
     max_rounds = SUB_TURN_MAX_ROUNDS if depth >= 1 else MAX_TOOL_ROUNDS
     tools_used: list[str] = ["_live_context"]
+    # Receipts for anything this turn ran unattended — populated by the
+    # deterministic memory router and by delegated sub-turns, both of which can
+    # fire before the main tool loop's own autonomy check.
+    delegated_auto: list[dict] = []
     turn_attachments: list[dict] = []
     turn = Turn()
 
     def _run_deterministic_tool(tool_name: str, arguments: dict) -> dict:
+        # The routers below call this directly, so they never pass through
+        # role_tool_schemas(). Without this check a role's tool list describes
+        # only what the MODEL may ask for — a read-only role could still reach
+        # a write tool by phrasing a message that matches a router's regex.
+        # Checking here covers every existing router and every future one.
+        if not role_allows_tool(role, tool_name):
+            return {
+                "error": (
+                    f"The {role} agent is not permitted to call {tool_name}."
+                )
+            }
         result = execute(tool_name, arguments, landlord=landlord)
         safe_result = json.loads(json.dumps(result, default=str))
         tools_used.append(tool_name)
@@ -1928,6 +2138,81 @@ def run_turn(
             "the plan is still waiting for a yes/no)\n"
             + json.dumps(plan_brief(pending_plan), default=str)
         )
+
+    # "Remember that …" / "forget that …" — routed deterministically so a weak
+    # model can't drop a preference the landlord explicitly asked it to keep.
+    if deterministic_reply is None and pending_plan is None:
+        intent = _memory_intent(message)
+        if intent is not None:
+            preview = _run_deterministic_tool(intent["tool"], intent["arguments"])
+            if preview.get("error"):
+                deterministic_reply = str(preview["error"])
+            elif preview.get("needs_confirm"):
+                spec = {
+                    "kind": "single",
+                    "tool": intent["tool"],
+                    "arguments": intent["arguments"],
+                    "target": intent["arguments"].get("subject", ""),
+                }
+                auto = autonomy_policy.evaluate_turn(
+                    landlord,
+                    [spec],
+                    role=role,
+                    channel=channel,
+                    had_pending_plan=False,
+                )
+                if auto.approved:
+                    plan = save_batch(landlord, conversation_id, [spec])
+
+                    def _mem_audit(content):
+                        tools_used.append(content.get("tool", ""))
+                        audit(
+                            RamaAudit.Kind.TOOL_CALL,
+                            {**content, "autonomous": True, "deterministic_routing": True},
+                        )
+
+                    progress = run_plan(plan, landlord, audit=_mem_audit)
+                    receipts = autonomy_policy.record_auto_actions(
+                        landlord, conversation_id, progress, auto.policy
+                    )
+                    delegated_auto.extend(receipts)
+                    deterministic_reply = (
+                        _plan_fallback_reply(progress) + _undo_hint(receipts)
+                    )
+                else:
+                    save_single(
+                        landlord, conversation_id, intent["tool"], intent["arguments"]
+                    )
+                    deterministic_reply = _preview_reply(intent["tool"], preview)
+
+    # "Undo" — reverse the last thing RAMA did on its own. Handled here, with
+    # no provider round-trip, for the same reason yes/no is: the landlord
+    # taking something back must not depend on the model picking a tool.
+    if (
+        deterministic_reply is None
+        and pending_plan is None
+        and _is_undo_request(message)
+    ):
+        action = autonomy_policy.undoable_actions(landlord).first()
+        if action is None:
+            deterministic_reply = (
+                "There's nothing of mine to undo — I haven't run anything "
+                "automatically in the last day."
+            )
+        else:
+
+            def _undo_audit(content):
+                tools_used.append(content.get("tool", ""))
+                audit(RamaAudit.Kind.TOOL_CALL, {**content, "undo_of": str(action.pk)})
+
+            outcome = autonomy_policy.undo_action(action, landlord, audit=_undo_audit)
+            deterministic_reply = (
+                str(outcome["error"])
+                if outcome.get("error")
+                else "Undone — "
+                + _plan_fallback_reply(outcome["progress"]).strip().rstrip(".")
+                + "."
+            )
 
     # A yes/no immediately after create_group_room asked its legal
     # landlord-sharing question is an answer to that question, not a fresh
@@ -2222,6 +2507,7 @@ def run_turn(
             tools_used=tools_used,
             pending_plan=plan_brief(outstanding) if outstanding else None,
             deterministic=True,
+            auto_executed=delegated_auto,
         )
 
     # Every still-outstanding preview produced THIS turn.  They are persisted
@@ -2296,6 +2582,9 @@ def run_turn(
                     and call.name in DELEGATION_TOOL_NAMES
                 ):
                     result = _delegate(landlord, call.name, effective_arguments)
+                    for receipt in result.get("auto_executed") or []:
+                        if receipt not in delegated_auto:
+                            delegated_auto.append(receipt)
                 else:
                     result = execute(call.name, effective_arguments, landlord=landlord)
                 # JSON-safe for audit + tool message content (UUIDs, Decimals).
@@ -2462,6 +2751,63 @@ def run_turn(
             },
         )
 
+    # ------------------------------------------------- the autonomy gate
+    # The ONLY place a preview can become an execution without the landlord
+    # saying yes. Everything above is unchanged: the model previewed, and its
+    # `confirm` was blanked. What follows is the identical path a landlord's
+    # "yes" takes, with the yes supplied by a Constitution rule they confirmed.
+    auto_executed: list[dict] = []
+    auto = autonomy_policy.evaluate_turn(
+        landlord,
+        pending_specs,
+        role=role,
+        channel=channel,
+        had_pending_plan=pending_plan is not None or plan_progress is not None,
+    )
+    if auto.approved:
+        auto_plan = save_batch(landlord, conversation_id, pending_specs)
+
+        def _auto_audit(content):
+            tools_used.append(content.get("tool", ""))
+            audit(RamaAudit.Kind.TOOL_CALL, {**content, "autonomous": True})
+
+        errors = validate_plan(plan_to_payload(auto_plan)["steps"], landlord)
+        if errors:
+            # A blocker appeared between preview and now. Fall back to asking
+            # rather than executing something that no longer validates.
+            auto = autonomy_policy.AutonomyDecision(False, "; ".join(errors), auto.policy)
+        else:
+            progress = run_plan(auto_plan, landlord, audit=_auto_audit)
+            auto_executed = autonomy_policy.record_auto_actions(
+                landlord, conversation_id, progress, auto.policy
+            )
+            # The model's "reply yes to confirm" prose described a proposal
+            # that has now already happened, so it is discarded exactly as the
+            # confirmed-yes path discards it.
+            reply = _plan_fallback_reply(progress) + _undo_hint(auto_executed)
+            audit(
+                RamaAudit.Kind.ASSISTANT_MESSAGE,
+                {
+                    "text": reply,
+                    "tools_used": tools_used,
+                    "deterministic": True,
+                    "auto_executed": [item["id"] for item in auto_executed],
+                    "policy_rule_id": auto.policy.rule_id if auto.policy else None,
+                },
+            )
+            outstanding = load_fresh_plan(landlord, conversation_id)
+            return TurnResult(
+                conversation_id=conversation_id,
+                reply=reply,
+                provider=provider_name,
+                model=model,
+                tools_used=tools_used,
+                attachments=turn_attachments,
+                pending_plan=plan_brief(outstanding) if outstanding else None,
+                deterministic=True,
+                auto_executed=delegated_auto + auto_executed,
+            )
+
     _persist_pending(landlord, conversation_id, pending_specs)
     outstanding = load_fresh_plan(landlord, conversation_id)
     if outstanding is not None and outstanding.operation == "preview_batch":
@@ -2510,4 +2856,5 @@ def run_turn(
         attachments=turn_attachments,
         pending_plan=plan_brief(outstanding) if outstanding else None,
         deterministic=response_deterministic,
+        auto_executed=delegated_auto,
     )

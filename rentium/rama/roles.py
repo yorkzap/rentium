@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from .registry import tool_schemas
 
-ROLES = ("corporal", "general", "fsa")
+ROLES = ("corporal", "general", "fsa", "treasurer")
 
 # Tool-round budget for delegated sub-turns (the top-level budget lives in
 # service.MAX_TOOL_ROUNDS).
@@ -150,6 +150,11 @@ WRITE ACTIONS (L4 — confirmed only; same business rules as the UI):
   error, report that error and STOP. Never turn either result into a prose preview.
 - Never invent success, an executable plan, or a workaround that tools did not
   actually return.
+- A few routine actions the landlord pre-authorised in their Constitution run
+  immediately instead of waiting. You never decide this, you never set confirm,
+  and you always preview exactly as above — the server decides. If a reply comes
+  back reporting work as already done, report it as done and mention it can be
+  undone; never re-run it.
 - Unsure which write tool? Call crud_capabilities.
 
 PROPERTIES: create_property / update_property / delete_property. \
@@ -313,12 +318,21 @@ HARD RULES:
 DELEGATION (your staff):
 - ask_fsa(question) → the Financial Services Administrator: money analysis,
   trends, anything requiring reasoning over ledger numbers.
+- ask_treasurer(question) → the Treasurer, your finance head: whether spending
+  is worth it, property value and equity, mortgage, where money is leaking,
+  what a decision would cost or return. Judgement about money over time, as
+  opposed to the FSA's read of what the ledger says today.
 - ask_corporal(instruction) → operations: CRUD, lookups in detail, bulk
   plans, room setups. For simple operational asks, delegate rather than
   doing it yourself.
 - Relay a delegate's answer faithfully. If a delegate prepared a plan, show
   ALL its steps and blocked items; the system handles the landlord's yes/no.
 - Delegates cannot delegate further. One level, always.
+- TREASURER REQUESTS: when a "## TREASURER REQUESTS" block is present, relay
+  each line VERBATIM, prefixed "Treasurer request: ". You never answer one
+  yourself, never guess the figure, and never soften it into a suggestion —
+  the Treasurer asked because the number changes its recommendation. If the
+  landlord answers, record it with record_treasurer_fact.
 
 DECIDING:
 - Consult the Constitution first (vendor matrix → list_vendors; policies →
@@ -352,10 +366,34 @@ HARD RULES:
 3) You cannot mutate anything without a previewed plan the landlord confirms.
 4) Be brief: finding → evidence (numbers) → recommendation."""
 
+TREASURER_PROMPT = """\
+You are the Treasurer for exactly one landlord's rental portfolio inside
+Rentium (Canada). You are the finance head. Your job is that the landlord ends
+each year with more money than they otherwise would have: spend less, earn
+more, waste less, and see what is coming before it arrives.
+
+You do NOT run the business. You read, reason, and report. Everything that
+changes the portfolio is done by the General or the Corporal, with the
+landlord's explicit yes.
+
+HARD RULES:
+1) Every figure MUST come from LIVE PORTFOLIO, a FACTS block, or a tool result
+   in THIS turn. Never invent, estimate silently, or carry a number over from
+   memory. If you do not have a figure, say which one you are missing and what
+   it would change — do not guess it.
+2) Say where each number came from. A landlord acting on your advice needs to
+   know what is measured and what is assumed.
+3) Never present a tax figure as anything but a planning estimate to confirm
+   with an accountant.
+4) You have no write tools. If something needs doing, name it plainly and let
+   the General take it to the landlord. Never claim you have done anything.
+5) Lead with the answer. Then the evidence, then the reasoning."""
+
 ROLE_PROMPTS: dict[str, str] = {
     "corporal": CORPORAL_PROMPT,
     "general": GENERAL_PROMPT,
     "fsa": FSA_PROMPT,
+    "treasurer": TREASURER_PROMPT,
 }
 
 # Read-only surface (facts): shared by every role.
@@ -374,6 +412,7 @@ READ_TOOLS = (
     "lease_pdf_info", "list_lease_roster", "crud_capabilities",
     "list_viewing_requests", "get_viewing_availability",
     "get_notification_channels", "list_capability_gaps", "list_co_landlords",
+    "list_memories",
 )
 
 # The General plans and amends policy but never runs single write tools —
@@ -383,6 +422,17 @@ GENERAL_TOOLS = READ_TOOLS + (
     "plan_move_tenant",
     "amend_constitution",
     "log_capability_gap",
+    # Standing preferences the landlord states in passing. The General is the
+    # role that hears them, so it is the role that records them.
+    "remember",
+    "forget",
+    # The WRITE side of the financial data layer. Deliberately here and not on
+    # the Treasurer: the agent that concludes "your equity looks strong" must
+    # not also be able to adjust the valuation that rests on.
+    "record_treasurer_fact",
+    "record_holding_financials",
+    "record_valuation",
+    "record_mortgage",
     # Common landlord edits the General should do DIRECTLY (previews before any
     # write), instead of a delegation round-trip that weak models fumble — this
     # is what made Telegram RAMA fall back to hallucinated "not available" answers.
@@ -409,6 +459,22 @@ GENERAL_TOOLS = READ_TOOLS + (
 
 # The FSA reasons over facts; its proposal surface arrives in Phase 4.
 FSA_TOOLS = READ_TOOLS
+
+# The Treasurer is read-only over the domain by construction: no tool on this
+# list takes a `confirm` argument, which test_treasurer asserts. Its output is
+# advice; execution belongs to the General with the landlord's yes.
+#
+# deposit_position and tenant_statement are registered tools that were, until
+# now, on NO role's list — so nothing could call them. The finance head is
+# their natural home.
+TREASURER_TOOLS = READ_TOOLS + (
+    "deposit_position",
+    "tenant_statement",
+    # Prior-year history the landlord uploaded but has not committed. Reading
+    # is safe; committing creates real ledger rows and is not a tool at all.
+    "list_import_batches",
+    "read_staged_entries",
+)
 
 # Delegation is not a registry tool: the engine intercepts these calls and
 # runs a bounded sub-turn (service._delegate). Only the General at depth 0
@@ -440,29 +506,94 @@ DELEGATION_TOOL_SCHEMAS = [
             "required": ["question"],
         },
     },
+    {
+        "name": "ask_treasurer",
+        "description": (
+            "Ask the Treasurer — the finance head — a question about making or "
+            "saving money: whether a cost is worth it, what a property is "
+            "worth, mortgage and equity, where spend is drifting, what a "
+            "decision would cost or return. Use this for judgement about "
+            "money over time. Use ask_fsa instead for a straight read of what "
+            "the ledger currently says. The Treasurer never changes anything; "
+            "it answers, and you bring anything actionable to the landlord."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        },
+    },
 ]
 DELEGATION_TOOL_NAMES = {t["name"] for t in DELEGATION_TOOL_SCHEMAS}
 
 
+# The single source of truth for what each role may call. None = the full
+# current surface (the corporal is the operator; everything else is narrower).
+#
+# This is a table rather than an if/elif chain because the chain used to end in
+# a bare `return tool_schemas()` — so ANY unrecognised role silently received
+# the entire write surface. A typo in a role name was a privilege escalation.
+# role_tool_schemas() now raises instead.
+ROLE_TOOLS: dict[str, tuple[str, ...] | None] = {
+    "corporal": None,
+    "general": GENERAL_TOOLS,
+    "fsa": FSA_TOOLS,
+    "treasurer": TREASURER_TOOLS,
+}
+
+# Roles that may never write. Enforced in three places that must agree:
+# role_tool_schemas (what the model is offered), autonomy.evaluate_turn
+# (nothing auto-runs), and service._run_deterministic_tool (the routers that
+# bypass the tool list entirely).
+READ_ONLY_ROLES: frozenset[str] = frozenset({"fsa", "treasurer"})
+
+
 def role_tool_schemas(role: str, depth: int = 0) -> list[dict]:
     """The tool subset a role sees. Corporal = the full current surface;
-    depth >= 1 strips delegation so the hierarchy is strictly single-level."""
-    if role == "general":
-        allowed = set(GENERAL_TOOLS)
-        schemas = [t for t in tool_schemas() if t["name"] in allowed]
-        if depth == 0:
-            schemas += DELEGATION_TOOL_SCHEMAS
-        return schemas
-    if role == "fsa":
-        allowed = set(FSA_TOOLS)
-        return [t for t in tool_schemas() if t["name"] in allowed]
-    return tool_schemas()
+    depth >= 1 strips delegation so the hierarchy is strictly single-level.
+
+    Raises on an unknown role: failing closed is the whole point.
+    """
+    if role not in ROLE_TOOLS:
+        raise ValueError(
+            f"Unknown RAMA role {role!r} — add it to ROLE_TOOLS (and "
+            f"READ_ONLY_ROLES if it must not write) before using it."
+        )
+    allowed_names = ROLE_TOOLS[role]
+    if allowed_names is None:
+        return tool_schemas()
+    allowed = set(allowed_names)
+    schemas = [t for t in tool_schemas() if t["name"] in allowed]
+    if role == "general" and depth == 0:
+        schemas += DELEGATION_TOOL_SCHEMAS
+    return schemas
+
+
+def role_allows_tool(role: str, tool_name: str) -> bool:
+    """Whether `role` may call `tool_name` at all.
+
+    Used by the deterministic routers in service.py, which call
+    registry.execute() directly and would otherwise bypass the role's tool
+    list completely.
+    """
+    allowed_names = ROLE_TOOLS.get(role)
+    if allowed_names is None and role in ROLE_TOOLS:
+        return True
+    return tool_name in set(allowed_names or ())
 
 
 def role_context(role: str, landlord) -> str:
     """Dynamic per-landlord system-prompt sections for a role."""
     if role == "general":
         from .constitution import render_for_prompt
+        from .deliberation import render_requests_for_general
 
-        return render_for_prompt(landlord)
+        parts = [render_for_prompt(landlord)]
+        # Injected rather than fetched by a tool: relaying what the Treasurer
+        # needs must not depend on the model choosing to look, and then
+        # choosing to mention what it found.
+        requests = render_requests_for_general(landlord)
+        if requests:
+            parts.append(requests)
+        return "\n\n".join(p for p in parts if p)
     return ""

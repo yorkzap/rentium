@@ -136,11 +136,33 @@ FSA_DEFAULT_MODELS = {
     "openai": "gpt-5.6-luna",
     "gemini": "gemini-flash-latest",
 }
-_ROLE_DEFAULTS = {"general": GENERAL_DEFAULT_MODELS, "fsa": FSA_DEFAULT_MODELS}
+# The Treasurer runs long, structured, multi-pass work, so it wants a model
+# that is cheap per call and reliable at following a narrow contract rather
+# than one that is clever in a single shot. Gemini Flash is the default tier
+# for exactly that reason. Switching a landlord to Anthropic or xAI must not
+# change WHAT it concludes — the reasoning structure is Python; the model only
+# fills in bounded slots — so a different provider should read differently,
+# never decide differently.
+TREASURER_DEFAULT_MODELS = {
+    "gemini": "gemini-flash-latest",
+    "mistral": "mistral-medium-latest",
+    "anthropic": "claude-haiku-4-5",
+    "xai": "grok-4.3",
+    "openai": "gpt-5.6-luna",
+}
+# Provider fallback when the landlord has expressed no preference for the role.
+# Everything else inherits the landlord's chat provider; the Treasurer is the
+# one role with an opinion of its own.
+ROLE_PREFERRED_PROVIDERS = {"treasurer": "gemini"}
+_ROLE_DEFAULTS = {
+    "general": GENERAL_DEFAULT_MODELS,
+    "fsa": FSA_DEFAULT_MODELS,
+    "treasurer": TREASURER_DEFAULT_MODELS,
+}
 
 
 def get_role_config(landlord, role: str) -> LandlordRamaConfig:
-    """Provider/model for one agent role (corporal | general | fsa).
+    """Provider/model for one agent role (corporal | general | fsa | treasurer).
 
     Resolution: landlord's per-role prefs → platform RAMA_<ROLE>_* settings →
     the landlord's chat provider with the role's default model tier. BYOK:
@@ -155,9 +177,17 @@ def get_role_config(landlord, role: str) -> LandlordRamaConfig:
 
     prefs = RamaPreferences.for_landlord(landlord)
     role_provider = (getattr(prefs, f"{role}_provider", "") or "").strip().lower()
+    # A role with its own preferred provider (the Treasurer wants Gemini) uses
+    # it only when nothing has been configured AND that provider can actually
+    # be called. Otherwise fall back to the chat provider rather than routing
+    # to a model there is no key for.
+    preferred = ROLE_PREFERRED_PROVIDERS.get(role, "")
+    if preferred and not platform_api_key(preferred):
+        preferred = ""
     provider = (
         role_provider
         or (getattr(settings, f"RAMA_{role.upper()}_PROVIDER", "") or "").strip().lower()
+        or preferred
         or chat.provider
     )
     # A per-role MODEL only applies alongside its per-role PROVIDER — otherwise a

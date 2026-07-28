@@ -670,3 +670,196 @@ class StagedLedgerEntry(models.Model):
 
     def __str__(self):
         return f"row {self.row_number} of {self.batch_id}: {self.entry_type} {self.amount}"
+
+
+# ---------------------------------------------------------------------------
+# What a property cost, what it is worth, and what is owed on it.
+#
+# These are what turn "how much rent came in" into "am I actually making
+# money". They are separate models rather than fields on PropertyHolding
+# because two of the three are inherently HISTORIES: a valuation is only
+# meaningful with its date, and a mortgage is superseded at each renewal.
+#
+# PropertyBankBalance (above) is the cautionary example — it is
+# update_or_create per holding, so a correction overwrites the previous figure
+# and no trend can ever be computed from it.
+# ---------------------------------------------------------------------------
+class HoldingFinancials(models.Model):
+    """Acquisition facts for one holding. One row; these rarely change."""
+
+    holding = models.OneToOneField(
+        "properties.PropertyHolding",
+        on_delete=models.CASCADE,
+        related_name="financials",
+    )
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="holding_financials",
+    )
+    purchase_price = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True
+    )
+    purchase_date = models.DateField(null=True, blank=True)
+    land_transfer_tax = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    closing_costs = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    # Capital improvements raise the adjusted cost base and therefore reduce
+    # the eventual capital gain — worth tracking from day one, because
+    # reconstructing it at sale is how people lose the deduction.
+    capital_improvements_to_date = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True
+    )
+    year_built = models.PositiveIntegerField(null=True, blank=True)
+    heated_area_sqft = models.PositiveIntegerField(null=True, blank=True)
+    # Feeds which improvements are even applicable (a heat-pump analysis is
+    # meaningless for a place already on a heat pump).
+    heating_type = models.CharField(max_length=30, blank=True, default="")
+    source_document = models.ForeignKey(
+        "rama.RamaDocument",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "holding financials"
+        verbose_name_plural = "holding financials"
+
+    def __str__(self):
+        return f"Financials for {self.holding_id}"
+
+
+class HoldingValuation(models.Model):
+    """What a holding was worth, on a date, on a stated basis.
+
+    Append-only on purpose: many rows per holding is the point. Equity trend,
+    "is this still worth what I paid", and any return calculation need the
+    series, not the latest number.
+    """
+
+    class Basis(models.TextChoices):
+        BC_ASSESSMENT = "BC_ASSESSMENT", _("BC Assessment")
+        REALTOR_CMA = "REALTOR_CMA", _("Realtor comparative market analysis")
+        APPRAISAL = "APPRAISAL", _("Professional appraisal")
+        LANDLORD_ESTIMATE = "LANDLORD_ESTIMATE", _("Landlord's own estimate")
+        AUTOMATED = "AUTOMATED", _("Automated estimate")
+
+    holding = models.ForeignKey(
+        "properties.PropertyHolding",
+        on_delete=models.CASCADE,
+        related_name="valuations",
+    )
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="holding_valuations",
+    )
+    as_of = models.DateField()
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    basis = models.CharField(max_length=20, choices=Basis.choices)
+    source_url = models.URLField(max_length=500, blank=True, default="")
+    source_fetched_at = models.DateTimeField(null=True, blank=True)
+    note = models.CharField(max_length=200, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-as_of"]
+        # One figure per basis per date: a second BC Assessment for the same
+        # year is a correction, not a new data point.
+        constraints = [
+            models.UniqueConstraint(
+                fields=["holding", "as_of", "basis"],
+                name="holding_valuation_unique_per_basis_date",
+            )
+        ]
+        indexes = [models.Index(fields=["landlord", "holding", "-as_of"])]
+
+    def __str__(self):
+        return f"{self.holding_id} worth {self.amount} on {self.as_of} ({self.basis})"
+
+
+class HoldingMortgage(models.Model):
+    """A mortgage on a holding. Many rows, at most one ACTIVE.
+
+    Superseded rather than edited at renewal, so "what rate were we on in
+    2024" stays answerable — which is exactly the question a renewal decision
+    needs.
+    """
+
+    class Status(models.TextChoices):
+        ACTIVE = "ACTIVE", _("Active")
+        DISCHARGED = "DISCHARGED", _("Discharged")
+        SUPERSEDED = "SUPERSEDED", _("Superseded by a renewal")
+
+    class RateType(models.TextChoices):
+        FIXED = "FIXED", _("Fixed")
+        VARIABLE = "VARIABLE", _("Variable")
+
+    holding = models.ForeignKey(
+        "properties.PropertyHolding",
+        on_delete=models.CASCADE,
+        related_name="mortgages",
+    )
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="holding_mortgages",
+    )
+    lender = models.CharField(max_length=120, blank=True, default="")
+    original_principal = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True
+    )
+    current_principal = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True
+    )
+    # A balance is only meaningful with the date it was true on; without this
+    # the projection below cannot say how stale it is.
+    current_principal_as_of = models.DateField(null=True, blank=True)
+    rate_percent = models.DecimalField(
+        max_digits=6, decimal_places=3, null=True, blank=True
+    )
+    rate_type = models.CharField(
+        max_length=10, choices=RateType.choices, blank=True, default=""
+    )
+    amortization_months = models.PositiveIntegerField(null=True, blank=True)
+    payment_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    payment_frequency = models.CharField(max_length=12, blank=True, default="")
+    term_start = models.DateField(null=True, blank=True)
+    term_end = models.DateField(null=True, blank=True)  # the renewal date
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.ACTIVE, db_index=True
+    )
+    supersedes = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    source_document = models.ForeignKey(
+        "rama.RamaDocument",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-term_start", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["holding"],
+                condition=models.Q(status="ACTIVE"),
+                name="holding_mortgage_single_active",
+            )
+        ]
+        indexes = [models.Index(fields=["landlord", "status", "term_end"])]
+
+    def __str__(self):
+        return f"{self.lender or 'Mortgage'} on {self.holding_id} ({self.status})"

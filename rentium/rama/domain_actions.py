@@ -1441,6 +1441,9 @@ def triage_capability_gap(
         "1", "true", "yes", "y", "on",
     )
     preview = {
+        # gap_id makes the triage reversible by id rather than by fuzzy text
+        # match (tool_meta._undo_triage_capability_gap).
+        "gap_id": str(gap.pk),
         "gap": gap.request[:200],
         "from_status": gap.status,
         "to_status": new_status or gap.status,
@@ -2278,6 +2281,7 @@ def create_expense(
     amount: str,
     description: str,
     property_query: str = "",
+    holding_name: str = "",
     effective_date: str = "",
     confirm: str = "",
 ) -> dict:
@@ -2293,13 +2297,16 @@ def create_expense(
     if not desc:
         return {"error": "description is required."}
 
-    # Reuses the maintenance target resolver so an expense can name a LISTING
-    # or a whole UNIT. Without the unit path, a shared repair could only be
-    # booked against one of the rooms that share the space — which is how the
-    # $19.78 shower knob ended up charged to Room C alone.
-    prop = unit = None
-    if property_query:
-        prop, unit, _a, err = _resolve_maintenance_target(landlord, property_query)
+    # A LISTING, a whole UNIT, the whole HOLDING, or portfolio-wide. Without
+    # the unit path a shared repair could only be booked against one of the
+    # rooms that share the space — which is how the $19.78 shower knob ended up
+    # charged to Room C alone. Without the holding path, "the whole house" was
+    # not expressible at all and quietly resolved to a unit inside it.
+    prop = unit = holding = None
+    if property_query or holding_name:
+        prop, unit, holding, err = _resolve_expense_scope(
+            landlord, property_query, holding_name
+        )
         if err:
             return err
 
@@ -2310,17 +2317,29 @@ def create_expense(
         except ValueError:
             return {"error": f"effective_date must be YYYY-MM-DD, got {effective_date!r}."}
 
-    where = (
-        prop.name
-        if prop is not None
-        else (f"{unit.name} ({unit.holding.name}) — shared" if unit else None)
-    )
+    where = _expense_scope_label(prop, unit, holding)
     preview = {
         "amount": str(amt),
         "description": desc[:200],
         "property": where,
         "effective_date": day.isoformat(),
     }
+    # Shown in the preview so the landlord decides BEFORE the money is on the
+    # books, rather than discovering the double entry in a month-end total.
+    duplicates = ledger_services.find_duplicate_expense_candidates(
+        landlord,
+        amount=amt,
+        on_date=day,
+        property=prop,
+        holding=(prop.holding if prop is not None else (unit.holding if unit else holding)),
+    )
+    if duplicates:
+        preview["possible_duplicates"] = duplicates
+        preview["duplicate_warning"] = (
+            f"You already have {len(duplicates)} expense(s) of ${amt} within "
+            f"two weeks of this date. Check this is not the same cost being "
+            f"recorded twice before confirming."
+        )
     if not _confirmed(confirm):
         return _preview("create_expense", preview, "Posts a landlord expense to the ledger.")
 
@@ -2334,12 +2353,14 @@ def create_expense(
             description=desc[:255],
             incurred_date=day,
             property=prop,
-            # A shared-space cost has no listing to charge but always has an
-            # address, so it stays attributable instead of landing nowhere.
+            # A shared-space or whole-property cost has no listing to charge
+            # but always has an address, so it stays attributable instead of
+            # landing nowhere. property=None + holding=X is the ledger's
+            # first-class representation of a holding-wide cost.
             holding=(
                 prop.holding
                 if prop is not None
-                else (unit.holding if unit is not None else None)
+                else (unit.holding if unit is not None else holding)
             ),
             vendor="",
             created_by=landlord.user,
@@ -2355,6 +2376,11 @@ def create_expense(
             "amount": str(amt),
             "description": desc[:200],
             "property": where,
+            # `scope` is what the confirmation message reads back
+            # (service._write_label), so a holding-wide cost is reported as the
+            # whole property rather than falling back to whichever unit label
+            # happened to be on the plan step.
+            "scope": where or "portfolio-wide",
             "effective_date": day.isoformat(),
         },
     }

@@ -2,9 +2,11 @@ from django.contrib import admin
 
 from .models import (
     RamaAudit,
+    RamaAutoAction,
     RamaCapabilityGap,
     RamaDocument,
     RamaDocumentEvent,
+    RamaMemory,
     RamaPreferences,
 )
 
@@ -92,4 +94,65 @@ class RamaAuditAdmin(admin.ModelAdmin):
         return False
 
     def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(RamaAutoAction)
+class RamaAutoActionAdmin(admin.ModelAdmin):
+    """Read-only: the record of what RAMA did unattended.
+
+    Editable receipts would defeat the point — this is the evidence a landlord
+    (or we, in support) rely on to answer "why did that change?". Undo happens
+    through the API, which records the reversal rather than rewriting history.
+    """
+
+    list_display = (
+        "created_at",
+        "landlord",
+        "tool",
+        "target_label",
+        "status",
+        "policy_rule_id",
+    )
+    list_filter = ("status", "tool")
+    search_fields = ("landlord__user__email", "tool", "target_label", "conversation_id")
+    ordering = ("-created_at",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(RamaMemory)
+class RamaMemoryAdmin(admin.ModelAdmin):
+    """Support view over durable landlord preferences.
+
+    Deliberately not editable: corrections happen by supersession (memory.write)
+    so the chain stays intact. Deleting IS allowed — an erasure request has to
+    be able to actually remove the text.
+    """
+
+    list_display = (
+        "created_at",
+        "landlord",
+        "key",
+        "scope",
+        "source",
+        "status",
+        "contains_personal_data",
+        "use_count",
+    )
+    list_filter = ("status", "scope", "source", "contains_personal_data")
+    search_fields = ("landlord__user__email", "key", "body", "entity_key")
+    ordering = ("-created_at",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
         return False

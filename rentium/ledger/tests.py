@@ -78,3 +78,89 @@ def test_next_charge_points_at_future_rent(bc_lease, landlord):
 
 def test_next_charge_none_when_nothing_upcoming(landlord):
     assert services.next_upcoming_charge(landlord) is None
+
+
+# ------------------------------------------- damage claims vs expected income
+# A FEE_CHARGE means two unrelated things. A late fee is ordinary income and
+# must keep counting; a damage-recovery claim is contested and settles at
+# move-out. Only the damage claim carries a work_order.
+def _work_order(landlord, prop):
+    from rentium.maintenance.models import WorkOrder
+
+    return WorkOrder.objects.create(
+        property=prop,
+        title="Shower leak + hot water knob replacement",
+        category=WorkOrder.Category.PLUMBING,
+    )
+
+
+def _damage_fee(landlord, lease, prop, work_order, amount="19.78"):
+    from rentium.ledger import services
+
+    charge, _ = services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=lease,
+        property=prop,
+        amount=amount,
+        due_date=date.today().replace(day=1),
+        entry_type=EntryType.FEE_CHARGE,
+        description="Damage recovery: shower leak",
+        work_order=work_order,
+    )
+    return charge
+
+
+def _late_fee(landlord, lease, prop, amount="25.00"):
+    from rentium.ledger import services
+
+    charge, _ = services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=lease,
+        property=prop,
+        amount=amount,
+        due_date=date.today().replace(day=1),
+        entry_type=EntryType.FEE_CHARGE,
+        description="Late fee",
+    )
+    return charge
+
+
+@pytest.mark.django_db
+def test_damage_claim_is_excluded_from_expected_income(landlord, bc_lease, bc_property):
+    from rentium.ledger.models import LedgerEntry
+
+    _damage_fee(landlord, bc_lease, bc_property, _work_order(landlord, bc_property))
+    live = LedgerEntry.objects.filter(landlord=landlord).not_voided()
+
+    assert live.damage_claims().count() == 1
+    assert live.expected_income().filter(entry_type=EntryType.FEE_CHARGE).count() == 0
+
+
+@pytest.mark.django_db
+def test_a_late_fee_is_still_expected_income(landlord, bc_lease, bc_property):
+    """The narrow fix must not quietly stop counting real fee income."""
+    from rentium.ledger.models import LedgerEntry
+
+    _late_fee(landlord, bc_lease, bc_property)
+    live = LedgerEntry.objects.filter(landlord=landlord).not_voided()
+
+    assert live.damage_claims().count() == 0
+    assert live.expected_income().filter(entry_type=EntryType.FEE_CHARGE).count() == 1
+
+
+@pytest.mark.django_db
+def test_a_damage_claim_is_still_a_claim_against_the_deposit(
+    landlord, bc_lease, bc_property
+):
+    """Excluding it from expected income must not make it disappear — it is
+    still owed, and deposit_position must still report it with its routes."""
+    from rentium.ledger import services
+
+    _damage_fee(landlord, bc_lease, bc_property, _work_order(landlord, bc_property))
+    position = services.deposit_position(landlord, lease=bc_lease)
+
+    assert Decimal(position["claimed"]) >= Decimal("19.78")
+    assert position["claims"]
+    assert position["lawful_routes"]

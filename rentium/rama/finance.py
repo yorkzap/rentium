@@ -158,3 +158,123 @@ def list_bank_balances(landlord) -> dict:
             "not a live balance."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Historical data the landlord has uploaded but not yet committed.
+#
+# A DRAFT ImportBatch is a spreadsheet of rows that are freely editable and
+# have NOT touched the append-only ledger. That makes them genuinely useful to
+# the Treasurer — a year of prior transactions is exactly the missing history
+# that makes "am I actually making money" answerable — and genuinely dangerous
+# to mix with real totals, because the landlord may still delete half of them.
+#
+# So they are returned under their own key, labelled PROVISIONAL, and the
+# Treasurer is told in the payload never to add them to a ledger figure.
+# Committing is the landlord's act through the import UI (or the corporal);
+# commit_batch() is not a RAMA tool at all, in any role.
+# ---------------------------------------------------------------------------
+MAX_STAGED_ROWS = 200
+
+
+def list_import_batches(landlord) -> dict:
+    """Uploaded historical batches and their state."""
+    from rentium.ledger.models import ImportBatch
+
+    batches = ImportBatch.objects.filter(landlord=landlord).prefetch_related("rows")
+    rows = []
+    for batch in batches:
+        staged = list(batch.rows.all())
+        rows.append(
+            {
+                "id": str(batch.pk),
+                "label": batch.label or batch.source_filename,
+                "status": batch.status,
+                "row_count": len(staged),
+                "rows_with_issues": sum(1 for r in staged if r.issues),
+                "created_at": batch.created_at.date().isoformat(),
+                "committed_at": (
+                    batch.committed_at.date().isoformat()
+                    if batch.committed_at
+                    else None
+                ),
+            }
+        )
+    return {
+        "batches": rows,
+        "count": len(rows),
+        "instruction": (
+            "DRAFT batches are PROVISIONAL — the landlord can still edit or "
+            "discard every row, and none of it is in the ledger. COMMITTED "
+            "batches are already ledger entries, so reading their rows again "
+            "and adding them to a ledger total double-counts. You cannot "
+            "commit a batch; only the landlord can."
+        ),
+    }
+
+
+def read_staged_entries(landlord, batch_id: str = "", limit: str = "") -> dict:
+    """Rows of a DRAFT import batch, as provisional history."""
+    from rentium.ledger.models import ImportBatch, StagedLedgerEntry
+
+    batch = None
+    if batch_id:
+        batch = ImportBatch.objects.filter(landlord=landlord, pk=batch_id).first()
+        if batch is None:
+            return {
+                "error": "no_such_batch",
+                "message": "I could not find that import batch.",
+            }
+    else:
+        batch = (
+            ImportBatch.objects.filter(
+                landlord=landlord, status=ImportBatch.Status.DRAFT
+            )
+            .order_by("-created_at")
+            .first()
+        )
+        if batch is None:
+            return {"rows": [], "count": 0, "message": "No draft import batches."}
+
+    try:
+        cap = min(int(limit), MAX_STAGED_ROWS) if limit else MAX_STAGED_ROWS
+    except (TypeError, ValueError):
+        cap = MAX_STAGED_ROWS
+
+    queryset = StagedLedgerEntry.objects.filter(batch=batch).select_related("property")
+    total = queryset.count()
+    rows = [
+        {
+            "row_number": row.row_number,
+            "entry_type": row.entry_type,
+            "amount": str(row.amount) if row.amount is not None else None,
+            "effective_date": (
+                row.effective_date.isoformat() if row.effective_date else None
+            ),
+            "category": row.category,
+            "vendor": row.vendor,
+            "description": row.description,
+            "property": row.property.name if row.property else None,
+            "issues": [i.get("message", "") for i in (row.issues or [])],
+        }
+        for row in queryset[:cap]
+    ]
+    return {
+        "batch": {
+            "id": str(batch.pk),
+            "label": batch.label or batch.source_filename,
+            "status": batch.status,
+        },
+        "rows": rows,
+        "count": len(rows),
+        "total_rows": total,
+        "truncated": total > len(rows),
+        "provenance": "PROVISIONAL" if batch.status == "DRAFT" else "LEDGER",
+        "instruction": (
+            "These rows are PROVISIONAL while the batch is DRAFT: nothing here "
+            "is in the ledger, the landlord can still change any of it, and a "
+            "row carrying an issue would not even commit. Use them to describe "
+            "history and say so, but never add them to a ledger total and "
+            "never present one as a recorded fact."
+        ),
+    }

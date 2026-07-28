@@ -3462,6 +3462,15 @@ def test_tool_meta_covers_every_write_tool():
         "lease_pdf_info", "list_lease_roster", "crud_capabilities",
         "list_viewing_requests", "get_viewing_availability",
         "get_notification_channels",
+        # Backlog/roster reads. These carried TOOL_META entries for a while
+        # despite mutating nothing; they belong here.
+        "list_capability_gaps", "list_co_landlords",
+        # Durable landlord preferences. remember/forget mutate and ARE
+        # classified; listing them does not.
+        "list_memories",
+        # Uploaded historical data. Reading a staged batch mutates nothing —
+        # commit_batch is what creates ledger rows, and it is not a tool.
+        "list_import_batches", "read_staged_entries",
         # plan builders only compose previews; the runner executes real tools
         "plan_operation", "plan_move_tenant",
     }

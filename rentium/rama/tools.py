@@ -982,18 +982,30 @@ def bulk_add_inventory(
     )
 
 
+@_params(
+    amount="The cost, e.g. '75.00'.",
+    description="What the money was spent on.",
+    property_query="The LISTING this belongs to, or the UNIT when the cost is "
+    "for shared space inside one ('McKenzie Basement') — never pick one of the "
+    "rooms that share it. Leave blank for a whole-property or portfolio cost.",
+    holding_name="The whole physical property, when the cost belongs to the "
+    "building rather than to anything inside it (roof, property tax, mulch for "
+    "the yard) — e.g. '950 McKenzie Ave'. Use this INSTEAD of property_query.",
+)
 def create_expense(
     landlord,
     amount: str,
     description: str,
     property_query: str = "",
+    holding_name: str = "",
     effective_date: str = "",
     confirm: str = "",
 ) -> dict:
-    """Record a landlord expense. amount e.g. '75.00'. property_query is the
-    listing it belongs to, OR the unit when the cost is for SHARED space
-    ('McKenzie Basement') — never pick one of the rooms that share it. Leave
-    blank for a portfolio-wide cost. Preview first; confirm=yes."""
+    """Record a landlord expense. Four scopes, narrowest first: a LISTING
+    (property_query), the SHARED space of a unit (property_query), the WHOLE
+    physical property (holding_name), or portfolio-wide (leave both blank).
+    Use holding_name when the landlord says "the whole house" or names the
+    address rather than a listing. Preview first; confirm=yes."""
     from .domain_actions import create_expense as _fn
 
     return _fn(
@@ -1644,6 +1656,25 @@ def list_bank_balances(landlord) -> dict:
     questions and before any min-balance analysis."""
     from .finance import list_bank_balances as _fn
     return _fn(landlord)
+
+
+def list_import_batches(landlord) -> dict:
+    """Uploaded historical data batches (bank statements, prior-year
+    spreadsheets) and whether they are still DRAFT. DRAFT rows are NOT in the
+    ledger. You cannot commit a batch — only the landlord can."""
+    from .finance import list_import_batches as _fn
+    return _fn(landlord)
+
+
+@_params(
+    batch_id="Batch id from list_import_batches. Blank uses the newest DRAFT batch.",
+    limit="Max rows to return (default 200).",
+)
+def read_staged_entries(landlord, batch_id: str = "", limit: str = "") -> dict:
+    """Rows of an uploaded batch, as PROVISIONAL history. Use for prior-year
+    context. Never add these to a ledger total — say they are provisional."""
+    from .finance import read_staged_entries as _fn
+    return _fn(landlord, batch_id=batch_id, limit=limit)
 
 
 @_params(
@@ -2360,3 +2391,207 @@ def tenant_statement(landlord, tenant: str, lease_number: str = "") -> dict:
     from .domain_crud import tenant_statement as _fn
 
     return _fn(landlord, tenant=tenant, lease_number=lease_number)
+
+
+def list_memories(landlord, query: str = "") -> dict:
+    """What the landlord has told you to remember across conversations
+    (preferences and standing instructions, NOT portfolio data). Answers
+    'what do you know about how I work?' / 'what have I told you?'."""
+    from .memory import payload
+
+    return payload(landlord, query)
+
+
+@_params(
+    subject="Short label for what this is about, e.g. 'viewings' or 'bookkeeper'. "
+    "Reusing a subject REPLACES the old preference on it.",
+    fact="The standing preference, in one sentence, in the landlord's terms.",
+    applies_to="Optional listing/property name when it is only true for one of them. "
+    "Leave empty for portfolio-wide preferences.",
+)
+def remember(
+    landlord,
+    subject: str,
+    fact: str,
+    applies_to: str = "",
+    confirm: str = "",
+) -> dict:
+    """Store a durable PREFERENCE or standing instruction the landlord stated,
+    so it survives into future conversations ("invoices go to my bookkeeper
+    Dana", "never viewings on Sundays", "call the basement suite the Garden").
+    NEVER use for portfolio facts — rents, balances, dates, counts, occupancy
+    and lease terms are read live every turn and must not be copied here.
+    Reusing a subject replaces what you knew about it."""
+    from .domain_memory import remember as _fn
+
+    return _fn(
+        landlord,
+        subject=subject,
+        fact=fact,
+        applies_to=applies_to,
+        confirm=confirm,
+    )
+
+
+def forget(landlord, subject: str, confirm: str = "") -> dict:
+    """Drop a preference you were told to remember. subject is its label or
+    distinctive words from it."""
+    from .domain_memory import forget as _fn
+
+    return _fn(landlord, subject=subject, confirm=confirm)
+
+
+@_params(
+    holding_name="The physical property, e.g. '950 McKenzie Ave'.",
+    purchase_price="What was paid for it.",
+    purchase_date="YYYY-MM-DD.",
+    year_built="Year of construction — decides which improvements even apply.",
+    heating_type="e.g. 'gas furnace', 'baseboard electric', 'heat pump'.",
+    capital_improvements="Total spent on improvements since purchase. Raises "
+    "the adjusted cost base and reduces the eventual capital gain.",
+)
+def record_holding_financials(
+    landlord,
+    holding_name: str,
+    purchase_price: str = "",
+    purchase_date: str = "",
+    year_built: str = "",
+    heating_type: str = "",
+    capital_improvements: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record what a property cost to acquire. Used for return, equity and
+    capital-gain estimates. Preview; confirm=yes."""
+    from .domain_financials import record_holding_financials as _fn
+
+    return _fn(
+        landlord,
+        holding_name=holding_name,
+        purchase_price=purchase_price,
+        purchase_date=purchase_date,
+        year_built=year_built,
+        heating_type=heating_type,
+        capital_improvements=capital_improvements,
+        confirm=confirm,
+    )
+
+
+@_params(
+    holding_name="The physical property.",
+    amount="What it is worth.",
+    as_of="YYYY-MM-DD the figure was true on. Defaults to today.",
+    basis="Where the number came from: BC_ASSESSMENT, REALTOR_CMA, APPRAISAL, "
+    "LANDLORD_ESTIMATE or AUTOMATED. The basis changes how much weight it "
+    "carries, so do not guess it.",
+)
+def record_valuation(
+    landlord,
+    holding_name: str,
+    amount: str,
+    as_of: str = "",
+    basis: str = "LANDLORD_ESTIMATE",
+    confirm: str = "",
+) -> dict:
+    """Record what a property is worth on a date. ADDS to the history rather
+    than replacing it — the series is what makes equity trend and return
+    computable. Preview; confirm=yes."""
+    from .domain_financials import record_valuation as _fn
+
+    return _fn(
+        landlord,
+        holding_name=holding_name,
+        amount=amount,
+        as_of=as_of,
+        basis=basis,
+        confirm=confirm,
+    )
+
+
+@_params(
+    holding_name="The physical property.",
+    current_principal="Balance still owing.",
+    balance_as_of="YYYY-MM-DD that balance was true on. Required with a "
+    "balance — without it there is no way to tell how stale the figure is.",
+    rate_percent="Annual rate as a percentage, e.g. '4.5'.",
+    payment_amount="The regular payment.",
+    payment_frequency="MONTHLY, BIWEEKLY, ACCELERATED_BIWEEKLY, WEEKLY or "
+    "SEMI_MONTHLY.",
+    term_end="YYYY-MM-DD the term ends — the renewal date.",
+    lender="Who holds the mortgage.",
+)
+def record_mortgage(
+    landlord,
+    holding_name: str,
+    current_principal: str = "",
+    balance_as_of: str = "",
+    rate_percent: str = "",
+    payment_amount: str = "",
+    payment_frequency: str = "MONTHLY",
+    term_end: str = "",
+    lender: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record the mortgage on a property. Any existing one is kept as history
+    rather than edited, so past rates stay answerable at renewal.
+    Preview; confirm=yes."""
+    from .domain_financials import record_mortgage as _fn
+
+    return _fn(
+        landlord,
+        holding_name=holding_name,
+        current_principal=current_principal,
+        balance_as_of=balance_as_of,
+        rate_percent=rate_percent,
+        payment_amount=payment_amount,
+        payment_frequency=payment_frequency,
+        term_end=term_end,
+        lender=lender,
+        confirm=confirm,
+    )
+
+
+@_params(
+    subject="Short label for what this fact is about, e.g. 'upstairs rent "
+    "2024'. Reusing a subject REPLACES what was recorded under it.",
+    fact="The fact in one sentence, in the landlord's own terms.",
+    amount="The figure, e.g. '2000' or '$2,000/mo'.",
+    period="ONE_TIME, MONTHLY or ANNUAL.",
+    direction="INCOME (money in), EXPENSE (money out), or NEUTRAL (a rate, a "
+    "value, a count).",
+    holding_name="Which physical property this applies to. Leave blank for "
+    "the whole portfolio.",
+    effective_from="YYYY-MM-DD the figure starts applying. Required for a "
+    "per-month or per-year amount.",
+    effective_to="YYYY-MM-DD it stops applying.",
+)
+def record_treasurer_fact(
+    landlord,
+    subject: str,
+    fact: str,
+    amount: str = "",
+    period: str = "",
+    direction: str = "",
+    holding_name: str = "",
+    effective_from: str = "",
+    effective_to: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record a financial fact the books do not have, so future analysis takes
+    it into account — e.g. "we took $2,000/mo rent from another tenant for a
+    year that isn\'t in the ledger". It is checked against the ledger first: if
+    the books already record most of it, it is kept on file but left OUT of
+    totals so it can\'t be double-counted. Preview; confirm=yes."""
+    from .domain_treasurer import record_treasurer_fact as _fn
+
+    return _fn(
+        landlord,
+        subject=subject,
+        fact=fact,
+        amount=amount,
+        period=period,
+        direction=direction,
+        holding_name=holding_name,
+        effective_from=effective_from,
+        effective_to=effective_to,
+        confirm=confirm,
+    )

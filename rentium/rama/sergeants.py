@@ -372,6 +372,9 @@ def run_all() -> dict:
         ("late_patterns", profile_late_patterns),
         ("expense_anomalies", detect_expense_anomalies),
         ("surplus", compute_surplus),
+        ("mortgage_renewals", check_mortgage_renewals),
+        ("valuation_staleness", check_valuation_staleness),
+        ("spend_drift", check_spend_drift),
     ):
         try:
             report[name] = fn()
@@ -379,3 +382,136 @@ def run_all() -> dict:
             logger.exception("Sergeant %s failed", name)
             report[name] = {"error": True}
     return report
+
+
+# ---------------------------------------------------------------------------
+# Finance watchers. Same shape as the five above: deterministic, $0, idempotent
+# via dedupe_key. These are what make the Treasurer notice things rather than
+# only answering when asked.
+# ---------------------------------------------------------------------------
+RENEWAL_WARN_DAYS = 120
+VALUATION_STALE_DAYS = 730
+SPEND_DRIFT_RATIO = Decimal("1.30")
+SPEND_DRIFT_MIN_DELTA = Decimal("300.00")
+
+
+def check_mortgage_renewals() -> dict:
+    """A renewal is the one dated financial decision a landlord can miss.
+
+    Warned early on purpose: a rate hold has to be arranged before the term
+    ends, so finding out on the day is finding out too late.
+    """
+    from datetime import date, timedelta
+
+    from rentium.ledger.models import HoldingMortgage
+
+    found = 0
+    horizon = date.today() + timedelta(days=RENEWAL_WARN_DAYS)
+    for mortgage in HoldingMortgage.objects.filter(
+        status=HoldingMortgage.Status.ACTIVE,
+        term_end__isnull=False,
+        term_end__lte=horizon,
+        term_end__gte=date.today(),
+    ).select_related("holding", "landlord"):
+        days = (mortgage.term_end - date.today()).days
+        if _publish_finding(
+            "rama.sentinel.mortgage_renewal",
+            f"renewal:{mortgage.pk}:{mortgage.term_end.isoformat()}",
+            mortgage.landlord,
+            {
+                "holding": mortgage.holding.name,
+                "days_to_renewal": days,
+                "term_end": mortgage.term_end.isoformat(),
+                "rate_percent": str(mortgage.rate_percent or ""),
+                "lender": mortgage.lender,
+                "severity": "WARN",
+            },
+        ):
+            found += 1
+    return {"findings_published": found}
+
+
+def check_valuation_staleness() -> dict:
+    """Equity computed off a years-old valuation is a confident wrong number."""
+    from datetime import date, timedelta
+
+    from rentium.properties.models import PropertyHolding
+
+    found = 0
+    cutoff = date.today() - timedelta(days=VALUATION_STALE_DAYS)
+    for holding in PropertyHolding.objects.select_related("landlord"):
+        latest = holding.valuations.order_by("-as_of").first()
+        if latest is None or latest.as_of > cutoff:
+            continue
+        if _publish_finding(
+            "rama.sentinel.valuation_stale",
+            f"valstale:{holding.pk}:{latest.as_of.isoformat()}",
+            holding.landlord,
+            {
+                "holding": holding.name,
+                "last_valued": latest.as_of.isoformat(),
+                "amount": str(latest.amount),
+                "basis": latest.basis,
+                "severity": "INFO",
+            },
+        ):
+            found += 1
+    return {"findings_published": found}
+
+
+def check_spend_drift() -> dict:
+    """A category quietly costing more than it used to.
+
+    Distinct from detect_expense_anomalies, which looks at one month against a
+    trailing mean. This compares a full year against the year before, so a
+    slow creep shows up where a monthly spike would not.
+    """
+    from datetime import date, timedelta
+
+    from django.db.models import Sum
+
+    from rentium.ledger.models import EntryType, LedgerEntry
+    from rentium.users.models import LandlordProfile
+
+    today = date.today()
+    this_year = (today - timedelta(days=365), today)
+    last_year = (today - timedelta(days=730), today - timedelta(days=365))
+    found = 0
+
+    for landlord in LandlordProfile.objects.all():
+        def totals(window):
+            rows = (
+                LedgerEntry.objects.not_voided()
+                .filter(
+                    landlord=landlord,
+                    entry_type=EntryType.EXPENSE,
+                    effective_date__gte=window[0],
+                    effective_date__lt=window[1],
+                )
+                .values("category")
+                .annotate(total=Sum("amount"))
+            )
+            return {r["category"]: (r["total"] or Decimal("0")) for r in rows}
+
+        now, before = totals(this_year), totals(last_year)
+        for category, amount in now.items():
+            prior = before.get(category)
+            if not prior or prior <= 0:
+                continue
+            delta = amount - prior
+            if amount / prior < SPEND_DRIFT_RATIO or delta < SPEND_DRIFT_MIN_DELTA:
+                continue
+            if _publish_finding(
+                "rama.sentinel.spend_drift",
+                f"drift:{landlord.pk}:{category}:{today.strftime('%Y-%m')}",
+                landlord,
+                {
+                    "category": category,
+                    "this_year": str(amount),
+                    "last_year": str(prior),
+                    "increase": str(delta),
+                    "severity": "WARN",
+                },
+            ):
+                found += 1
+    return {"findings_published": found}

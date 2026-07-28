@@ -16,6 +16,9 @@ SENTINEL_EVENT_TYPES = (
     "rama.sentinel.late_pattern",
     "rama.sentinel.expense_anomaly",
     "rama.sentinel.surplus",
+    "rama.sentinel.mortgage_renewal",
+    "rama.sentinel.valuation_stale",
+    "rama.sentinel.spend_drift",
 )
 
 
