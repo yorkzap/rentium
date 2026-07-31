@@ -223,6 +223,13 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "seen the viewing",
         "opened the status page",
     ),
+    "tenant_lease_status": (
+        "has signed the lease",
+        "has seen the lease",
+        "opened the lease invite",
+        "when did they open the lease",
+        "has the tenant signed",
+    ),
     "schedule_viewing": (
         "book showing",
         "property tour",
@@ -475,15 +482,20 @@ def supported_tool_for_request(request: str) -> str | None:
     ):
         return "convert_inquiry_to_viewing"
     if re.search(
-        r"\bvoid\b.+\b(charge|expense|entry|payment)\b"
-        r"|\breverse\b.+\b(ledger|charge|expense)\b",
+        r"\bvoid\b.+\b(charge|expense|entry|payment|\d)\b"
+        r"|\breverse\b.+\b(ledger|charge|expense)\b"
+        r"|\bvoid both\b|\bvoid the (wrong |two |\$)?",
         text,
     ):
         return "void_ledger_entry"
     if re.search(
-        r"\b(mark|marked)\b.+\b(expense|bill)\b.+\bpaid\b"
+        r"\b(mark|marked)\b.+\b(expense|bill|draino|invoice)\b.+\bpaid\b"
+        r"|\b(expense|bill|draino|invoice)\b.+\b(mark|marked|needs?).+\bpaid\b"
         r"|\b(paid|cleared)\b.+\b(from )?(my )?(bank|account)\b"
-        r"|\bexpense (is )?paid\b",
+        r"|\bexpense (is )?paid\b"
+        r"|\bnot yet taken\b"
+        r"|\bwhy does it say not yet\b"
+        r"|\bneeds? to be (marked )?paid\b",
         text,
     ):
         return "mark_ledger_paid"
@@ -546,10 +558,11 @@ def supported_tool_for_request(request: str) -> str | None:
         r"|\b(signed|viewed|opened|seen)\b.+\b(lease|invite)\b"
         r"|\blast (seen|opened|viewed)\b.+\b(lease|invite|tenant)\b"
         r"|\bwhen did .+\b(open|see|view)\b.+\b(lease|invite)\b"
-        r"|\bcreated an? account\b|\bsigned up\b",
+        r"|\bcreated an? account\b|\bsigned up\b"
+        r"|\bhas \w+ signed\b|\bhas \w+ seen\b",
         text,
     ):
-        return "list_lease_roster"
+        return "tenant_lease_status"
     if re.search(
         r"\b(reschedule|re-schedule|move|change)\b.+\b(viewing|showing|appointment)\b"
         r"|\b(viewing|showing)\b.+\b(from|to)\b.+\b(am|pm|\d{1,2}:\d{2}|august|july|june|may|september)\b"

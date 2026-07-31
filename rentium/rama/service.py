@@ -1725,6 +1725,41 @@ def _preview_reply(tool: str, result: dict) -> str:
             )
         lines.append("Reply yes to schedule and email, or no to cancel.")
         return "\n".join(lines)
+    if tool == "reschedule_viewing":
+        lines = [
+            "Reschedule viewing:",
+            f"• Property: {preview.get('property') or '—'}",
+            f"• From: {preview.get('from') or '—'}",
+            f"• To: {preview.get('to') or '—'}",
+        ]
+        if preview.get("contact_name") or preview.get("contact_email"):
+            lines.append(
+                f"• Prospect: {preview.get('contact_name') or ''} "
+                f"{preview.get('contact_email') or ''}".strip()
+            )
+        if preview.get("will_email_prospect"):
+            lines.append("• Will email prospect the new time")
+        lines.append("Reply yes to reschedule, or no to cancel.")
+        return "\n".join(lines)
+    if tool == "cancel_viewing":
+        lines = [
+            "Cancel viewing:",
+            f"• Property: {preview.get('property') or preview.get('property_name') or '—'}",
+            f"• When: {preview.get('starts_at') or preview.get('when') or '—'}",
+        ]
+        if preview.get("contact_name"):
+            lines.append(f"• Prospect: {preview['contact_name']}")
+        lines.append("Reply yes to cancel, or no to keep it.")
+        return "\n".join(lines)
+    if tool == "mark_ledger_paid":
+        lines = [
+            "Mark expense paid:",
+            f"• Amount: ${preview.get('amount') or '—'}",
+            f"• Description: {preview.get('description') or '—'}",
+            f"• Paid on: {preview.get('paid_on') or 'today'}",
+        ]
+        lines.append("Reply yes to mark paid, or no to cancel.")
+        return "\n".join(lines)
     if tool == "create_house_layout":
         holding = preview.get("holding") or {}
         lines = [
@@ -3763,6 +3798,228 @@ def run_turn(
             else:
                 deterministic_reply = str(
                     result.get("error") or result.get("message") or result,
+                )
+
+    # Practical money/lease/viewing status chains (backend can do these — always
+    # prefer tools over "I can't" / capability-gap hallucinations).
+    if deterministic_reply is None and pending_plan is None:
+        low_msg = (message or "").casefold()
+        # "has Siya signed/seen the lease?"
+        if re.search(
+            r"\b(has|have|did)\b.+\b(signed|seen|viewed|opened)\b.+\b(lease|invite)\b"
+            r"|\b(signed|seen)\b.+\b(lease|invite)\b"
+            r"|\bhas \w+ signed\b|\bhas \w+ seen\b",
+            low_msg,
+        ) and not re.search(r"\b(viewing|showing)\b", low_msg):
+            person = ""
+            # Prefer explicit capitalized name: "has Siya signed"
+            m2 = re.search(r"\bhas\s+([A-Z][a-zA-Z'’\-]+)\b", message or "")
+            if m2 and m2.group(1).casefold() not in {
+                "the", "she", "he", "they", "anyone", "someone",
+            }:
+                person = m2.group(1)
+            if not person:
+                m3 = re.search(
+                    r"\b([A-Z][a-zA-Z'’\-]+)\s+(signed|seen|viewed|opened)\b",
+                    message or "",
+                )
+                if m3:
+                    person = m3.group(1)
+            if not person:
+                m = re.search(
+                    r"\bhas\s+([A-Za-z][A-Za-z'’\-]+)\b",
+                    message or "",
+                    re.I,
+                )
+                if m and m.group(1).casefold() not in {
+                    "the", "she", "he", "they", "anyone", "someone",
+                }:
+                    person = m.group(1)
+            result = execute(
+                "tenant_lease_status",
+                {"person_query": person or (message or "")[:80]},
+                landlord=landlord,
+            )
+            tools_used.append("tenant_lease_status")
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": "tenant_lease_status",
+                    "arguments": {"person_query": person},
+                    "result": json.loads(json.dumps(result, default=str)),
+                    "deterministic_routing": True,
+                },
+            )
+            deterministic_reply = str(
+                result.get("message") or result.get("error") or result
+            )
+
+    if deterministic_reply is None and pending_plan is None:
+        low_msg = (message or "").casefold()
+        # Mark expense paid / "not yet taken" follow-ups
+        if re.search(
+            r"\b(mark|marked).+\bpaid\b"
+            r"|\bneeds? to be (marked )?paid\b"
+            r"|\bnot yet taken\b"
+            r"|\bwhy does it say not yet\b"
+            r"|\b(expense|draino|invoice).+\bpaid\b",
+            low_msg,
+        ) and not re.search(r"\b(cleaning fee)\b", low_msg):
+            amt_m = re.search(r"\$?\s*(\d+\.\d{2})\b", message or "")
+            desc = re.sub(
+                r"\b(mark|marked|needs?|to be|as paid|paid|the|expense|"
+                r"not yet taken|why does it say|please)\b",
+                " ",
+                message or "",
+                flags=re.I,
+            )
+            desc = re.sub(r"\$?\s*\d+\.\d{2}", " ", desc)
+            desc = re.sub(r"\s+", " ", desc).strip(" .,")
+            args = {
+                "description_query": desc[:80] if desc else "expense",
+                "amount": amt_m.group(1) if amt_m else "",
+                "paid_on": "today",
+            }
+            # Prefer mark_ledger_paid — if multi-match, tool returns candidates
+            result = execute("mark_ledger_paid", args, landlord=landlord)
+            tools_used.append("mark_ledger_paid")
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": "mark_ledger_paid",
+                    "arguments": args,
+                    "result": json.loads(json.dumps(result, default=str)),
+                    "deterministic_routing": True,
+                },
+            )
+            if result.get("needs_confirm"):
+                save_single(landlord, conversation_id, "mark_ledger_paid", args)
+                deterministic_reply = _preview_reply("mark_ledger_paid", result)
+            else:
+                deterministic_reply = str(
+                    result.get("message") or result.get("error") or result
+                )
+
+    if deterministic_reply is None and pending_plan is None:
+        low_msg = (message or "").casefold()
+        # Reschedule existing viewing (not a brand-new schedule)
+        if re.search(
+            r"\b(reschedule|re-schedule|change|move)\b.+\b(viewing|showing|time|date)\b"
+            r"|\b(viewing|showing)\b.+\b(reschedule|change|move)\b"
+            r"|\bit should be on\b.+\b(am|pm|\d{1,2}:\d{2}|july|august|today|tomorrow)\b",
+            low_msg,
+        ) and not re.search(r"\b(make|create|book|schedule) a (new )?viewing\b", low_msg):
+            # If there's already a pending schedule_viewing, amend path handles it.
+            # Otherwise reschedule the latest matching scheduled viewing.
+            when = _relative_when_from_text(message)
+            contact = ""
+            em = re.search(
+                r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+                message or "",
+            )
+            if em:
+                contact = em.group(1)
+            else:
+                # pull from recent schedule
+                for row in RamaAudit.objects.filter(
+                    landlord=landlord,
+                    conversation_id=conversation_id,
+                    kind=RamaAudit.Kind.TOOL_CALL,
+                ).order_by("-created_at")[:15]:
+                    content = row.content or {}
+                    if content.get("tool") in {
+                        "schedule_viewing",
+                        "reschedule_viewing",
+                    }:
+                        args0 = content.get("arguments") or {}
+                        contact = (
+                            args0.get("contact_email")
+                            or args0.get("contact_name")
+                            or args0.get("contact")
+                            or ""
+                        )
+                        if contact:
+                            break
+            prop = "Garden Suite" if "garden" in low_msg else ""
+            args = {
+                "when": when,
+                "contact": contact,
+                "property_query": prop,
+                "notes": "",
+            }
+            result = execute("reschedule_viewing", args, landlord=landlord)
+            tools_used.append("reschedule_viewing")
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": "reschedule_viewing",
+                    "arguments": args,
+                    "result": json.loads(json.dumps(result, default=str)),
+                    "deterministic_routing": True,
+                },
+            )
+            if result.get("needs_confirm"):
+                save_single(
+                    landlord, conversation_id, "reschedule_viewing", args,
+                )
+                deterministic_reply = _preview_reply(
+                    "reschedule_viewing", result,
+                )
+            elif result.get("already_done"):
+                deterministic_reply = str(
+                    result.get("message")
+                    or f"Already at {result.get('when') or when}."
+                )
+            else:
+                deterministic_reply = str(
+                    result.get("message") or result.get("error") or result
+                )
+
+    if deterministic_reply is None and pending_plan is None:
+        low_msg = (message or "").casefold()
+        if re.search(
+            r"\bcancel\b.+\b(viewing|showing)\b"
+            r"|\b(viewing|showing)\b.+\bcancel\b",
+            low_msg,
+        ):
+            contact = ""
+            em = re.search(
+                r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+                message or "",
+            )
+            if em:
+                contact = em.group(1)
+            else:
+                m = re.search(
+                    r"\bfor\s+([A-Z][a-zA-Z'’-]+(?:\s+[A-Z][a-zA-Z'’-]+)?)",
+                    message or "",
+                )
+                if m:
+                    contact = m.group(1)
+            args = {
+                "contact": contact,
+                "property_query": (
+                    "Garden Suite" if "garden" in low_msg else ""
+                ),
+                "reason": "Landlord cancelled via chat",
+            }
+            result = execute("cancel_viewing", args, landlord=landlord)
+            tools_used.append("cancel_viewing")
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": "cancel_viewing",
+                    "arguments": args,
+                    "result": json.loads(json.dumps(result, default=str)),
+                    "deterministic_routing": True,
+                },
+            )
+            if result.get("needs_confirm"):
+                save_single(landlord, conversation_id, "cancel_viewing", args)
+                deterministic_reply = _preview_reply("cancel_viewing", result)
+            else:
+                deterministic_reply = str(
+                    result.get("message") or result.get("error") or result
                 )
 
     # "Have they seen the viewing link?" — never claim we cannot track opens.

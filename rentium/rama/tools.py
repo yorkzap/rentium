@@ -2516,17 +2516,20 @@ def mark_ledger_paid(
     landlord,
     entry_id: str = "",
     description_query: str = "",
+    amount: str = "",
     paid_on: str = "",
     unmark: str = "0",
     confirm: str = "",
 ) -> dict:
-    """Mark expense bank-cleared (paid_on) or unmark=yes. Preview; confirm=yes."""
+    """Mark expense bank-cleared (paid_on) or unmark=yes. Use when landlord says
+    'mark the Draino expense paid' or 'why not yet taken'. Preview; confirm=yes."""
     from .domain_gap_tools import mark_ledger_paid as _fn
 
     return _fn(
         landlord,
         entry_id=entry_id,
         description_query=description_query,
+        amount=amount,
         paid_on=paid_on,
         unmark=unmark,
         confirm=confirm,
@@ -2672,15 +2675,25 @@ def mark_inspection_delivered(
     )
 
 
+@_params(
+    appointment_id="Exact appointment UUID when known.",
+    request_ref="Short ref from list_viewing_requests / list_appointments.",
+    property_query="Listing name when unique, e.g. 'Garden Suite'.",
+    contact="Prospect name or email, e.g. 'Ishupreet' or 'ishu@gmail.com'.",
+    reason="Optional why cancelled (audit/email).",
+    confirm="Leave empty to preview; yes to cancel.",
+)
 def cancel_viewing(
     landlord,
     appointment_id: str = "",
     request_ref: str = "",
     property_query: str = "",
+    contact: str = "",
     reason: str = "",
     confirm: str = "",
 ) -> dict:
-    """Cancel a pending or scheduled viewing. Preview; confirm=yes."""
+    """Cancel a pending or scheduled viewing (emails prospect when possible).
+    Prefer contact= name/email. Preview; confirm=yes."""
     from .domain_gap_tools import cancel_viewing as _fn
 
     return _fn(
@@ -2688,9 +2701,23 @@ def cancel_viewing(
         appointment_id=appointment_id,
         request_ref=request_ref,
         property_query=property_query,
+        contact=contact,
         reason=reason,
         confirm=confirm,
     )
+
+
+@_params(
+    person_query="Tenant name or email, e.g. 'Siya' or 'siya@gmail.com'.",
+)
+def tenant_lease_status(landlord, person_query: str = "") -> dict:
+    """Has this person signed or opened their lease invite?
+
+    Use for 'has Siya signed?', 'has she seen the lease?', 'when did they open
+    the invite?'. Portfolio-wide search. Read-only."""
+    from .domain_actions import tenant_lease_status as _fn
+
+    return _fn(landlord, person_query=person_query)
 
 
 def mark_cleaning_fee_paid(

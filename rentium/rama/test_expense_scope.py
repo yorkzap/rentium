@@ -152,6 +152,18 @@ def test_void_message_never_creates_expense(landlord):
     assert void_intent["arguments"]["amount"] == "125.00"
 
 
+def test_practical_phrase_routing():
+    from rentium.rama.capabilities import supported_tool_for_request as s
+
+    assert s("has siya signed the lease") == "tenant_lease_status"
+    assert s("mark the draino expense as paid") == "mark_ledger_paid"
+    assert s("why does it say Not yet taken") == "mark_ledger_paid"
+    assert s("void both 125 expenses") == "void_ledger_entry"
+    assert s("cancel the viewing for Ishupreet") == "cancel_viewing"
+    assert s("have they seen the viewing link") == "viewing_invite_status"
+    assert s("reschedule the viewing to tomorrow 4pm") == "reschedule_viewing"
+
+
 def test_make_viewing_not_hijacked_by_calendar_link(landlord):
     from rentium.rama.capabilities import supported_tool_for_request
     from rentium.rama.service import _dashboard_collection_intent

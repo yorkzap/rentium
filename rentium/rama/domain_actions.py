@@ -2878,6 +2878,102 @@ def resend_lease_invite(
     }
 
 
+def tenant_lease_status(landlord, *, person_query: str = "") -> dict:
+    """Answer 'has Siya signed / seen the lease?' across the portfolio.
+
+    Searches active/pending lease slots by name or email and returns
+    invite_lifecycle (last_seen_at, has_seen_lease, signed).
+    """
+    from django.db.models import Q
+
+    from rentium.leases.models import Lease
+    from rentium.leases.models import LeaseTenant
+
+    q = (person_query or "").strip()
+    if not q:
+        return {"error": "Pass a tenant name or email (e.g. Siya)."}
+    qs = (
+        LeaseTenant.objects.filter(lease__landlord=landlord)
+        .exclude(declined=True)
+        .filter(
+            lease__status__in=[
+                Lease.LeaseStatus.DRAFT,
+                Lease.LeaseStatus.PENDING_SIGNATURES,
+                Lease.LeaseStatus.ACTIVE,
+            ]
+        )
+        .filter(
+            Q(invited_name__icontains=q)
+            | Q(invited_email__icontains=q)
+            | Q(tenant__user__name__icontains=q)
+            | Q(tenant__user__email__icontains=q)
+        )
+        .select_related("lease", "lease__property", "tenant__user")
+        .order_by("-lease__created_at")[:15]
+    )
+    rows = list(qs)
+    if not rows:
+        return {
+            "ok": True,
+            "found": 0,
+            "message": f"No tenant/invite matching {q!r} on open leases.",
+            "people": [],
+        }
+    people = []
+    for lt in rows:
+        slot = _slot_label(lt)
+        life = slot.get("invite_lifecycle") or {}
+        place = (
+            lt.lease.property.name
+            if lt.lease.property_id
+            else (lt.lease.group.name if lt.lease.group_id else "")
+        )
+        people.append(
+            {
+                "name": slot.get("name"),
+                "email": slot.get("email"),
+                "lease_number": lt.lease.lease_number,
+                "lease_status": lt.lease.status,
+                "property": place,
+                "has_signed": bool(slot.get("has_signed")),
+                "has_seen_lease": life.get("has_seen_lease"),
+                "last_seen_at": life.get("last_seen_at"),
+                "seen_count": life.get("seen_count"),
+                "last_seen_source": life.get("last_seen_source"),
+                "invite_status": life.get("status") or slot.get("status"),
+            }
+        )
+    # Prefer the most recent lease for the headline message.
+    top = people[0]
+    if top.get("has_signed"):
+        headline = (
+            f"{top['name']} has signed lease {top['lease_number']} "
+            f"({top['property'] or 'property'})."
+        )
+    elif top.get("has_seen_lease"):
+        headline = (
+            f"{top['name']} has opened/viewed the lease invite "
+            f"(last seen {top.get('last_seen_at') or 'recently'}; "
+            f"seen {top.get('seen_count') or 1}×) but has not signed yet "
+            f"on {top['lease_number']}."
+        )
+    else:
+        headline = (
+            f"{top['name']} has not opened the lease invite yet "
+            f"on {top['lease_number']} ({top['property'] or 'property'})."
+        )
+    return {
+        "ok": True,
+        "found": len(people),
+        "message": headline,
+        "people": people,
+        "note": (
+            "last_seen tracks invite-link / agreement opens — not email pixels. "
+            "has_signed is the legal signature flag."
+        ),
+    }
+
+
 def list_lease_roster(
     landlord, *, property_query: str = "", lease_number: str = ""
 ) -> dict:

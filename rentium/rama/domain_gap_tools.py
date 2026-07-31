@@ -219,6 +219,7 @@ def mark_ledger_paid(
     *,
     entry_id: str = "",
     description_query: str = "",
+    amount: str = "",
     paid_on: str = "",
     unmark: str = "0",
     confirm: str = "",
@@ -226,9 +227,16 @@ def mark_ledger_paid(
     """Mark an expense as bank-cleared (or unmark). Only mutates paid_on."""
     from rentium.ledger import services as ledger_services
 
-    entry, err = _resolve_ledger_entry(landlord, entry_id, description_query)
+    rows, err = _resolve_ledger_entries(
+        landlord,
+        entry_id=entry_id,
+        description_query=description_query,
+        amount=amount,
+        allow_multiple=False,
+    )
     if err:
         return err if isinstance(err, dict) else {"error": err}
+    entry = rows[0]
 
     do_unmark = _truthy(unmark)
     when = None
@@ -832,16 +840,20 @@ def cancel_viewing(
     appointment_id: str = "",
     request_ref: str = "",
     property_query: str = "",
+    contact: str = "",
     reason: str = "",
     confirm: str = "",
 ) -> dict:
     """Cancel a viewing (pending or scheduled) → CANCELLED + event."""
+    from django.db.models import Q
+
     from rentium.appointments.models import Appointment
     from rentium.appointments.services import notification_receipt
 
     appt = None
     aid = (appointment_id or "").strip()
     ref = (request_ref or "").strip()
+    contact_q = (contact or "").strip()
     if aid:
         appt = Appointment.objects.filter(
             pk=aid, landlord=landlord, kind=Appointment.Kind.VIEWING
@@ -855,6 +867,36 @@ def cancel_viewing(
             if str(a.pk)[:8].upper() == ref.upper() or str(a.pk) == ref:
                 appt = a
                 break
+    elif contact_q:
+        qs = (
+            Appointment.objects.filter(
+                landlord=landlord,
+                kind=Appointment.Kind.VIEWING,
+            )
+            .exclude(status=Appointment.Status.CANCELLED)
+            .filter(
+                Q(contact_name__icontains=contact_q)
+                | Q(contact_email__icontains=contact_q)
+            )
+            .select_related("property")
+            .order_by("-starts_at")[:10]
+        )
+        rows = list(qs)
+        if len(rows) == 1:
+            appt = rows[0]
+        elif len(rows) > 1:
+            return {
+                "error": f"Multiple viewings match {contact_q!r}; pass appointment_id.",
+                "matches": [
+                    {
+                        "id": str(a.pk),
+                        "property": a.property.name if a.property_id else "",
+                        "starts_at": a.starts_at.isoformat(),
+                        "contact_name": a.contact_name,
+                    }
+                    for a in rows
+                ],
+            }
     elif property_query:
         prop, err = _resolve_property(landlord, property_query)
         if err:
@@ -872,7 +914,8 @@ def cancel_viewing(
     if appt is None:
         return {
             "error": (
-                "No viewing found. Pass appointment_id, request_ref, or property_query."
+                "No viewing found. Pass appointment_id, request_ref, contact "
+                "(name/email), or property_query."
             ),
         }
     if appt.status == Appointment.Status.CANCELLED:
