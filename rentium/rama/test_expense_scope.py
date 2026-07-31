@@ -152,6 +152,26 @@ def test_void_message_never_creates_expense(landlord):
     assert void_intent["arguments"]["amount"] == "125.00"
 
 
+def test_make_viewing_not_hijacked_by_calendar_link(landlord):
+    from rentium.rama.capabilities import supported_tool_for_request
+    from rentium.rama.service import _dashboard_collection_intent
+    from rentium.rama.service import _schedule_viewing_intent
+
+    msg = (
+        "Make a viewing for 950 mckenzie garden suite tomorrow at 3 pm for "
+        "Ishupreet Sidhu and send her an email for it Ishusidhu.3600@gmail.com"
+    )
+    assert _dashboard_collection_intent(msg) is None
+    assert supported_tool_for_request(msg) == "schedule_viewing"
+    intent = _schedule_viewing_intent(msg)
+    assert intent is not None
+    assert intent["tool"] == "schedule_viewing"
+    assert "15:00" in intent["arguments"]["when"]
+    assert intent["arguments"]["contact_email"].lower().startswith("ishusidhu")
+    assert intent["arguments"]["property_query"].casefold() == "garden suite"
+    assert intent["arguments"]["contact_name"] == "Ishupreet Sidhu"
+
+
 def test_void_both_duplicate_expenses_by_amount(landlord):
     from decimal import Decimal
 

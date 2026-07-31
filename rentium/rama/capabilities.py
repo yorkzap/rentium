@@ -550,8 +550,10 @@ def supported_tool_for_request(request: str) -> str | None:
     ):
         return "reschedule_viewing"
     if re.search(
-        r"\b(schedule|book|set up)\b.+\b(viewing|showing|tour|appointment)\b"
-        r"|\bviewing\b.+\b(tomorrow|today|at \d|@)\b",
+        r"\b(schedule|book|set up|make|create|arrange)\b.+\b"
+        r"(viewing|showing|tour|appointment)\b"
+        r"|\bviewing\b.+\b(tomorrow|today|at \d|@|pm|am)\b"
+        r"|\b(viewing|showing)\b.+\b(send|email|invite)\b",
         text,
     ):
         return "schedule_viewing"

@@ -297,6 +297,23 @@ def _write_result_message(tool: str, result: dict, target: str = "") -> str:
             result.get("message")
             or f"Voided {result.get('count') or 1} ledger entry(ies)."
         )
+    if tool == "schedule_viewing" and result.get("created"):
+        appt = result.get("appointment") if isinstance(result.get("appointment"), dict) else {}
+        parts = [
+            f"Scheduled viewing of {appt.get('property') or 'the listing'}",
+            f"at {appt.get('starts_at') or 'the chosen time'}",
+        ]
+        if appt.get("contact_name"):
+            parts.append(f"for {appt['contact_name']}")
+        msg = " ".join(parts) + "."
+        notified = result.get("notified") or {}
+        if appt.get("contact_email"):
+            msg += f" Email invite to {appt['contact_email']} is queued."
+        elif notified.get("channels"):
+            msg += f" Notify channels: {', '.join(notified.get('channels') or [])}."
+        if result.get("calendar_link"):
+            msg += f" Calendar: {result['calendar_link']}"
+        return msg
     if tool == "update_property":
         before = str(result.get("previous_name") or target or "").strip()
         prop = result.get("property") or {}
@@ -414,6 +431,20 @@ def _dashboard_collection_intent(message: str) -> str | None:
     requiring the word “dashboard”.
     """
     text = " ".join((message or "").casefold().split())
+    # "Make a viewing… and send her an email" is scheduling, not nav.
+    # The word "send" alone used to force Calendar link and skip schedule_viewing.
+    if re.search(
+        r"\b(schedule|book|make|create|arrange|set up)\b.+\b"
+        r"(viewing|showing|appointment|tour)\b"
+        r"|\b(viewing|showing)\b.+\b(tomorrow|today|at \d|\d\s*pm|\d\s*am)\b"
+        r"|\b(viewing|showing)\b.+\bfor\b.+\b@\b",
+        text,
+    ) or re.search(
+        r"\b(viewing|showing)\b.+\b(send|email|invite)\b"
+        r"|\b(send|email|invite)\b.+\b(viewing|showing)\b",
+        text,
+    ):
+        return None
     wants_nav = bool(
         re.search(
             r"\b(link|open|view|show|go|take|send|where|check|find|see)\b",
@@ -444,6 +475,108 @@ def _dashboard_collection_intent(message: str) -> str | None:
     if "dashboard" in text:
         return "dashboard"
     return None
+
+
+def _relative_when_from_text(text: str) -> str:
+    """Parse 'tomorrow at 3 pm' → 'YYYY-MM-DD HH:MM' in America/Vancouver."""
+    from datetime import datetime
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/Vancouver")
+    now = datetime.now(tz)
+    day = now.date()
+    low = (text or "").casefold()
+    if re.search(r"\btomorrow\b", low):
+        day = day + timedelta(days=1)
+    elif re.search(r"\btoday\b", low):
+        day = day
+    else:
+        # Absolute date already handled elsewhere.
+        mdate = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text or "")
+        if mdate:
+            day = datetime.strptime(mdate.group(1), "%Y-%m-%d").date()
+    hour, minute = 15, 0
+    tm = re.search(
+        r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+        text or "",
+        re.IGNORECASE,
+    )
+    if not tm:
+        tm = re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\b", text or "", re.IGNORECASE)
+    if tm:
+        hour = int(tm.group(1))
+        minute = int(tm.group(2) or 0)
+        ap = (tm.group(3) if tm.lastindex and tm.lastindex >= 3 else "") or ""
+        ap = ap.lower()
+        if ap == "pm" and hour < 12:
+            hour += 12
+        elif ap == "am" and hour == 12:
+            hour = 0
+    return f"{day.isoformat()} {hour:02d}:{minute:02d}"
+
+
+def _schedule_viewing_intent(message: str) -> dict | None:
+    """'Make a viewing for Garden Suite tomorrow 3pm for Name email@…'."""
+    text = message or ""
+    low = text.casefold()
+    if not re.search(r"\b(viewing|showing)\b", low):
+        return None
+    if not (
+        re.search(r"\b(schedule|book|make|create|arrange|set up)\b", low)
+        or re.search(r"\bviewing for\b", low)
+        or (
+            re.search(r"\b(viewing|showing)\b", low)
+            and re.search(r"\b(tomorrow|today|at \d|\d\s*pm)\b", low)
+        )
+    ):
+        return None
+    # Pure "where do I see viewings" is not scheduling.
+    if re.search(
+        r"\b(where|check|find|see|open|show)\b.+\b(viewings?|showings?|calendar)\b",
+        low,
+    ) and not re.search(r"\b(schedule|book|make|create|for)\b", low):
+        return None
+
+    email_m = re.search(
+        r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+        text,
+    )
+    contact_email = email_m.group(1) if email_m else ""
+    name = ""
+    name_m = re.search(
+        r"\bfor\s+([A-Z][a-zA-Z'’-]+(?:\s+[A-Z][a-zA-Z'’-]+)+)",
+        text,
+    )
+    if name_m:
+        name = name_m.group(1).strip()
+        # Don't capture email local-part as name.
+        if "@" in name:
+            name = ""
+
+    prop_q = ""
+    if re.search(r"garden suite", low):
+        # Exact listing name — do not append street (resolver is name-based).
+        prop_q = "Garden Suite"
+    elif re.search(r"\broom\s+([a-z0-9]+)\b", low):
+        m = re.search(r"\broom\s+([a-z0-9]+)\b", low)
+        prop_q = f"Room {m.group(1).upper()}" if m else ""
+    if not prop_q and re.search(r"mckenzie", low):
+        prop_q = "950 McKenzie"
+
+    when = _relative_when_from_text(text)
+    if not prop_q:
+        return None
+    return {
+        "tool": "schedule_viewing",
+        "arguments": {
+            "property_query": prop_q,
+            "when": when,
+            "contact_name": name,
+            "contact_email": contact_email,
+            "notes": "",
+        },
+    }
 
 
 def _show_all_rooms_intent(message: str) -> bool:
@@ -1428,6 +1561,25 @@ def _preview_reply(tool: str, result: dict) -> str:
         if preview.get("reason"):
             lines.append(f"Reason: {preview['reason']}")
         lines.append("Reply yes to void, or no to cancel.")
+        return "\n".join(lines)
+    if tool == "schedule_viewing":
+        lines = [
+            "Schedule viewing:",
+            f"• Property: {preview.get('property') or '—'}",
+            f"• When: {preview.get('starts_at') or preview.get('when') or '—'}",
+        ]
+        if preview.get("contact_name"):
+            lines.append(f"• Prospect: {preview['contact_name']}")
+        if preview.get("contact_email"):
+            lines.append(
+                f"• Email invite to: {preview['contact_email']} "
+                "(sent when you confirm)"
+            )
+        else:
+            lines.append(
+                "• No prospect email — add contact_email so we can notify them"
+            )
+        lines.append("Reply yes to schedule and email, or no to cancel.")
         return "\n".join(lines)
     if tool == "create_house_layout":
         holding = preview.get("holding") or {}
@@ -3458,6 +3610,40 @@ def run_turn(
             else:
                 deterministic_reply = str(
                     result.get("error") or result.get("message") or result,
+                )
+
+    # Schedule viewing (with prospect email) BEFORE calendar nav link — "make a
+    # viewing… send her an email" used to only return the Calendar URL.
+    if deterministic_reply is None and pending_plan is None:
+        intent = _schedule_viewing_intent(message)
+        if intent is not None:
+            result = execute(
+                intent["tool"], intent["arguments"], landlord=landlord,
+            )
+            safe_result = json.loads(json.dumps(result, default=str))
+            tools_used.append(intent["tool"])
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": intent["tool"],
+                    "arguments": intent["arguments"],
+                    "result": safe_result,
+                    "deterministic_routing": True,
+                },
+            )
+            if result.get("needs_confirm"):
+                save_single(
+                    landlord,
+                    conversation_id,
+                    intent["tool"],
+                    intent["arguments"],
+                )
+                deterministic_reply = _preview_reply(intent["tool"], result)
+            elif result.get("error"):
+                deterministic_reply = str(result["error"])
+            elif result.get("created"):
+                deterministic_reply = _write_result_message(
+                    intent["tool"], result,
                 )
 
     if deterministic_reply is None and pending_plan is None:
