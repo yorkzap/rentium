@@ -485,6 +485,16 @@ def test_receipt_followup_catalogs_and_links_existing_expense(landlord):
     )
     assert catalogued.get("catalogued") or catalogued.get("updated"), catalogued
 
+    preview = registry.execute(
+        "file_business_document",
+        {
+            "document_id": str(document.pk),
+            "amount": "13.41",
+            "duplicate_resolution": "auto_link",
+        },
+        landlord=landlord,
+    )
+    assert preview.get("needs_confirm"), preview
     linked = registry.execute(
         "file_business_document",
         {
@@ -505,3 +515,90 @@ def test_receipt_followup_catalogs_and_links_existing_expense(landlord):
         .count()
         == 1
     )
+
+
+def test_already_logged_alone_links_pending_receipt(landlord):
+    """Bare 'Expense is already logged' must attach receipt, not shrug."""
+    import uuid
+    from datetime import date
+    from decimal import Decimal
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from rentium.ledger.models import EntryType, ExpenseCategory, LedgerEntry
+    from rentium.rama.document_services import ingest_document
+    from rentium.rama.models import RamaAudit, RamaDocument
+    from rentium.rama.service import _pending_unscoped_document_id
+    from rentium.rama.service import _wants_link_existing_expense
+    from rentium.rama import registry
+
+    holding = _holding(landlord)
+    entry = LedgerEntry.objects.create(
+        landlord=landlord,
+        holding=holding,
+        entry_type=EntryType.EXPENSE,
+        amount=Decimal("13.41"),
+        description="Draino",
+        category=ExpenseCategory.SUPPLIES,
+        effective_date=date.today(),
+    )
+    upload = SimpleUploadedFile(
+        "r.pdf", b"%PDF-already-logged-unique", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.kind = RamaDocument.Kind.EXPENSE
+    document.amount = Decimal("13.41")
+    document.title = "Draino receipt"
+    document.ocr_text = "DRANO 2.37L $11.97 GIFT CARD $1000"
+    document.expense_category = ExpenseCategory.SUPPLIES
+    document.payment_state = RamaDocument.PaymentState.UNPAID
+    document.status = RamaDocument.Status.NEEDS_REVIEW
+    document.extracted_data = {
+        "amount_candidates": [
+            {"amount": "11.97", "score": 80, "source": "line_item"},
+            {"amount": "1000.00", "score": 5, "source": "gift_card_line"},
+        ]
+    }
+    document.save()
+    conversation = uuid.uuid4()
+    RamaAudit.objects.create(
+        landlord=landlord,
+        conversation_id=conversation,
+        kind=RamaAudit.Kind.USER_MESSAGE,
+        content={"text": "Found the draino receipt"},
+    )
+    RamaAudit.objects.create(
+        landlord=landlord,
+        conversation_id=conversation,
+        kind=RamaAudit.Kind.TOOL_CALL,
+        content={
+            "tool": "catalog_business_document",
+            "result": {"prepared": True, "document_id": str(document.pk)},
+        },
+    )
+    assert _wants_link_existing_expense("Expense is already logged")
+    assert _pending_unscoped_document_id(landlord, conversation) == str(document.pk)
+
+    # Scope + link the way deterministic path does after match.
+    registry.execute(
+        "catalog_business_document",
+        {
+            "document_id": str(document.pk),
+            "scope_query": "950 McKenzie Ave",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    linked = registry.execute(
+        "file_business_document",
+        {
+            "document_id": str(document.pk),
+            "amount": "13.41",
+            "duplicate_resolution": f"link:{entry.pk}",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert linked.get("linked_existing"), linked
+    document.refresh_from_db()
+    assert document.ledger_entry_id == entry.pk

@@ -90,46 +90,8 @@ def _link_to_existing_expense(document, entry_id: str, actor):
     return entry
 
 
-def find_expense_to_attach_receipt(
-    landlord,
-    *,
-    amount=None,
-    holding=None,
-    description_hint: str = "",
-    window_days: int = 45,
-) -> list:
-    """Find open expenses this receipt likely documents (already logged in chat).
-
-    Prefer exact amount + same holding; fall back to description tokens
-    (e.g. draino) when OCR amount was wrong and the landlord corrected it.
-    """
-    from datetime import timedelta
-
-    from rentium.ledger.models import EntryType, LedgerEntry
-
-    day = date.today()
-    qs = (
-        LedgerEntry.objects.not_voided()
-        .filter(
-            landlord=landlord,
-            entry_type=EntryType.EXPENSE,
-            effective_date__gte=day - timedelta(days=window_days),
-        )
-        .select_related("holding", "property")
-        .order_by("-effective_date", "-created_at")
-    )
-    if holding is not None:
-        qs = qs.filter(holding_id=holding.pk)
-
-    amt = None
-    if amount not in (None, ""):
-        try:
-            amt = Decimal(str(amount))
-        except (InvalidOperation, TypeError, ValueError):
-            amt = None
-
-    # Tokens from OCR title / landlord words — skip noise.
-    stop = {
+_HINT_STOPWORDS = frozenset(
+    {
         "the",
         "and",
         "for",
@@ -137,6 +99,10 @@ def find_expense_to_attach_receipt(
         "from",
         "this",
         "that",
+        "these",
+        "those",
+        "found",
+        "here",
         "expense",
         "receipt",
         "invoice",
@@ -159,25 +125,114 @@ def find_expense_to_attach_receipt(
         "portfolio",
         "property",
         "address",
+        "walmart",
+        "costco",
+        "canadian",
+        "tire",
+        "home",
+        "depot",
+        "photo",
+        "picture",
+        "image",
+        "file",
+        "please",
+        "want",
+        "need",
+        "have",
     }
-    tokens = [
-        t
-        for t in re.findall(r"[a-zA-Z]{4,}", (description_hint or "").casefold())
-        if t not in stop
-    ]
+)
 
-    rows = list(qs[:80])
+
+def _hint_tokens(*parts: str) -> list[str]:
+    joined = " ".join(p for p in parts if p)
+    tokens = []
+    seen: set[str] = set()
+    for t in re.findall(r"[a-zA-Z]{3,}", joined.casefold()):
+        if t in _HINT_STOPWORDS or t in seen:
+            continue
+        # Normalize common brand spellings so "drano" matches "draino".
+        if t in {"drano", "draino"}:
+            t = "drano"
+        seen.add(t)
+        tokens.append(t)
+    return tokens
+
+
+def find_expense_to_attach_receipt(
+    landlord,
+    *,
+    amount=None,
+    amount_candidates: list | None = None,
+    holding=None,
+    description_hint: str = "",
+    window_days: int = 60,
+) -> list:
+    """Find open expenses this receipt likely documents (already logged in chat).
+
+    Prefer description tokens (e.g. draino) + any OCR amount candidate that
+    matches the logged amount — so a gift-card $1000 OCR total does not hide a
+    $13.41 Draino expense when the slip also has $11.97 / the landlord said
+    draino.
+    """
+    from datetime import timedelta
+
+    from rentium.ledger.models import EntryType, LedgerEntry
+
+    day = date.today()
+    qs = (
+        LedgerEntry.objects.not_voided()
+        .filter(
+            landlord=landlord,
+            entry_type=EntryType.EXPENSE,
+            effective_date__gte=day - timedelta(days=window_days),
+        )
+        .select_related("holding", "property")
+        .order_by("-effective_date", "-created_at")
+    )
+    if holding is not None:
+        qs = qs.filter(holding_id=holding.pk)
+
+    amounts: set[Decimal] = set()
+    if amount not in (None, ""):
+        try:
+            amounts.add(Decimal(str(amount)))
+        except (InvalidOperation, TypeError, ValueError):
+            pass
+    for raw in amount_candidates or []:
+        try:
+            if isinstance(raw, dict):
+                raw = raw.get("amount")
+            amounts.add(Decimal(str(raw)))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+
+    tokens = _hint_tokens(description_hint)
+
+    rows = list(qs[:100])
     scored: list[tuple[int, object]] = []
     for entry in rows:
         score = 0
-        if amt is not None and entry.amount == amt:
+        if amounts and entry.amount in amounts:
             score += 50
+        # Near-amount (tax/rounding) within $2 of a candidate.
+        elif amounts:
+            for a in amounts:
+                if abs(entry.amount - a) <= Decimal("2.00"):
+                    score += 25
+                    break
         if holding is not None and entry.holding_id == holding.pk:
             score += 20
         desc = (entry.description or "").casefold()
+        # Normalize draino/drano in expense description too.
+        desc_norm = desc.replace("draino", "drano")
+        token_hits = 0
         for tok in tokens:
-            if tok in desc:
-                score += 15
+            if tok in desc_norm or tok in desc:
+                token_hits += 1
+                score += 20 if tok in {"drano", "screens", "mulch"} else 15
+        # Caption-only match (no amount) is enough when unique brand token hits.
+        if token_hits and not amounts:
+            score += 10
         # Prefer rows that still lack a source document.
         has_doc = False
         try:
@@ -185,7 +240,6 @@ def find_expense_to_attach_receipt(
         except Exception:  # noqa: BLE001
             has_doc = False
         if not has_doc:
-            # reverse FK from RamaDocument.ledger_entry
             has_doc = RamaDocument.objects.filter(ledger_entry_id=entry.pk).exists()
         if has_doc:
             score -= 40
@@ -193,6 +247,66 @@ def find_expense_to_attach_receipt(
             scored.append((score, entry))
     scored.sort(key=lambda pair: (-pair[0], -pair[1].effective_date.toordinal()))
     return [e for _, e in scored[:8]]
+
+
+def match_receipt_to_logged_expense(
+    landlord,
+    document: RamaDocument,
+    *,
+    caption: str = "",
+) -> dict | None:
+    """If this receipt is for an expense already on the books, return the match.
+
+    Uses landlord caption ("the draino receipt"), OCR text/title, and OCR amount
+    *candidates* (not only the max $ figure) so gift-card lines do not block a
+    match to a $13 Draino expense.
+    """
+    data = document.extracted_data or {}
+    candidates = data.get("amount_candidates") or []
+    if not candidates and (document.ocr_text or ""):
+        candidates = _money_candidates(document.ocr_text)
+    hint = " ".join(
+        part
+        for part in (
+            caption,
+            document.title or "",
+            document.issuer or "",
+            (document.ocr_text or "")[:500],
+        )
+        if part
+    )
+    matches = find_expense_to_attach_receipt(
+        landlord,
+        amount=document.amount,
+        amount_candidates=candidates,
+        holding=document.holding,
+        description_hint=hint,
+    )
+    if not matches:
+        # Retry without holding filter — OCR may not have set property yet.
+        matches = find_expense_to_attach_receipt(
+            landlord,
+            amount=document.amount,
+            amount_candidates=candidates,
+            holding=None,
+            description_hint=hint,
+        )
+    if len(matches) != 1:
+        return None
+    entry = matches[0]
+    # Prefer the logged amount over a gift-card OCR total.
+    return {
+        "expense_id": str(entry.pk),
+        "amount": str(entry.amount),
+        "description": (entry.description or "")[:160],
+        "holding_id": str(entry.holding_id) if entry.holding_id else None,
+        "holding_address": (
+            entry.holding.address or entry.holding.name if entry.holding_id else None
+        ),
+        "effective_date": str(entry.effective_date) if entry.effective_date else None,
+        "paid_on": str(entry.paid_on) if entry.paid_on else None,
+        "match_reason": "caption_ocr_amount_candidates",
+    }
 
 
 def _event(document, kind, *, actor=None, **detail):
@@ -1333,26 +1447,153 @@ def _first_money(text: str) -> Decimal | None:
     return values[0] if values else None
 
 
+# Gift-card / prepaid loads look like huge "totals" and poison max-$ extraction.
+_GIFT_CARD_LINE_RE = re.compile(
+    r"\b(gift\s*card|prepaid|load(?:ed)?\s*(?:card)?|visa\s*gift|"
+    r"mastercard\s*gift|cash\s*card|reload)\b",
+    re.I,
+)
+_LINE_ITEM_AMOUNT_RE = re.compile(
+    r"(?P<label>[^\n$]{2,60}?)(?:\s{1,}|\$)\s*\$?\s*(?P<amt>[\d,]+(?:\.\d{2}))\b"
+)
+
+
+def _money_candidates(text: str) -> list[dict]:
+    """Ranked money figures from a receipt/invoice with source labels.
+
+    Gift-card / prepaid lines are kept as candidates but heavily down-ranked so
+    a $1000 gift-card load does not beat a $11.97 product line.
+    """
+    body = text or ""
+    scored: list[tuple[int, Decimal, str]] = []
+    seen: set[str] = set()
+
+    def add(value: Decimal | None, score: int, source: str) -> None:
+        if value is None:
+            return
+        # Dedupe same amount — keep highest score, but never let bare_money
+        # erase a more specific gift_card/line_item/labeled tag (needed so
+        # gift-card detection survives a later bare $ pass).
+        for i, (s, v, src) in enumerate(scored):
+            if v != value:
+                continue
+            specific = {
+                "gift_card_line",
+                "labeled_total_gift_context",
+                "line_item",
+                "labeled_total",
+            }
+            if src in specific and source == "bare_money":
+                return
+            if score > s or (score == s and source in specific and src == "bare_money"):
+                scored[i] = (score, value, source)
+            return
+        scored.append((score, value, source))
+
+    # Labeled totals (invoice total / amount due) — strong, but not if the
+    # surrounding line is a gift-card load.
+    for m in re.finditer(
+        r"(?P<ctx>[^\n]{0,40})(?:grand\s*total|invoice\s*total|amount\s*due|"
+        r"balance\s*due|total\s*due|total\s*amount|amount\s*paid|(?<![a-z])total)"
+        r"\b[^\n\d$]{0,40}\$?\s*(?P<amt>[\d,]+(?:\.\d{2})?)",
+        body,
+        re.I,
+    ):
+        value = _parse_money(m.group("amt"))
+        ctx = f"{m.group('ctx')} {m.group(0)}"
+        if _GIFT_CARD_LINE_RE.search(ctx):
+            add(value, 10, "labeled_total_gift_context")
+        else:
+            add(value, 100, "labeled_total")
+
+    # Product-ish line items: "DRANO 2.37L … $11.97" (same line or next line).
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    for idx, line in enumerate(lines):
+        money_on_line = re.findall(
+            r"(?:CAD\s*)?\$\s*([\d,]+(?:\.\d{2})?)|([\d,]+\.\d{2})\b", line, re.I
+        )
+        amounts_here = []
+        for a, b in money_on_line:
+            v = _parse_money(a or b)
+            if v is not None:
+                amounts_here.append(v)
+        label = re.sub(
+            r"(?:CAD\s*)?\$\s*[\d,]+(?:\.\d{2})?|[\d,]+\.\d{2}",
+            " ",
+            line,
+            flags=re.I,
+        ).strip(" -.:")
+        # Amount alone on this line → pair with previous product line.
+        if amounts_here and not re.search(r"[A-Za-z]{3,}", label) and idx > 0:
+            label = lines[idx - 1]
+        if not amounts_here:
+            continue
+        for value in amounts_here:
+            ctx = f"{label} {line}"
+            if _GIFT_CARD_LINE_RE.search(ctx):
+                add(value, 5, "gift_card_line")
+                continue
+            if re.search(
+                r"\b(grand\s*total|invoice\s*total|amount\s*due|balance\s*due|"
+                r"total\s*due|subtotal|tax|hst|gst|pst|change)\b",
+                ctx,
+                re.I,
+            ):
+                continue  # handled as labeled / ignored noise
+            score = 40
+            if re.search(r"[A-Za-z]{3,}", label):
+                score += 25
+            if re.search(
+                r"\d+\.?\d*\s*(L|ml|kg|g|oz|pk|ct|ea)\b", label, re.I
+            ):
+                score += 15
+            if re.search(
+                r"\b(cash|debit|credit|visa|mastercard|tender)\b", label, re.I
+            ):
+                score -= 25
+            add(value, score, "line_item")
+
+    # Remaining bare $ figures (lowest priority; max used only as fallback).
+    for value in _all_money_values(body):
+        add(value, 15, "bare_money")
+
+    scored.sort(key=lambda row: (-row[0], -row[1]))
+    return [
+        {"amount": str(value), "score": score, "source": source}
+        for score, value, source in scored
+        if score > 0
+    ]
+
+
 def _extract_amount(text: str) -> Decimal | None:
     """Best-effort invoice/receipt total — not the first random $ figure.
 
-    Prefer labeled totals (Total / Amount Due / Balance Due / Grand Total).
-    When several match, use the last (usually grand total). Otherwise the
-    largest money figure on the page (subtotals are usually smaller).
+    Prefer labeled totals (Total / Amount Due), then product line items.
+    Gift-card / prepaid loads are never preferred. When a gift-card line is
+    present, labeled "TOTAL" is often the gift+product sum — prefer the best
+    merchandise line item instead.
     """
-    labeled = re.findall(
-        r"(?:grand\s*total|invoice\s*total|amount\s*due|balance\s*due|"
-        r"total\s*due|total\s*amount|amount\s*paid|total)\b"
-        r"[^\n\d$]{0,40}\$?\s*([\d,]+(?:\.\d{2})?)",
-        text or "",
-        re.I,
-    )
-    for raw in reversed(labeled):
-        value = _parse_money(raw)
-        if value is not None:
-            return value
-    values = _all_money_values(text)
-    return max(values) if values else None
+    candidates = _money_candidates(text)
+    if not candidates:
+        return None
+    has_gift = any(
+        c.get("source") in {"gift_card_line", "labeled_total_gift_context"}
+        or "gift" in str(c.get("source") or "")
+        for c in candidates
+    ) or bool(_GIFT_CARD_LINE_RE.search(text or ""))
+    line_items = [c for c in candidates if c.get("source") == "line_item"]
+    labeled = [c for c in candidates if c.get("source") == "labeled_total"]
+    if has_gift and line_items:
+        # Walmart-style: DRANO $11.97 + GIFT CARD $1000 + TOTAL $1011.97
+        return Decimal(line_items[0]["amount"])
+    if labeled:
+        return Decimal(labeled[0]["amount"])
+    for row in candidates:
+        if row["source"] != "gift_card_line" and not str(row["source"]).endswith(
+            "gift_context"
+        ):
+            return Decimal(row["amount"])
+    return Decimal(candidates[0]["amount"])
 
 
 def _classify(text: str, filename: str) -> dict:
@@ -1552,7 +1793,9 @@ def _relocate_archive(document: RamaDocument) -> None:
     document.archival_pdf.storage.delete(old_name)
 
 
-def document_intelligence_payload(document: RamaDocument) -> dict:
+def document_intelligence_payload(
+    document: RamaDocument, *, caption: str = ""
+) -> dict:
     """What chat/UI must relay after OCR — never invent these numbers."""
     expense_like = document.kind in {
         RamaDocument.Kind.EXPENSE,
@@ -1564,8 +1807,25 @@ def document_intelligence_payload(document: RamaDocument) -> dict:
     ocr_excerpt = (document.ocr_text or "").strip()
     if len(ocr_excerpt) > 400:
         ocr_excerpt = ocr_excerpt[:400] + "…"
+    data = document.extracted_data or {}
+    amount_candidates = data.get("amount_candidates") or []
+    matching_expense = None
+    if expense_like and not document.ledger_entry_id:
+        matching_expense = match_receipt_to_logged_expense(
+            document.landlord, document, caption=caption
+        )
     next_steps: list[str] = []
-    if expense_like and document.amount:
+    if matching_expense:
+        next_steps.append(
+            "MATCHED existing ledger expense "
+            f"${matching_expense['amount']} — {matching_expense['description']} "
+            f"at {matching_expense.get('holding_address') or 'portfolio'}. "
+            "Offer to store this receipt against that expense "
+            "(file_business_document with duplicate_resolution=link:"
+            f"{matching_expense['expense_id']} or auto_link). "
+            "Do NOT ask which property. Do NOT post a second expense."
+        )
+    elif expense_like and document.amount:
         if document.payment_state == RamaDocument.PaymentState.UNKNOWN:
             next_steps.append(
                 "ASK the landlord: has this amount already left the bank "
@@ -1603,6 +1863,7 @@ def document_intelligence_payload(document: RamaDocument) -> dict:
         "kind_display": document.get_kind_display(),
         "title": document.title or document.original_filename,
         "amount": str(document.amount) if document.amount is not None else None,
+        "amount_candidates": amount_candidates[:8],
         "currency": getattr(document, "currency", None) or "CAD",
         "expense_category": document.expense_category or None,
         "payment_state": document.payment_state,
@@ -1619,6 +1880,7 @@ def document_intelligence_payload(document: RamaDocument) -> dict:
             if document.holding_id
             else None
         ),
+        "matching_expense": matching_expense,
         "clarification_question": document.clarification_question or None,
         "ocr_excerpt": ocr_excerpt or None,
         "expense_like": expense_like,
@@ -1630,8 +1892,10 @@ def document_intelligence_payload(document: RamaDocument) -> dict:
         ),
         "next_steps": next_steps,
         "rules_for_model": (
-            "NEVER invent or guess the amount — use amount from this payload "
-            "only. NEVER offer to void an expense because it was paid. "
+            "NEVER invent or guess the amount — use amount / amount_candidates "
+            "from this payload only. If matching_expense is set, offer to attach "
+            "the receipt to that expense and do NOT ask for property or post a "
+            "new expense. NEVER void because an expense was paid. "
             "Paid means post with payment_state=PAID (sets paid_on). "
             "Unpaid means post with payment_state=UNPAID (paid_on null)."
         ),
@@ -1702,6 +1966,11 @@ def process_document(document_id) -> RamaDocument:
             document.holding = holding
         document.classification_confidence = result["confidence"]
         document.match_confidence = match_confidence
+        amount_candidates = (
+            []
+            if result["kind"] == RamaDocument.Kind.BANK_STATEMENT
+            else _money_candidates(text)
+        )
         reasons = []
         if not text.strip():
             reasons.append("I could not read enough text from the file.")
@@ -1717,6 +1986,20 @@ def process_document(document_id) -> RamaDocument:
                 "I cannot tell whether this amount has left the bank — "
                 "ask if it is already paid."
             )
+        # Ambiguous amounts (gift card + product lines) — surface for matching.
+        non_gift = [
+            c
+            for c in amount_candidates
+            if c.get("source") not in {"gift_card_line", "labeled_total_gift_context"}
+        ]
+        if len(non_gift) >= 2 and result["amount"] is not None:
+            top = Decimal(non_gift[0]["amount"])
+            second = Decimal(non_gift[1]["amount"])
+            if top != second and abs(top - second) > Decimal("5"):
+                reasons.append(
+                    "Several money figures appear on this slip; confirm the "
+                    "real purchase total if OCR is wrong."
+                )
         document.clarification_question = " ".join(reasons)
         document.status = (
             RamaDocument.Status.NEEDS_REVIEW if reasons else RamaDocument.Status.READY
@@ -1729,7 +2012,8 @@ def process_document(document_id) -> RamaDocument:
             **(document.extracted_data or {}),
             "classifier": "rentium-rules-v2",
             "ocr_characters": len(text),
-            "amount_extractor": "labeled_total_or_max",
+            "amount_extractor": "ranked_candidates_v1",
+            "amount_candidates": amount_candidates[:12],
         }
         document.full_clean()
         document.save()
@@ -1983,6 +2267,7 @@ def file_business_document_for_chat(
                 "intelligence": document_intelligence_payload(document),
             }
         link_id = ""
+        entry_probe = None
         if resolution.startswith("link:"):
             link_id = resolution.split(":", 1)[1].strip()
         else:
@@ -1995,14 +2280,17 @@ def file_business_document_for_chat(
                 )
                 if part
             )
+            data = document.extracted_data or {}
             matches = find_expense_to_attach_receipt(
                 landlord,
                 amount=amt or None,
+                amount_candidates=data.get("amount_candidates") or [],
                 holding=document.holding,
                 description_hint=hint,
             )
             if len(matches) == 1:
                 link_id = str(matches[0].pk)
+                entry_probe = matches[0]
             elif len(matches) > 1:
                 return {
                     "error": "Several expenses could match this receipt.",
@@ -2037,7 +2325,10 @@ def file_business_document_for_chat(
         # Payment state mirrors the existing entry once linked.
         from rentium.ledger.models import LedgerEntry
 
-        entry_probe = LedgerEntry.objects.filter(pk=link_id, landlord=landlord).first()
+        if entry_probe is None:
+            entry_probe = LedgerEntry.objects.filter(
+                pk=link_id, landlord=landlord
+            ).first()
         pay = (
             RamaDocument.PaymentState.PAID
             if entry_probe and entry_probe.paid_on
@@ -2051,6 +2342,31 @@ def file_business_document_for_chat(
                 "question_for_user": "What total should we store on the receipt?",
                 "intelligence": document_intelligence_payload(document),
             }
+        preview = {
+            "document_id": str(document.pk),
+            "action": "link_receipt_to_existing_expense",
+            "amount": amt,
+            "expense_id": link_id,
+            "expense_description": (
+                (entry_probe.description or "")[:120] if entry_probe else ""
+            ),
+            "holding": (
+                document.holding.address or document.holding.name
+                if document.holding_id
+                else None
+            ),
+            "side_effects": [
+                "File the document",
+                "Link to existing ledger expense (no new post)",
+            ],
+            "never": "Never post a second expense for the same cost.",
+        }
+        if not _confirmed(confirm):
+            return _preview(
+                "file_business_document",
+                preview,
+                "Attaches this receipt to the existing expense only.",
+            )
         try:
             filed = file_document(
                 document,

@@ -4560,59 +4560,251 @@ def run_turn(
         else:
             file_arg = {}
         if file_arg:
+            from rentium.rama.document_services import match_receipt_to_logged_expense
+            from rentium.rama.models import RamaDocument as _RamaDoc
+
+            # Caption context: this message + recent user words (e.g. "draino").
+            caption_bits = [_landlord_words(message or "")]
+            for row in RamaAudit.objects.filter(
+                landlord=landlord,
+                conversation_id=conversation_id,
+                kind=RamaAudit.Kind.USER_MESSAGE,
+            ).order_by("-created_at")[:6]:
+                caption_bits.append(
+                    _landlord_words(str((row.content or {}).get("text") or ""))
+                )
+            caption = " ".join(b for b in caption_bits if b)[:500]
+
             # Landlord amount correction before catalog so intelligence matches.
             target_doc = file_arg.get("document_id") or pending_doc_id
             if amount_correction and target_doc:
                 _apply_document_amount_correction(
                     landlord, target_doc, amount_correction
                 )
+
+            # If expense already logged / store receipt — resolve holding from
+            # the matched expense when the landlord did not restate the address.
+            matched_expense = None
+            if target_doc and (link_existing or receipt_followup or not scope_query):
+                doc_row = _RamaDoc.objects.filter(
+                    pk=target_doc, landlord=landlord
+                ).first()
+                if doc_row is not None:
+                    matched_expense = match_receipt_to_logged_expense(
+                        landlord, doc_row, caption=caption
+                    )
+                    if matched_expense and amount_correction:
+                        # Keep landlord's corrected total on the document.
+                        _apply_document_amount_correction(
+                            landlord,
+                            target_doc,
+                            amount_correction,
+                        )
+                    elif matched_expense and matched_expense.get("amount"):
+                        # Prefer logged amount over gift-card OCR total.
+                        _apply_document_amount_correction(
+                            landlord,
+                            target_doc,
+                            matched_expense["amount"],
+                        )
+
+            effective_scope = scope_query or ""
+            if not effective_scope and matched_expense and matched_expense.get(
+                "holding_address"
+            ):
+                effective_scope = matched_expense["holding_address"]
+
             arguments = {
-                "scope_query": scope_query or "",
+                "scope_query": effective_scope,
                 "issuer": focus.get("issuer") or "",
                 "document_date": focus.get("document_date") or "",
                 **file_arg,
             }
-            # When they named the address and corrected amount / said store receipt,
-            # skip the extra yes-preview and catalog immediately (still no new expense
-            # until file_business_document).
-            auto_scope = bool(scope_query) and (
-                receipt_followup or link_existing or bool(amount_correction)
+            # Auto-catalog when we know the holding (named or matched expense).
+            auto_scope = bool(effective_scope) and (
+                receipt_followup
+                or link_existing
+                or bool(amount_correction)
+                or bool(matched_expense)
             )
-            if auto_scope:
+            # "Expense is already logged" alone → catalog + link immediately.
+            auto_link_now = bool(link_existing) and bool(
+                effective_scope or matched_expense
+            )
+            if auto_scope or auto_link_now:
                 arguments["confirm"] = "yes"
+                if not arguments.get("scope_query") and effective_scope:
+                    arguments["scope_query"] = effective_scope
             result = execute(
                 "catalog_business_document", arguments, landlord=landlord,
             )
-            # Link-to-existing when they said the expense is already logged.
+            if not isinstance(result, dict):
+                result = {"error": str(result)}
+
+            # Enrich intelligence with caption-based expense match.
+            doc_id = str(
+                result.get("document_id")
+                or target_doc
+                or (result.get("intelligence") or {}).get("document_id")
+                or ""
+            )
+            if doc_id:
+                doc_row = _RamaDoc.objects.filter(
+                    pk=doc_id, landlord=landlord
+                ).first()
+                if doc_row is not None:
+                    matched_expense = match_receipt_to_logged_expense(
+                        landlord, doc_row, caption=caption
+                    ) or matched_expense
+                    intel = result.get("intelligence") or {}
+                    if matched_expense:
+                        intel = {**intel, "matching_expense": matched_expense}
+                        # Align primary amount with logged expense when OCR
+                        # preferred a gift-card line.
+                        if matched_expense.get("amount"):
+                            intel["amount"] = matched_expense["amount"]
+                            if not amount_correction:
+                                _apply_document_amount_correction(
+                                    landlord,
+                                    doc_id,
+                                    matched_expense["amount"],
+                                )
+                    result["intelligence"] = intel
+                    result["matching_expense"] = matched_expense
+
+            # Link when landlord confirmed expense already logged, OR when we
+            # matched uniquely and they accepted / auto path.
+            should_link = bool(link_existing) or (
+                auto_link_now and matched_expense is not None
+            )
             if (
-                link_existing
-                and isinstance(result, dict)
+                should_link
+                and doc_id
                 and (
                     result.get("catalogued")
                     or result.get("already_done")
                     or result.get("updated")
+                    or result.get("ok")
+                    or (matched_expense and effective_scope)
                 )
             ):
-                doc_id = str(result.get("document_id") or target_doc or "")
-                if doc_id:
-                    link_result = execute(
-                        "file_business_document",
+                # Ensure holding is set before link.
+                if (
+                    matched_expense
+                    and matched_expense.get("holding_address")
+                    and not result.get("catalogued")
+                ):
+                    scoped = execute(
+                        "catalog_business_document",
                         {
                             "document_id": doc_id,
-                            "amount": amount_correction or "",
-                            "payment_state": "",
-                            "duplicate_resolution": "auto_link",
+                            "scope_query": matched_expense["holding_address"],
                             "confirm": "yes",
                         },
                         landlord=landlord,
                     )
-                    if isinstance(link_result, dict) and not link_result.get("error"):
-                        result = {**result, **link_result, "linked_existing": True}
-                    elif isinstance(link_result, dict):
-                        result = {
-                            **result,
-                            "link_attempt": link_result,
-                        }
+                    if isinstance(scoped, dict) and not scoped.get("error"):
+                        result = {**result, **scoped}
+                link_args = {
+                    "document_id": doc_id,
+                    "amount": amount_correction
+                    or (matched_expense or {}).get("amount")
+                    or "",
+                    "payment_state": "",
+                    "duplicate_resolution": (
+                        f"link:{matched_expense['expense_id']}"
+                        if matched_expense and matched_expense.get("expense_id")
+                        else "auto_link"
+                    ),
+                    "confirm": "yes",
+                }
+                link_result = execute(
+                    "file_business_document", link_args, landlord=landlord,
+                )
+                if isinstance(link_result, dict) and not link_result.get("error"):
+                    result = {**result, **link_result, "linked_existing": True}
+                elif isinstance(link_result, dict):
+                    result = {**result, "link_attempt": link_result}
+
+            # First prepare with a unique expense match → confirm-link plan,
+            # do not ask "which property?".
+            if (
+                not result.get("linked_existing")
+                and not link_existing
+                and matched_expense
+                and (
+                    result.get("needs_input")
+                    or result.get("prepared")
+                    or result.get("needs_confirm")
+                )
+            ):
+                save_single(
+                    landlord,
+                    conversation_id,
+                    "file_business_document",
+                    {
+                        "document_id": doc_id,
+                        "amount": matched_expense.get("amount") or "",
+                        "duplicate_resolution": (
+                            f"link:{matched_expense['expense_id']}"
+                        ),
+                        "confirm": "yes",
+                    },
+                )
+                # Also ensure scope is ready on confirm.
+                if matched_expense.get("holding_address"):
+                    save_single(
+                        landlord,
+                        conversation_id,
+                        "catalog_business_document",
+                        {
+                            "document_id": doc_id,
+                            "scope_query": matched_expense["holding_address"],
+                            "confirm": "yes",
+                        },
+                    )
+                # save_single overwrites — use one composite plan via sequential
+                # file after catalog on yes. Prefer single file plan that
+                # auto_links (catalogs scope inside file path if holding set).
+                # Pre-scope now so yes only needs file.
+                if matched_expense.get("holding_address"):
+                    execute(
+                        "catalog_business_document",
+                        {
+                            "document_id": doc_id,
+                            "scope_query": matched_expense["holding_address"],
+                            "confirm": "yes",
+                        },
+                        landlord=landlord,
+                    )
+                save_single(
+                    landlord,
+                    conversation_id,
+                    "file_business_document",
+                    {
+                        "document_id": doc_id,
+                        "amount": matched_expense.get("amount") or "",
+                        "duplicate_resolution": (
+                            f"link:{matched_expense['expense_id']}"
+                        ),
+                    },
+                )
+                me = matched_expense
+                deterministic_reply = (
+                    f"This looks like the receipt for the existing expense:\n"
+                    f"• ${me.get('amount')} — {me.get('description')}\n"
+                    f"• Property: {me.get('holding_address') or 'portfolio'}\n"
+                    f"OCR may also show other figures (e.g. gift cards); "
+                    f"I will use the logged ${me.get('amount')}.\n"
+                    f"Reply yes to store this receipt against that expense "
+                    f"(no second expense), or no to cancel."
+                )
+                result = {
+                    **result,
+                    "needs_confirm_link": True,
+                    "matching_expense": me,
+                }
+
             safe_result = json.loads(json.dumps(result, default=str))
             tools_used.append("catalog_business_document")
             audit(
@@ -4624,7 +4816,9 @@ def run_turn(
                     "deterministic_routing": True,
                 },
             )
-            if result.get("needs_confirm"):
+            if result.get("needs_confirm_link"):
+                pass  # reply already set
+            elif result.get("needs_confirm"):
                 save_single(
                     landlord,
                     conversation_id,
@@ -4633,7 +4827,6 @@ def run_turn(
                 )
                 deterministic_reply = _document_preview_reply(result)
             elif result.get("needs_input"):
-                # Prepared + OCR done; ask for holding only now.
                 intel = result.get("intelligence") or {}
                 bits = []
                 if intel.get("kind_display") or intel.get("kind"):
@@ -4642,6 +4835,13 @@ def run_turn(
                     bits.append(str(intel["title"]))
                 if intel.get("amount"):
                     bits.append(f"${intel['amount']}")
+                cands = intel.get("amount_candidates") or []
+                if cands and len(cands) > 1:
+                    alt = ", ".join(
+                        f"${c.get('amount')}" for c in cands[:4] if c.get("amount")
+                    )
+                    if alt:
+                        bits.append(f"also saw {alt}")
                 summary = (
                     ("I read this as " + " · ".join(bits) + ". ") if bits else ""
                 )
@@ -4656,24 +4856,41 @@ def run_turn(
                         + str(result.get("question_for_user") or "")
                     ).strip()
                 else:
-                    # Prefer a matching open expense holding when OCR amount is noisy.
-                    suggested = result.get("suggested_scope") or (
-                        (intel.get("matching_expense") or {}).get("holding_address")
+                    me = result.get("matching_expense") or intel.get(
+                        "matching_expense"
                     )
-                    q = str(
-                        result.get("question_for_user")
-                        or (
-                            "Which physical property address does this belong "
-                            "to? (Or whole portfolio.)"
+                    if me:
+                        deterministic_reply = (
+                            summary
+                            + f"This matches the logged expense "
+                            f"${me.get('amount')} — {me.get('description')} "
+                            f"at {me.get('holding_address') or 'portfolio'}. "
+                            f"Reply yes to store the receipt against that expense "
+                            f"(no second post), or name a different property."
+                        ).strip()
+                        save_single(
+                            landlord,
+                            conversation_id,
+                            "file_business_document",
+                            {
+                                "document_id": doc_id,
+                                "amount": me.get("amount") or "",
+                                "duplicate_resolution": (
+                                    f"link:{me['expense_id']}"
+                                ),
+                            },
                         )
-                    )
-                    if suggested and "which physical" in q.casefold():
-                        q = (
-                            f"OCR amount may be wrong if the slip has other totals. "
-                            f"This looks related to {suggested}. Reply with that "
-                            f"address (or another), and the real total if OCR is off."
-                        )
-                    deterministic_reply = (summary + q).strip()
+                    else:
+                        deterministic_reply = (
+                            summary
+                            + str(
+                                result.get("question_for_user")
+                                or (
+                                    "Which physical property address does this "
+                                    "belong to? (Or whole portfolio.)"
+                                )
+                            )
+                        ).strip()
             elif result.get("filed") or result.get("linked_existing"):
                 det = result.get("message") or result.get("relay_instruction") or ""
                 if result.get("ledger_entry_id") or result.get("linked_existing"):
@@ -4693,18 +4910,54 @@ def run_turn(
                 else:
                     deterministic_reply = det or "Document filed."
             elif result.get("already_done") or result.get("is_duplicate"):
-                deterministic_reply = str(
-                    result.get("message")
-                    or result.get("relay_instruction")
-                    or "This file is already in your document library."
-                )
+                # Already in library — still try link if they said already logged.
+                if link_existing and doc_id and not result.get("linked_existing"):
+                    link_result = execute(
+                        "file_business_document",
+                        {
+                            "document_id": doc_id,
+                            "amount": amount_correction
+                            or (matched_expense or {}).get("amount")
+                            or "",
+                            "duplicate_resolution": "auto_link",
+                            "confirm": "yes",
+                        },
+                        landlord=landlord,
+                    )
+                    if isinstance(link_result, dict) and (
+                        link_result.get("filed") or link_result.get("linked_existing")
+                    ):
+                        deterministic_reply = str(
+                            link_result.get("message")
+                            or "Receipt linked to the existing expense."
+                        )
+                    else:
+                        deterministic_reply = str(
+                            (link_result or {}).get("error")
+                            or result.get("message")
+                            or "This file is already in your document library."
+                        )
+                else:
+                    deterministic_reply = str(
+                        result.get("message")
+                        or result.get("relay_instruction")
+                        or "This file is already in your document library."
+                    )
             elif result.get("error"):
                 deterministic_reply = str(result["error"])
             elif result.get("catalogued"):
                 intel = result.get("intelligence") or {}
-                amt = intel.get("amount") or amount_correction
-                hold = (result.get("holding") or {}).get("address") or scope_query
-                if link_existing and result.get("link_attempt"):
+                amt = (
+                    amount_correction
+                    or (matched_expense or {}).get("amount")
+                    or intel.get("amount")
+                )
+                hold = (
+                    (result.get("holding") or {}).get("address")
+                    or (matched_expense or {}).get("holding_address")
+                    or effective_scope
+                )
+                if result.get("link_attempt") and not result.get("linked_existing"):
                     deterministic_reply = (
                         f"Stored the receipt under {hold}"
                         + (f" at ${amt}" if amt else "")
@@ -4714,6 +4967,27 @@ def run_turn(
                             or result["link_attempt"].get("question_for_user")
                             or "Could not auto-link the expense — say which one."
                         )
+                    )
+                elif matched_expense and not result.get("linked_existing"):
+                    save_single(
+                        landlord,
+                        conversation_id,
+                        "file_business_document",
+                        {
+                            "document_id": doc_id,
+                            "amount": amt or "",
+                            "duplicate_resolution": (
+                                f"link:{matched_expense['expense_id']}"
+                            ),
+                        },
+                    )
+                    deterministic_reply = (
+                        f"Stored under {hold}"
+                        + (f" · ${amt}" if amt else "")
+                        + f". This matches ${matched_expense.get('amount')} — "
+                        f"{matched_expense.get('description')}. "
+                        f"Reply yes to attach the receipt to that expense "
+                        f"(no second post)."
                     )
                 else:
                     deterministic_reply = (
@@ -4732,6 +5006,54 @@ def run_turn(
                     )
             elif result.get("prepared"):
                 deterministic_reply = _document_preview_reply(result)
+            elif result.get("ok") and link_existing and not result.get(
+                "linked_existing"
+            ):
+                # Status-only return (document_id path without scope) after
+                # "expense is already logged" — try match + link.
+                if matched_expense and doc_id:
+                    if matched_expense.get("holding_address"):
+                        execute(
+                            "catalog_business_document",
+                            {
+                                "document_id": doc_id,
+                                "scope_query": matched_expense["holding_address"],
+                                "confirm": "yes",
+                            },
+                            landlord=landlord,
+                        )
+                    link_result = execute(
+                        "file_business_document",
+                        {
+                            "document_id": doc_id,
+                            "amount": amount_correction
+                            or matched_expense.get("amount")
+                            or "",
+                            "duplicate_resolution": (
+                                f"link:{matched_expense['expense_id']}"
+                            ),
+                            "confirm": "yes",
+                        },
+                        landlord=landlord,
+                    )
+                    if isinstance(link_result, dict) and (
+                        link_result.get("filed") or link_result.get("linked_existing")
+                    ):
+                        deterministic_reply = str(
+                            link_result.get("message")
+                            or "Receipt linked to the existing expense."
+                        )
+                    else:
+                        deterministic_reply = str(
+                            (link_result or {}).get("error")
+                            or "Could not link the receipt to the logged expense."
+                        )
+                else:
+                    deterministic_reply = (
+                        "I have the receipt but could not uniquely match a logged "
+                        "expense. Name the amount or property (e.g. Draino $13.41 "
+                        "at McKenzie)."
+                    )
 
     if (
         deterministic_reply is None

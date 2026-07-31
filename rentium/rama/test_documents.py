@@ -801,3 +801,75 @@ def test_query_and_tag_business_documents(landlord):
     assert chat["count"] >= 1
     assert chat["documents"][0]["title"] == "Window screens invoice"
     assert "hvac" in chat["documents"][0]["tags"]
+
+
+def test_money_candidates_downrank_gift_card_prefer_product_line():
+    from decimal import Decimal
+
+    from rentium.rama.document_services import _extract_amount
+    from rentium.rama.document_services import _money_candidates
+
+    text = (
+        "WALMART\n"
+        "DRANO 2.37L\n$11.97\n"
+        "GIFT CARD LOAD\n$1000.00\n"
+        "SUBTOTAL $1011.97\n"
+        "TOTAL $1011.97\n"
+    )
+    cands = _money_candidates(text)
+    assert any(c["amount"] == "11.97" for c in cands)
+    assert any(c["amount"] == "1000.00" for c in cands)
+    # Gift-card present → prefer merchandise line, not TOTAL that includes gift.
+    amount = _extract_amount(text)
+    assert amount == Decimal("11.97")
+    scores = {c["amount"]: c["score"] for c in cands}
+    assert scores.get("11.97", 0) > scores.get("1000.00", 0)
+
+
+def test_receipt_matches_logged_draino_expense_despite_gift_card_ocr(landlord):
+    """Caption 'draino receipt' + OCR with gift card still matches $13.41 expense."""
+    from datetime import date
+    from decimal import Decimal
+    from unittest.mock import patch
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from rentium.ledger.models import EntryType, ExpenseCategory, LedgerEntry
+    from rentium.rama.document_services import ingest_document
+    from rentium.rama.document_services import match_receipt_to_logged_expense
+    from rentium.rama.document_services import process_document
+
+    holding = _holding(landlord)
+    entry = LedgerEntry.objects.create(
+        landlord=landlord,
+        holding=holding,
+        entry_type=EntryType.EXPENSE,
+        amount=Decimal("13.41"),
+        description="Draino for 950 McKenzie house",
+        category=ExpenseCategory.SUPPLIES,
+        effective_date=date.today(),
+    )
+    upload = SimpleUploadedFile(
+        "walmart.jpg", b"%PDF-walmart-draino", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    text = (
+        "WALMART SUPERCENTER\n"
+        "DRANO 2.37L\n$11.97\n"
+        "GIFT CARD\n$1000.00\n"
+        "TOTAL $1011.97\n"
+        "950 MCKENZIE AREA\n"
+    )
+    with patch(
+        "rentium.rama.document_services._pdf_and_text",
+        return_value=(b"%PDF-archival", text),
+    ):
+        process_document(document.pk)
+    document.refresh_from_db()
+    match = match_receipt_to_logged_expense(
+        landlord, document, caption="Found the draino receipt"
+    )
+    assert match is not None, document.extracted_data
+    assert match["expense_id"] == str(entry.pk)
+    assert match["amount"] == "13.41"
+    assert match.get("holding_address")
