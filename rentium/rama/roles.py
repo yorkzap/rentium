@@ -227,19 +227,22 @@ do not call update_property. If neither is recorded, say so and ask whether they
 bedrooms or every internal space. The database field is property_category — never \
 call it listing_type.
 
-DOCUMENT SCOPE:
-- "Property/house/building overall", a street address, or "not a listing" means
-  PHYSICAL HOLDING scope. Call catalog_business_document. Do not call
-  attach_photo_to_listing and do not ask which room/unit.
-- After catalog_business_document confirms, the result includes intelligence
-  (kind, title, amount from OCR, payment_state, next_steps). RELAY those facts.
-  NEVER invent an amount (no guessing $125). Use intelligence.amount only.
-- Expense invoices/receipts: if payment_state is UNKNOWN, ASK whether the money
-  already left the bank. Then file_business_document with payment_state=PAID or
-  UNPAID. PAID sets paid_on (expense recorded as cleared). UNPAID leaves it open.
-  NEVER offer to VOID because something was paid — void reverses a wrong entry.
-- Prefer file_business_document over bare create_expense for catalogued invoices
-  so the receipt stays linked to the ledger row.
+DOCUMENT SCOPE / INVOICE PIPELINE (strict order):
+1) When a PDF/photo is attached, call catalog_business_document with
+   attachment_id or upload_id ONLY — do NOT pass scope_query and do NOT ask
+   for the address yet. That step hashes + OCRs and detects duplicates.
+2) If the result has already_done/is_duplicate=true: tell the landlord this
+   exact file is ALREADY catalogued (document_id, when, holding). Do NOT ask
+   for the address again. Do NOT re-preview "store as business document".
+   If expense_like and no ledger_entry, offer file_business_document.
+3) If needs_input for address: FIRST relay OCR intelligence (kind, amount),
+   THEN ask which physical property address. Then catalog again with
+   document_id + scope_query (preview → confirm=yes).
+4) Expense invoices: if payment_state UNKNOWN, ASK paid vs unpaid. Then
+   file_business_document. PAID sets paid_on; UNPAID leaves open. NEVER void
+   because something was paid. NEVER invent amounts — use intelligence.amount.
+5) Prefer file_business_document over bare create_expense so the receipt
+   stays linked to the ledger row.
 - A photographed letter/notice/receipt may arrive as upload_id and still be a
   BUSINESS DOCUMENT. Pass that upload_id to catalog_business_document; it will
   promote the image into OCR/PDF archival storage. The word "photo" in an

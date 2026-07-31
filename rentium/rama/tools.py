@@ -692,20 +692,22 @@ def list_documents(
 
 
 @_params(
-    document_id="Business document UUID shown in the attachment note. Pass this OR upload_id.",
+    document_id="Business document UUID if already prepared/OCR'd. Pass this OR "
+    "attachment_id/upload_id.",
     attachment_id="Exact file UUID from a RAMA attachment batch. Preferred for "
     "new chat uploads; pass this OR document_id/upload_id.",
     upload_id="Staged photo UUID when the attachment is photographed mail, receipt, "
     "invoice, notice, or other paperwork. Pass this OR document_id.",
-    scope_query="Physical holding name or exact legal street address, e.g. "
-    "'950 McKenzie Ave'. This is NOT a listing query.",
+    scope_query="Physical holding street address e.g. '950 McKenzie Ave'. "
+    "OPTIONAL on the first call — omit to OCR/hash first and detect duplicates. "
+    "Only required to file a NEW unscoped document.",
     issuer="Optional sender/issuer, e.g. Scotiabank.",
     document_date="Optional document/received date in YYYY-MM-DD.",
     confirm="Leave empty to preview; pass yes only after landlord approval.",
 )
 def catalog_business_document(
     landlord,
-    scope_query: str,
+    scope_query: str = "",
     document_id: str = "",
     attachment_id: str = "",
     upload_id: str = "",
@@ -713,17 +715,19 @@ def catalog_business_document(
     document_date: str = "",
     confirm: str = "",
 ) -> dict:
-    """Store an uploaded business record against a PHYSICAL PROPERTY/HOLDING.
-    Use when the landlord says an address overall, whole property, house, or
-    building—not a rental listing. If no holding exists but listings share the
-    exact legal address, this proposes creating it and linking those child
-    rooms/units. Distinct apartment addresses stay separate. Never force a
-    child listing choice.
+    """File a chat PDF/photo as a business document at a PHYSICAL HOLDING.
 
-    On confirm, OCR runs and the result includes intelligence: kind, title,
-    amount (from the document — NEVER invent), payment_state, next_steps.
-    Relay those facts. For invoices/receipts continue with
-    file_business_document (ask PAID vs UNPAID if unknown)."""
+    Correct order (ALWAYS):
+    1) Call with attachment_id or upload_id and NO scope_query first — this
+       hashes the file, OCRs it, and returns either already_done (duplicate
+       of a document already in the inbox) or intelligence + needs_input for
+       the address.
+    2) Only if needs_input: ask the address, then call again with
+       document_id + scope_query (preview, then confirm=yes).
+    3) For expenses: file_business_document after catalog (paid/unpaid).
+
+    NEVER ask for the address before step 1. NEVER re-catalog a duplicate.
+    Amounts come from intelligence — never invent figures."""
     from .document_services import catalog_batch_attachment_as_document
     from .document_services import catalog_document_scope
     from .document_services import catalog_staged_photo_as_document
@@ -736,7 +740,7 @@ def catalog_business_document(
             return {"error": "document_date must be YYYY-MM-DD."}
     common = {
         "landlord": landlord,
-        "scope_query": scope_query,
+        "scope_query": (scope_query or "").strip(),
         "actor": getattr(landlord, "user", None),
         "issuer": issuer,
         "document_date": parsed_date,
@@ -753,7 +757,19 @@ def catalog_business_document(
             **common,
         )
     if not document_id.strip():
-        return {"error": "Pass attachment_id, document_id, or upload_id."}
+        # No id at all — still try prepare if nothing? error.
+        return {
+            "error": (
+                "Pass attachment_id, upload_id, or document_id. "
+                "For a new chat file, pass attachment_id alone first (no address) "
+                "to OCR and check duplicates."
+            ),
+        }
+    # document_id path: if no scope yet, return status / need scope after OCR.
+    if not (scope_query or "").strip():
+        from .document_services import business_document_status as status_fn
+
+        return status_fn(landlord, document_id=document_id.strip())
     return catalog_document_scope(
         document_id=document_id.strip(),
         **common,

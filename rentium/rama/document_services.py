@@ -463,29 +463,368 @@ def catalog_document_scope(
     }
 
 
+def _bytes_as_upload(filename: str, data: bytes, content_type: str = ""):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    return SimpleUploadedFile(
+        filename or "document",
+        data,
+        content_type=(content_type or "application/octet-stream")[:160],
+    )
+
+
+def _duplicate_catalog_payload(document: RamaDocument, *, source: str) -> dict:
+    """Hard stop when this exact file is already in the document inbox."""
+    document = _ensure_ocr(document)
+    intelligence = document_intelligence_payload(document)
+    filed = document.status == RamaDocument.Status.FILED
+    holding = None
+    if document.holding_id:
+        holding = {
+            "id": str(document.holding_id),
+            "name": document.holding.name,
+            "address": document.holding.address,
+        }
+    return {
+        "already_done": True,
+        "is_duplicate": True,
+        "duplicate_of_document_id": str(document.pk),
+        "document_id": str(document.pk),
+        "created_at": document.created_at.isoformat() if document.created_at else None,
+        "status": document.status,
+        "holding": holding,
+        "ledger_entry_id": (
+            str(document.ledger_entry_id) if document.ledger_entry_id else None
+        ),
+        "expense_already_posted": bool(document.ledger_entry_id),
+        "documents_page": url_for_path(
+            f"/dashboard/documents?document={document.pk}"
+        ),
+        "intelligence": intelligence,
+        "message": (
+            f"This exact file is already catalogued as document {document.pk}"
+            + (
+                f" for {holding['address'] or holding['name']}."
+                if holding
+                else " (holding not set yet)."
+            )
+            + (
+                " An expense is already linked on the ledger."
+                if document.ledger_entry_id
+                else (
+                    " No ledger expense yet — use file_business_document if you "
+                    "want to post one."
+                    if intelligence.get("expense_like")
+                    else ""
+                )
+            )
+        ),
+        "relay_instruction": (
+            "Tell the landlord this is a DUPLICATE of an existing document "
+            f"(id {document.pk}, stored "
+            f"{document.created_at.isoformat() if document.created_at else 'earlier'}). "
+            "Do NOT ask for the address again and do NOT re-catalog. "
+            "If they want a ledger expense and none is linked, call "
+            "file_business_document with this document_id."
+        ),
+        "source": source,
+        "filed": filed,
+    }
+
+
+def promote_chat_file_to_document(
+    landlord,
+    *,
+    attachment_id: str = "",
+    upload_id: str = "",
+    actor=None,
+) -> dict:
+    """Ingest chat file by content hash, OCR it, detect duplicates.
+
+    Does NOT require a holding address. Safe to call on every attachment turn.
+    """
+    from .models import RamaAttachment, RamaUpload
+
+    aid = (attachment_id or "").strip()
+    uid = (upload_id or "").strip()
+    if not aid and not uid:
+        return {"error": "Pass attachment_id or upload_id."}
+
+    staged_attachment = None
+    staged_upload = None
+    data = None
+    filename = "document"
+    content_type = ""
+
+    if aid:
+        staged_attachment = (
+            RamaAttachment.objects.select_related("batch")
+            .filter(pk=aid, batch__landlord=landlord)
+            .first()
+        )
+        if staged_attachment is None:
+            return {"error": f"No attachment {aid!r}."}
+        # Already promoted earlier in this chat.
+        if (
+            staged_attachment.status == RamaAttachment.Status.APPLIED
+            and staged_attachment.target_id
+        ):
+            existing = RamaDocument.objects.filter(
+                pk=staged_attachment.target_id, landlord=landlord
+            ).first()
+            if existing:
+                return {
+                    **_duplicate_catalog_payload(
+                        existing, source="attachment_already_applied"
+                    ),
+                    "attachment_id": str(staged_attachment.pk),
+                    "attachment_batch_id": str(staged_attachment.batch_id),
+                }
+        staged_attachment.original.open("rb")
+        try:
+            data = staged_attachment.original.read()
+        finally:
+            staged_attachment.original.close()
+        filename = staged_attachment.original_filename or "attachment"
+        content_type = staged_attachment.content_type or ""
+    else:
+        staged_upload = RamaUpload.objects.filter(pk=uid, landlord=landlord).first()
+        if staged_upload is None:
+            return {"error": f"No upload {uid!r}."}
+        staged_upload.image.open("rb")
+        try:
+            data = staged_upload.image.read()
+        finally:
+            staged_upload.image.close()
+        filename = Path(staged_upload.image.name).name
+        suffix = Path(filename).suffix.lower()
+        content_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".tif": "image/tiff",
+            ".tiff": "image/tiff",
+            ".webp": "image/webp",
+            ".heic": "image/heic",
+            ".heif": "image/heif",
+            ".pdf": "application/pdf",
+        }.get(suffix, "image/jpeg")
+
+    digest = hashlib.sha256(data).hexdigest()
+    existing = RamaDocument.objects.filter(landlord=landlord, sha256=digest).first()
+    created = False
+    if existing is not None:
+        # Already fully catalogued (holding set or filed) → hard stop.
+        if existing.holding_id or existing.status == RamaDocument.Status.FILED:
+            if staged_attachment is not None and staged_attachment.status != (
+                RamaAttachment.Status.APPLIED
+            ):
+                staged_attachment.classification = (
+                    RamaAttachment.Classification.DOCUMENT
+                )
+                staged_attachment.status = RamaAttachment.Status.APPLIED
+                staged_attachment.target_type = "rama_document"
+                staged_attachment.target_id = str(existing.pk)
+                staged_attachment.result = {
+                    "document_id": str(existing.pk),
+                    "created": False,
+                    "duplicate": True,
+                }
+                staged_attachment.save(
+                    update_fields=[
+                        "classification",
+                        "status",
+                        "target_type",
+                        "target_id",
+                        "result",
+                        "updated_at",
+                    ]
+                )
+            if staged_upload is not None and staged_upload.used_at is None:
+                staged_upload.used_at = timezone.now()
+                staged_upload.save(update_fields=["used_at"])
+            payload = _duplicate_catalog_payload(existing, source="sha256_match")
+            if staged_attachment is not None:
+                payload["attachment_id"] = str(staged_attachment.pk)
+                payload["attachment_batch_id"] = str(staged_attachment.batch_id)
+            if staged_upload is not None:
+                payload["upload_id"] = str(staged_upload.pk)
+            return payload
+        # Same bytes already ingested but not yet scoped — continue with that row.
+        document = existing
+    else:
+        upload = _bytes_as_upload(filename, data, content_type)
+        document, created = ingest_document(
+            landlord=landlord, upload=upload, created_by=actor
+        )
+    document = _ensure_ocr(document)
+
+    if staged_attachment is not None:
+        staged_attachment.classification = RamaAttachment.Classification.DOCUMENT
+        staged_attachment.status = RamaAttachment.Status.APPLIED
+        staged_attachment.target_type = "rama_document"
+        staged_attachment.target_id = str(document.pk)
+        staged_attachment.result = {
+            "document_id": str(document.pk),
+            "created": created,
+        }
+        staged_attachment.save(
+            update_fields=[
+                "classification",
+                "status",
+                "target_type",
+                "target_id",
+                "result",
+                "updated_at",
+            ]
+        )
+    if staged_upload is not None and staged_upload.used_at is None:
+        # Not fully "used" until scoped, but hash is now a document — leave
+        # used_at null until scope confirms, so retries can re-find it.
+        pass
+
+    intelligence = document_intelligence_payload(document)
+    proposed = None
+    if document.holding_id:
+        proposed = {
+            "holding_id": str(document.holding_id),
+            "name": document.holding.name,
+            "address": document.holding.address,
+            "source": "already_on_document",
+        }
+    elif document.holding_id is None:
+        # OCR may have matched a holding into match fields without save path
+        # when user_scope_locked — process_document sets holding when confident.
+        pass
+
+    needs_scope = document.holding_id is None
+    next_steps = []
+    if needs_scope:
+        next_steps.append(
+            "Ask which physical property address this belongs to "
+            "(or whole portfolio). Then call catalog_business_document with "
+            f"document_id={document.pk} and scope_query=<address>."
+        )
+    else:
+        next_steps.append(
+            "Holding already set. If expense_like, ask paid/unpaid and call "
+            f"file_business_document document_id={document.pk}."
+        )
+
+    return {
+        "prepared": True,
+        "is_new_document": created,
+        "is_duplicate": False,
+        "document_id": str(document.pk),
+        "sha256": digest,
+        "status": document.status,
+        "holding": (
+            {
+                "id": str(document.holding_id),
+                "name": document.holding.name,
+                "address": document.holding.address,
+            }
+            if document.holding_id
+            else None
+        ),
+        "proposed_scope": proposed,
+        "needs_scope": needs_scope,
+        "intelligence": intelligence,
+        "attachment_id": str(staged_attachment.pk) if staged_attachment else None,
+        "attachment_batch_id": (
+            str(staged_attachment.batch_id) if staged_attachment else None
+        ),
+        "upload_id": str(staged_upload.pk) if staged_upload else None,
+        "next_steps": next_steps,
+        "relay_instruction": (
+            "FIRST relay OCR intelligence (kind, title, amount — never invent). "
+            + (
+                "This is a NEW document that needs a physical property address "
+                "before filing. Ask once for the holding address, then call "
+                f"catalog_business_document with document_id={document.pk} "
+                "and scope_query."
+                if needs_scope
+                else "Holding is known. Proceed to file_business_document if "
+                "they want a ledger expense."
+            )
+        ),
+    }
+
+
 @transaction.atomic
 def catalog_staged_photo_as_document(
     landlord,
     *,
     upload_id: str,
-    scope_query: str,
+    scope_query: str = "",
     actor=None,
     issuer: str = "",
     document_date=None,
     confirm: bool = False,
 ) -> dict:
-    """Promote a chat photo of mail/receipt into the document pipeline."""
-    from django.core.files.uploadedfile import SimpleUploadedFile
+    """Promote a chat photo of mail/receipt into the document pipeline.
 
-    from .models import RamaUpload
+    Inspect/OCR/hash first. If the same file was already catalogued, return
+    already_done. Scope is only required for new (or unscoped) documents.
+    """
+    prepared = promote_chat_file_to_document(
+        landlord, upload_id=upload_id, actor=actor
+    )
+    if prepared.get("error"):
+        return prepared
+    if prepared.get("already_done") or prepared.get("is_duplicate"):
+        return prepared
 
-    staged = RamaUpload.objects.filter(
-        pk=upload_id,
-        landlord=landlord,
-        used_at__isnull=True,
-    ).first()
-    if staged is None:
-        return {"error": "No unused attached photo with that upload_id."}
+    document_id = prepared["document_id"]
+    document = RamaDocument.objects.filter(pk=document_id, landlord=landlord).first()
+    if document is None:
+        return {"error": "Document disappeared after prepare."}
+
+    # Scope already known from prior catalog / OCR match.
+    if document.holding_id and not (scope_query or "").strip():
+        from .models import RamaUpload
+
+        staged = RamaUpload.objects.filter(pk=upload_id, landlord=landlord).first()
+        if staged and staged.used_at is None:
+            staged.used_at = timezone.now()
+            staged.save(update_fields=["used_at"])
+        return {
+            "already_done": True,
+            "document_id": str(document.pk),
+            "message": (
+                f"Document already filed against "
+                f"{document.holding.address or document.holding.name}."
+            ),
+            "intelligence": document_intelligence_payload(document),
+            "holding": {
+                "id": str(document.holding_id),
+                "name": document.holding.name,
+                "address": document.holding.address,
+            },
+            "relay_instruction": (
+                "Already catalogued. Do not ask for address again. "
+                "Offer file_business_document if they want a ledger expense."
+            ),
+        }
+
+    if not (scope_query or "").strip():
+        return {
+            "needs_input": True,
+            "document_id": str(document.pk),
+            "question_for_user": (
+                "Which physical property address does this belong to? "
+                "(You can also say the whole portfolio.)"
+            ),
+            "intelligence": prepared.get("intelligence"),
+            "relay_instruction": (
+                "Show OCR findings FIRST (kind, amount). Then ask "
+                "question_for_user. When they answer, call "
+                f"catalog_business_document with document_id={document.pk} "
+                "and scope_query=<their address>."
+            ),
+            "upload_id": upload_id,
+        }
+
     resolved = resolve_holding_scope(landlord, scope_query)
     if resolved.get("error"):
         return resolved
@@ -494,49 +833,29 @@ def catalog_staged_photo_as_document(
             "needs_confirm": True,
             "action": "catalog_business_document",
             "preview": {
-                "upload_id": str(staged.pk),
-                "document": Path(staged.image.name).name,
+                "document_id": str(document.pk),
+                "upload_id": upload_id,
+                "document": document.title or document.original_filename,
                 "scope": resolved["address"] or scope_query,
                 "scope_kind": "physical_property_holding",
-                "convert_photo_to_ocr_document": True,
                 "create_holding": resolved["create"],
                 "child_listings": resolved["listings"],
+                "is_duplicate": False,
+                "intelligence": document_intelligence_payload(document),
                 "issuer": issuer or None,
                 "document_date": str(document_date or "") or None,
                 "rule": (
-                    "This is photographed mail/business paperwork. Convert it to "
-                    "an archival OCR document and file it above all child listings."
+                    "New document (content hash not seen before). File at the "
+                    "holding — not a room listing."
                 ),
             },
             "instruction": (
-                "Show this preview. If approved, call catalog_business_document "
-                "again with the same upload_id/scope and confirm=yes."
+                "Show OCR intelligence + this filing preview. On yes, call "
+                "catalog_business_document again with the same document_id/"
+                "scope_query/upload_id and confirm=yes."
             ),
         }
 
-    staged.image.open("rb")
-    try:
-        data = staged.image.read()
-    finally:
-        staged.image.close()
-    filename = Path(staged.image.name).name
-    suffix = Path(filename).suffix.lower()
-    media_type = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".tif": "image/tiff",
-        ".tiff": "image/tiff",
-        ".webp": "image/webp",
-        ".heic": "image/heic",
-        ".heif": "image/heif",
-    }.get(suffix, "image/jpeg")
-    upload = SimpleUploadedFile(filename, data, content_type=media_type)
-    document, created = ingest_document(
-        landlord=landlord,
-        upload=upload,
-        created_by=actor,
-    )
     result = catalog_document_scope(
         landlord,
         document_id=str(document.pk),
@@ -548,13 +867,16 @@ def catalog_staged_photo_as_document(
     )
     if result.get("error"):
         return result
-    staged.used_at = timezone.now()
-    staged.save(update_fields=["used_at"])
-    # catalog_document_scope already runs _ensure_ocr and returns intelligence.
+    from .models import RamaUpload
+
+    staged = RamaUpload.objects.filter(pk=upload_id, landlord=landlord).first()
+    if staged and staged.used_at is None:
+        staged.used_at = timezone.now()
+        staged.save(update_fields=["used_at"])
     return {
         **result,
-        "promoted_from_upload_id": str(staged.pk),
-        "ocr_complete": bool((result.get("intelligence") or {}).get("ocr_excerpt")),
+        "promoted_from_upload_id": upload_id,
+        "ocr_complete": True,
     }
 
 
@@ -563,45 +885,73 @@ def catalog_batch_attachment_as_document(
     landlord,
     *,
     attachment_id: str,
-    scope_query: str,
+    scope_query: str = "",
     actor=None,
     issuer: str = "",
     document_date=None,
     confirm: bool = False,
 ) -> dict:
-    """Promote one exact attachment-batch item into the document pipeline."""
-    from django.core.files.uploadedfile import SimpleUploadedFile
+    """Promote one attachment-batch item: hash/OCR first, then scope.
 
-    from .models import RamaAttachment
+    Same-file re-sends return already_done with the existing document — never
+    a fresh "store for 950 McKenzie" preview that looks like a new filing.
+    """
+    prepared = promote_chat_file_to_document(
+        landlord, attachment_id=attachment_id, actor=actor
+    )
+    if prepared.get("error"):
+        return prepared
+    if prepared.get("already_done") or prepared.get("is_duplicate"):
+        return prepared
 
-    staged = (
-        RamaAttachment.objects.select_related("batch")
-        .filter(
-            pk=attachment_id,
-            batch__landlord=landlord,
-            status__in=[
-                RamaAttachment.Status.STAGED,
-                RamaAttachment.Status.CLASSIFIED,
-            ],
-        )
+    document_id = prepared["document_id"]
+    document = (
+        RamaDocument.objects.select_related("holding")
+        .filter(pk=document_id, landlord=landlord)
         .first()
     )
-    if staged is None:
-        already = RamaAttachment.objects.filter(
-            pk=attachment_id,
-            batch__landlord=landlord,
-            status=RamaAttachment.Status.APPLIED,
-            classification=RamaAttachment.Classification.DOCUMENT,
-        ).first()
-        if already is not None:
-            return {
-                "already_done": (
-                    f"{already.original_filename} is already stored as document "
-                    f"{already.target_id}."
-                ),
-                "document_id": already.target_id,
-            }
-        return {"error": "No available attachment with that attachment_id."}
+    if document is None:
+        return {"error": "Document disappeared after prepare."}
+
+    if document.holding_id and not (scope_query or "").strip():
+        return {
+            "already_done": True,
+            "document_id": str(document.pk),
+            "message": (
+                f"Document already catalogued for "
+                f"{document.holding.address or document.holding.name}."
+            ),
+            "intelligence": document_intelligence_payload(document),
+            "holding": {
+                "id": str(document.holding_id),
+                "name": document.holding.name,
+                "address": document.holding.address,
+            },
+            "attachment_id": attachment_id,
+            "relay_instruction": (
+                "Already catalogued — do not re-file. Use file_business_document "
+                "only if they want a ledger expense and none is linked."
+            ),
+        }
+
+    if not (scope_query or "").strip():
+        return {
+            "needs_input": True,
+            "document_id": str(document.pk),
+            "attachment_id": attachment_id,
+            "question_for_user": (
+                "Which physical property address does this belong to? "
+                "(You can also say the whole portfolio.)"
+            ),
+            "intelligence": prepared.get("intelligence"),
+            "relay_instruction": (
+                "Show OCR findings FIRST (kind, amount from intelligence — "
+                "never invent). Then ask question_for_user. When they answer, "
+                f"call catalog_business_document with document_id={document.pk} "
+                "and scope_query=<address> (attachment_id optional)."
+            ),
+        }
+
     resolved = resolve_holding_scope(landlord, scope_query)
     if resolved.get("error"):
         return resolved
@@ -610,38 +960,28 @@ def catalog_batch_attachment_as_document(
             "needs_confirm": True,
             "action": "catalog_business_document",
             "preview": {
-                "attachment_batch_id": str(staged.batch_id),
-                "attachment_id": str(staged.pk),
-                "document": staged.original_filename,
+                "document_id": str(document.pk),
+                "attachment_id": attachment_id,
+                "attachment_batch_id": prepared.get("attachment_batch_id"),
+                "document": document.title or document.original_filename,
                 "scope": resolved["address"] or scope_query,
                 "scope_kind": "physical_property_holding",
                 "convert_to_ocr_document": True,
                 "create_holding": resolved["create"],
                 "child_listings": resolved["listings"],
+                "is_duplicate": False,
+                "is_new_document": prepared.get("is_new_document"),
+                "intelligence": document_intelligence_payload(document),
                 "issuer": issuer or None,
                 "document_date": str(document_date or "") or None,
             },
             "instruction": (
-                "Show this preview. On approval, call catalog_business_document "
-                "again with the same attachment_id/scope and confirm=yes."
+                "Show OCR intelligence + filing preview. On yes: "
+                "catalog_business_document with same document_id/scope_query "
+                "and confirm=yes."
             ),
         }
 
-    staged.original.open("rb")
-    try:
-        data = staged.original.read()
-    finally:
-        staged.original.close()
-    upload = SimpleUploadedFile(
-        staged.original_filename,
-        data,
-        content_type=staged.content_type or "application/octet-stream",
-    )
-    document, created = ingest_document(
-        landlord=landlord,
-        upload=upload,
-        created_by=actor,
-    )
     result = catalog_document_scope(
         landlord,
         document_id=str(document.pk),
@@ -653,28 +993,14 @@ def catalog_batch_attachment_as_document(
     )
     if result.get("error"):
         return result
-    staged.classification = RamaAttachment.Classification.DOCUMENT
-    staged.status = RamaAttachment.Status.APPLIED
-    staged.target_type = "rama_document"
-    staged.target_id = str(document.pk)
-    staged.result = {"document_id": str(document.pk), "created": created}
-    staged.save(
-        update_fields=[
-            "classification",
-            "status",
-            "target_type",
-            "target_id",
-            "result",
-            "updated_at",
-        ]
-    )
-    # catalog_document_scope already ran OCR + returned intelligence.
     intelligence = result.get("intelligence") or {}
     return {
         **result,
-        "promoted_from_attachment_id": str(staged.pk),
-        "attachment_batch_id": str(staged.batch_id),
-        "ocr_complete": bool(intelligence.get("ocr_excerpt") or intelligence.get("amount")),
+        "promoted_from_attachment_id": attachment_id,
+        "attachment_batch_id": prepared.get("attachment_batch_id"),
+        "ocr_complete": bool(
+            intelligence.get("ocr_excerpt") or intelligence.get("amount")
+        ),
     }
 
 

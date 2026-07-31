@@ -30,14 +30,31 @@ legal addresses are not combined.
 
 ## Pipeline
 
+### Chat / RAMA (correct order)
+
+1. **Prepare (no address yet)** — `catalog_business_document` with
+   `attachment_id` / `upload_id` only. Content is SHA-256 hashed and OCR’d.
+2. **Duplicate stop** — same bytes as an existing `RamaDocument` →
+   `already_done` / `is_duplicate` with the prior document_id, holding, and
+   whether an expense is already linked. No second “file for 950 McKenzie”
+   preview.
+3. **Scope only if new/unscoped** — ask physical holding address (or whole
+   portfolio), then confirm catalog to that holding.
+4. **Expense** — `file_business_document` with `payment_state=PAID|UNPAID`.
+   Paid sets `paid_on`; never void because paid. Amounts come from OCR
+   intelligence, never model invention.
+
+### HTTP / Documents UI
+
 1. `POST /api/rama/documents/` stores the byte-identical original and a SHA-256
    checksum. Duplicate submissions for one landlord are idempotent.
-2. Celery runs `process_rama_document`.
+2. Celery runs `process_rama_document` (chat path also runs OCR synchronously).
 3. OCRmyPDF rotates and deskews pages, runs English/French OCR, and emits PDF/A
    plus a text sidecar. Existing text pages are preserved.
 4. Deterministic classification proposes type, amount, paid/unpaid state, and
    a holding match. Low-confidence or ambiguous results become `NEEDS_REVIEW`.
-5. The landlord confirms or corrects the proposal in the Documents UI.
+5. The landlord confirms or corrects the proposal in the Documents UI or via
+   `file_business_document` in chat.
 6. The file is stored at:
 
    `business_documents/<landlord>/<holding>/<year>/<category>/<canonical-name>.pdf`

@@ -2458,18 +2458,20 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
             f"placed. "
             + (
                 "Treat them as business documents. Call catalog_business_document "
-                "with attachment_id/upload_id and scope_query=street address "
-                "(holding). That path runs OCR and can propose a maintenance "
-                "expense. NEVER claim you lack OCR or a PDF scanner — that is false. "
-                "If the address is unclear, ask once which holding/address. "
-                "Do not use attach_photo_to_listing for receipts/PDFs."
+                "with attachment_id/upload_id ONLY first (no scope_query) — that "
+                "hashes + OCRs and returns already_done if this exact file was "
+                "already catalogued. Do NOT ask for the address before that call. "
+                "Only if needs_input, ask the holding address, then catalog with "
+                "document_id + scope_query. NEVER invent amounts. NEVER re-file "
+                "duplicates. NEVER claim you lack OCR."
                 if business_record
                 else (
                     "To put them on a listing call attach_photo_to_listing "
                     "ONCE with attachment_batch_id from this focus. That uses "
                     "only this message's ordered batch. Never substitute an "
                     "older batch or global pending uploads. If they meant a "
-                    "receipt/expense, use catalog_business_document instead."
+                    "receipt/expense, use catalog_business_document (no address "
+                    "first) instead."
                 )
             )
         ),
