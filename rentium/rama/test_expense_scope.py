@@ -369,3 +369,139 @@ def test_chained_operations_on_one_property_still_share_an_item_key(landlord):
     plan = save_batch(landlord, __import__("uuid").uuid4(), specs)
     keys = [s.item_key for s in plan.steps.order_by("order")]
     assert keys[0] == keys[1]
+
+
+def test_receipt_correction_is_not_verbal_expense(landlord):
+    """OCR misread $1000 gift card; landlord says real total + already logged → not create_expense."""
+    from rentium.rama.service import _looks_like_receipt_followup
+    from rentium.rama.service import _verbal_expense_intent
+    from rentium.rama.service import _wants_link_existing_expense
+    from rentium.rama.service import _amount_from_message
+
+    live = {
+        "listings": [
+            {"address": "950 McKenzie Ave", "name": "Room A"},
+        ]
+    }
+    text = (
+        "No it's $13.41 (the $1000 figure was just about a gift card purchase) "
+        "and the draino purchase was for 950 Mckenzie Ave u should know. "
+        "You should know the expense is logged so just store this as the "
+        "receipt/document"
+    )
+    assert _looks_like_receipt_followup(text) is True
+    assert _wants_link_existing_expense(text) is True
+    assert _amount_from_message(text) == "13.41"
+    assert _verbal_expense_intent(landlord, text, live) is None
+
+
+def test_receipt_followup_catalogs_and_links_existing_expense(landlord):
+    """Pending unscoped receipt + correction + 'expense is logged' → link, no second post."""
+    import uuid
+    from decimal import Decimal
+    from datetime import date
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from rentium.ledger.models import EntryType, ExpenseCategory, LedgerEntry
+    from rentium.rama.document_services import ingest_document
+    from rentium.rama.models import RamaAudit, RamaDocument
+    from rentium.rama.service import _amount_from_message
+    from rentium.rama.service import _looks_like_receipt_followup
+    from rentium.rama.service import _pending_unscoped_document_id
+    from rentium.rama.service import _verbal_expense_intent
+    from rentium.rama.service import _wants_link_existing_expense
+    from rentium.rama import registry
+
+    holding = _holding(landlord)
+    # Existing chat-logged expense (no receipt yet).
+    entry = LedgerEntry.objects.create(
+        landlord=landlord,
+        holding=holding,
+        entry_type=EntryType.EXPENSE,
+        amount=Decimal("13.41"),
+        description="Draino for 950 McKenzie house",
+        category=ExpenseCategory.SUPPLIES,
+        effective_date=date.today(),
+    )
+    upload = SimpleUploadedFile(
+        "draino.jpg", b"%PDF-draino-receipt-bytes", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.kind = RamaDocument.Kind.EXPENSE
+    document.title = "Expense Invoice"
+    document.amount = Decimal("1000.00")  # OCR misread gift card
+    document.expense_category = ExpenseCategory.SUPPLIES
+    document.payment_state = RamaDocument.PaymentState.UNKNOWN
+    document.status = RamaDocument.Status.NEEDS_REVIEW
+    document.save()
+
+    conversation = uuid.uuid4()
+    RamaAudit.objects.create(
+        landlord=landlord,
+        conversation_id=conversation,
+        kind=RamaAudit.Kind.TOOL_CALL,
+        content={
+            "tool": "catalog_business_document",
+            "arguments": {},
+            "result": {
+                "prepared": True,
+                "document_id": str(document.pk),
+                "needs_scope": True,
+            },
+        },
+    )
+
+    text = (
+        "No it's $13.41 (the $1000 figure was just about a gift card purchase) "
+        "and the draino purchase was for 950 Mckenzie Ave. "
+        "The expense is logged so just store this as the receipt/document"
+    )
+    live = {"listings": [{"address": "950 McKenzie Ave", "name": "Room A"}]}
+    assert _verbal_expense_intent(landlord, text, live) is None
+    assert _looks_like_receipt_followup(text)
+    assert _wants_link_existing_expense(text)
+    assert _amount_from_message(text) == "13.41"
+    assert _pending_unscoped_document_id(landlord, conversation) == str(document.pk)
+
+    from rentium.rama.service import _apply_document_amount_correction
+    from rentium.rama.service import _address_scope_from_message
+
+    _apply_document_amount_correction(landlord, str(document.pk), "13.41")
+    document.refresh_from_db()
+    assert document.amount == Decimal("13.41")
+
+    scope = _address_scope_from_message(text, live)
+    assert "mckenzie" in scope.casefold()
+
+    catalogued = registry.execute(
+        "catalog_business_document",
+        {
+            "document_id": str(document.pk),
+            "scope_query": scope,
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert catalogued.get("catalogued") or catalogued.get("updated"), catalogued
+
+    linked = registry.execute(
+        "file_business_document",
+        {
+            "document_id": str(document.pk),
+            "amount": "13.41",
+            "duplicate_resolution": "auto_link",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert linked.get("linked_existing") or linked.get("filed"), linked
+    document.refresh_from_db()
+    assert document.status == RamaDocument.Status.FILED
+    assert document.ledger_entry_id == entry.pk
+    assert (
+        LedgerEntry.objects.not_voided()
+        .filter(landlord=landlord, entry_type=EntryType.EXPENSE)
+        .count()
+        == 1
+    )

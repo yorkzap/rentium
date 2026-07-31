@@ -2924,6 +2924,24 @@ _NO_RECEIPT_RE = re.compile(
     r"already been recorded|already recorded)",
     re.IGNORECASE,
 )
+# Follow-up on a photographed receipt — never create_expense with the chat text.
+_RECEIPT_FOLLOWUP_RE = re.compile(
+    r"\b(receipt|document|invoice|pdf|photo of (the )?(receipt|bill)|"
+    r"store (this|it) as|file (this|it) as|just store|attach (this|it)|"
+    r"link (this|it|to)|expense is (already )?(logged|recorded|posted)|"
+    r"(already|is) (logged|recorded|posted)|gift card|"
+    r"no it'?s \$?\d|the \$?[\d.]+ (figure|amount|was|is)|"
+    r"\$?[\d.]+ (figure )?was just|not (the )?\$?[\d.]+\b|"
+    r"u should know|you should know)\b",
+    re.IGNORECASE,
+)
+_AMOUNT_CORRECTION_RE = re.compile(
+    r"(?:no[, ]+(?:it'?s|its|the (?:real |actual )?amount is|amount is)|"
+    r"(?:actually|correct(?:ly)?|real|actual) (?:amount |total )?|"
+    r"(?:amount|total) (?:is|should be|was) )\s*\$?\s*(\d+(?:\.\d{1,2})?)"
+    r"|(?:^|[^\d])\$\s*(\d+\.\d{2})\b",
+    re.IGNORECASE,
+)
 # "void the expense" must NEVER become create_expense with description "void…".
 _VOID_EXPENSE_RE = re.compile(
     r"\b(void|reverse|undo|cancel|delete|remove)\b.{0,40}\b("
@@ -2993,6 +3011,137 @@ def _void_expense_intent(landlord, message: str) -> dict | None:
     }
 
 
+def _looks_like_receipt_followup(message: str) -> bool:
+    """True when the landlord is correcting/filing a receipt, not a bare cash log."""
+    text = _landlord_words(message or "")
+    if not text:
+        return False
+    if _RECEIPT_FOLLOWUP_RE.search(text):
+        return True
+    # "No it's $13.41" / amount corrections without bought/purchased.
+    if _AMOUNT_CORRECTION_RE.search(text) and not _VERBAL_EXPENSE_RE.search(text):
+        return True
+    return False
+
+
+def _amount_from_message(message: str) -> str:
+    """Prefer an explicit correction amount; else first money token."""
+    text = _landlord_words(message or "")
+    m = _AMOUNT_CORRECTION_RE.search(text)
+    if m:
+        return (m.group(1) or m.group(2) or "").strip()
+    money = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)", text)
+    if money:
+        return money.group(1)
+    money = re.search(r"\b(\d+\.\d{2})\b", text)
+    return money.group(1) if money else ""
+
+
+def _wants_link_existing_expense(message: str) -> bool:
+    text = (message or "").casefold()
+    return bool(
+        re.search(
+            r"\b(expense is (already )?(logged|recorded|posted)|"
+            r"(already|is) (logged|recorded|posted)|"
+            r"just store (this |it )?(as )?(the )?(receipt|document)|"
+            r"store this as (the )?(receipt|document)|"
+            r"attach (to|as)|link (to|the )?(existing |logged )?(expense|entry)|"
+            r"don'?t (create|post|log) (a )?(new )?expense|"
+            r"receipt only|document only)\b",
+            text,
+        )
+    )
+
+
+def _pending_unscoped_document_id(landlord, conversation_id) -> str:
+    """Newest prepared document from this chat that still needs holding/filing."""
+    from .models import RamaDocument
+
+    # Prefer document_ids returned by recent tool calls in this conversation.
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+    ).order_by("-created_at")[:30]
+    seen: list[str] = []
+    for row in rows:
+        content = row.content or {}
+        result = content.get("result") or {}
+        args = content.get("arguments") or {}
+        tool = str(content.get("tool") or "")
+        if tool and "document" not in tool and "catalog" not in tool:
+            continue
+        for candidate in (
+            result.get("document_id") if isinstance(result, dict) else None,
+            args.get("document_id") if isinstance(args, dict) else None,
+        ):
+            if candidate and str(candidate) not in seen:
+                seen.append(str(candidate))
+    if not seen:
+        # Fallback: newest unscoped doc for landlord (same as catalog tool bare path).
+        pending = (
+            RamaDocument.objects.filter(
+                landlord=landlord, holding__isnull=True, deleted_at__isnull=True
+            )
+            .exclude(status=RamaDocument.Status.FILED)
+            .order_by("-created_at")
+            .first()
+        )
+        return str(pending.pk) if pending else ""
+
+    for doc_id in seen:
+        doc = (
+            RamaDocument.objects.filter(
+                pk=doc_id, landlord=landlord, deleted_at__isnull=True
+            )
+            .exclude(status=RamaDocument.Status.FILED)
+            .first()
+        )
+        if doc is None:
+            continue
+        # Unscoped, or scoped but not yet linked/filed — still "pending".
+        if not doc.holding_id or not doc.ledger_entry_id:
+            return str(doc.pk)
+    return ""
+
+
+def _focus_has_pending_file(focus: dict | None) -> bool:
+    focus = focus or {}
+    return bool(
+        focus.get("unresolved_upload_ids")
+        or focus.get("attachment_ids")
+        or focus.get("document_ids")
+    )
+
+
+def _apply_document_amount_correction(landlord, document_id: str, amount: str) -> None:
+    if not document_id or not amount:
+        return
+    from decimal import Decimal, InvalidOperation
+
+    from .models import RamaDocument
+
+    try:
+        value = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return
+    if value <= 0:
+        return
+    doc = RamaDocument.objects.filter(pk=document_id, landlord=landlord).first()
+    if doc is None or doc.status == RamaDocument.Status.FILED:
+        return
+    if doc.amount == value:
+        return
+    old = doc.amount
+    doc.amount = value
+    # Landlord overrode OCR (e.g. gift-card line misread as total).
+    data = dict(doc.extracted_data or {})
+    data["amount_source"] = "landlord_correction"
+    data["amount_ocr_was"] = str(old) if old is not None else None
+    doc.extracted_data = data
+    doc.save(update_fields=["amount", "extracted_data", "updated_at"])
+
+
 def _verbal_expense_intent(landlord, message: str, live_portfolio: dict) -> dict | None:
     """Parse 'I bought X for $Y at McKenzie, paid' with no photo → create_expense.
 
@@ -3007,11 +3156,18 @@ def _verbal_expense_intent(landlord, message: str, live_portfolio: dict) -> dict
     # Void/reverse is a ledger control — never create_expense.
     if _VOID_EXPENSE_RE.search(text) or text.casefold().startswith("void "):
         return None
+    # Receipt correction / "store as document" is never a verbal create.
+    if _looks_like_receipt_followup(text):
+        return None
     # Explicit "no receipt / something new" is enough even without "bought".
     looks_expense = bool(_VERBAL_EXPENSE_RE.search(text)) or bool(
         re.search(r"\$\s*\d", text) and re.search(r"\b(for|at|on)\b", text)
     )
     if not looks_expense and not _NO_RECEIPT_RE.search(text):
+        return None
+    # Bare "$X for address" without bought/purchased is too often a receipt
+    # correction — require explicit buy language or no-receipt language.
+    if not _VERBAL_EXPENSE_RE.search(text) and not _NO_RECEIPT_RE.search(text):
         return None
     money = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)", text)
     if not money:
@@ -4294,12 +4450,25 @@ def run_turn(
                     intent["arguments"]["void_all"] = "yes"
             deterministic_reply = _run_money_intent(intent)
 
-    # Verbal cash expense with no receipt this turn — before document OCR path,
-    # so an old pending receipt cannot steal "I bought Draino for $18".
+    # Verbal cash expense with no receipt this turn. Pending receipt photos /
+    # unscoped docs win unless the landlord explicitly says "no receipt".
+    pending_doc_id = _pending_unscoped_document_id(landlord, conversation_id)
+    focus_has_pending_file = _focus_has_pending_file(attachment_focus)
+    receipt_followup = _looks_like_receipt_followup(message)
     if deterministic_reply is None and pending_plan is None:
-        intent = _verbal_expense_intent(landlord, message, safe_context)
-        if intent is not None:
-            deterministic_reply = _run_money_intent(intent)
+        allow_verbal = True
+        if (focus_has_pending_file or pending_doc_id) and not _NO_RECEIPT_RE.search(
+            message or ""
+        ):
+            # Old pending receipt must not be abandoned by "$13 for McKenzie"
+            # correction language — only explicit no-receipt / new cash log.
+            allow_verbal = False
+        if receipt_followup:
+            allow_verbal = False
+        if allow_verbal:
+            intent = _verbal_expense_intent(landlord, message, safe_context)
+            if intent is not None:
+                deterministic_reply = _run_money_intent(intent)
 
     # Deterministic document routing: weak models repeatedly treated photographed
     # invoices as listing photos, or claimed OCR does not exist. Once intent is
@@ -4314,30 +4483,50 @@ def run_turn(
         r"(?:attachment_id=|items=\d+:)([0-9a-fA-F-]{32,36})", message or ""
     )
     # Do not re-open catalog for a prior upload when this turn is a verbal expense.
-    verbal_this_turn = _verbal_expense_intent(landlord, message, safe_context)
+    verbal_this_turn = None
+    if not receipt_followup and not (
+        (focus_has_pending_file or pending_doc_id)
+        and not _NO_RECEIPT_RE.search(message or "")
+    ):
+        verbal_this_turn = _verbal_expense_intent(landlord, message, safe_context)
     focus = attachment_focus or {}
-    focus_has_pending_file = bool(
-        focus.get("unresolved_upload_ids")
-        or focus.get("attachment_ids")
-        or focus.get("document_ids")
+    scope_query = _address_scope_from_message(message, safe_context)
+    amount_correction = _amount_from_message(message)
+    link_existing = _wants_link_existing_expense(message)
+    # Follow-up after prepare: "950 McKenzie" / amount correction / "store as receipt"
+    # even when the synthetic upload markers are no longer in the last user text.
+    can_catalog = (
+        bool(msg_upload_ids)
+        or bool(msg_attachment_ids)
+        or (
+            focus.get("landlord_described_as_business_record")
+            and focus_has_pending_file
+        )
+        or supported_tool_for_request(message) == "catalog_business_document"
+        or (
+            bool(pending_doc_id)
+            and (
+                bool(scope_query)
+                or receipt_followup
+                or link_existing
+                or bool(amount_correction)
+            )
+        )
+        or (
+            focus_has_pending_file
+            and (bool(scope_query) or receipt_followup or link_existing)
+        )
     )
     if (
         deterministic_reply is None
         and pending_plan is None
         and verbal_this_turn is None
-        and (
-            bool(msg_upload_ids)
-            or bool(msg_attachment_ids)
-            or (
-                focus.get("landlord_described_as_business_record")
-                and focus_has_pending_file
-            )
-            or supported_tool_for_request(message) == "catalog_business_document"
-        )
+        and can_catalog
         and (
             attachment_focus
             or msg_upload_ids
             or msg_attachment_ids
+            or pending_doc_id
         )
     ):
         focus = attachment_focus or {}
@@ -4351,13 +4540,17 @@ def run_turn(
         for mid in msg_attachment_ids:
             if mid not in batch_ids:
                 batch_ids.append(mid)
-        scope_query = _address_scope_from_message(message, safe_context)
+        if pending_doc_id and pending_doc_id not in doc_ids:
+            doc_ids.append(pending_doc_id)
         # Exactly one file handle this turn — pick the right tool arg name.
         if len(batch_ids) == 1 and not upload_ids and not doc_ids:
             file_arg = {"attachment_id": batch_ids[0]}
         elif len(upload_ids) == 1 and not batch_ids and not doc_ids:
             file_arg = {"upload_id": upload_ids[0]}
         elif len(doc_ids) == 1 and not batch_ids and not upload_ids:
+            file_arg = {"document_id": doc_ids[0]}
+        elif len(doc_ids) >= 1 and (scope_query or receipt_followup or link_existing):
+            # Scope/amount follow-up: document_id is the right handle.
             file_arg = {"document_id": doc_ids[0]}
         elif len(upload_ids) == 1:
             # Mixed history: this turn's photo wins as upload.
@@ -4367,15 +4560,59 @@ def run_turn(
         else:
             file_arg = {}
         if file_arg:
+            # Landlord amount correction before catalog so intelligence matches.
+            target_doc = file_arg.get("document_id") or pending_doc_id
+            if amount_correction and target_doc:
+                _apply_document_amount_correction(
+                    landlord, target_doc, amount_correction
+                )
             arguments = {
                 "scope_query": scope_query or "",
                 "issuer": focus.get("issuer") or "",
                 "document_date": focus.get("document_date") or "",
                 **file_arg,
             }
+            # When they named the address and corrected amount / said store receipt,
+            # skip the extra yes-preview and catalog immediately (still no new expense
+            # until file_business_document).
+            auto_scope = bool(scope_query) and (
+                receipt_followup or link_existing or bool(amount_correction)
+            )
+            if auto_scope:
+                arguments["confirm"] = "yes"
             result = execute(
                 "catalog_business_document", arguments, landlord=landlord,
             )
+            # Link-to-existing when they said the expense is already logged.
+            if (
+                link_existing
+                and isinstance(result, dict)
+                and (
+                    result.get("catalogued")
+                    or result.get("already_done")
+                    or result.get("updated")
+                )
+            ):
+                doc_id = str(result.get("document_id") or target_doc or "")
+                if doc_id:
+                    link_result = execute(
+                        "file_business_document",
+                        {
+                            "document_id": doc_id,
+                            "amount": amount_correction or "",
+                            "payment_state": "",
+                            "duplicate_resolution": "auto_link",
+                            "confirm": "yes",
+                        },
+                        landlord=landlord,
+                    )
+                    if isinstance(link_result, dict) and not link_result.get("error"):
+                        result = {**result, **link_result, "linked_existing": True}
+                    elif isinstance(link_result, dict):
+                        result = {
+                            **result,
+                            "link_attempt": link_result,
+                        }
             safe_result = json.loads(json.dumps(result, default=str))
             tools_used.append("catalog_business_document")
             audit(
@@ -4419,16 +4656,42 @@ def run_turn(
                         + str(result.get("question_for_user") or "")
                     ).strip()
                 else:
-                    deterministic_reply = (
-                        summary
-                        + str(
-                            result.get("question_for_user")
-                            or (
-                                "Which physical property address does this belong "
-                                "to? (Or whole portfolio.)"
-                            )
+                    # Prefer a matching open expense holding when OCR amount is noisy.
+                    suggested = result.get("suggested_scope") or (
+                        (intel.get("matching_expense") or {}).get("holding_address")
+                    )
+                    q = str(
+                        result.get("question_for_user")
+                        or (
+                            "Which physical property address does this belong "
+                            "to? (Or whole portfolio.)"
                         )
-                    ).strip()
+                    )
+                    if suggested and "which physical" in q.casefold():
+                        q = (
+                            f"OCR amount may be wrong if the slip has other totals. "
+                            f"This looks related to {suggested}. Reply with that "
+                            f"address (or another), and the real total if OCR is off."
+                        )
+                    deterministic_reply = (summary + q).strip()
+            elif result.get("filed") or result.get("linked_existing"):
+                det = result.get("message") or result.get("relay_instruction") or ""
+                if result.get("ledger_entry_id") or result.get("linked_existing"):
+                    deterministic_reply = (
+                        det
+                        or (
+                            "Stored the receipt and linked it to the existing "
+                            f"expense"
+                            + (
+                                f" (${result.get('amount')})"
+                                if result.get("amount")
+                                else ""
+                            )
+                            + " — no second expense posted."
+                        )
+                    )
+                else:
+                    deterministic_reply = det or "Document filed."
             elif result.get("already_done") or result.get("is_duplicate"):
                 deterministic_reply = str(
                     result.get("message")
@@ -4437,7 +4700,37 @@ def run_turn(
                 )
             elif result.get("error"):
                 deterministic_reply = str(result["error"])
-            elif result.get("prepared") or result.get("catalogued"):
+            elif result.get("catalogued"):
+                intel = result.get("intelligence") or {}
+                amt = intel.get("amount") or amount_correction
+                hold = (result.get("holding") or {}).get("address") or scope_query
+                if link_existing and result.get("link_attempt"):
+                    deterministic_reply = (
+                        f"Stored the receipt under {hold}"
+                        + (f" at ${amt}" if amt else "")
+                        + ". "
+                        + str(
+                            result["link_attempt"].get("error")
+                            or result["link_attempt"].get("question_for_user")
+                            or "Could not auto-link the expense — say which one."
+                        )
+                    )
+                else:
+                    deterministic_reply = (
+                        f"Stored as a business document for {hold}"
+                        + (f" · ${amt}" if amt else "")
+                        + ". "
+                        + (
+                            "Linked to the existing expense — no new ledger row."
+                            if result.get("linked_existing")
+                            else (
+                                "If the expense is already on the books, say so "
+                                "and I will attach this receipt without posting "
+                                "again; otherwise say paid/unpaid to file it."
+                            )
+                        )
+                    )
+            elif result.get("prepared"):
                 deterministic_reply = _document_preview_reply(result)
 
     if (

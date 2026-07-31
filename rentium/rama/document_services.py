@@ -90,6 +90,111 @@ def _link_to_existing_expense(document, entry_id: str, actor):
     return entry
 
 
+def find_expense_to_attach_receipt(
+    landlord,
+    *,
+    amount=None,
+    holding=None,
+    description_hint: str = "",
+    window_days: int = 45,
+) -> list:
+    """Find open expenses this receipt likely documents (already logged in chat).
+
+    Prefer exact amount + same holding; fall back to description tokens
+    (e.g. draino) when OCR amount was wrong and the landlord corrected it.
+    """
+    from datetime import timedelta
+
+    from rentium.ledger.models import EntryType, LedgerEntry
+
+    day = date.today()
+    qs = (
+        LedgerEntry.objects.not_voided()
+        .filter(
+            landlord=landlord,
+            entry_type=EntryType.EXPENSE,
+            effective_date__gte=day - timedelta(days=window_days),
+        )
+        .select_related("holding", "property")
+        .order_by("-effective_date", "-created_at")
+    )
+    if holding is not None:
+        qs = qs.filter(holding_id=holding.pk)
+
+    amt = None
+    if amount not in (None, ""):
+        try:
+            amt = Decimal(str(amount))
+        except (InvalidOperation, TypeError, ValueError):
+            amt = None
+
+    # Tokens from OCR title / landlord words — skip noise.
+    stop = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "this",
+        "that",
+        "expense",
+        "receipt",
+        "invoice",
+        "purchase",
+        "bought",
+        "paid",
+        "just",
+        "store",
+        "document",
+        "should",
+        "know",
+        "already",
+        "logged",
+        "recorded",
+        "gift",
+        "card",
+        "figure",
+        "about",
+        "whole",
+        "portfolio",
+        "property",
+        "address",
+    }
+    tokens = [
+        t
+        for t in re.findall(r"[a-zA-Z]{4,}", (description_hint or "").casefold())
+        if t not in stop
+    ]
+
+    rows = list(qs[:80])
+    scored: list[tuple[int, object]] = []
+    for entry in rows:
+        score = 0
+        if amt is not None and entry.amount == amt:
+            score += 50
+        if holding is not None and entry.holding_id == holding.pk:
+            score += 20
+        desc = (entry.description or "").casefold()
+        for tok in tokens:
+            if tok in desc:
+                score += 15
+        # Prefer rows that still lack a source document.
+        has_doc = False
+        try:
+            has_doc = getattr(entry, "source_document", None) is not None
+        except Exception:  # noqa: BLE001
+            has_doc = False
+        if not has_doc:
+            # reverse FK from RamaDocument.ledger_entry
+            has_doc = RamaDocument.objects.filter(ledger_entry_id=entry.pk).exists()
+        if has_doc:
+            score -= 40
+        if score > 0:
+            scored.append((score, entry))
+    scored.sort(key=lambda pair: (-pair[0], -pair[1].effective_date.toordinal()))
+    return [e for _, e in scored[:8]]
+
+
 def _event(document, kind, *, actor=None, **detail):
     return RamaDocumentEvent.objects.create(
         document=document, kind=kind, actor=actor, detail=detail
@@ -1811,7 +1916,14 @@ def file_business_document_for_chat(
     duplicate_resolution: str = "",
     confirm: str = "",
 ) -> dict:
-    """Chat wrapper around file_document: post expense from OCR with paid/unpaid."""
+    """Chat wrapper around file_document: post expense from OCR with paid/unpaid.
+
+    `duplicate_resolution`:
+    - "" / default — refuse if same-cost candidates (or post new)
+    - "new" — post a separate expense
+    - "link:<id>" — attach receipt to that entry only
+    - "auto_link" — pick the best matching existing expense and link (no post)
+    """
 
     def _confirmed(value: str) -> bool:
         return str(value or "").strip().lower() in ("yes", "true", "1", "y", "confirm")
@@ -1847,6 +1959,143 @@ def file_business_document_for_chat(
         }
 
     document = _ensure_ocr(document)
+    resolution = (duplicate_resolution or "").strip()
+    auto_link = resolution.casefold() in {
+        "auto_link",
+        "auto-link",
+        "link",
+        "existing",
+    }
+
+    amt = amount.strip() if amount else ""
+    if not amt and document.amount is not None:
+        amt = str(document.amount)
+
+    # Auto-link / explicit link: do not require payment_state (expense already exists).
+    if auto_link or resolution.startswith("link:"):
+        if not document.holding_id and not document.portfolio_wide:
+            return {
+                "needs_input": True,
+                "question_for_user": (
+                    "Which physical property is this receipt for? "
+                    "(Needed to match the existing expense.)"
+                ),
+                "intelligence": document_intelligence_payload(document),
+            }
+        link_id = ""
+        if resolution.startswith("link:"):
+            link_id = resolution.split(":", 1)[1].strip()
+        else:
+            hint = " ".join(
+                part
+                for part in (
+                    document.title or "",
+                    document.issuer or "",
+                    (document.ocr_text or "")[:200],
+                )
+                if part
+            )
+            matches = find_expense_to_attach_receipt(
+                landlord,
+                amount=amt or None,
+                holding=document.holding,
+                description_hint=hint,
+            )
+            if len(matches) == 1:
+                link_id = str(matches[0].pk)
+            elif len(matches) > 1:
+                return {
+                    "error": "Several expenses could match this receipt.",
+                    "code": "AMBIGUOUS_EXPENSE",
+                    "candidates": [
+                        {
+                            "id": str(e.pk),
+                            "amount": str(e.amount),
+                            "description": (e.description or "")[:120],
+                            "effective_date": str(e.effective_date),
+                            "scope": (
+                                e.holding.address
+                                if e.holding_id
+                                else (e.property.name if e.property_id else "")
+                            ),
+                        }
+                        for e in matches[:5]
+                    ],
+                    "resolutions": {
+                        "link": "duplicate_resolution=link:<entry_id>",
+                    },
+                }
+            else:
+                return {
+                    "error": (
+                        "No matching open expense found to attach this receipt to. "
+                        "Say the amount/description of the logged expense, or file "
+                        "as a new expense with paid/unpaid."
+                    ),
+                    "code": "NO_MATCHING_EXPENSE",
+                }
+        # Payment state mirrors the existing entry once linked.
+        from rentium.ledger.models import LedgerEntry
+
+        entry_probe = LedgerEntry.objects.filter(pk=link_id, landlord=landlord).first()
+        pay = (
+            RamaDocument.PaymentState.PAID
+            if entry_probe and entry_probe.paid_on
+            else RamaDocument.PaymentState.UNPAID
+        )
+        if not amt and entry_probe is not None:
+            amt = str(entry_probe.amount)
+        if not amt:
+            return {
+                "needs_input": True,
+                "question_for_user": "What total should we store on the receipt?",
+                "intelligence": document_intelligence_payload(document),
+            }
+        try:
+            filed = file_document(
+                document,
+                actor=getattr(landlord, "user", None),
+                holding=document.holding,
+                kind=document.kind or RamaDocument.Kind.EXPENSE,
+                title=(title or document.title or "Receipt")[:255],
+                amount=amt,
+                expense_category=(
+                    expense_category
+                    or document.expense_category
+                    or ExpenseCategory.OTHER
+                ),
+                payment_state=pay,
+                document_date=document.document_date,
+                issuer=issuer if issuer != "" else document.issuer,
+                duplicate_resolution=f"link:{link_id}",
+            )
+        except DocumentError as exc:
+            return {"error": str(exc)}
+        entry = filed.ledger_entry
+        return {
+            "filed": True,
+            "linked_existing": True,
+            "document_id": str(filed.pk),
+            "ledger_entry_id": str(entry.pk) if entry else link_id,
+            "amount": str(entry.amount) if entry else amt,
+            "paid_on": str(entry.paid_on) if entry and entry.paid_on else None,
+            "holding": (
+                filed.holding.address or filed.holding.name
+                if filed.holding_id
+                else None
+            ),
+            "documents_page": url_for_path(
+                f"/dashboard/documents?document={filed.pk}"
+            ),
+            "message": (
+                f"Stored the receipt and linked it to the existing "
+                f"${entry.amount if entry else amt} expense"
+                f" ({(entry.description if entry else '')[:80]}) — "
+                f"no second expense posted."
+            ),
+            "intelligence": document_intelligence_payload(filed),
+        }
+
     pay = (payment_state or "").strip().upper()
     if pay in ("PAID", "YES", "Y", "TRUE", "1"):
         pay = RamaDocument.PaymentState.PAID
@@ -1874,9 +2123,6 @@ def file_business_document_for_chat(
                 "intelligence": document_intelligence_payload(document),
             }
 
-    amt = amount.strip() if amount else ""
-    if not amt and document.amount is not None:
-        amt = str(document.amount)
     if not amt:
         return {
             "needs_input": True,
