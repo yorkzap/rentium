@@ -242,22 +242,33 @@ class AppointmentViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def reschedule(self, request, pk=None):
-        """Move a viewing (or other visit) to a new starts_at. Emails the
-        prospect when the appointment is a viewing. Body: {starts_at, message?}."""
+        """Move a viewing to a new starts_at. Emails the prospect (and tenants
+        on the lease). Body: {starts_at, message?}. Naive datetimes are treated
+        as the landlord's local wall clock (America/Vancouver by default)."""
         from django.core.exceptions import ValidationError as DjangoValidationError
         from django.utils.dateparse import parse_datetime
 
+        from rentium.appointments.services import landlord_tz
         from rentium.appointments.services import reschedule_viewing
 
-        self._landlord()
+        landlord = self._landlord()
         appt = self.get_object()
-        parsed = parse_datetime(str(request.data.get("starts_at") or ""))
+        raw = str(request.data.get("starts_at") or "").strip()
+        parsed = parse_datetime(raw.replace("Z", "+00:00") if raw.endswith("Z") else raw)
+        if not parsed:
+            # Also accept "YYYY-MM-DDTHH:MM" from the calendar form.
+            try:
+                from datetime import datetime as dt
+
+                parsed = dt.fromisoformat(raw)
+            except ValueError:
+                parsed = None
         if not parsed:
             raise ValidationError({"starts_at": "Pick a date and time."})
         from django.utils import timezone as djtz
 
         if djtz.is_naive(parsed):
-            parsed = djtz.make_aware(parsed)
+            parsed = parsed.replace(tzinfo=landlord_tz(landlord))
         if parsed <= djtz.now():
             raise ValidationError({"starts_at": "Pick a time in the future."})
         try:
@@ -270,7 +281,14 @@ class AppointmentViewSet(viewsets.ModelViewSet):
             if hasattr(exc, "message_dict"):
                 raise ValidationError(exc.message_dict) from exc
             raise ValidationError({"detail": "; ".join(exc.messages)}) from exc
-        return Response(self.get_serializer(appt).data)
+        data = self.get_serializer(appt).data
+        if getattr(appt, "_reschedule_noop", False):
+            data = {
+                **data,
+                "already_done": True,
+                "detail": "Already scheduled for that time — nothing changed.",
+            }
+        return Response(data)
 
     @action(detail=True, methods=["post"])
     def tenant_respond(self, request, pk=None):

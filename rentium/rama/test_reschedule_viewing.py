@@ -119,3 +119,25 @@ def test_log_capability_gap_refuses_reschedule(landlord):
     )
     assert out.get("logged") is False
     assert out.get("tool") == "reschedule_viewing"
+
+
+def test_reschedule_same_slot_is_already_done_not_an_error(landlord, room):
+    appt = _scheduled(
+        landlord,
+        room,
+        datetime(2026, 8, 4, 14, 0, tzinfo=TZ),
+    )
+    out = registry.execute(
+        "reschedule_viewing",
+        {
+            "appointment_ref": str(appt.pk),
+            "when": "2026-08-04 14:00",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert out.get("already_done") is True
+    assert out.get("rescheduled") is False
+    assert "error" not in out
+    appt.refresh_from_db()
+    assert appt.starts_at.astimezone(TZ).day == 4

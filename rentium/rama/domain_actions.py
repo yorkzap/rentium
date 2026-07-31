@@ -1079,8 +1079,18 @@ def reschedule_viewing(
     if err:
         return err
 
-    previous_local = timezone.localtime(appt.starts_at)
-    new_local = timezone.localtime(new_start)
+    from zoneinfo import ZoneInfo
+
+    from rentium.appointments.services import _same_viewing_slot
+    from rentium.appointments.services import landlord_tz
+
+    display_tz = landlord_tz(landlord)
+    previous_local = appt.starts_at.astimezone(display_tz)
+    new_local = new_start.astimezone(display_tz)
+    calendar_link = url_for_path("/dashboard/calendar")
+    status_link = url_for_path(f"/viewing/status/{appt.public_token}")
+    same_slot = _same_viewing_slot(appt.starts_at, new_start)
+
     preview = {
         "ref": str(appt.pk)[:8].upper(),
         "appointment_id": str(appt.pk),
@@ -1091,12 +1101,45 @@ def reschedule_viewing(
         "to": new_local.strftime("%A, %Y-%m-%d %H:%M %Z"),
         "status": appt.status,
         "notes": (notes or "")[:200],
+        "will_email_prospect": bool(appt.contact_email),
+        "will_notify_tenants": bool(appt.lease_id),
+        "calendar_link": calendar_link,
+        "prospect_status_link": status_link,
     }
+
+    if same_slot:
+        # Already on this minute — do not ask for a yes that will "fail".
+        return {
+            "already_done": True,
+            "rescheduled": False,
+            "appointment": {
+                "id": str(appt.pk),
+                "ref": str(appt.pk)[:8].upper(),
+                "property": appt.property.name,
+                "starts_at": appt.starts_at.isoformat(),
+                "status": appt.status,
+                "contact_name": appt.contact_name,
+                "contact_email": appt.contact_email,
+            },
+            "when": previous_local.strftime("%A, %Y-%m-%d %H:%M %Z"),
+            "calendar_link": calendar_link,
+            "prospect_status_link": status_link,
+            "message": (
+                f"Already scheduled for {previous_local.strftime('%b %d %I:%M %p %Z')} "
+                f"({appt.property.name}). Nothing to change. "
+                f"Calendar: {calendar_link}"
+            ),
+        }
+
     if not _confirmed(confirm):
         return _preview(
             "reschedule_viewing",
             preview,
-            "Updates this viewing's start time and emails the contact.",
+            (
+                "Updates this viewing's start time and emails the prospect"
+                + (" and current tenants" if appt.lease_id else "")
+                + "."
+            ),
         )
 
     try:
@@ -1108,8 +1151,18 @@ def reschedule_viewing(
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Could not reschedule: {exc}"}
 
-    calendar_link = url_for_path("/dashboard/calendar")
-    status_link = url_for_path(f"/viewing/status/{appt.public_token}")
+    after_local = appt.starts_at.astimezone(display_tz)
+    if getattr(appt, "_reschedule_noop", False):
+        return {
+            "already_done": True,
+            "rescheduled": False,
+            "message": (
+                f"Already scheduled for {after_local.strftime('%b %d %I:%M %p %Z')}."
+            ),
+            "calendar_link": calendar_link,
+            "prospect_status_link": status_link,
+        }
+
     return {
         "rescheduled": True,
         "appointment": {
@@ -1122,14 +1175,16 @@ def reschedule_viewing(
             "contact_email": appt.contact_email,
         },
         "from": previous_local.strftime("%A, %Y-%m-%d %H:%M %Z"),
-        "to": timezone.localtime(appt.starts_at).strftime("%A, %Y-%m-%d %H:%M %Z"),
+        "to": after_local.strftime("%A, %Y-%m-%d %H:%M %Z"),
         "notified": notification_receipt(appt),
         "calendar_link": calendar_link,
         "prospect_status_link": status_link,
         "message": (
             f"Rescheduled {appt.property.name} viewing from "
             f"{previous_local.strftime('%b %d %I:%M %p')} to "
-            f"{timezone.localtime(appt.starts_at).strftime('%b %d %I:%M %p')}. "
+            f"{after_local.strftime('%b %d %I:%M %p')}. "
+            f"{'Prospect emailed' if appt.contact_email else 'No prospect email on file'}"
+            f"{'; current tenants notified' if appt.lease_id else ''}. "
             f"See Calendar: {calendar_link}"
         ),
     }

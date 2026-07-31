@@ -76,6 +76,17 @@ def schedule_viewing(
     return appointment
 
 
+def _same_viewing_slot(left: datetime, right: datetime) -> bool:
+    """Minute-resolution equality across timezones (UTC vs Pacific wall clock)."""
+
+    def slot(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=ZoneInfo(DEFAULT_TZ))
+        return value.astimezone(ZoneInfo("UTC")).replace(second=0, microsecond=0)
+
+    return slot(left) == slot(right)
+
+
 @transaction.atomic
 def reschedule_viewing(
     *,
@@ -88,6 +99,9 @@ def reschedule_viewing(
     Keeps the same appointment row, public_token, and prospect contact so their
     tracking link still works. Records a proposal for audit and publishes
     appointment.rescheduled so the prospect is emailed the new time.
+
+    Same-slot requests are a no-op: the appointment is returned unchanged and
+    no event is published (callers should treat that as already done, not an error).
     """
     from .models import Appointment, AppointmentProposal
 
@@ -102,11 +116,15 @@ def reschedule_viewing(
         starts_at = starts_at.replace(tzinfo=landlord_tz(appointment.landlord))
 
     previous = appointment.starts_at
-    if previous == starts_at:
-        raise ValidationError({"starts_at": "That is already the scheduled time."})
+    if _same_viewing_slot(previous, starts_at):
+        # Idempotent: already on this minute. Do not raise — RAMA/UI treat this
+        # as success/already-done rather than a failed confirm.
+        appointment._reschedule_noop = True  # type: ignore[attr-defined]
+        return appointment
 
     appointment.starts_at = starts_at
     appointment.stamp_time_class()
+    appointment._reschedule_noop = False  # type: ignore[attr-defined]
     # Reschedule of an already-confirmed visit stays SCHEDULED (landlord owns
     # the time). Pending requests keep their negotiation state.
     if appointment.status in (
@@ -138,8 +156,6 @@ def reschedule_viewing(
             previous_starts_at=previous.isoformat(),
             rescheduled_by="LANDLORD",
         )
-        if appointment.lease_id:
-            appointment.publish_event("appointment.tenant_review")
     return appointment
 
 

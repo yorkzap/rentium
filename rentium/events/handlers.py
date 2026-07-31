@@ -253,14 +253,33 @@ def on_appointment_cancelled(event):
 
 @on("appointment.rescheduled")
 def on_appointment_rescheduled(event):
-    """Landlord moved a confirmed viewing. Email the prospect the new time and
-    keep their status-page link valid; notify current tenants if applicable."""
+    """Landlord moved a confirmed viewing.
+
+    Business rule: every real time change emails the prospect (contact_email)
+    with the new when + status link, and emails/notifies any current tenants on
+    the lease as an updated notice of entry. Silent reschedules are a bug.
+    """
     appt = _appointment_from(event)
     if not appt:
         return
-    previous = (event.payload or {}).get("previous_starts_at") or "the previous time"
+    previous_raw = (event.payload or {}).get("previous_starts_at")
+    if previous_raw:
+        try:
+            from django.utils.dateparse import parse_datetime
+
+            prev_dt = parse_datetime(str(previous_raw))
+            previous_label = (
+                prev_dt.astimezone().strftime("%A, %B %d at %I:%M %p %Z")
+                if prev_dt
+                else str(previous_raw)
+            )
+        except Exception:  # noqa: BLE001
+            previous_label = str(previous_raw)
+    else:
+        previous_label = "the previous time"
     status_url = _frontend_url(f"/viewing/status/{appt.public_token}")
 
+    # Prospect / visitor — always email when we have an address.
     if appt.contact_email:
         _send_email(
             appt.contact_email,
@@ -269,26 +288,25 @@ def on_appointment_rescheduled(event):
                 f"Hi {appt.contact_name or 'there'},\n\n"
                 f"Your viewing of {appt.property.name} has been rescheduled.\n\n"
                 f"New time: {_fmt_when(appt)}\n"
-                f"(was: {previous})\n\n"
-                f"Details and any further updates:\n{status_url}\n\n"
+                f"Previously: {previous_label}\n\n"
+                f"Track this visit any time:\n{status_url}\n\n"
                 "— Rentium"
             ),
         )
 
-    if appt.lease_id:
-        for lt in appt.lease.lease_tenants.select_related("tenant__user"):
-            if lt.tenant:
-                _notify(
-                    lt.tenant.user,
-                    category="SYSTEM",
-                    title=f"Visit rescheduled at {appt.property.name}",
-                    body=(
-                        f"{appt.get_kind_display()} moved to {_fmt_when(appt)}. "
-                        "This is your updated notice of entry."
-                    ),
-                    url="/dashboard/tenancy/calendar",
-                    event=event,
-                )
+    # Current tenants on the unit — full channel fan-out (in-app + email +
+    # linked channels). This is their updated entry notice.
+    for tenant in _lease_tenants(appt):
+        _ping_tenant(
+            tenant,
+            title=f"Visit rescheduled at {appt.property.name}",
+            body=(
+                f"{appt.get_kind_display()} moved to {_fmt_when(appt)} "
+                f"(was {previous_label}). This is your updated notice of entry."
+            ),
+            url="/dashboard/tenancy/calendar",
+            event=event,
+        )
 
 
 @on("appointment.countered")
