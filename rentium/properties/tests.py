@@ -6,6 +6,7 @@ cards, and not by RAMA's grounded rows (tested in rama/tests.py).
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
+from rest_framework.test import APIClient
 
 from rentium.properties.models import PropertyImage
 
@@ -91,6 +92,41 @@ def test_display_image_falls_back_to_first_gallery_image(bc_property):
 
 def test_display_image_none_when_no_images(bc_property):
     assert bc_property.display_image is None
+
+
+def test_property_media_api_lists_and_deletes_exact_primary_or_gallery(
+    landlord,
+    bc_property,
+):
+    bc_property.primary_image = _img("hero.gif")
+    bc_property.save()
+    gallery = _gallery(bc_property, 2)
+    client = APIClient()
+    client.force_authenticate(user=landlord.user)
+
+    manifest = client.get(f"/api/properties/{bc_property.pk}/media/")
+    assert manifest.status_code == 200
+    assert [row["handle"] for row in manifest.json()] == [
+        "primary",
+        f"gallery:{gallery[0].pk}",
+        f"gallery:{gallery[1].pk}",
+    ]
+    assert [row["selection_number"] for row in manifest.json()] == [1, 2, 3]
+
+    removed_primary = client.delete(
+        f"/api/properties/{bc_property.pk}/media/primary/",
+    )
+    assert removed_primary.status_code == 200
+    bc_property.refresh_from_db()
+    assert not bc_property.primary_image
+    assert bc_property.property_images.count() == 2
+
+    removed_gallery = client.delete(
+        f"/api/properties/{bc_property.pk}/media/gallery%3A{gallery[0].pk}/",
+    )
+    assert removed_gallery.status_code == 200
+    assert not bc_property.property_images.filter(pk=gallery[0].pk).exists()
+    assert bc_property.property_images.filter(pk=gallery[1].pk).exists()
 
 
 def test_group_membership_keeps_common_area_associations_synchronized(landlord):

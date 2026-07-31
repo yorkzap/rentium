@@ -106,6 +106,10 @@ the universal safety boundary: RAMA shows one complete preview, waits for an
 explicit confirmation, then reports the concrete result (for example,
 “Renamed McKenzie B to Room A”).
 
+The General also directly handles the routine lease, invite, payment, viewing,
+listing-media, and unit-structure operations. Delegating these to a second model
+is optional specialization, not a capability gate.
+
 Compound routine instructions use the same boundary. If one turn previews
 several creations, renames, or group assignments, RAMA persists every preview
 in dependency order as one confirmation batch; it never keeps only the final
@@ -156,6 +160,59 @@ not see that it had guessed. Missing facts produce a usable unit flagged
 market, so it pauses for its own confirmation inside a multi-step plan even
 though it deletes nothing. It refuses outright while any lease is live in the
 unit.
+
+When the request includes the new room offerings themselves, use
+`configure_unit_room_offerings` rather than separate layout/mode/group calls.
+It previews the complete result, then atomically parks (does not delete) the
+whole-unit listing, creates or reuses the unit's group, records each named
+bedroom, creates/reuses exactly those room offerings, and applies every stated
+common area to the resulting group. Room labels are never generated from a
+sequence: if the landlord says J and K, preview and execution remain J and K.
+Draft, pending, and active leases block the entire operation.
+
+### Chat attachments are exact batches
+
+Every selection in the RAMA composer belongs to one explicit attachment batch
+for that conversation. Additional picks append to the still-open batch; sending
+the message seals it. RAMA may apply only that batch (or selected IDs inside
+it), never every older unused upload for the landlord.
+
+Photo intent calls `attach_photo_to_listing`; document intent promotes the
+specific attachment to `RamaDocument`. A photographed bank letter remains a
+document when the landlord says it is a document. `list_listing_media` returns
+numbered thumbnails and stable handles. The web chat renders per-image Remove
+controls; `remove_photos_from_listing` collects one or several selected handles
+into one exact preview and one confirmation.
+
+### Leases, invites, and viewings
+
+Lease creation through the dashboard and RAMA both call
+`leases.services.create_lease_record`. A request to “make a draft, then invite”
+therefore creates the full dated/financial/legal draft first and adds the tenant
+only in the subsequent confirmed invite operation.
+
+Invite state is evidence-backed and no longer collapsed into “unsigned”:
+sent, token link opened, account linked, signed, declined, and resent are
+separate append-only events. Opening the link proves only that the URL was
+opened—not who read or understood the agreement. `list_lease_roster` and the
+lease-detail API expose those exact facts.
+
+Dashboard and RAMA viewings both call `appointments.services.schedule_viewing`.
+The selected property ID is resolved within the landlord's portfolio before the
+transaction, so “McKenzie Garden Suite” cannot silently become Wascana Garden
+Suite merely because both contain “Garden Suite.”
+
+### Financial wording
+
+Payments settle an immutable charge; they do not rewrite it. A $100 payment on
+a $425 deposit charge leaves the original charge at $425 and its computed
+outstanding balance at $325. RAMA reports the entry ID, amount, resulting
+balance, and charge status from the ledger service.
+
+The financial ledger UI labels its on-screen charge sum **Charges shown**. It is
+the face value of charge lines in the current filtered ledger—including future
+scheduled and overdue charges—not cash received, not current debt, and not net
+income. Cash received is under **In**; expenses paid are under **Out**.
 
 ### Playbooks
 

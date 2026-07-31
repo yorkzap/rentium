@@ -24,6 +24,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.text import slugify
 
@@ -33,6 +34,97 @@ from .models import TreasurerFact
 # again is more likely to be double-counting than a genuine gap. Not a
 # certainty — which is why the fact is kept and flagged rather than refused.
 DOUBLE_COUNT_THRESHOLD = Decimal("0.80")
+
+# How far either side of today a dateless ONE_TIME assertion is taken to refer
+# to. Somebody saying "we received $100 for the Room C deposit" without giving
+# a date means recently; a fact about last year carries a period and dates,
+# which are required for MONTHLY/ANNUAL and used instead when present.
+UNDATED_WINDOW_DAYS = 45
+
+
+def already_in_ledger(
+    landlord,
+    *,
+    amount,
+    holding=None,
+    effective_from=None,
+    effective_to=None,
+) -> str | None:
+    """The ledger entry that already holds this money, described — or None.
+
+    WHY THIS IS SEPARATE FROM `reconcile`
+    -------------------------------------
+    `reconcile` answers a different, coarser question: what SHARE of an
+    asserted total does the ledger already contain, aggregated over a scope and
+    window, so a $2,000-a-year assertion can be flagged as mostly-already-known.
+    It is a proportion, it needs a direction to know which side to compare, and
+    it returns no opinion at all when the direction is NEUTRAL.
+
+    This answers the narrow question the landlord actually cared about: "is
+    THIS exact payment already on the books?" So it is deliberately built to
+    survive every distinction the aggregate version depends on —
+
+      * direction: not consulted. Money is money; a fact asserting $100 is a
+        duplicate of a $100 entry whichever way the aggregate would have
+        classified the sentence. This is what stops an inferred (or NEUTRAL)
+        direction from silently disabling the check.
+      * dates: an undated assertion still gets a window rather than no filter.
+      * scope: a fact scoped to a holding matches entries on that holding AND
+        on properties under it, because entries are written per-property.
+
+    Returns a sentence naming the entry, suitable for showing the landlord.
+    """
+    from datetime import timedelta
+
+    from rentium.ledger.models import EntryType, LedgerEntry
+
+    if amount is None:
+        return None
+    amount = Decimal(amount)
+    if amount <= 0:
+        return None
+
+    rows = LedgerEntry.objects.not_voided().filter(landlord=landlord, amount=amount)
+
+    # Money that actually MOVED. A charge is a receivable, not a record that
+    # the money arrived, so asserting "we received $100" is not duplicated by a
+    # $100 charge sitting unpaid.
+    rows = rows.filter(
+        entry_type__in=(
+            EntryType.PAYMENT,
+            EntryType.EXPENSE,
+            EntryType.CREDIT,
+            EntryType.DEPOSIT_RETURN,
+        )
+    )
+
+    if holding is not None:
+        rows = rows.filter(Q(holding=holding) | Q(property__holding=holding))
+
+    start, end = effective_from, effective_to
+    if not start and not end:
+        today = date.today()
+        start = today - timedelta(days=UNDATED_WINDOW_DAYS)
+        end = today + timedelta(days=UNDATED_WINDOW_DAYS)
+    if start:
+        rows = rows.filter(effective_date__gte=start)
+    if end:
+        rows = rows.filter(effective_date__lte=end)
+
+    match = rows.select_related("property").order_by("-effective_date").first()
+    if match is None:
+        return None
+
+    where = match.property.name if match.property_id else "the portfolio"
+    method = f", {match.get_payment_method_display()}" if match.payment_method else ""
+    return (
+        f"${amount} is already in the ledger: {match.get_entry_type_display()} "
+        f"on {match.effective_date.isoformat()}{method} — "
+        f"\"{match.description}\" ({where}). A Treasurer fact is for money the "
+        f"ledger does NOT have, so recording this again would count it twice. "
+        f"If that ledger entry is wrong, correct it there instead."
+    )
+
 
 # ------------------------------------------------------------------ guards
 def rejects(statement: str, *, value_numeric=None) -> str | None:

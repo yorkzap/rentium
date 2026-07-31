@@ -13,6 +13,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from django.core.exceptions import ValidationError
+from django.db import transaction
+
 from .models import AvailabilityWindow
 
 # time_class values, kept as flat strings so they travel cleanly through JSON
@@ -22,6 +25,122 @@ OUT_OF_HOURS = "OUT_OF_HOURS"
 UNSET = "UNSET"  # the landlord hasn't configured any preferred hours yet
 
 DEFAULT_TZ = "America/Vancouver"
+
+
+@transaction.atomic
+def schedule_viewing(
+    *,
+    landlord,
+    property_obj,
+    starts_at: datetime,
+    contact_name: str = "",
+    contact_email: str = "",
+    contact_phone: str = "",
+    notes: str = "",
+):
+    """Create and publish a landlord-confirmed property viewing."""
+    from .models import Appointment, AppointmentProposal
+
+    if property_obj.landlord_id != landlord.pk:
+        raise ValidationError({"property": "That property is outside this portfolio."})
+    if starts_at.tzinfo is None:
+        starts_at = starts_at.replace(tzinfo=landlord_tz(landlord))
+    active_lease = current_active_lease(property_obj)
+    appointment = Appointment.objects.create(
+        landlord=landlord,
+        property=property_obj,
+        lease=active_lease,
+        kind=Appointment.Kind.VIEWING,
+        status=Appointment.Status.SCHEDULED,
+        starts_at=starts_at,
+        contact_name=(contact_name or "")[:200],
+        contact_email=(contact_email or "")[:150],
+        contact_phone=(contact_phone or "")[:30],
+        notes=(notes or "")[:2000],
+        tenant_consent=(
+            Appointment.TenantConsent.PENDING
+            if active_lease
+            else Appointment.TenantConsent.NOT_APPLICABLE
+        ),
+    )
+    appointment.stamp_time_class()
+    appointment.save(update_fields=["time_class"])
+    appointment.record_proposal(
+        by=AppointmentProposal.By.LANDLORD,
+        starts_at=starts_at,
+        message=notes or "",
+    )
+    appointment.publish_event("appointment.scheduled")
+    if active_lease:
+        appointment.publish_event("appointment.tenant_review")
+    return appointment
+
+
+@transaction.atomic
+def reschedule_viewing(
+    *,
+    appointment,
+    starts_at: datetime,
+    message: str = "",
+):
+    """Move an existing SCHEDULED (or pending) viewing to a new start time.
+
+    Keeps the same appointment row, public_token, and prospect contact so their
+    tracking link still works. Records a proposal for audit and publishes
+    appointment.rescheduled so the prospect is emailed the new time.
+    """
+    from .models import Appointment, AppointmentProposal
+
+    if appointment.kind != Appointment.Kind.VIEWING:
+        raise ValidationError({"kind": "Only viewings can be rescheduled this way."})
+    if appointment.status == Appointment.Status.CANCELLED:
+        raise ValidationError({"status": "A cancelled viewing cannot be rescheduled."})
+    if appointment.status == Appointment.Status.COMPLETED:
+        raise ValidationError({"status": "A completed viewing cannot be rescheduled."})
+
+    if starts_at.tzinfo is None:
+        starts_at = starts_at.replace(tzinfo=landlord_tz(appointment.landlord))
+
+    previous = appointment.starts_at
+    if previous == starts_at:
+        raise ValidationError({"starts_at": "That is already the scheduled time."})
+
+    appointment.starts_at = starts_at
+    appointment.stamp_time_class()
+    # Reschedule of an already-confirmed visit stays SCHEDULED (landlord owns
+    # the time). Pending requests keep their negotiation state.
+    if appointment.status in (
+        Appointment.Status.REQUESTED,
+        Appointment.Status.AWAITING_REQUESTER,
+    ):
+        # Landlord setting a firm new time on a pending request is a counter.
+        appointment.transition_to(Appointment.Status.AWAITING_REQUESTER)
+        appointment.save(update_fields=["starts_at", "time_class", "status", "updated_at"])
+        appointment.record_proposal(
+            by=AppointmentProposal.By.LANDLORD,
+            starts_at=starts_at,
+            message=message or "Rescheduled",
+        )
+        appointment.publish_event(
+            "appointment.countered",
+            proposed_by="LANDLORD",
+            previous_starts_at=previous.isoformat(),
+        )
+    else:
+        appointment.save(update_fields=["starts_at", "time_class", "updated_at"])
+        appointment.record_proposal(
+            by=AppointmentProposal.By.LANDLORD,
+            starts_at=starts_at,
+            message=message or "Rescheduled by landlord",
+        )
+        appointment.publish_event(
+            "appointment.rescheduled",
+            previous_starts_at=previous.isoformat(),
+            rescheduled_by="LANDLORD",
+        )
+        if appointment.lease_id:
+            appointment.publish_event("appointment.tenant_review")
+    return appointment
 
 
 def landlord_tz(landlord) -> ZoneInfo:

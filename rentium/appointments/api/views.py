@@ -114,8 +114,27 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         lease = serializer.validated_data.get("lease")
         if lease and lease.landlord != landlord:
             raise ValidationError({"lease": "Not your lease."})
-        appt = serializer.save(landlord=landlord, status=Appointment.Status.SCHEDULED)
-        appt.publish_event("appointment.scheduled")
+        kind = serializer.validated_data.get("kind", Appointment.Kind.VIEWING)
+        if kind == Appointment.Kind.VIEWING:
+            from rentium.appointments.services import schedule_viewing
+
+            data = serializer.validated_data
+            appt = schedule_viewing(
+                landlord=landlord,
+                property_obj=prop,
+                starts_at=data["starts_at"],
+                contact_name=data.get("contact_name", ""),
+                contact_email=data.get("contact_email", ""),
+                contact_phone=data.get("contact_phone", ""),
+                notes=data.get("notes", ""),
+            )
+            serializer.instance = appt
+        else:
+            appt = serializer.save(
+                landlord=landlord,
+                status=Appointment.Status.SCHEDULED,
+            )
+            appt.publish_event("appointment.scheduled")
 
     def perform_update(self, serializer):
         self._landlord()
@@ -219,6 +238,38 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         except IllegalTransition as exc:
             raise ValidationError({"detail": str(exc)})
         appt.publish_event("appointment.cancelled", cancelled_by="LANDLORD")
+        return Response(self.get_serializer(appt).data)
+
+    @action(detail=True, methods=["post"])
+    def reschedule(self, request, pk=None):
+        """Move a viewing (or other visit) to a new starts_at. Emails the
+        prospect when the appointment is a viewing. Body: {starts_at, message?}."""
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from django.utils.dateparse import parse_datetime
+
+        from rentium.appointments.services import reschedule_viewing
+
+        self._landlord()
+        appt = self.get_object()
+        parsed = parse_datetime(str(request.data.get("starts_at") or ""))
+        if not parsed:
+            raise ValidationError({"starts_at": "Pick a date and time."})
+        from django.utils import timezone as djtz
+
+        if djtz.is_naive(parsed):
+            parsed = djtz.make_aware(parsed)
+        if parsed <= djtz.now():
+            raise ValidationError({"starts_at": "Pick a time in the future."})
+        try:
+            appt = reschedule_viewing(
+                appointment=appt,
+                starts_at=parsed,
+                message=(request.data.get("message") or "").strip(),
+            )
+        except DjangoValidationError as exc:
+            if hasattr(exc, "message_dict"):
+                raise ValidationError(exc.message_dict) from exc
+            raise ValidationError({"detail": "; ".join(exc.messages)}) from exc
         return Response(self.get_serializer(appt).data)
 
     @action(detail=True, methods=["post"])

@@ -7,6 +7,16 @@ app_name = "rama"
 urlpatterns = [
     path("chat/", views.chat_view, name="chat"),
     path("upload/", views.upload_view, name="upload"),
+    path(
+        "attachment-batches/",
+        views.attachment_batches_view,
+        name="attachment-batches",
+    ),
+    path(
+        "attachments/<uuid:attachment_id>/",
+        views.attachment_detail_view,
+        name="attachment-detail",
+    ),
     path("documents/", views.documents_view, name="documents"),
     path(
         "documents/<uuid:document_id>/",

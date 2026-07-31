@@ -1,6 +1,9 @@
 from django.contrib import admin
 
 from .models import (
+    RamaActionReceipt,
+    RamaAttachment,
+    RamaAttachmentBatch,
     RamaAudit,
     RamaAutoAction,
     RamaCapabilityGap,
@@ -8,6 +11,7 @@ from .models import (
     RamaDocumentEvent,
     RamaMemory,
     RamaPreferences,
+    RamaTask,
 )
 
 
@@ -95,6 +99,92 @@ class RamaAuditAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(RamaTask)
+class RamaTaskAdmin(admin.ModelAdmin):
+    list_display = (
+        "created_at",
+        "landlord",
+        "capability_key",
+        "status",
+        "conversation_id",
+    )
+    list_filter = ("status", "capability_key")
+    search_fields = ("conversation_id", "landlord__user__email", "idempotency_key")
+    readonly_fields = (
+        "landlord",
+        "conversation_id",
+        "capability_key",
+        "status",
+        "input",
+        "context",
+        "outcome",
+        "idempotency_key",
+        "error",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(RamaActionReceipt)
+class RamaActionReceiptAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "landlord", "capability_key", "task")
+    list_filter = ("capability_key",)
+    search_fields = ("landlord__user__email", "idempotency_key", "task__conversation_id")
+    readonly_fields = (
+        "landlord",
+        "task",
+        "capability_key",
+        "idempotency_key",
+        "inputs",
+        "effects",
+        "entity_refs",
+        "verification",
+        "links",
+        "created_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(RamaAttachmentBatch)
+class RamaAttachmentBatchAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "landlord", "conversation_id", "status")
+    list_filter = ("status",)
+    search_fields = ("conversation_id", "message_id", "landlord__user__email")
+    readonly_fields = ("created_at", "sealed_at", "completed_at")
+
+
+@admin.register(RamaAttachment)
+class RamaAttachmentAdmin(admin.ModelAdmin):
+    list_display = (
+        "created_at",
+        "original_filename",
+        "batch",
+        "classification",
+        "status",
+        "sequence",
+    )
+    list_filter = ("classification", "status")
+    search_fields = ("original_filename", "sha256", "target_id")
+    readonly_fields = ("sha256", "size", "created_at", "updated_at")
 
 
 @admin.register(RamaAutoAction)

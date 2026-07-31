@@ -18,6 +18,55 @@ def _day(raw, field):
         return None, {"error": f"{field} must be YYYY-MM-DD, got {raw!r}."}
 
 
+def treasurer_fact_already_done(
+    landlord,
+    *,
+    subject: str = "",
+    fact: str = "",
+    amount: str = "",
+    period: str = "",
+    direction: str = "",
+    holding_name: str = "",
+    effective_from: str = "",
+    effective_to: str = "",
+    **_ignored,
+) -> str | None:
+    """Refuse a Treasurer fact that restates money the ledger already holds.
+
+    The store boundary — "a Treasurer fact is for what the ledger CANNOT hold"
+    — was documented but not enforced, so RAMA offered to record a $100 deposit
+    payment as a fact when that same $100 was already a ledger PAYMENT. Two
+    stores of one event, and nothing outside a Monday deliberation ever reads
+    the second one, so the divergence would have stayed invisible.
+
+    Signature mirrors the tool's, so `already_done_for` can pass the step's
+    arguments straight through.
+    """
+    from . import treasurer_facts as facts
+
+    parsed_amount, _period = facts.parse_amount(amount or fact)
+    if parsed_amount is None:
+        return None
+
+    holding = None
+    if (holding_name or "").strip():
+        holding, err = _resolve_holding(landlord, holding_name)
+        if err:
+            # Can't resolve the scope, so can't judge the overlap. Say nothing
+            # and let the normal preview/confirm handle it.
+            return None
+
+    start, _ = _day(effective_from, "effective_from")
+    end, _ = _day(effective_to, "effective_to")
+    return facts.already_in_ledger(
+        landlord,
+        amount=parsed_amount,
+        holding=holding,
+        effective_from=start,
+        effective_to=end,
+    )
+
+
 def record_treasurer_fact(
     landlord,
     *,

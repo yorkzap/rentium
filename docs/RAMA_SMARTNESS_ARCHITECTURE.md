@@ -21,6 +21,21 @@ The proposal below has been **built**. Summary of what now exists in `rama/`:
 | — | Editable manifest broadened (leases, work orders, inquiries, inventory) | `manifest.py` |
 | 4 | `capability_digest()` — capabilities come from **data**, persona keeps behaviour | `manifest.py`, `service.py` |
 
+### July 30, 2026 command-engine addendum
+
+The fixed-tool surface is now fronted by selective capability retrieval
+(`rama/capabilities.py`), so each turn receives a small relevant schema set and
+can explicitly search the registered catalogue. Confirmed work is durable
+workflow state (`RamaTask`) and produces immutable `RamaActionReceipt` evidence;
+provider prose cannot stand in for completion.
+
+The high-cost orchestration failures from real conversations now have
+application-owned composite/service boundaries: exact chat attachment batches,
+listing media manifests/removal, shared lease creation, shared viewing
+scheduling, invite lifecycle evidence, partial ledger settlement, and atomic
+whole-suite-to-room-offering conversion. These remain bespoke because they are
+real workflows, not simple field access.
+
 **Certification.** New Mistral-Small eval scenarios (composed `read`, a field
 `update_lease` lacks via `update`, a deep `link`) all **PASS** on the weak-model
 bar (`scripts/rama_eval.py`, `RAMA_EVAL_MODELS=mistral:mistral-small-latest`).

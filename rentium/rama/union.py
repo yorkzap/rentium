@@ -13,6 +13,9 @@ from decimal import Decimal
 
 from django.db.models import Count, Sum
 
+from rentium.ledger.position import Scope
+from rentium.ledger.position import financial_position
+
 
 def _month_bounds(day: date) -> tuple[date, date]:
     start = day.replace(day=1)
@@ -793,7 +796,15 @@ def live_context(landlord) -> dict:
             "Expense lines must be quoted by description+amount from this_month_expenses only. "
             "draft_leases / draft_lease_count: DRAFT paperwork only — not rented; "
             "still answer 'any draft leases?' from this list. "
-            "outstanding_total is money OWED now (due_date <= today, unpaid). "
+            # This used to read "outstanding_total is money OWED now", which is
+            # false: it is income-only. A landlord owing nothing but a $425
+            # deposit has outstanding_total 0.00, and the model confidently
+            # reported "nothing outstanding" while the deposit sat overdue.
+            "outstanding_total is unpaid INCOME charges due on or before today. "
+            "It EXCLUDES deposits, which are a refundable liability, not income. "
+            "For everything owed including deposits use owed_total; for the "
+            "deposit alone use deposits_outstanding. If asked 'is anything "
+            "owed?' answer from owed_total, never from outstanding_total. "
             "next_charge is FUTURE and is NOT outstanding. "
             "If vacant_today is true, answer 'Is X vacant today?' with Yes first. "
             "For viewings use date+weekday from upcoming_appointments only — "
@@ -1436,13 +1447,10 @@ def state_of_the_union(landlord) -> dict:
     # showed every charge type, the contradiction this fixes would simply
     # reappear one layer up — RAMA telling the landlord $19.78 while the page
     # in front of them said $444.78.
-    open_all = LedgerEntry.objects.filter(landlord=landlord).open_charges(as_of=today)
-    open_charges = open_all.income_charges()
-    agg = open_charges.aggregate(total=Sum("outstanding"), count=Count("id"))
-    overdue_count = open_charges.filter(due_date__lt=today).count()
-    owed_agg = open_all.aggregate(total=Sum("outstanding"), count=Count("id"))
-    owed_overdue_count = open_all.filter(due_date__lt=today).count()
-    deposits_owed = open_all.deposit_charges().aggregate(t=Sum("outstanding"))["t"]
+    # One computation for every figure below — see ledger/position.py. These
+    # used to be six hand-rolled aggregates, and the per-tenant one disagreed
+    # with the portfolio one about the same money.
+    money = financial_position(landlord, scope=Scope.portfolio(), as_of=today)
 
     open_work = (
         WorkOrder.objects.for_landlord(landlord)
@@ -1518,16 +1526,21 @@ def state_of_the_union(landlord) -> dict:
             "expenses_not_yet_taken_from_bank"
         ],
         "deposits_held": str(deposits),
-        "outstanding_total": str(agg["total"] or Decimal("0.00")),
-        "outstanding_count": agg["count"] or 0,
-        "overdue_count": overdue_count,
+        # NOTE the name is historical and INCOME-ONLY — the frontend and
+        # /api/ledger/summary/ both read this key, so it keeps its name. What
+        # it excludes is spelled out in COPY_EXACTLY below, because a landlord
+        # with only an unpaid deposit sees 0.00 here and that is correct but
+        # deeply misleading unless said out loud.
+        "outstanding_total": str(money.income_outstanding_now),
+        "outstanding_count": money.income_open_count,
+        "overdue_count": money.income_overdue_count,
         # Every charge type, matching the Financial page's tiles. Deposits are
         # owed but refundable, so they are reported here and never folded into
         # income.
-        "owed_total": str(owed_agg["total"] or Decimal("0.00")),
-        "owed_count": owed_agg["count"] or 0,
-        "owed_overdue_count": owed_overdue_count,
-        "deposits_outstanding": str(deposits_owed or Decimal("0.00")),
+        "owed_total": str(money.outstanding_now),
+        "owed_count": money.open_count,
+        "owed_overdue_count": money.overdue_count,
+        "deposits_outstanding": str(money.deposits_outstanding),
         "active_leases": lease_counts["active"],
         "draft_leases": draft_count,
         "next_charge": next_ch,
@@ -1578,9 +1591,11 @@ def state_of_the_union(landlord) -> dict:
         "this_month": this_month,
         "this_month_expenses": this_month.get("expense_lines", []),
         "outstanding": {
-            "total": str(agg["total"] or Decimal("0.00")),
-            "count": agg["count"] or 0,
-            "overdue_count": overdue_count,
+            # Income-only, matching dashboard_truth.outstanding_total.
+            "total": str(money.income_outstanding_now),
+            "count": money.income_open_count,
+            "overdue_count": money.income_overdue_count,
+            "excludes_deposits": str(money.deposits_outstanding),
         },
         "deposits_held": str(deposits),
         "next_charge": next_ch,

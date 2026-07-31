@@ -10,48 +10,51 @@ call the exact same code path.
 
 import uuid
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
+from decimal import InvalidOperation
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.http import FileResponse
 from django.utils import timezone
-
 from rest_framework import status as http_status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view
+from rest_framework.decorators import permission_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .models import RamaPreferences
 from .providers import PROVIDERS
-from .runtime import (
-    MODEL_CATALOG,
-    get_landlord_config,
-    get_role_config,
-    platform_api_key,
-)
-from .service import MAX_MESSAGE_CHARS, PENDING_ACTION_TTL_SECONDS, run_turn
+from .runtime import MODEL_CATALOG
+from .runtime import get_landlord_config
+from .runtime import get_role_config
+from .runtime import platform_api_key
+from .service import MAX_MESSAGE_CHARS
+from .service import PENDING_ACTION_TTL_SECONDS
+from .service import run_turn
 from .union import state_of_the_union
 
 __all__ = [
+    "PENDING_ACTION_TTL_SECONDS",  # re-exported for tests/back-compat
+    "attachment_batches_view",
+    "attachment_detail_view",
+    "auto_action_undo_view",
+    "auto_actions_view",
+    "bank_balances_view",
     "chat_view",
-    "upload_view",
+    "config_view",
+    "constitution_view",
     "general_chat_view",
+    "holdings_view",
+    "insight_detail_view",
+    "insights_view",
+    "memory_delete_view",
+    "memory_view",
+    "settings_view",
     "treasurer_chat_view",
     "treasurer_view",
-    "constitution_view",
-    "memory_view",
-    "memory_delete_view",
-    "auto_actions_view",
-    "auto_action_undo_view",
-    "insights_view",
-    "insight_detail_view",
-    "holdings_view",
-    "bank_balances_view",
-    "config_view",
-    "settings_view",
     "union_view",
-    "PENDING_ACTION_TTL_SECONDS",  # re-exported for tests/back-compat
+    "upload_view",
 ]
 
 
@@ -150,7 +153,7 @@ def portfolios_view(request):
             "portfolios": portfolios,
             "acting_as": str(acting.pk),
             "acting_name": (getattr(acting.user, "name", "") or acting.user.email),
-        }
+        },
     )
 
 
@@ -181,7 +184,7 @@ def config_view(request):
             "platform_ready": {
                 name: bool(platform_api_key(name)) for name in PROVIDERS
             },
-        }
+        },
     )
 
 
@@ -231,7 +234,7 @@ def settings_view(request):
         role_err = _apply_role_prefs(prefs, data, role)
         if role_err:
             return Response(
-                {"detail": role_err}, status=http_status.HTTP_400_BAD_REQUEST
+                {"detail": role_err}, status=http_status.HTTP_400_BAD_REQUEST,
             )
 
     prefs.save()
@@ -285,7 +288,8 @@ def _chat_response(result) -> Response:
             "tools_used": result.tools_used,
             "pending_plan": result.pending_plan,
             "auto_executed": result.auto_executed,
-        }
+            "attachments": result.attachments,
+        },
     )
 
 
@@ -321,8 +325,86 @@ def upload_view(request):
             status=http_status.HTTP_400_BAD_REQUEST,
         )
     return Response(
-        {"upload_id": str(upload.pk)}, status=http_status.HTTP_201_CREATED
+        {"upload_id": str(upload.pk)}, status=http_status.HTTP_201_CREATED,
     )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def attachment_batches_view(request):
+    """Stage exactly the files currently selected in the chat composer."""
+    from .attachment_services import AttachmentError
+    from .attachment_services import batch_payload
+    from .attachment_services import stage_files
+
+    landlord = _landlord(request)
+    raw_conversation = request.data.get("conversation_id")
+    try:
+        conversation_id = (
+            uuid.UUID(str(raw_conversation)) if raw_conversation else uuid.uuid4()
+        )
+    except ValueError:
+        return Response(
+            {"detail": "conversation_id must be a UUID."},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    uploads = request.FILES.getlist("files")
+    if not uploads:
+        one = request.FILES.get("file")
+        uploads = [one] if one else []
+    try:
+        batch = stage_files(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            uploads=uploads,
+            batch_id=str(request.data.get("batch_id") or ""),
+        )
+    except AttachmentError as exc:
+        return Response(
+            {"detail": str(exc)},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(batch_payload(batch), status=http_status.HTTP_201_CREATED)
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def attachment_detail_view(request, attachment_id):
+    from .attachment_services import AttachmentError
+    from .attachment_services import batch_payload
+    from .attachment_services import remove_staged_attachment
+
+    try:
+        batch = remove_staged_attachment(
+            landlord=_landlord(request),
+            attachment_id=attachment_id,
+        )
+    except AttachmentError as exc:
+        return Response(
+            {"detail": str(exc)},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(batch_payload(batch))
+
+
+def _attachment_batch_note(request, landlord, conversation_id) -> str:
+    from .attachment_services import AttachmentError
+    from .attachment_services import batch_chat_note
+    from .attachment_services import seal_batch
+
+    batch_id = str(request.data.get("attachment_batch_id") or "").strip()
+    if not batch_id:
+        return ""
+    if conversation_id is None:
+        raise AttachmentError(
+            "conversation_id is required when sending an attachment batch.",
+        )
+    batch = seal_batch(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        batch_id=batch_id,
+    )
+    return batch_chat_note(batch)
 
 
 def _attachment_note(request, landlord) -> str:
@@ -343,7 +425,7 @@ def _attachment_note(request, landlord) -> str:
     valid = [
         str(pk)
         for pk in RamaUpload.objects.filter(
-            landlord=landlord, used_at__isnull=True, pk__in=ids
+            landlord=landlord, used_at__isnull=True, pk__in=ids,
         ).values_list("pk", flat=True)
     ]
     if not valid:
@@ -402,7 +484,7 @@ def chat_view(request):
         return Response(
             {
                 "detail": "RAMA is turned off for your account. "
-                "Enable it under Account → RAMA."
+                "Enable it under Account → RAMA.",
             },
             status=http_status.HTTP_403_FORBIDDEN,
         )
@@ -412,7 +494,7 @@ def chat_view(request):
                 "detail": (
                     "Add your API key under Account → RAMA (e.g. an xAI Grok key), "
                     "then try again."
-                )
+                ),
             },
             status=http_status.HTTP_503_SERVICE_UNAVAILABLE,
         )
@@ -423,13 +505,24 @@ def chat_view(request):
 
     # If the landlord attached photo(s) in the chat, tell the model so it can
     # attach_photo_to_listing them (the image itself is staged server-side).
+    try:
+        batch_note = _attachment_batch_note(request, landlord, conversation_id)
+    except Exception as exc:
+        from .attachment_services import AttachmentError
+
+        if isinstance(exc, AttachmentError):
+            return Response(
+                {"detail": str(exc)},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        raise
     message = (
-        f"{message}{_attachment_note(request, landlord)}"
+        f"{message}{batch_note}{_attachment_note(request, landlord)}"
         f"{_document_attachment_note(request, landlord)}"
     )
 
     result = run_turn(
-        landlord, message, conversation_id, role="corporal", channel="web"
+        landlord, message, conversation_id, role="corporal", channel="web",
     )
     return _chat_response(result)
 
@@ -459,8 +552,8 @@ def insights_view(request):
                     "created_at": i.created_at,
                 }
                 for i in qs[:100]
-            ]
-        }
+            ],
+        },
     )
 
 
@@ -541,7 +634,8 @@ def _document_payload(document, request=None):
 @permission_classes([IsAuthenticated])
 def documents_view(request):
     """Upload or list the acting landlord's OCR-backed business records."""
-    from .document_services import DocumentError, ingest_document
+    from .document_services import DocumentError
+    from .document_services import ingest_document
     from .models import RamaDocument
     from .tasks import process_rama_document
 
@@ -555,7 +649,7 @@ def documents_view(request):
         if status_filter:
             queryset = (
                 RamaDocument.objects.filter(
-                    landlord=landlord, status=status_filter
+                    landlord=landlord, status=status_filter,
                 )
                 .select_related("holding", "property", "ledger_entry")[:200]
             )
@@ -569,11 +663,11 @@ def documents_view(request):
         )
     try:
         document, created = ingest_document(
-            landlord=landlord, upload=upload, created_by=request.user
+            landlord=landlord, upload=upload, created_by=request.user,
         )
     except DocumentError as exc:
         return Response(
-            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
         )
     if created:
         process_rama_document.delay(str(document.pk))
@@ -587,9 +681,12 @@ def documents_view(request):
 @permission_classes([IsAuthenticated])
 def document_detail_view(request, document_id):
     """Inspect OCR results or confirm/correct the proposed filing."""
-    from rentium.properties.models import Property, PropertyHolding
+    from rentium.properties.models import Property
+    from rentium.properties.models import PropertyHolding
 
-    from .document_services import DocumentError, DuplicateExpenseError, file_document
+    from .document_services import DocumentError
+    from .document_services import DuplicateExpenseError
+    from .document_services import file_document
     from .models import RamaDocument
 
     landlord = _landlord(request)
@@ -600,7 +697,7 @@ def document_detail_view(request, document_id):
     )
     if document is None:
         return Response(
-            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND
+            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
         )
     if request.method == "GET":
         payload = _document_payload(document, request)
@@ -620,19 +717,19 @@ def document_detail_view(request, document_id):
     property_obj = None
     if data.get("holding_id"):
         holding = PropertyHolding.objects.filter(
-            pk=data["holding_id"], landlord=landlord
+            pk=data["holding_id"], landlord=landlord,
         ).first()
         if holding is None:
             return Response(
-                {"detail": "No such holding."}, status=http_status.HTTP_400_BAD_REQUEST
+                {"detail": "No such holding."}, status=http_status.HTTP_400_BAD_REQUEST,
             )
     if data.get("property_id"):
         property_obj = Property.objects.filter(
-            pk=data["property_id"], landlord=landlord
+            pk=data["property_id"], landlord=landlord,
         ).first()
         if property_obj is None:
             return Response(
-                {"detail": "No such listing."}, status=http_status.HTTP_400_BAD_REQUEST
+                {"detail": "No such listing."}, status=http_status.HTTP_400_BAD_REQUEST,
             )
 
     def parsed_date(key):
@@ -681,7 +778,7 @@ def document_detail_view(request, document_id):
         )
     except (DocumentError, ValueError) as exc:
         return Response(
-            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
         )
     document.refresh_from_db()
     return Response(_document_payload(document, request))
@@ -694,11 +791,11 @@ def document_download_view(request, document_id):
     from .models import RamaDocument
 
     document = RamaDocument.objects.filter(
-        pk=document_id, landlord=_landlord(request)
+        pk=document_id, landlord=_landlord(request),
     ).first()
     if document is None:
         return Response(
-            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND
+            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
         )
     field = document.archival_pdf or document.original_file
     field.open("rb")
@@ -717,14 +814,16 @@ def bank_balances_view(request):
     POST {holding_id?, label?, balance, as_of?} — a landlord-direct entry
     (no chat confirm needed for their own UI edit; chat/General-origin
     writes go through the guarded update_bank_balance tool instead)."""
-    from .finance import balance_payload, list_bank_balances
+    from .finance import balance_payload
+    from .finance import list_bank_balances
 
     landlord = _landlord(request)
     if request.method == "GET":
         return Response(list_bank_balances(landlord))
 
     from datetime import date as _date
-    from decimal import Decimal, InvalidOperation
+    from decimal import Decimal
+    from decimal import InvalidOperation
 
     from rentium.ledger.models import PropertyBankBalance
     from rentium.properties.models import PropertyHolding
@@ -736,7 +835,7 @@ def bank_balances_view(request):
         holding = PropertyHolding.objects.filter(pk=holding_id, landlord=landlord).first()
         if holding is None:
             return Response(
-                {"detail": "No such holding."}, status=http_status.HTTP_400_BAD_REQUEST
+                {"detail": "No such holding."}, status=http_status.HTTP_400_BAD_REQUEST,
             )
     try:
         balance = Decimal(str(data.get("balance")))
@@ -750,7 +849,7 @@ def bank_balances_view(request):
         as_of = _date.fromisoformat(as_of_raw) if as_of_raw else _date.today()
     except ValueError:
         return Response(
-            {"detail": "as_of must be YYYY-MM-DD."}, status=http_status.HTTP_400_BAD_REQUEST
+            {"detail": "as_of must be YYYY-MM-DD."}, status=http_status.HTTP_400_BAD_REQUEST,
         )
     row, _created = PropertyBankBalance.objects.update_or_create(
         landlord=landlord, holding=holding,
@@ -785,7 +884,7 @@ def general_chat_view(request):
                 "detail": (
                     "No API key available for the General's provider "
                     f"({role_cfg.provider}). Set one under Settings → RAMA."
-                )
+                ),
             },
             status=http_status.HTTP_503_SERVICE_UNAVAILABLE,
         )
@@ -793,9 +892,20 @@ def general_chat_view(request):
     message, conversation_id, err = _validated_chat_input(request)
     if err is not None:
         return err
+    try:
+        message += _attachment_batch_note(request, landlord, conversation_id)
+    except Exception as exc:
+        from .attachment_services import AttachmentError
+
+        if isinstance(exc, AttachmentError):
+            return Response(
+                {"detail": str(exc)},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        raise
 
     result = run_turn(
-        landlord, message, conversation_id, role="general", channel="web"
+        landlord, message, conversation_id, role="general", channel="web",
     )
     return _chat_response(result)
 
@@ -825,7 +935,7 @@ def treasurer_chat_view(request):
                 "detail": (
                     "No API key available for the Treasurer's provider "
                     f"({role_cfg.provider}). Set one under Settings → RAMA."
-                )
+                ),
             },
             status=http_status.HTTP_503_SERVICE_UNAVAILABLE,
         )
@@ -835,7 +945,7 @@ def treasurer_chat_view(request):
         return err
 
     result = run_turn(
-        landlord, message, conversation_id, role="treasurer", channel="web"
+        landlord, message, conversation_id, role="treasurer", channel="web",
     )
     return _chat_response(result)
 
@@ -850,7 +960,9 @@ def constitution_view(request):
     need the chat confirm gate; General-origin amendments go through the
     guarded amend_constitution tool instead).
     """
-    from .constitution import amend, parse_rule_changes, section_payload
+    from .constitution import amend
+    from .constitution import parse_rule_changes
+    from .constitution import section_payload
     from .models import RamaConstitutionSection
 
     landlord = _landlord(request)
@@ -861,7 +973,7 @@ def constitution_view(request):
     key = str(data.get("key") or "").strip().lower()
     if not key:
         return Response(
-            {"detail": "key is required."}, status=http_status.HTTP_400_BAD_REQUEST
+            {"detail": "key is required."}, status=http_status.HTTP_400_BAD_REQUEST,
         )
     raw_changes = data.get("rule_changes")
     if isinstance(raw_changes, (list, dict)):
@@ -871,7 +983,7 @@ def constitution_view(request):
     changes, err_msg = parse_rule_changes(str(raw_changes or ""))
     if err_msg:
         return Response(
-            {"detail": err_msg}, status=http_status.HTTP_400_BAD_REQUEST
+            {"detail": err_msg}, status=http_status.HTTP_400_BAD_REQUEST,
         )
     result = amend(
         landlord,
@@ -913,7 +1025,7 @@ def capability_gaps_view(request):
             valid = {c for c, _ in RamaCapabilityGap.Status.choices}
             if new_status not in valid:
                 return Response(
-                    {"error": f"status must be one of {sorted(valid)}."}, status=400
+                    {"error": f"status must be one of {sorted(valid)}."}, status=400,
                 )
             gap.status = new_status
             fields.append("status")
@@ -926,7 +1038,7 @@ def capability_gaps_view(request):
                 "id": str(gap.pk),
                 "status": gap.status,
                 "prioritised": gap.prioritised,
-            }
+            },
         )
 
     status_filter = request.query_params.get("status")
@@ -936,7 +1048,7 @@ def capability_gaps_view(request):
     counts = {}
     for code, _label in RamaCapabilityGap.Status.choices:
         counts[code] = RamaCapabilityGap.objects.filter(
-            landlord=landlord, status=code
+            landlord=landlord, status=code,
         ).count()
 
     return Response(
@@ -954,7 +1066,7 @@ def capability_gaps_view(request):
                 }
                 for g in qs[:200]
             ],
-        }
+        },
     )
 
 
@@ -998,8 +1110,8 @@ def auto_actions_view(request):
                     "undone_at": row.undone_at.isoformat() if row.undone_at else None,
                 }
                 for row in rows
-            ]
-        }
+            ],
+        },
     )
 
 
@@ -1012,7 +1124,8 @@ def auto_action_undo_view(request, action_id):
     privilege the chat path doesn't already have.
     """
     from .autonomy import undo_action
-    from .models import RamaAudit, RamaAutoAction
+    from .models import RamaAudit
+    from .models import RamaAutoAction
 
     landlord = _landlord(request)
     action = RamaAutoAction.objects.filter(landlord=landlord, pk=action_id).first()
@@ -1054,7 +1167,8 @@ def memory_delete_view(request, memory_id):
     the personal data into the append-only audit trail, which is worse than not
     deleting at all. What survives is proof that something was removed and when.
     """
-    from .models import RamaAudit, RamaMemory
+    from .models import RamaAudit
+    from .models import RamaMemory
 
     landlord = _landlord(request)
     row = RamaMemory.objects.filter(landlord=landlord, pk=memory_id).first()
@@ -1090,11 +1204,8 @@ def treasurer_view(request):
     """
     from django.utils import timezone
 
-    from .models import (
-        LandlordFinancialProfile,
-        RamaDeliberation,
-        TreasurerRequest,
-    )
+    from .models import LandlordFinancialProfile
+    from .models import RamaDeliberation
 
     landlord = _landlord(request)
     profile, _ = LandlordFinancialProfile.objects.get_or_create(landlord=landlord)
@@ -1193,7 +1304,7 @@ def treasurer_view(request):
                 for d in deliberations
             ],
             "data_gaps": _treasurer_data_gaps(landlord),
-        }
+        },
     )
 
 
@@ -1203,7 +1314,8 @@ def _treasurer_data_gaps(landlord) -> list[dict]:
     Stated as concrete missing facts rather than a percentage, because "62%
     complete" tells a landlord nothing about what to go and do.
     """
-    from rentium.ledger.models import HoldingFinancials, HoldingMortgage
+    from rentium.ledger.models import HoldingFinancials
+    from rentium.ledger.models import HoldingMortgage
     from rentium.properties.models import PropertyHolding
 
     gaps = []
@@ -1217,7 +1329,7 @@ def _treasurer_data_gaps(landlord) -> list[dict]:
         if not holding.valuations.exists():
             missing.append("a recent valuation")
         if not HoldingMortgage.objects.filter(
-            holding=holding, status=HoldingMortgage.Status.ACTIVE
+            holding=holding, status=HoldingMortgage.Status.ACTIVE,
         ).exists():
             missing.append("the mortgage on it")
         if missing:

@@ -58,6 +58,11 @@ them, and the listing API hides them unless `?include_inactive=true`.
 `properties.services` owns rental-mode switching for both REST and RAMA:
 `describe_rental_mode_switch` previews without writing, and `set_rental_mode`
 refuses while any DRAFT, PENDING or ACTIVE lease exists anywhere in the unit.
+`configure_room_offerings` is the composite boundary for converting an existing
+whole floor/suite into named room rentals: in one transaction it creates or
+reuses the unit's `PropertyGroup`, records the bedroom layout, creates/reuses
+the room `Property` offerings, and parks the complete-unit offering. It applies
+the same live-lease blocker and never creates a parallel fake suite.
 `Lease._validate_no_cross_scope_overlap` blocks the other direction, so a unit
 can never be let whole and by the room at the same time.
 
@@ -120,18 +125,23 @@ is:
 ```text
 Web chat or linked landlord channel
 → deterministic high-confidence intent routing
-→ role/tool allowlist and landlord-scoped resolution
-→ read result, clarification, or complete mutation preview
+→ capability retrieval over the role's allowlist
+→ landlord-scoped resolution and application service
+→ typed answer, clarification, no-op, failure, or complete mutation preview
 → explicit confirmation
 → service-layer transaction
-→ concrete completion message and audit record
+→ immutable action receipt, verification, and concrete completion message
 ```
 
-High-confidence property rename, dashboard navigation, room listing, and
-group-room creation requests bypass speculative planning. The General has
-direct access to routine property tools and may still delegate specialized
-work. Known supported requests are rejected by `log_capability_gap` with the
-matching tool name so they cannot create false capability records.
+`rama/capabilities.py` indexes registered operations by business-language
+aliases, descriptions, risk, and schema. A turn sees a small relevant subset
+instead of the entire registry; `search_capabilities` lets the model retrieve a
+missed operation without pretending it is unsupported. High-confidence
+property rename, dashboard navigation, room listing, and group-room creation
+requests still bypass speculative planning. The General directly handles
+routine leases, invites, payments, viewings, media, and property structure and
+may delegate specialist analysis. Known supported requests are rejected by
+`log_capability_gap` with the matching operation name.
 
 Routine writes retain the same safety rule everywhere: one complete preview,
 then an explicit confirmation using the same arguments. `create_group_room`
@@ -149,6 +159,39 @@ group-wide areas. Missing location and landlord-use facts produce one
 state-backed clarification; the completed hierarchy then receives one preview
 and one transaction.
 
+### Command state and receipts
+
+Provider prose is presentation, never workflow state. A confirmed operation is
+backed by `RamaTask` and follows a validated FSM:
+
+```text
+RECEIVED → NEEDS_INPUT / AWAITING_CONFIRMATION → EXECUTING
+         → VERIFIED / FAILED / CANCELLED
+```
+
+Pending plans point at their task. Each completed plan step writes one immutable
+`RamaActionReceipt` containing the capability, exact inputs, effects, entity
+references, verification evidence, and links. Repeated confirmations are
+recognized as already applied, and tool-specific `already_done` guards run both
+before preview and immediately before execution.
+
+### Attachments and listing media
+
+Chat files are grouped in a conversation-owned `RamaAttachmentBatch`. The
+composer sends that exact batch ID with the message; the server seals it, and
+media/document tools must target the batch or explicit attachment IDs. There is
+no fallback to “all unused uploads,” so a later set of 11 photos cannot absorb
+17 earlier photos or a mortgage document from another message.
+
+`properties.media_services` is the shared REST/RAMA boundary for attach,
+manifest, reorder, exact removal, and atomic removal of a selected set. Media
+manifests use numbered thumbnails and stable handles (`primary`,
+`gallery:<id>`). The dashboard and RAMA both delete through those handles, so
+one confirmation removes only the selected images. Business documents are
+promoted from one exact attachment into
+`RamaDocument`; the landlord's stated intent, not the file merely being an
+image, determines whether it is a listing photo or a document.
+
 ### Roles
 
 Four roles, dispatched from one table in `rama/roles.py`. `ROLE_TOOLS` is
@@ -160,7 +203,7 @@ otherwise bypass the role's tool list entirely.
 | Role | Writes | Reachable |
 |---|---|---|
 | Corporal | Yes, always behind a confirmation | Chat |
-| General | Plans and policy; delegates execution | Chat |
+| General | Routine operations, planning, policy, and specialist delegation | Chat |
 | FSA | No (`READ_ONLY_ROLES`) | Delegation only |
 | Treasurer | No (`READ_ONLY_ROLES`) | Chat, delegation, weekly beat |
 
@@ -179,6 +222,32 @@ Registered collection routes include dashboard home, properties, property
 groups, documents, leases, finances, maintenance, and settings. Entity routes
 use registered templates such as `/dashboard/properties/{id}` and RAMA
 document detail.
+Public listing links use the listing's canonical
+`/<province>/<city_slug>/<public_slug>` route and report whether the visibility
+rules currently make it live; name-derived `/properties/...` URLs are never
+invented.
+
+## Shared application-service boundaries
+
+REST and RAMA are adapters over the same domain functions for workflows that
+previously drifted:
+
+- `leases.services.create_lease_record` owns portfolio scope, defaults, model
+  validation, and landlord-shared legal-clause derivation.
+- `appointments.services.schedule_viewing` owns exact property scope,
+  timezone, tenant-consent state, proposal history, and event publication.
+- `properties.services.configure_room_offerings` owns complete-unit to by-room
+  conversion, exact room names, and the common areas stated in that request.
+- `properties.media_services` owns listing media.
+- `ledger.services.record_payment` remains the immutable, idempotent settlement
+  boundary; a partial payment settles the original charge and leaves its
+  computed balance without rewriting that charge.
+
+Lease invitations additionally have an append-only `LeaseInviteEvent` stream:
+`SENT`, `LINK_OPENED`, `ACCOUNT_LINKED`, `SIGNED`, `DECLINED`, and `RESENT`.
+`LINK_OPENED` means the token-gated URL was opened; it is deliberately not
+described as proof that the recipient read the lease. RAMA and the lease API
+project the same lifecycle facts.
 
 ## Document intelligence
 

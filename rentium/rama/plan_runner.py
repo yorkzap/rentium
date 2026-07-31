@@ -30,9 +30,11 @@ import json
 
 from django.utils import timezone
 
-from .models import RamaPendingPlan, RamaPlanStep
+from .command_engine import create_task, record_receipt
+from .models import RamaPendingPlan, RamaPlanStep, RamaTask
+from .outcomes import CommandOutcome, OutcomeKind
 from .registry import REGISTRY, execute
-from .tool_meta import blockers_for, meta_for
+from .tool_meta import already_done_for, blockers_for, meta_for
 
 PENDING_PLAN_TTL_SECONDS = 30 * 60
 
@@ -70,6 +72,14 @@ def validate_plan(steps: list[dict], landlord) -> list[str]:
         safe_args = {k: v for k, v in args.items() if k in allowed and k != "confirm"}
         for blocker in blockers_for(tool_name, landlord, **safe_args):
             errors.append(f"Step {i} ({tool_name}): {blocker['detail']}")
+        # Second of the two sites the check runs at. Preview time catches it
+        # before the landlord is ever shown the proposal; this catches the
+        # window between them seeing it and saying yes — a payment can land by
+        # another route in between, and confirming a stale preview would then
+        # record the same money twice.
+        duplicate = already_done_for(tool_name, landlord, **safe_args)
+        if duplicate:
+            errors.append(f"Step {i} ({tool_name}): {duplicate}")
     return errors
 
 
@@ -77,9 +87,24 @@ def validate_plan(steps: list[dict], landlord) -> list[str]:
 def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
     """Persist a playbook plan payload (latest plan per conversation wins)."""
     clear_plan(landlord, conversation_id)
+    task = create_task(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        capability_key=plan_payload.get("operation") or "plan",
+        inputs=plan_payload,
+    )
+    task.transition_to(
+        RamaTask.Status.AWAITING_CONFIRMATION,
+        outcome=CommandOutcome(
+            OutcomeKind.PREVIEW,
+            plan_payload.get("summary") or "Ready for confirmation.",
+            data={"operation": plan_payload.get("operation") or "plan"},
+        ).as_dict(),
+    )
     plan = RamaPendingPlan.objects.create(
         conversation_id=conversation_id,
         landlord=landlord,
+        task=task,
         operation=plan_payload.get("operation") or "plan",
         summary=plan_payload.get("summary") or "",
         blocked=plan_payload.get("blocked") or [],
@@ -89,6 +114,7 @@ def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
             plan=plan,
             order=i,
             tool=s["tool"],
+            capability_key=s.get("capability_key") or s["tool"],
             arguments=s.get("arguments") or {},
             target_label=s.get("target") or "",
             item_key=s.get("item_key") or str(i),
@@ -261,21 +287,40 @@ def load_fresh_plan(landlord, conversation_id) -> RamaPendingPlan | None:
         RamaPendingPlan.objects.filter(
             conversation_id=conversation_id, landlord=landlord
         )
+        .select_related("task")
         .prefetch_related("steps")
         .first()
     )
     if plan is None:
         return None
     if (timezone.now() - plan.updated_at).total_seconds() > PENDING_PLAN_TTL_SECONDS:
+        if plan.task_id and plan.task.status not in RamaTask.TERMINAL_STATUSES:
+            plan.task.transition_to(
+                RamaTask.Status.CANCELLED,
+                outcome=CommandOutcome(
+                    OutcomeKind.NOOP,
+                    "The confirmation window expired; nothing was executed.",
+                ).as_dict(),
+            )
         plan.delete()
         return None
     return plan
 
 
 def clear_plan(landlord, conversation_id) -> None:
-    RamaPendingPlan.objects.filter(
+    plans = RamaPendingPlan.objects.filter(
         conversation_id=conversation_id, landlord=landlord
-    ).delete()
+    ).select_related("task")
+    for plan in plans:
+        if plan.task_id and plan.task.status not in RamaTask.TERMINAL_STATUSES:
+            plan.task.transition_to(
+                RamaTask.Status.CANCELLED,
+                outcome=CommandOutcome(
+                    OutcomeKind.NOOP,
+                    "Replaced by a newer plan.",
+                ).as_dict(),
+            )
+        plan.delete()
 
 
 def plan_to_payload(plan: RamaPendingPlan) -> dict:
@@ -303,6 +348,11 @@ def plan_brief(plan: RamaPendingPlan) -> dict:
     """JSON-safe description of an outstanding plan (for the UI + prompt)."""
     steps = list(plan.steps.all())
     return {
+        "task": {
+            "id": str(plan.task_id) if plan.task_id else None,
+            "status": plan.task.status if plan.task_id else None,
+            "outcome": plan.task.outcome if plan.task_id else None,
+        },
         "operation": plan.operation,
         "summary": plan.summary,
         "status": plan.status,
@@ -349,6 +399,9 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
     execution finishes; it survives only while paused.
     """
     steps = list(plan.steps.order_by("order"))
+    task = plan.task
+    if task is not None and task.status != RamaTask.Status.EXECUTING:
+        task.transition_to(RamaTask.Status.EXECUTING)
     multi_step = len(steps) > 1
     # A "yes" while paused confirms exactly the step we paused on.
     step_confirmed_order = (
@@ -412,8 +465,23 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
             failed.append(_step_outcome(step))
         else:
             step.status = RamaPlanStep.Status.DONE
+            if task is not None:
+                receipt, _ = record_receipt(
+                    task=task,
+                    capability_key=step.capability_key or step.tool,
+                    inputs=step.arguments,
+                    effects=safe_result,
+                    verification={
+                        "verified": True,
+                        "source": "tool_result",
+                    },
+                )
+                step.receipt = receipt
             executed.append(_step_outcome(step))
-        step.save(update_fields=["status", "result", "updated_at"])
+        update_fields = ["status", "result", "updated_at"]
+        if step.receipt_id:
+            update_fields.append("receipt")
+        step.save(update_fields=update_fields)
         plan.cursor = step.order + 1
         # An executed own-confirm step consumes its confirmation.
         if step.order == step_confirmed_order:
@@ -424,9 +492,42 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
     if awaiting is None:
         # Finished (fully or partially) — the outstanding-plan row goes away.
         status = "partial" if failed or skipped else "done"
+        if task is not None:
+            if failed:
+                task.transition_to(
+                    RamaTask.Status.FAILED,
+                    outcome=CommandOutcome(
+                        OutcomeKind.FAILED,
+                        "The plan completed with failures.",
+                        data={
+                            "executed": len(executed),
+                            "failed": len(failed),
+                            "skipped": len(skipped),
+                        },
+                    ).as_dict(),
+                    error="One or more plan steps failed verification.",
+                )
+            else:
+                task.transition_to(
+                    RamaTask.Status.VERIFIED,
+                    outcome=CommandOutcome(
+                        OutcomeKind.COMPLETED,
+                        "The confirmed plan completed and was verified.",
+                        data={"executed": len(executed)},
+                    ).as_dict(),
+                )
         plan.delete()
     else:
         status = "awaiting_step"
+        if task is not None:
+            task.transition_to(
+                RamaTask.Status.AWAITING_CONFIRMATION,
+                outcome=CommandOutcome(
+                    OutcomeKind.PREVIEW,
+                    "The next high-risk step needs its own confirmation.",
+                    data={"awaiting": awaiting},
+                ).as_dict(),
+            )
 
     bits = []
     if executed:
@@ -440,6 +541,19 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
     summary = "; ".join(bits) or "nothing to do"
 
     return {
+        "task": {
+            "id": str(task.pk) if task is not None else None,
+            "status": task.status if task is not None else None,
+            "outcome": task.outcome if task is not None else None,
+        },
+        "receipts": [
+            {
+                "id": str(step.receipt_id),
+                "capability": step.capability_key or step.tool,
+            }
+            for step in steps
+            if step.receipt_id
+        ],
         "executed": executed,
         "failed": failed,
         "skipped": skipped,

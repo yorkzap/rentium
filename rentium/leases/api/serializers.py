@@ -124,6 +124,7 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
         source="room.name", read_only=True, allow_null=True
     )
     invite_status = serializers.SerializerMethodField()
+    invite_lifecycle = serializers.SerializerMethodField()
     invite_url = serializers.SerializerMethodField()
     effective_rent = serializers.SerializerMethodField()
     rent_adjustments = RentAdjustmentSerializer(many=True, read_only=True)
@@ -172,6 +173,7 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
             "invited_name",
             "invited_phone",
             "invite_status",
+            "invite_lifecycle",
             "invite_url",
             "invite_sent_at",
             "invite_accepted_at",
@@ -191,6 +193,7 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
             "declined_at",
             "cleaning_fee_paid",
             "invite_status",
+            "invite_lifecycle",
             "invite_sent_at",
             "invite_accepted_at",
             "created_at",
@@ -227,6 +230,11 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
         if obj.invite_sent_at:
             return "PENDING"
         return "NOT_SENT"
+
+    def get_invite_lifecycle(self, obj):
+        from rentium.leases.services import invite_lifecycle
+
+        return invite_lifecycle(obj)
 
     def get_invite_url(self, obj):
         """
@@ -928,22 +936,12 @@ class LeaseSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        lease = super().create(validated_data)
-        # Auto-derive the shared-with-landlord clause from area-level flags
-        # when the landlord didn't set it explicitly. If any common area on
-        # this lease's property/group is flagged shared_with_landlord, the
-        # lease records LANDLORD in common_space_shared_with — which is what
-        # flips the tenancy into the RTA s.4(c) exemption in
-        # tenancy_rules.py and prints the clause on the lease document.
-        # Roommate leases only (the clause field is validated as
-        # roommate-only by the model).
-        if (
-            "ROOMMATE" in (lease.lease_type or "")
-            and not lease.common_space_shared_with
-        ):
-            from rentium.leases.tenancy_rules import landlord_shares_common_areas
+        from rentium.leases.services import create_lease_record
 
-            if landlord_shares_common_areas(lease):
-                lease.common_space_shared_with = ["LANDLORD"]
-                lease.save(update_fields=["common_space_shared_with", "updated_at"])
-        return lease
+        landlord = validated_data.get("landlord")
+        if landlord is None:
+            raise serializers.ValidationError("Landlord context is required.")
+        try:
+            return create_lease_record(landlord=landlord, values=validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(serializers.as_serializer_error(exc)) from exc

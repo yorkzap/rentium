@@ -1,42 +1,255 @@
-"""Deterministic recognition of already-supported RAMA requests."""
+"""One searchable catalogue over RAMA's registered operations.
+
+The registry remains the compatibility adapter for existing tools.  This
+module adds the command metadata and selective retrieval layer so models see a
+small relevant surface instead of all 100+ schemas on every turn.
+"""
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+from .registry import REGISTRY
+from .tool_meta import meta_for
+
+_TOKEN = re.compile(r"[a-z0-9]+")
+
+# Business-language aliases that do not naturally occur in Python function
+# names.  Keep these focused: descriptions remain the general retrieval corpus.
+CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "record_payment": (
+        "received money",
+        "partial payment",
+        "paid deposit",
+        "e-transfer received",
+        "cash received",
+        "remaining balance",
+    ),
+    "attach_photo_to_listing": (
+        "add pictures",
+        "listing photos",
+        "gallery images",
+        "upload photos",
+    ),
+    "remove_photo_from_listing": (
+        "remove wrong image",
+        "delete listing photo",
+        "mortgage image on listing",
+        "remove basement photos",
+    ),
+    "remove_photos_from_listing": (
+        "remove selected images",
+        "delete multiple listing photos",
+        "remove photo numbers",
+        "delete specific pictures",
+    ),
+    "list_listing_media": (
+        "which listing photos",
+        "image handles",
+        "show gallery",
+    ),
+    "create_lease": (
+        "draft lease",
+        "new tenancy",
+        "room lease",
+        "rental agreement",
+    ),
+    "invite_tenant_to_lease": (
+        "send lease",
+        "invite renter",
+        "email agreement",
+    ),
+    "list_lease_roster": (
+        "viewed invite",
+        "opened lease",
+        "created account",
+        "signed up",
+        "signed lease",
+    ),
+    "create_property_structure": (
+        "create unit",
+        "property hierarchy",
+        "suite structure",
+    ),
+    "update_unit_layout": (
+        "add bedrooms",
+        "add rooms",
+        "bonus room",
+        "change layout",
+    ),
+    "set_unit_rental_mode": (
+        "rent by room",
+        "whole unit",
+        "convert suite",
+        "property group",
+    ),
+    "configure_unit_room_offerings": (
+        "turn suite into rooms",
+        "add rooms to complete unit",
+        "add two rooms into the garden suite",
+        "convert garden suite to property group",
+        "change how this unit is rented",
+        "rent by room",
+        "bonus room",
+        "rooms on the market",
+        "divide suite into rooms",
+        "mckenzie garden suite rooms",
+    ),
+    "schedule_viewing": (
+        "book showing",
+        "property tour",
+        "appointment tomorrow",
+    ),
+    "reschedule_viewing": (
+        "change viewing time",
+        "move showing",
+        "reschedule appointment",
+        "change from july to august",
+        "new time for viewing",
+    ),
+    "link": (
+        "public link",
+        "listing url",
+        "dashboard link",
+        "open page",
+    ),
+    "public_property_link": (
+        "public link",
+        "listing for applicants",
+        "rental url",
+        "send prospect the listing",
+    ),
+    "charge_status": (
+        "outstanding",
+        "amount left",
+        "overdue",
+        "charge balance",
+    ),
+    "month_money": (
+        "charged total",
+        "received this month",
+        "money in out net",
+    ),
+}
+
+CORE_CAPABILITIES = (
+    "search_capabilities",
+    "portfolio_snapshot",
+    "data_catalogue",
+    "read",
+    "link",
+)
+
+
+@dataclass(frozen=True)
+class CapabilitySpec:
+    key: str
+    aliases: tuple[str, ...]
+    description: str
+    input_schema: dict
+    risk: str
+    requires_confirmation: bool
+
+    def schema(self) -> dict:
+        return {
+            "name": self.key,
+            "description": self.description,
+            "parameters": self.input_schema,
+        }
+
+
+def get_capability(key: str) -> CapabilitySpec | None:
+    tool = REGISTRY.get(key)
+    if tool is None:
+        return None
+    meta = meta_for(key)
+    return CapabilitySpec(
+        key=key,
+        aliases=CAPABILITY_ALIASES.get(key, ()),
+        description=tool.description,
+        input_schema=tool.parameters,
+        risk=meta.risk,
+        requires_confirmation="confirm" in tool.parameters.get("properties", {}),
+    )
+
+
+def catalogue(keys: Iterable[str] | None = None) -> list[CapabilitySpec]:
+    names = keys if keys is not None else REGISTRY
+    return [spec for name in names if (spec := get_capability(name)) is not None]
+
+
+def _tokens(text: str) -> set[str]:
+    return set(_TOKEN.findall((text or "").casefold()))
+
+
+def _score(message: str, spec: CapabilitySpec) -> tuple[int, int, str]:
+    query = _tokens(message)
+    name_tokens = _tokens(spec.key.replace("_", " "))
+    alias_tokens = _tokens(" ".join(spec.aliases))
+    description_tokens = _tokens(spec.description)
+    exact_alias = max(
+        (len(_tokens(alias)) for alias in spec.aliases if alias.casefold() in message.casefold()),
+        default=0,
+    )
+    score = (
+        12 * len(query & name_tokens)
+        + 8 * len(query & alias_tokens)
+        + 2 * len(query & description_tokens)
+        + 20 * exact_alias
+    )
+    return score, exact_alias, spec.key
+
+
+def search_capability_catalogue(
+    query: str,
+    *,
+    allowed_names: Iterable[str] | None = None,
+    limit: int = 8,
+) -> list[dict]:
+    specs = catalogue(allowed_names)
+    ranked = [
+        spec
+        for spec in sorted(specs, key=lambda spec: _score(query, spec), reverse=True)
+        if _score(query, spec)[0] > 0
+    ]
+    return [
+        {
+            "key": spec.key,
+            "description": spec.description,
+            "aliases": list(spec.aliases),
+            "risk": spec.risk,
+            "requires_confirmation": spec.requires_confirmation,
+        }
+        for spec in ranked[: max(1, limit)]
+    ]
 
 
 def supported_tool_for_request(request: str) -> str | None:
+    """Fail capability-gap logging closed for operations already implemented.
+
+    These high-confidence business phrases intentionally remain deterministic;
+    catalogue retrieval is advisory, while gap creation must not turn a weak
+    similarity score into a false claim that the product supports something.
+    """
     text = " ".join((request or "").casefold().split())
     if not text:
         return None
-    tool = None
-    # A daily briefing already ships (Celery beat, 07:00, per-channel opt-in).
-    # Without this, "how come no morning updates?" was answered by denying the
-    # feature and offering to log a gap for it.
     if re.search(
         r"\b(morning|daily|every ?day|scheduled|recurring)\b.*"
         r"\b(update|updates|briefing|brief|digest|summary|message|report)\b",
         text,
     ) or re.search(r"\bmorning (brief|briefing|update)\b", text):
-        tool = "get_notification_channels"
-    # A described fault is a work order RAMA can raise itself, rather than
-    # pointing the landlord at the maintenance dashboard to do it by hand.
-    elif re.search(
+        return "get_notification_channels"
+    if re.search(
         r"\b(leak|leaking|broken|not working|doesn'?t work|won'?t work|"
         r"clogged|blocked|cracked|damaged|faulty|jammed|stuck|no hot water|"
         r"no heat|flooding|dripping)\b",
         text,
     ):
-        tool = "create_work_order"
-    # Money already on the books, booked in the wrong place. This one is here
-    # for the opposite reason to the rest: the others stop RAMA denying a
-    # feature it has, this stops it IMPROVISING one it didn't. Asked to move a
-    # shared-space repair off a single room, RAMA had create_expense but no
-    # reallocation tool, so it composed a fresh expense with an out-of-band
-    # void — three unlinked ledger rows for one $19.78 repair, and no recorded
-    # reason. A correction to posted money is one named operation or it is a
-    # gap; it is never assembled out of parts.
-    elif re.search(
+        return "create_work_order"
+    if re.search(
         r"\b(expense|cost|bill|charge|repair|invoice)\b.*"
         r"\b(wrong|mis-?scoped|misfiled|shouldn'?t be|should not be|belongs?)\b"
         r"|\b(move|reallocate|re-?assign|rebook|re-?book|shift|transfer)\b.*"
@@ -45,38 +258,167 @@ def supported_tool_for_request(request: str) -> str | None:
         r"off (of )?(the )?room)\b",
         text,
     ):
-        tool = "reallocate_expense"
-    elif re.search(r"\brename\b.+\bto\b", text):
-        tool = "update_property"
-    elif (
-        re.search(r"\b(link|open|view|show|go to|take me to)\b", text)
+        return "reallocate_expense"
+    # Leases — the most common false "I can't create a lease" gap.
+    # Deliberately exclude co-landlord / co-host / invite-only phrasings.
+    if not re.search(
+        r"\b(co-?landlord|co-?host|another landlord|property manager)\b",
+        text,
+    ) and re.search(
+        r"\b(create|draft|make|start|new)\b.+\b(lease|tenancy|rental agreement)\b"
+        r"|\b(draft|new)\b.+\blease\b"
+        r"|\blease for (room|suite|unit)\b"
+        r"|\blease term\b|\btotal monthly rent\b"
+        r"|\b(monthly )?rent\b.+\b(security )?deposit\b",
+        text,
+    ):
+        return "create_lease"
+    if re.search(
+        r"\b(invite|send)\b.+\b(lease|tenant|renter|sign)\b"
+        r"|\bsend (the )?lease\b|\binvite .+@(?:gmail|yahoo|hotmail|outlook|icloud)",
+        text,
+    ):
+        return "invite_tenant_to_lease"
+    if re.search(
+        r"\b(has|did|have)\b.+\b(signed|viewed|opened|clicked)\b.+\b(lease|invite)\b"
+        r"|\b(signed|viewed|opened)\b.+\b(lease|invite)\b"
+        r"|\bcreated an? account\b|\bsigned up\b",
+        text,
+    ):
+        return "list_lease_roster"
+    if re.search(
+        r"\b(reschedule|re-schedule|move|change)\b.+\b(viewing|showing|appointment)\b"
+        r"|\b(viewing|showing)\b.+\b(from|to)\b.+\b(am|pm|\d{1,2}:\d{2}|august|july|june|may|september)\b"
+        r"|\bchange (the )?(viewing|showing) (time|date|to)\b",
+        text,
+    ):
+        return "reschedule_viewing"
+    if re.search(
+        r"\b(schedule|book|set up)\b.+\b(viewing|showing|tour|appointment)\b"
+        r"|\bviewing\b.+\b(tomorrow|today|at \d|@)\b",
+        text,
+    ):
+        return "schedule_viewing"
+    if re.search(
+        r"\b(remove|delete|take off)\b.+\b(photo|photos|image|images|picture|pictures)\b"
+        r"|\b(photo|photos|image|images)\b.+\b(remove|delete)\b",
+        text,
+    ):
+        return "remove_photos_from_listing"
+    if re.search(
+        r"\b(add|attach|upload)\b.+\b(photo|photos|pic|pics|image|images|picture|pictures)\b"
+        r"|\b(photo|photos|pics)\b.+\b(listing|property|suite|room)\b",
+        text,
+    ):
+        return "attach_photo_to_listing"
+    if re.search(r"\brename\b.+\bto\b", text):
+        return "update_property"
+    if (
+        re.search(r"\b(link|open|view|show|go to|take me to|where|check)\b", text)
         and re.search(
             r"\b(dashboard|properties|property groups|documents|leases|"
-            r"finances?|financial|maintenance|settings)\b",
+            r"finances?|financial|maintenance|settings|calendar|appointments?|"
+            r"viewings?|showings?|visits?)\b",
             text,
         )
     ):
-        tool = "link"
-    elif re.search(
-        r"\b(show|list|view)\b.*\b(all|every|my)\b.*\brooms?\b",
+        return "link"
+    if re.search(
+        r"\b(public link|listing url|listing for applicants|send (me )?the (public )?link)\b",
         text,
+    ) or (
+        re.search(r"\b(public|applicant)\b.+\blink\b", text)
+        and re.search(r"\b(listing|property|room|suite)\b", text)
     ):
-        tool = "list_properties"
-    elif (
+        return "public_property_link"
+    if re.search(r"\b(show|list|view)\b.*\b(all|every|my)\b.*\brooms?\b", text):
+        return "list_properties"
+    if (
         re.search(r"\b(create|add|make)\b", text)
         and re.search(r"\b(house|holding|building)\b", text)
         and re.search(r"\b(property )?groups?\b", text)
         and re.search(r"\brooms?\b", text)
     ):
-        tool = "create_house_layout"
-    elif (
+        return "create_house_layout"
+    if (
+        (
+            re.search(r"\b(create|add|make)\b", text)
+            and re.search(r"\brooms?\b", text)
+            and re.search(r"\b(suite|floor|unit)\b", text)
+        )
+        or re.search(
+            r"\b(convert|turn|divide|split)\b.+\b(suite|unit|floor)\b.+\brooms?\b"
+            r"|\bchange how\b.+\brented\b"
+            r"|\brent\b.+\b(by room|room by room|room-by-room)\b",
+            text,
+        )
+    ):
+        return "configure_unit_room_offerings"
+    if (
         re.search(r"\b(create|add|make)\b", text)
         and re.search(r"\broom\b", text)
         and re.search(r"\b(property )?group\b", text)
     ):
-        tool = "create_group_room"
-    elif re.search(r"\b(create|add)\b.*\bproperty group\b", text):
-        tool = "create_property_group"
-    elif re.search(r"\b(move|assign|add|remove)\b.*\broom\b.*\bgroup\b", text):
-        tool = "assign_property_to_group"
-    return tool
+        return "create_group_room"
+    if re.search(r"\b(create|add)\b.*\bproperty group\b", text):
+        return "create_property_group"
+    if re.search(r"\b(move|assign|add|remove)\b.*\broom\b.*\bgroup\b", text):
+        return "assign_property_to_group"
+    return None
+
+
+def select_tool_schemas(
+    message: str,
+    schemas: list[dict],
+    *,
+    limit: int = 12,
+) -> list[dict]:
+    """Return a stable, relevant subset from an already role-filtered surface."""
+    if len(schemas) <= limit:
+        return schemas
+    by_name = {schema["name"]: schema for schema in schemas}
+    ranked = search_capability_catalogue(
+        message,
+        allowed_names=by_name,
+        limit=max(limit * 2, limit),
+    )
+    selected: list[dict] = []
+    for name in CORE_CAPABILITIES:
+        if name in by_name and by_name[name] not in selected:
+            selected.append(by_name[name])
+    # Pin tools that the weak model otherwise invents gaps for — even when
+    # retrieval ranks them below unrelated catalogue noise.
+    forced = supported_tool_for_request(message)
+    if forced and forced in by_name and by_name[forced] not in selected:
+        selected.append(by_name[forced])
+    # Lease drafts almost always need invite as the next step.
+    if forced == "create_lease" and "invite_tenant_to_lease" in by_name:
+        invite = by_name["invite_tenant_to_lease"]
+        if invite not in selected:
+            selected.append(invite)
+    for row in ranked:
+        schema = by_name.get(row["key"])
+        if schema is not None and schema not in selected:
+            selected.append(schema)
+        if len(selected) >= limit:
+            break
+    # Delegation schemas are not registry capabilities. Score them locally and
+    # include only when relevant, while preserving the same total limit.
+    if len(selected) < limit:
+        query = _tokens(message)
+        extras = sorted(
+            (schema for schema in schemas if schema["name"] not in REGISTRY),
+            key=lambda schema: len(
+                query
+                & _tokens(
+                    f"{schema['name']} {schema.get('description', '')}",
+                ),
+            ),
+            reverse=True,
+        )
+        for schema in extras:
+            if schema not in selected:
+                selected.append(schema)
+            if len(selected) >= limit:
+                break
+    return selected[:limit]

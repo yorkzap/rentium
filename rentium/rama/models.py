@@ -127,6 +127,163 @@ class RamaAudit(models.Model):
         return f"{self.kind} ({self.provider}/{self.model}) {self.created_at:%Y-%m-%d %H:%M}"
 
 
+class RamaTask(models.Model):
+    """Durable state for one user request.
+
+    Chat prose is not workflow state.  A task records what RAMA is trying to
+    do, the validated inputs it has collected, and the terminal outcome it
+    reached.  The command engine is the only writer of task transitions.
+    """
+
+    class Status(models.TextChoices):
+        RECEIVED = "RECEIVED", "Received"
+        NEEDS_INPUT = "NEEDS_INPUT", "Needs input"
+        READY = "READY", "Ready"
+        AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION", "Awaiting confirmation"
+        EXECUTING = "EXECUTING", "Executing"
+        VERIFIED = "VERIFIED", "Verified"
+        FAILED = "FAILED", "Failed"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    TERMINAL_STATUSES = frozenset({Status.VERIFIED, Status.FAILED, Status.CANCELLED})
+    ALLOWED_TRANSITIONS = {
+        Status.RECEIVED: {
+            Status.NEEDS_INPUT,
+            Status.READY,
+            Status.AWAITING_CONFIRMATION,
+            Status.EXECUTING,
+            Status.FAILED,
+            Status.CANCELLED,
+        },
+        Status.NEEDS_INPUT: {
+            Status.READY,
+            Status.AWAITING_CONFIRMATION,
+            Status.CANCELLED,
+            Status.FAILED,
+        },
+        Status.READY: {
+            Status.AWAITING_CONFIRMATION,
+            Status.EXECUTING,
+            Status.CANCELLED,
+            Status.FAILED,
+        },
+        Status.AWAITING_CONFIRMATION: {
+            Status.READY,
+            Status.EXECUTING,
+            Status.CANCELLED,
+            Status.FAILED,
+        },
+        Status.EXECUTING: {
+            Status.AWAITING_CONFIRMATION,
+            Status.VERIFIED,
+            Status.FAILED,
+        },
+        Status.VERIFIED: set(),
+        Status.FAILED: set(),
+        Status.CANCELLED: set(),
+    }
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_tasks",
+    )
+    conversation_id = models.UUIDField(db_index=True)
+    capability_key = models.CharField(max_length=120, db_index=True)
+    status = models.CharField(
+        max_length=30, choices=Status.choices, default=Status.RECEIVED, db_index=True
+    )
+    input = models.JSONField(default=dict, blank=True)
+    context = models.JSONField(default=dict, blank=True)
+    outcome = models.JSONField(default=dict, blank=True)
+    idempotency_key = models.CharField(max_length=160, blank=True, default="")
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["landlord", "conversation_id", "-created_at"],
+                name="rama_task_conversation_idx",
+            ),
+            models.Index(
+                fields=["landlord", "idempotency_key"],
+                name="rama_task_idempotency_idx",
+            ),
+        ]
+
+    def transition_to(self, status: str, *, outcome=None, error: str = "") -> None:
+        if status == self.status:
+            return
+        if status not in self.ALLOWED_TRANSITIONS[self.status]:
+            raise ValueError(f"Invalid RAMA task transition: {self.status} -> {status}")
+        self.status = status
+        update_fields = ["status", "updated_at"]
+        if outcome is not None:
+            self.outcome = outcome
+            update_fields.append("outcome")
+        if error:
+            self.error = error
+            update_fields.append("error")
+        self.save(update_fields=update_fields)
+
+    def __str__(self):
+        return f"{self.capability_key} ({self.status}) for {self.landlord_id}"
+
+
+class RamaActionReceipt(models.Model):
+    """Immutable evidence that a RAMA command completed and was verified."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_action_receipts",
+    )
+    task = models.ForeignKey(
+        RamaTask,
+        on_delete=models.PROTECT,
+        related_name="receipts",
+    )
+    capability_key = models.CharField(max_length=120, db_index=True)
+    idempotency_key = models.CharField(max_length=160)
+    inputs = models.JSONField(default=dict)
+    effects = models.JSONField(default=dict)
+    entity_refs = models.JSONField(default=list, blank=True)
+    verification = models.JSONField(default=dict)
+    links = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["landlord", "idempotency_key"],
+                name="rama_receipt_landlord_idempotency_unique",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["landlord", "capability_key", "-created_at"],
+                name="rama_receipt_capability_idx",
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValueError("RAMA action receipts are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValueError("RAMA action receipts are immutable.")
+
+    def __str__(self):
+        return f"{self.capability_key} receipt {self.pk}"
+
+
 class RamaPendingPlan(models.Model):
     """The multi-step plan a turn previewed and is waiting to be confirmed.
 
@@ -153,6 +310,13 @@ class RamaPendingPlan(models.Model):
         "users.LandlordProfile",
         on_delete=models.CASCADE,
         related_name="rama_pending_plans",
+    )
+    task = models.OneToOneField(
+        RamaTask,
+        on_delete=models.CASCADE,
+        related_name="pending_plan",
+        null=True,
+        blank=True,
     )
     operation = models.CharField(max_length=60, default="single")
     summary = models.TextField(blank=True, default="")
@@ -191,6 +355,7 @@ class RamaPlanStep(models.Model):
     )
     order = models.PositiveIntegerField()
     tool = models.CharField(max_length=100)
+    capability_key = models.CharField(max_length=120, blank=True, default="")
     arguments = models.JSONField(default=dict)
     target_label = models.CharField(max_length=200, blank=True, default="")
     # Steps sharing an item_key belong to one target: if one fails the rest
@@ -201,6 +366,13 @@ class RamaPlanStep(models.Model):
         max_length=20, choices=Status.choices, default=Status.PENDING
     )
     result = models.JSONField(default=dict, blank=True)
+    receipt = models.OneToOneField(
+        RamaActionReceipt,
+        on_delete=models.PROTECT,
+        related_name="plan_step",
+        null=True,
+        blank=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -404,6 +576,103 @@ class RamaCapabilityGap(models.Model):
 
     def __str__(self):
         return f"Gap [{self.status}] {self.request[:60]}"
+
+
+class RamaAttachmentBatch(models.Model):
+    """The exact files attached to one chat composer send.
+
+    A batch is conversation-owned and sealed when the message is sent.  Tools
+    must receive its ID explicitly; there is intentionally no "all unused
+    uploads for this landlord" fallback.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "OPEN", "Open"
+        SEALED = "SEALED", "Sealed"
+        PROCESSING = "PROCESSING", "Processing"
+        COMPLETED = "COMPLETED", "Completed"
+        FAILED = "FAILED", "Failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_attachment_batches",
+    )
+    conversation_id = models.UUIDField(db_index=True)
+    message_id = models.UUIDField(null=True, blank=True, db_index=True)
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.OPEN, db_index=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    sealed_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["landlord", "conversation_id", "-created_at"],
+                name="rama_attachment_batch_idx",
+            )
+        ]
+
+    def __str__(self):
+        return f"RAMA attachment batch {self.pk} ({self.status})"
+
+
+class RamaAttachment(models.Model):
+    """A staged file with explicit classification and disposition."""
+
+    class Classification(models.TextChoices):
+        UNKNOWN = "UNKNOWN", "Unknown"
+        PROPERTY_PHOTO = "PROPERTY_PHOTO", "Property photo"
+        DOCUMENT = "DOCUMENT", "Document"
+
+    class Status(models.TextChoices):
+        STAGED = "STAGED", "Staged"
+        CLASSIFIED = "CLASSIFIED", "Classified"
+        APPLIED = "APPLIED", "Applied"
+        REJECTED = "REJECTED", "Rejected"
+        FAILED = "FAILED", "Failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    batch = models.ForeignKey(
+        RamaAttachmentBatch,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    original = models.FileField(upload_to="rama_attachments/%Y/%m/")
+    original_filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=160, blank=True, default="")
+    sha256 = models.CharField(max_length=64, db_index=True)
+    size = models.PositiveBigIntegerField(default=0)
+    sequence = models.PositiveIntegerField()
+    classification = models.CharField(
+        max_length=30,
+        choices=Classification.choices,
+        default=Classification.UNKNOWN,
+    )
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.STAGED, db_index=True
+    )
+    target_type = models.CharField(max_length=80, blank=True, default="")
+    target_id = models.CharField(max_length=100, blank=True, default="")
+    result = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sequence", "created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["batch", "sequence"],
+                name="rama_attachment_batch_sequence_unique",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.original_filename} in {self.batch_id}"
 
 
 class RamaUpload(models.Model):

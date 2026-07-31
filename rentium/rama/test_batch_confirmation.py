@@ -1,5 +1,6 @@
 """Regression tests for RAMA's collected-preview confirmation contract."""
 
+import uuid
 from unittest import mock
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from rentium.rama import registry
 from rentium.rama.models import RamaPendingPlan
 from rentium.rama.models import RamaPreferences
+from rentium.rama.models import RamaTask
 from rentium.rama.providers import ToolCall
 from rentium.rama.providers import Turn
 
@@ -127,6 +129,8 @@ def test_chained_renames_and_future_name_assignments_run_on_one_yes(landlord):
     assert "Rename Room 4 to Room 1" in preview.reply
     assert "Put Room 1 in Wascana Main Floor" in preview.reply
     plan = RamaPendingPlan.objects.get(conversation_id=preview.conversation_id)
+    assert plan.task.status == RamaTask.Status.AWAITING_CONFIRMATION
+    assert preview.pending_plan["task"]["id"] == str(plan.task_id)
     steps = list(plan.steps.order_by("order"))
     assert [step.tool for step in steps] == [
         "update_property",
@@ -159,6 +163,36 @@ def test_chained_renames_and_future_name_assignments_run_on_one_yes(landlord):
     assert not RamaPendingPlan.objects.filter(
         conversation_id=preview.conversation_id,
     ).exists()
+    task = RamaTask.objects.get(pk=plan.task_id)
+    assert task.status == RamaTask.Status.VERIFIED
+    assert task.receipts.count() == 4
+    assert all(receipt.verification["verified"] for receipt in task.receipts.all())
+    assert any(receipt.entity_refs for receipt in task.receipts.all())
+
+
+def test_expired_confirmation_cancels_its_task(landlord):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from rentium.rama.plan_runner import load_fresh_plan, save_single
+
+    conversation_id = uuid.uuid4()
+    plan = save_single(
+        landlord,
+        conversation_id,
+        "update_property",
+        {"property_query": "missing", "name": "new"},
+    )
+    task_id = plan.task_id
+    RamaPendingPlan.objects.filter(pk=plan.pk).update(
+        updated_at=timezone.now() - timedelta(hours=1),
+    )
+
+    assert load_fresh_plan(landlord, conversation_id) is None
+    task = RamaTask.objects.get(pk=task_id)
+    assert task.status == RamaTask.Status.CANCELLED
+    assert "expired" in task.outcome["message"].casefold()
 
 
 def test_every_room_creation_previewed_in_one_turn_is_confirmed_together(landlord):

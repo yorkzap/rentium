@@ -17,6 +17,7 @@ Contract for every function:
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 
 
 def _params(**docs: str):
@@ -106,6 +107,19 @@ def data_catalogue(landlord) -> dict:
     return {"entities": entity_catalogue()}
 
 
+def search_capabilities(landlord, query: str = "") -> dict:
+    """Find the RAMA operations relevant to a request in business language.
+    Call this when the right operation is not in the initially offered tool
+    set. Returns capability keys, descriptions, risk, and confirmation policy;
+    it never changes data."""
+    from .capabilities import search_capability_catalogue
+
+    return {
+        "query": query,
+        "capabilities": search_capability_catalogue(query, limit=12),
+    }
+
+
 def read(landlord, entity: str = "", filters: str = "", fields: str = "",
          limit: str = "20") -> dict:
     """Query ANY catalogued entity directly — use for specific/composed questions
@@ -183,6 +197,15 @@ def open_property(landlord, property_query: str = "") -> dict:
     return _fn(landlord, property_query=property_query)
 
 
+def public_property_link(landlord, property_query: str = "") -> dict:
+    """Return the canonical logged-out public URL for a listing and whether it
+    is currently live. Use specifically when the landlord says public link,
+    rental link, applicant link, or the URL a prospect should open."""
+    from .domain_actions import public_property_link as _fn
+
+    return _fn(landlord, property_query=property_query)
+
+
 def list_appointments(landlord, day: str = "", days_ahead: str = "60") -> dict:
     """List viewings, showings, and contractor appointments. Optional day as
     YYYY-MM-DD (e.g. 2026-07-30) filters that calendar day; otherwise returns
@@ -225,7 +248,7 @@ def resolve_person(landlord, name: str) -> dict:
         .filter(
             Q(invited_name__icontains=name)
             | Q(invited_email__icontains=name)
-            | Q(tenant__user__name__icontains=name)
+            | Q(tenant__user__name__icontains=name),
         )
         .select_related("tenant__user", "lease", "lease__property", "lease__group")
         .order_by("-lease__start_date")[:10]
@@ -249,7 +272,7 @@ def resolve_person(landlord, name: str) -> dict:
                 "property": place,
                 "is_primary_tenant": lt.is_primary_tenant,
                 "has_signed": lt.has_signed,
-            }
+            },
         )
     return {"query": name, "candidates": candidates}
 
@@ -289,7 +312,7 @@ def lease_state(landlord, lease_id: str) -> dict:
                     "bill": key,
                     "included_in_rent": bool(details.get("included")),
                     "provider": details.get("provider") or "",
-                }
+                },
             )
     try:
         etransfer = lease.get_effective_etransfer_email() or ""
@@ -327,7 +350,8 @@ def charge_status(landlord, lease_id: str, month: str = "") -> dict:
     month?" — call resolve_person first to get the lease_id."""
     from django.core.exceptions import ValidationError
 
-    from rentium.ledger.models import CHARGE_TYPES, LedgerEntry
+    from rentium.ledger.models import CHARGE_TYPES
+    from rentium.ledger.models import LedgerEntry
 
     try:
         start, end = _month_bounds(month)
@@ -345,7 +369,7 @@ def charge_status(landlord, lease_id: str, month: str = "") -> dict:
                 due_date__gte=start,
                 due_date__lt=end,
             )
-            .order_by("due_date", "created_at")
+            .order_by("due_date", "created_at"),
         )
     except (ValidationError, ValueError):
         return {"error": f"lease_id {lease_id!r} is not a valid id."}
@@ -360,6 +384,11 @@ def charge_status(landlord, lease_id: str, month: str = "") -> dict:
             status = "partially_paid"
         else:
             status = "unpaid"
+        due_now = (
+            outstanding
+            if outstanding > 0 and charge.due_date and charge.due_date <= today
+            else Decimal("0.00")
+        )
         rows.append(
             {
                 "description": charge.description,
@@ -367,12 +396,28 @@ def charge_status(landlord, lease_id: str, month: str = "") -> dict:
                 "amount": str(charge.amount),
                 "due_date": charge.due_date.isoformat(),
                 "paid": str(charge.settled_amount),
+                # Balance on this line, whatever the due date.
                 "outstanding": str(outstanding),
+                "balance_on_charge": str(outstanding),
+                # Money actually owed today. Carried here so answering "what do
+                # they owe now?" never requires switching to charge_schedule,
+                # where the same question used to be answered by a key that
+                # meant something else.
+                "due_now": str(due_now),
                 "status": status,
                 "overdue": bool(outstanding > 0 and charge.due_date < today),
-            }
+            },
         )
-    return {"lease_id": str(lease_id), "month": start.strftime("%Y-%m"), "charges": rows}
+    return {
+        "lease_id": str(lease_id),
+        "month": start.strftime("%Y-%m"),
+        "charges": rows,
+        "note": (
+            "outstanding / balance_on_charge is the unpaid balance on the line. "
+            "due_now is only what is owed as of today. A future scheduled charge "
+            "has a balance but due_now=0.00 — it is not owed yet."
+        ),
+    }
 
 
 def month_money(landlord, month: str = "") -> dict:
@@ -648,6 +693,8 @@ def list_documents(
 
 @_params(
     document_id="Business document UUID shown in the attachment note. Pass this OR upload_id.",
+    attachment_id="Exact file UUID from a RAMA attachment batch. Preferred for "
+    "new chat uploads; pass this OR document_id/upload_id.",
     upload_id="Staged photo UUID when the attachment is photographed mail, receipt, "
     "invoice, notice, or other paperwork. Pass this OR document_id.",
     scope_query="Physical holding name or exact legal street address, e.g. "
@@ -660,6 +707,7 @@ def catalog_business_document(
     landlord,
     scope_query: str,
     document_id: str = "",
+    attachment_id: str = "",
     upload_id: str = "",
     issuer: str = "",
     document_date: str = "",
@@ -671,6 +719,7 @@ def catalog_business_document(
     exact legal address, this proposes creating it and linking those child
     rooms/units. Distinct apartment addresses stay separate. Never force a
     child listing choice."""
+    from .document_services import catalog_batch_attachment_as_document
     from .document_services import catalog_document_scope
     from .document_services import catalog_staged_photo_as_document
 
@@ -688,13 +737,18 @@ def catalog_business_document(
         "document_date": parsed_date,
         "confirm": str(confirm).strip().lower() in {"yes", "y", "true", "1"},
     }
+    if attachment_id.strip():
+        return catalog_batch_attachment_as_document(
+            attachment_id=attachment_id.strip(),
+            **common,
+        )
     if upload_id.strip():
         return catalog_staged_photo_as_document(
             upload_id=upload_id.strip(),
             **common,
         )
     if not document_id.strip():
-        return {"error": "Pass document_id or upload_id."}
+        return {"error": "Pass attachment_id, document_id, or upload_id."}
     return catalog_document_scope(
         document_id=document_id.strip(),
         **common,
@@ -771,13 +825,13 @@ def transition_work_order(
 
 
 def mark_inquiry_replied(
-    landlord, inquiry_id: str = "", name_query: str = "", confirm: str = ""
+    landlord, inquiry_id: str = "", name_query: str = "", confirm: str = "",
 ) -> dict:
     """Mark a listing inquiry as REPLIED. Preview first; confirm=yes to save."""
     from .domain_actions import mark_inquiry_replied as _fn
 
     return _fn(
-        landlord, inquiry_id=inquiry_id, name_query=name_query, confirm=confirm
+        landlord, inquiry_id=inquiry_id, name_query=name_query, confirm=confirm,
     )
 
 
@@ -806,7 +860,7 @@ def send_tenant_message(
 
 
 def mark_messages_read(
-    landlord, conversation_id: str = "", confirm: str = ""
+    landlord, conversation_id: str = "", confirm: str = "",
 ) -> dict:
     """Mark unread tenant messages as read. Empty conversation_id = all threads.
     Preview first; confirm=yes to apply."""
@@ -836,6 +890,34 @@ def schedule_viewing(
         when=when,
         contact_name=contact_name,
         contact_email=contact_email,
+        notes=notes,
+        confirm=confirm,
+    )
+
+
+def reschedule_viewing(
+    landlord,
+    when: str,
+    appointment_ref: str = "",
+    property_query: str = "",
+    contact: str = "",
+    notes: str = "",
+    confirm: str = "",
+) -> dict:
+    """Move an EXISTING viewing to a new date/time (not a new booking).
+    when like '2026-08-04 14:00'. Prefer appointment_ref from list_appointments
+    (uuid or 8-char ref). Or property_query + contact email/name
+    (e.g. property_query='Room D' contact='Hitakshiverma01@gmail.com').
+    Emails the prospect the new time; keeps their status link. Preview first;
+    confirm=yes to apply."""
+    from .domain_actions import reschedule_viewing as _fn
+
+    return _fn(
+        landlord,
+        when=when,
+        appointment_ref=appointment_ref,
+        property_query=property_query,
+        contact=contact,
         notes=notes,
         confirm=confirm,
     )
@@ -963,7 +1045,7 @@ def lease_pdf_info(
     from .domain_actions import lease_pdf_info as _fn
 
     return _fn(
-        landlord, property_query=property_query, lease_number=lease_number
+        landlord, property_query=property_query, lease_number=lease_number,
     )
 
 
@@ -978,7 +1060,7 @@ def bulk_add_inventory(
     from .domain_actions import bulk_add_inventory as _fn
 
     return _fn(
-        landlord, property_query=property_query, items=items, confirm=confirm
+        landlord, property_query=property_query, items=items, confirm=confirm,
     )
 
 
@@ -1015,6 +1097,41 @@ def create_expense(
         property_query=property_query,
         holding_name=holding_name,
         effective_date=effective_date,
+        confirm=confirm,
+    )
+
+
+@_params(
+    amount="How much ARRIVED, e.g. '100.00'. A partial payment is normal — "
+    "record what was actually received, never the balance still owing.",
+    charge_query="Words from the charge this settles, e.g. 'deposit' or "
+    "'August rent'. Money is always recorded against a charge.",
+    property_query="The listing, to narrow it down when several charges match.",
+    payment_method="etransfer | cash | cheque. Take it from what the landlord said; leave BLANK if they did not say and the tool will ask. Never guess.",
+    payment_date="The day the money ARRIVED, YYYY-MM-DD. Leave blank if they did not say — it then dates from today, which is when they are telling you.",
+)
+def record_payment(
+    landlord,
+    amount: str,
+    charge_query: str = "",
+    property_query: str = "",
+    payment_method: str = "",
+    payment_date: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record money RECEIVED against a charge — rent arrived, deposit paid,
+    damage claim settled. Handles PARTIAL payments: $100 against a $425 deposit
+    leaves $325 owing, which the preview shows before you confirm. This is the
+    ONLY way money-in reaches the ledger. Preview first; confirm=yes."""
+    from .domain_actions import record_payment as _fn
+
+    return _fn(
+        landlord,
+        amount=amount,
+        charge_query=charge_query,
+        property_query=property_query,
+        payment_method=payment_method,
+        payment_date=payment_date,
         confirm=confirm,
     )
 
@@ -1166,13 +1283,13 @@ def replace_lease_invite(
 
 
 def list_lease_roster(
-    landlord, property_query: str = "", lease_number: str = ""
+    landlord, property_query: str = "", lease_number: str = "",
 ) -> dict:
     """Who is on a lease: pending invites, signed tenants, rent shares, primary.
     Use for 'who should sign?', 'any invitations sent?', rent split questions."""
     from .domain_actions import list_lease_roster as _fn
     return _fn(
-        landlord, property_query=property_query, lease_number=lease_number
+        landlord, property_query=property_query, lease_number=lease_number,
     )
 
 
@@ -1306,7 +1423,7 @@ def duplicate_listing(
     "build this — prioritises it.",
 )
 def log_capability_gap(
-    landlord, request: str, detail: str = "", learn_now: str = ""
+    landlord, request: str, detail: str = "", learn_now: str = "",
 ) -> dict:
     """Log something you genuinely CANNOT do yet as a structured gap for the team
     to build — instead of just saying 'I can't'. Call this whenever you hit a
@@ -1329,9 +1446,11 @@ def list_capability_gaps(landlord, status: str = "", limit: str = "20") -> dict:
 
 @_params(
     property_query="The listing to add the photo to: its exact name or id.",
-    upload_id="Staged photo id(s) from the chat note(s) '[The landlord attached a "
-    "photo, upload_id=…]'. One id, a comma-separated list for MULTIPLE photos, "
-    "'all', or blank = every photo they just attached.",
+    attachment_batch_id="Required for new chat uploads: the exact batch id shown "
+    "in '[RAMA attachment batch …]'. Only files in this batch may be used.",
+    attachment_ids="Optional comma-separated attachment ids from that batch. Omit "
+    "to use every image in the explicitly named batch.",
+    upload_id="Legacy only: explicit staged photo id(s). Blank and 'all' are refused.",
     set_primary="yes to make the FIRST photo the listing's MAIN photo (rest go to "
     "the gallery); omit for all gallery.",
     pick="If the name matches two listings: oldest|newest|1|2.",
@@ -1340,19 +1459,91 @@ def list_capability_gaps(landlord, status: str = "", limit: str = "20") -> dict:
 def attach_photo_to_listing(
     landlord,
     property_query: str,
+    attachment_batch_id: str = "",
+    attachment_ids: str = "",
     upload_id: str = "",
     set_primary: str = "",
     pick: str = "",
     confirm: str = "",
 ) -> dict:
-    """Attach a photo the landlord uploaded IN THE CHAT to a listing. When the
-    conversation contains '[The landlord attached a photo, upload_id=X]', use
-    this with that upload_id (or omit it to use their latest attachment).
-    set_primary=yes makes it the main photo. Preview; confirm=yes."""
+    """Attach property photos from one explicit chat attachment batch to a
+    listing. Never uses older or unrelated pending files. Gallery is the safe
+    default; set_primary=yes makes only the first selected image the main photo.
+    Preview; confirm=yes."""
     from .domain_crud import attach_photo_to_listing as _fn
     return _fn(
-        landlord, property_query=property_query, upload_id=upload_id,
+        landlord, property_query=property_query,
+        attachment_batch_id=attachment_batch_id,
+        attachment_ids=attachment_ids, upload_id=upload_id,
         set_primary=set_primary, pick=pick, confirm=confirm,
+    )
+
+
+def list_listing_media(
+    landlord,
+    property_query: str,
+    pick: str = "",
+) -> dict:
+    """List every image currently on one listing with a stable handle such as
+    primary or gallery:42. Use before removing an incorrect or old photo."""
+    from .domain_crud import list_listing_media as _fn
+
+    return _fn(landlord, property_query=property_query, pick=pick)
+
+
+@_params(
+    property_query="The listing whose image should be removed.",
+    media_handle="Exact handle from list_listing_media: primary or gallery:<id>.",
+    pick="If the name matches two listings: oldest|newest|1|2.",
+    confirm="Leave empty to preview; 'yes' to remove the exact image.",
+)
+def remove_photo_from_listing(
+    landlord,
+    property_query: str,
+    media_handle: str,
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Remove one exact image from a listing. Call list_listing_media first when
+    the handle is not already known. Preview; confirm=yes."""
+    from .domain_crud import remove_photo_from_listing as _fn
+
+    return _fn(
+        landlord,
+        property_query=property_query,
+        media_handle=media_handle,
+        pick=pick,
+        confirm=confirm,
+    )
+
+
+@_params(
+    property_query="The listing whose selected images should be removed.",
+    media_handles_json=(
+        "JSON list containing only exact handles from list_listing_media, "
+        'e.g. ["primary", "gallery:42"].'
+    ),
+    pick="If the name matches two listings: oldest|newest|1|2.",
+    confirm="Leave empty to preview; 'yes' removes the exact selected set.",
+)
+def remove_photos_from_listing(
+    landlord,
+    property_query: str,
+    media_handles_json: str,
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Remove an exact selection of one or more listing images as one
+    operation. Always call list_listing_media first so the landlord can choose
+    by numbered thumbnail. Preview once; one confirmation removes that set."""
+    from .domain_crud import remove_photos_from_listing as _fn
+
+    return _fn(
+        landlord,
+        property_query=property_query,
+        media_handles_json=media_handles_json,
+        pick=pick,
+        confirm=confirm,
     )
 
 
@@ -1606,7 +1797,7 @@ def update_property(
     confirm="Leave empty to PREVIEW; pass 'yes' to delete.",
 )
 def delete_property(
-    landlord, property_query: str, pick: str = "", confirm: str = ""
+    landlord, property_query: str, pick: str = "", confirm: str = "",
 ) -> dict:
     """Delete a listing. Blocked if ANY lease still references it (PROTECT).
     On duplicate names pass pick=oldest|newest|1|2 (or property_query=<id>) to
@@ -1617,7 +1808,7 @@ def delete_property(
 
 
 def create_property_group(
-    landlord, name: str, description: str = "", confirm: str = ""
+    landlord, name: str, description: str = "", confirm: str = "",
 ) -> dict:
     """Create a property group for shared rooms (e.g. McKenzie Side Unit). Preview; confirm=yes."""
     from .domain_crud import create_property_group as _fn
@@ -1872,12 +2063,12 @@ def list_co_landlords(landlord) -> dict:
 
 
 def delete_draft_lease(
-    landlord, property_query: str = "", lease_number: str = "", confirm: str = ""
+    landlord, property_query: str = "", lease_number: str = "", confirm: str = "",
 ) -> dict:
     """Delete ONLY a DRAFT lease. Pending/active → terminate_lease. Preview; confirm=yes."""
     from .domain_crud import delete_draft_lease as _fn
     return _fn(
-        landlord, property_query=property_query, lease_number=lease_number, confirm=confirm
+        landlord, property_query=property_query, lease_number=lease_number, confirm=confirm,
     )
 
 
@@ -1899,13 +2090,13 @@ def terminate_lease(
 
 
 def landlord_sign_lease(
-    landlord, property_query: str = "", lease_number: str = "", confirm: str = ""
+    landlord, property_query: str = "", lease_number: str = "", confirm: str = "",
 ) -> dict:
     """Record landlord signature. Rent must be fully allocated across tenants first.
     May activate lease if a tenant already signed. Preview; confirm=yes."""
     from .domain_crud import landlord_sign_lease as _fn
     return _fn(
-        landlord, property_query=property_query, lease_number=lease_number, confirm=confirm
+        landlord, property_query=property_query, lease_number=lease_number, confirm=confirm,
     )
 
 
@@ -2005,12 +2196,12 @@ def update_inventory_item(
 
 
 def delete_inventory_item(
-    landlord, property_query: str, item_name: str, confirm: str = ""
+    landlord, property_query: str, item_name: str, confirm: str = "",
 ) -> dict:
     """Delete private inventory item. Preview; confirm=yes."""
     from .domain_crud import delete_inventory_item as _fn
     return _fn(
-        landlord, property_query=property_query, item_name=item_name, confirm=confirm
+        landlord, property_query=property_query, item_name=item_name, confirm=confirm,
     )
 
 
@@ -2033,12 +2224,12 @@ def create_shared_inventory_item(
 
 
 def delete_shared_inventory_item(
-    landlord, group_name: str, item_name: str, confirm: str = ""
+    landlord, group_name: str, item_name: str, confirm: str = "",
 ) -> dict:
     """Delete shared inventory item. Preview; confirm=yes."""
     from .domain_crud import delete_shared_inventory_item as _fn
     return _fn(
-        landlord, group_name=group_name, item_name=item_name, confirm=confirm
+        landlord, group_name=group_name, item_name=item_name, confirm=confirm,
     )
 
 
@@ -2216,8 +2407,11 @@ def amend_constitution(
     "amount":"5000.00"}}, {"action":"remove","rule_id":3}].
     ALWAYS preview first (no confirm) and show the landlord exactly what will
     change; confirm=yes applies. Never amend silently."""
-    from .constitution import amend, parse_rule_changes, unlawful_deposit_language
-    from .domain_crud import _confirmed, _preview
+    from .constitution import amend
+    from .constitution import parse_rule_changes
+    from .constitution import unlawful_deposit_language
+    from .domain_crud import _confirmed
+    from .domain_crud import _preview
     from .models import RamaConstitutionSection
 
     key_s = (key or "").strip().lower()
@@ -2253,7 +2447,7 @@ def amend_constitution(
     }
     if not _confirmed(confirm):
         return _preview(
-            "amend_constitution", preview, "Amends the landlord's Constitution."
+            "amend_constitution", preview, "Amends the landlord's Constitution.",
         )
     return amend(
         landlord,
@@ -2344,16 +2538,58 @@ def update_unit_layout(
 
 
 def set_unit_rental_mode(
-    landlord, unit_name: str, rental_mode: str, confirm: str = ""
+    landlord,
+    unit_name: str,
+    rental_mode: str,
+    holding: str = "",
+    confirm: str = "",
 ) -> dict:
     """Switch a unit between being let as ONE home (WHOLE_UNIT) and let room by
     room (BY_ROOM). Nothing is deleted — the other mode's listings are parked
     and return if you switch back. Refused while any draft, pending or active
-    lease exists anywhere in the unit. One preview, then confirm=yes."""
+    lease exists anywhere in the unit. Prefer unit_name=<uuid>; when using a
+    free-text name that exists on more than one house, pass holding=<street
+    or house name> (e.g. holding='950 McKenzie Ave'). One preview, then
+    confirm=yes."""
     from .unit_structure import set_unit_rental_mode as _fn
 
     return _fn(
-        landlord, unit_name=unit_name, rental_mode=rental_mode, confirm=confirm
+        landlord,
+        unit_name=unit_name,
+        rental_mode=rental_mode,
+        holding=holding,
+        confirm=confirm,
+    )
+
+
+def configure_unit_room_offerings(
+    landlord,
+    unit_name: str,
+    room_names_json: str,
+    group_name: str = "",
+    shared_areas_json: str = "",
+    holding: str = "",
+    confirm: str = "",
+) -> dict:
+    """Convert an existing suite/floor into named room-by-room rentals in ONE
+    atomic operation. Use this whenever the landlord wants to add rooms into a
+    whole suite, turn a complete unit into a property group, or rent bedrooms
+    separately. room_names_json is a JSON list of the landlord's exact room
+    labels, e.g. ["Bonus room J", "Room K"] — never invent sequential letters
+    like L/M. shared_areas_json records kitchen/washroom/patio etc in the same
+    call. Prefer unit_name=<uuid>, or pass holding=<street> when names collide.
+    Parks the complete-unit listing (never deletes it). Refuses while draft/
+    pending/active leases exist. One complete preview, then confirm=yes."""
+    from .unit_structure import configure_unit_room_offerings as _fn
+
+    return _fn(
+        landlord,
+        unit_name=unit_name,
+        room_names_json=room_names_json,
+        group_name=group_name,
+        shared_areas_json=shared_areas_json,
+        holding=holding,
+        confirm=confirm,
     )
 
 

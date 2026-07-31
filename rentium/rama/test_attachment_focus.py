@@ -1,22 +1,4 @@
-"""
-Attaching a burst of photos to a listing.
-
-From a real transcript. Twelve images were uploaded and asked to be added to a
-listing's gallery. RAMA offered to file all of them as business documents; told
-"these are NOT business documents, these are gallery images", it re-previewed
-the SAME thing; then it offered 2 photos, then 1.
-
-Three separate faults compounded:
-
-1. `landlord_described_as_business_record` was a bare substring scan, so the
-   sentence "these are not business DOCUMENTS" matched "document" and set the
-   flag to True. Correcting RAMA reinforced the error being corrected.
-2. Upload ids were scraped out of the last 12 user messages. A burst of photos
-   scrolled out of that window as the conversation continued, so 12 pending
-   uploads were presented as 2, then 1 — while all 12 sat unused in the table.
-3. Nothing told the model how many photos were actually pending, or that one
-   call with a blank upload_id attaches all of them.
-"""
+"""Regression coverage for conversation-owned RAMA attachment batches."""
 
 from __future__ import annotations
 
@@ -25,17 +7,15 @@ import uuid
 import pytest
 from django.core.files.base import ContentFile
 
-from rentium.rama.models import RamaAudit, RamaUpload
+from rentium.rama.models import (
+    RamaAttachment,
+    RamaAttachmentBatch,
+    RamaAudit,
+    RamaUpload,
+)
 from rentium.rama.service import _conversation_attachment_focus
 
 pytestmark = pytest.mark.django_db
-
-
-def _upload(landlord, name="photo.jpg"):
-    upload = RamaUpload(landlord=landlord)
-    upload.image.save(name, ContentFile(b"x"), save=False)
-    upload.save()
-    return upload
 
 
 def _said(landlord, conversation_id, text):
@@ -47,128 +27,34 @@ def _said(landlord, conversation_id, text):
     )
 
 
-# ------------------------------------------------------------ the negation
-def test_saying_they_are_not_business_documents_is_believed(landlord):
-    conv = uuid.uuid4()
-    _upload(landlord)
-    _said(landlord, conv, "[The landlord attached a photo, upload_id=x] here")
+def _batch(landlord, conversation_id, count, prefix="photo"):
+    batch = RamaAttachmentBatch.objects.create(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        status=RamaAttachmentBatch.Status.SEALED,
+    )
+    rows = []
+    for sequence in range(count):
+        row = RamaAttachment(
+            batch=batch,
+            original_filename=f"{prefix}{sequence}.jpg",
+            content_type="image/jpeg",
+            sha256=f"{sequence:064d}",
+            size=1,
+            sequence=sequence,
+        )
+        row.original.save(
+            f"{prefix}{sequence}.jpg",
+            ContentFile(b"x"),
+            save=True,
+        )
+        rows.append(row)
     _said(
         landlord,
-        conv,
-        "No, these are not business documents, these are just images i want "
-        "to attach to mccaughey basement as gallery image dude",
+        conversation_id,
+        f"attach these\n\n[RAMA attachment batch {batch.pk}; exactly {count} file(s)]",
     )
-
-    focus = _conversation_attachment_focus(landlord, conv)
-    assert focus["landlord_described_as_business_record"] is False
-    assert "attach_photo_to_listing" in focus["instruction"]
-
-
-@pytest.mark.parametrize(
-    "denial",
-    [
-        "these are not documents",
-        "it isn't a receipt",
-        "they aren't invoices",
-        "no this is not mail",
-        "not paperwork, just pics",
-    ],
-)
-def test_every_shape_of_denial_is_believed(landlord, denial):
-    conv = uuid.uuid4()
-    _upload(landlord)
-    _said(landlord, conv, denial)
-    focus = _conversation_attachment_focus(landlord, conv)
-    assert focus["landlord_described_as_business_record"] is False
-
-
-def test_asking_for_the_gallery_is_believed(landlord):
-    conv = uuid.uuid4()
-    _upload(landlord)
-    _said(landlord, conv, "attach those as gallery images to McCaughey Basement")
-    focus = _conversation_attachment_focus(landlord, conv)
-    assert focus["landlord_described_as_business_record"] is False
-
-
-def test_a_genuine_business_document_is_still_detected(landlord):
-    """The fix must not stop RAMA filing photographed mail."""
-    conv = uuid.uuid4()
-    _upload(landlord)
-    _said(landlord, conv, "here is the Scotiabank mortgage statement for the house")
-    focus = _conversation_attachment_focus(landlord, conv)
-    assert focus["landlord_described_as_business_record"] is True
-    assert "catalog_business_document" in focus["instruction"]
-
-
-def test_the_latest_message_wins(landlord):
-    """Called it a document, then corrected — the correction must win."""
-    conv = uuid.uuid4()
-    _upload(landlord)
-    _said(landlord, conv, "here is a receipt")
-    _said(landlord, conv, "actually these are not receipts, just gallery photos")
-    focus = _conversation_attachment_focus(landlord, conv)
-    assert focus["landlord_described_as_business_record"] is False
-
-
-# ----------------------------------------------------- the vanishing photos
-def test_a_burst_of_twelve_photos_stays_twelve(landlord):
-    conv = uuid.uuid4()
-    for i in range(12):
-        _upload(landlord, f"photo{i}.jpg")
-    _said(landlord, conv, "attach these as gallery images")
-
-    focus = _conversation_attachment_focus(landlord, conv)
-    assert focus["pending_photo_count"] == 12
-    assert len(focus["unresolved_upload_ids"]) == 12
-
-
-def test_photos_survive_a_long_conversation(landlord):
-    """The regression: enough follow-up messages to push the upload markers
-    out of the 12-row history window used to drop them to 2, then 1."""
-    conv = uuid.uuid4()
-    for i in range(12):
-        _upload(landlord, f"photo{i}.jpg")
-    _said(landlord, conv, "[The landlord attached a photo, upload_id=x] 12 pics")
-    for i in range(20):
-        _said(landlord, conv, f"follow-up message number {i}")
-
-    focus = _conversation_attachment_focus(landlord, conv)
-    assert focus["pending_photo_count"] == 12
-
-
-def test_used_photos_are_not_offered_again(landlord):
-    from django.utils import timezone
-
-    conv = uuid.uuid4()
-    spent = _upload(landlord)
-    _upload(landlord)
-    spent.used_at = timezone.now()
-    spent.save(update_fields=["used_at"])
-    _said(landlord, conv, "attach these")
-
-    focus = _conversation_attachment_focus(landlord, conv)
-    assert focus["pending_photo_count"] == 1
-    assert str(spent.pk) not in focus["unresolved_upload_ids"]
-
-
-def test_uploads_are_landlord_scoped(landlord, other_landlord):
-    conv = uuid.uuid4()
-    _upload(other_landlord)
-    _said(landlord, conv, "attach these")
-    assert _conversation_attachment_focus(landlord, conv) == {}
-
-
-def test_the_instruction_says_attach_them_in_one_call(landlord):
-    """The model was calling the tool once per photo, or guessing a subset."""
-    conv = uuid.uuid4()
-    for i in range(12):
-        _upload(landlord, f"photo{i}.jpg")
-    _said(landlord, conv, "put these in the gallery")
-
-    focus = _conversation_attachment_focus(landlord, conv)
-    assert "ONCE" in focus["instruction"]
-    assert "BLANK" in focus["instruction"]
-    assert "12" in focus["instruction"]
+    return batch, rows
 
 
 @pytest.fixture
@@ -179,36 +65,167 @@ def other_landlord():
     return LandlordProfile.objects.create(user=UserFactory())
 
 
-def test_twelve_photos_attach_in_a_single_call(landlord):
-    """End to end: the transcript's actual goal. One call, blank upload_id,
-    all twelve placed — not 5 catalog steps, not 2 photos, not 1."""
+def test_focus_uses_only_the_explicit_conversation_batch(landlord):
+    conversation = uuid.uuid4()
+    _batch(landlord, uuid.uuid4(), 17, "old")
+    batch, rows = _batch(landlord, conversation, 11, "new")
+
+    focus = _conversation_attachment_focus(landlord, conversation)
+
+    assert focus["attachment_batch_id"] == str(batch.pk)
+    assert focus["attachment_ids"] == [str(row.pk) for row in rows]
+    assert focus["pending_photo_count"] == 11
+    assert "attachment_batch_id" in focus["instruction"]
+
+
+def test_latest_correction_controls_document_intent(landlord):
+    conversation = uuid.uuid4()
+    _batch(landlord, conversation, 1)
+    _said(landlord, conversation, "this is a Scotiabank mortgage statement")
+    _said(landlord, conversation, "No, it isn't a document; it is a gallery photo")
+
+    focus = _conversation_attachment_focus(landlord, conversation)
+
+    assert focus["landlord_described_as_business_record"] is False
+    assert "attach_photo_to_listing" in focus["instruction"]
+
+
+def test_genuine_business_document_is_still_detected(landlord):
+    conversation = uuid.uuid4()
+    _batch(landlord, conversation, 1, "mortgage")
+    _said(landlord, conversation, "the mortgage renewal letter for 950 McKenzie")
+
+    focus = _conversation_attachment_focus(landlord, conversation)
+
+    assert focus["landlord_described_as_business_record"] is True
+    assert "catalog_business_document" in focus["instruction"]
+
+
+def test_batches_are_landlord_scoped(landlord, other_landlord):
+    conversation = uuid.uuid4()
+    batch, _ = _batch(other_landlord, conversation, 2)
+    _said(
+        landlord,
+        conversation,
+        f"[RAMA attachment batch {batch.pk}; exactly 2 file(s)]",
+    )
+
+    assert _conversation_attachment_focus(landlord, conversation) == {}
+
+
+def test_eleven_photo_batch_does_not_consume_seventeen_older_files(landlord):
     from rentium.properties.models import Property
     from rentium.rama import registry
 
     prop = Property.objects.create(
         landlord=landlord,
-        name="McCaughey Basement",
-        address="5654 McCaughey Street",
+        name="McKenzie Garden Suite",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.COMPLETE_UNIT,
+        unit_type=Property.UnitType.GARDEN_SUITE,
+    )
+    old_batch, old_rows = _batch(landlord, uuid.uuid4(), 17, "old")
+    new_batch, new_rows = _batch(landlord, uuid.uuid4(), 11, "garden")
+
+    preview = registry.execute(
+        "attach_photo_to_listing",
+        {
+            "property_query": prop.name,
+            "attachment_batch_id": str(new_batch.pk),
+        },
+        landlord=landlord,
+    )
+    assert preview["preview"]["photos"] == 11
+    assert preview["preview"]["attachment_ids"] == [str(row.pk) for row in new_rows]
+
+    done = registry.execute(
+        "attach_photo_to_listing",
+        {
+            "property_query": prop.name,
+            "attachment_batch_id": str(new_batch.pk),
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert done["photos_added"] == 11
+    assert len(done["media"]) == 11
+    assert RamaAttachment.objects.filter(
+        batch=new_batch,
+        status=RamaAttachment.Status.APPLIED,
+    ).count() == 11
+    assert RamaAttachment.objects.filter(
+        batch=old_batch,
+        status=RamaAttachment.Status.STAGED,
+    ).count() == len(old_rows) == 17
+
+
+def test_blank_and_all_legacy_upload_selection_are_refused(landlord):
+    from rentium.properties.models import Property
+    from rentium.rama import registry
+
+    prop = Property.objects.create(
+        landlord=landlord,
+        name="Safe Gallery",
+        address="950 McKenzie Ave",
         city="Victoria",
         province="bc",
         property_category=Property.PropertyCategory.ROOM,
         room_type=Property.RoomType.PRIVATE,
     )
-    for i in range(12):
-        _upload(landlord, f"photo{i}.jpg")
+    RamaUpload.objects.create(
+        landlord=landlord,
+        image=ContentFile(b"x", name="unrelated.jpg"),
+    )
+    for upload_id in ("", "all"):
+        result = registry.execute(
+            "attach_photo_to_listing",
+            {"property_query": prop.name, "upload_id": upload_id},
+            landlord=landlord,
+        )
+        assert "explicit attachment_batch_id is required" in result["error"]
+
+
+def test_specific_wrong_photo_can_be_removed_by_stable_handle(landlord):
+    from rentium.properties.models import Property
+    from rentium.rama import registry
+
+    prop = Property.objects.create(
+        landlord=landlord,
+        name="Garden Suite",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.COMPLETE_UNIT,
+        unit_type=Property.UnitType.GARDEN_SUITE,
+    )
+    batch, _ = _batch(landlord, uuid.uuid4(), 1, "wrong-mortgage")
+    attached = registry.execute(
+        "attach_photo_to_listing",
+        {
+            "property_query": prop.name,
+            "attachment_batch_id": str(batch.pk),
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    handle = attached["media"][0]["handle"]
 
     preview = registry.execute(
-        "attach_photo_to_listing",
-        {"property_query": "McCaughey Basement"},
+        "remove_photo_from_listing",
+        {"property_query": prop.name, "media_handle": handle},
         landlord=landlord,
     )
-    assert preview["preview"]["photos"] == 12
-
+    assert preview["needs_confirm"] is True
     done = registry.execute(
-        "attach_photo_to_listing",
-        {"property_query": "McCaughey Basement", "confirm": "yes"},
+        "remove_photo_from_listing",
+        {
+            "property_query": prop.name,
+            "media_handle": handle,
+            "confirm": "yes",
+        },
         landlord=landlord,
     )
-    assert done["photos_added"] == 12
-    assert RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True).count() == 0
-    assert prop.image_count >= 12
+    assert done["removed"] is True
+    assert done["remaining_media"] == []

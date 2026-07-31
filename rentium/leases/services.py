@@ -9,6 +9,97 @@ lives here instead.
 
 from decimal import Decimal
 
+from django.core.exceptions import ValidationError
+from django.db import transaction
+
+
+@transaction.atomic
+def create_lease_record(*, landlord, values: dict):
+    """Create one lease through the application boundary used by API and RAMA.
+
+    Callers may prepare different input shapes, but ownership enforcement,
+    inherited utilities, model validation, legal shared-space derivation, and
+    post-save domain signals happen exactly once here.
+    """
+    from rentium.leases.models import Lease
+
+    data = dict(values)
+    data.pop("landlord", None)
+    property_obj = data.get("property")
+    group_obj = data.get("group")
+    if not ((property_obj is None) ^ (group_obj is None)):
+        raise ValidationError("Lease must link to either one property or one group.")
+    if property_obj is not None and property_obj.landlord_id != landlord.pk:
+        raise ValidationError({"property": "That property is outside this portfolio."})
+    if group_obj is not None and group_obj.landlord_id != landlord.pk:
+        raise ValidationError({"group": "That group is outside this portfolio."})
+    if (
+        not data.get("bills_included")
+        and property_obj is not None
+        and getattr(property_obj, "default_bills_included", None)
+    ):
+        data["bills_included"] = property_obj.default_bills_included
+
+    lease = Lease(landlord=landlord, **data)
+    lease.full_clean()
+    lease.save()
+
+    if "ROOMMATE" in (lease.lease_type or "") and not lease.common_space_shared_with:
+        from rentium.leases.tenancy_rules import landlord_shares_common_areas
+
+        if landlord_shares_common_areas(lease):
+            lease.common_space_shared_with = ["LANDLORD"]
+            lease.save(update_fields=["common_space_shared_with", "updated_at"])
+    return lease
+
+
+def record_invite_event(lease_tenant, kind: str, *, actor=None, metadata=None):
+    from rentium.leases.models import LeaseInviteEvent
+
+    return LeaseInviteEvent.objects.create(
+        lease_tenant=lease_tenant,
+        kind=kind,
+        actor=actor,
+        metadata=metadata or {},
+    )
+
+
+def invite_lifecycle(lease_tenant) -> dict:
+    """Facts RAMA/UI may state without conflating opened, linked, and signed."""
+    from rentium.leases.models import LeaseInviteEvent
+
+    events = list(lease_tenant.invite_events.order_by("created_at"))
+    latest: dict[str, object] = {}
+    for event in events:
+        latest[event.kind] = event.created_at
+    opened_at = latest.get(LeaseInviteEvent.Kind.LINK_OPENED)
+    linked_at = (
+        latest.get(LeaseInviteEvent.Kind.ACCOUNT_LINKED)
+        or lease_tenant.invite_accepted_at
+    )
+    signed_at = latest.get(LeaseInviteEvent.Kind.SIGNED) or lease_tenant.signed_date
+    return {
+        "invite_sent": bool(lease_tenant.invite_sent_at),
+        "invite_sent_at": (
+            lease_tenant.invite_sent_at.isoformat()
+            if lease_tenant.invite_sent_at
+            else None
+        ),
+        # Opening the token-gated preview proves the URL was opened. It does not
+        # prove the named person read or understood the agreement.
+        "invite_link_opened": bool(opened_at),
+        "invite_link_opened_at": opened_at.isoformat() if opened_at else None,
+        "account_linked": bool(lease_tenant.tenant_id),
+        "account_linked_at": linked_at.isoformat() if linked_at else None,
+        "signed": bool(lease_tenant.has_signed),
+        "signed_at": signed_at.isoformat() if signed_at else None,
+        "declined": bool(lease_tenant.declined),
+        "evidence_note": (
+            "LINK_OPENED means the token-gated invite URL was opened; it is not "
+            "proof that the recipient read the agreement."
+        ),
+    }
+
 
 def co_landlord_grants_for_lease(lease):
     """LandlordTeamMember grants that make someone a co-landlord on THIS lease:

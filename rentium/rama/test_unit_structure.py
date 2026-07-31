@@ -295,3 +295,182 @@ def test_mode_switch_parks_rather_than_deletes(landlord):
     whole.refresh_from_db()
     assert whole.is_active_offering is False
     assert Property.objects.filter(pk=whole.pk).exists()
+
+
+def test_existing_garden_suite_becomes_two_room_offerings_atomically(landlord):
+    result = _structure(
+        landlord,
+        [
+            {
+                "name": "Garden Suite",
+                "listing_name": "McKenzie Garden Suite",
+                "rental_mode": "WHOLE_UNIT",
+                "spaces": [
+                    {"name": "Kitchen"},
+                    {"name": "Washroom", "type": "BATHROOM"},
+                ],
+            }
+        ],
+    )
+    assert result.get("created")
+    unit = PropertyUnit.objects.get(name="Garden Suite")
+    whole = unit.active_offerings().get()
+
+    preview = registry.execute(
+        "configure_unit_room_offerings",
+        {
+            "unit_name": "Garden Suite",
+            "room_names_json": json.dumps(["Bonus room J", "Room K"]),
+            "shared_areas_json": json.dumps(
+                [
+                    {"name": "Washroom", "area_type": "BATHROOM"},
+                    {"name": "Kitchen", "area_type": "KITCHEN"},
+                    {"name": "Patio", "area_type": "BALCONY"},
+                ]
+            ),
+        },
+        landlord=landlord,
+    )
+    assert preview.get("needs_confirm")
+    assert [row["name"] for row in preview["preview"]["rooms"]] == [
+        "Bonus room J",
+        "Room K",
+    ]
+    assert [row["name"] for row in preview["preview"]["shared_areas"]] == [
+        "Washroom",
+        "Kitchen",
+        "Patio",
+    ]
+    assert unit.offerings.count() == 1
+
+    completed = registry.execute(
+        "configure_unit_room_offerings",
+        {
+            "unit_name": "Garden Suite",
+            "room_names_json": json.dumps(["Bonus room J", "Room K"]),
+            "shared_areas_json": json.dumps(
+                [
+                    {"name": "Washroom", "area_type": "BATHROOM"},
+                    {"name": "Kitchen", "area_type": "KITCHEN"},
+                    {"name": "Patio", "area_type": "BALCONY"},
+                ]
+            ),
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert completed.get("configured"), completed
+
+    unit.refresh_from_db()
+    whole.refresh_from_db()
+    assert unit.rental_mode == PropertyUnit.RentalMode.BY_ROOM
+    assert whole.is_active_offering is False
+    assert Property.objects.filter(pk=whole.pk).exists()
+    assert set(
+        unit.active_offerings().values_list("name", flat=True)
+    ) == {"Bonus room J", "Room K"}
+    assert unit.room_group.name == "McCaughey House Garden Suite"
+    assert set(
+        unit.areas.filter(
+            area_type=PropertyArea.AreaType.BEDROOM,
+            is_seeded_default=False,
+        ).values_list("name", flat=True)
+    ) == {"Bonus room J", "Room K"}
+    assert set(
+        PropertyArea.objects.filter(
+            property__group=unit.room_group,
+            is_group_common=True,
+        ).values_list("name", flat=True)
+    ) == {"Washroom", "Kitchen", "Patio"}
+
+
+def test_configure_room_offerings_reuses_existing_rows(landlord):
+    _structure(
+        landlord,
+        [
+            {
+                "name": "Garden Suite",
+                "rental_mode": "WHOLE_UNIT",
+                "spaces": [{"name": "Bathroom", "type": "BATHROOM"}],
+            }
+        ],
+    )
+    arguments = {
+        "unit_name": "Garden Suite",
+        "room_names_json": json.dumps(["Bonus room J", "Room K"]),
+        "confirm": "yes",
+    }
+    first = registry.execute(
+        "configure_unit_room_offerings", arguments, landlord=landlord
+    )
+    second = registry.execute(
+        "configure_unit_room_offerings", arguments, landlord=landlord
+    )
+    assert first.get("configured") and second.get("configured")
+    assert Property.objects.filter(
+        unit__name="Garden Suite",
+        property_category=Property.PropertyCategory.ROOM,
+    ).count() == 2
+
+
+def test_resolve_unit_uses_street_to_break_garden_suite_ties(landlord):
+    from rentium.properties.models import PropertyHolding
+    from rentium.rama.unit_structure import _resolve_unit
+
+    mck = PropertyHolding.objects.create(
+        landlord=landlord, name="McKenzie House", address="950 McKenzie Ave",
+    )
+    other = PropertyHolding.objects.create(
+        landlord=landlord, name="Other House", address="100 Other St",
+    )
+    mck_unit = PropertyUnit.objects.create(
+        landlord=landlord, holding=mck, name="Garden Suite",
+        rental_mode=PropertyUnit.RentalMode.WHOLE_UNIT,
+    )
+    PropertyUnit.objects.create(
+        landlord=landlord, holding=other, name="Garden Suite",
+        rental_mode=PropertyUnit.RentalMode.WHOLE_UNIT,
+    )
+
+    unit, err = _resolve_unit(landlord, "Garden Suite 950 McKenzie Ave")
+    assert err is None
+    assert unit.pk == mck_unit.pk
+
+    unit2, err2 = _resolve_unit(
+        landlord, "Garden Suite", holding="950 McKenzie",
+    )
+    assert err2 is None
+    assert unit2.pk == mck_unit.pk
+
+    bare, bare_err = _resolve_unit(landlord, "Garden Suite")
+    assert bare is None
+    assert bare_err and bare_err.get("candidates")
+
+
+def test_configure_room_offerings_is_blocked_by_draft_lease(landlord):
+    _structure(landlord, [MCCAUGHEY_MAIN_FLOOR])
+    unit = PropertyUnit.objects.get(name="Main Floor")
+    Lease.objects.create(
+        landlord=landlord,
+        property=unit.active_offerings().get(),
+        lease_type=Lease.LeaseType.BC_RESIDENTIAL_TENANCY,
+        status=Lease.LeaseStatus.DRAFT,
+        start_date=date.today(),
+        is_month_to_month=True,
+        total_rent="2400.00",
+    )
+
+    result = registry.execute(
+        "configure_unit_room_offerings",
+        {
+            "unit_name": "Main Floor",
+            "room_names_json": json.dumps(["Room A", "Room B"]),
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert "error" in result
+    assert result["blocked_by"][0]["status"] == Lease.LeaseStatus.DRAFT
+    assert not unit.offerings.filter(
+        property_category=Property.PropertyCategory.ROOM
+    ).exists()

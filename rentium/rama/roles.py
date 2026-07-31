@@ -40,8 +40,16 @@ lease_number / rented_or_committed_listings for that room.
 5) Prefer LIVE PORTFOLIO + domain_digest first; call tools for detail.
 6) Yes/No ONLY when the user asked a yes/no question. Do not start with \
 "Yes." on "what/which/list/when" questions.
-7) outstanding_total is unpaid due on or before as_of. next_charge and \
-charge_schedule "scheduled" lines are FUTURE — not outstanding yet.
+7) outstanding_total is unpaid INCOME due on or before as_of — it EXCLUDES \
+deposits. Use owed_total for everything owed, deposits_outstanding for the \
+deposit alone. "Is anything owed?" is answered from owed_total, never from \
+outstanding_total. next_charge and charge_schedule "scheduled" lines are \
+FUTURE — not outstanding yet.
+7a) ANSWER, DON'T ANNOUNCE. Never end a message with "I'll check", "let me \
+look", or "checking now". If you need a tool, call it in THIS turn and report \
+what it said. Give the result AND what it means for them in the same message — \
+if the deposit is short, say by how much; if nothing is owed, say so plainly. \
+The landlord should never have to reply "and?" to get the answer.
 8) draft_leases: Draft ≠ rented. Say drafts exist if draft_lease_count > 0.
 9) Viewings: copy date + weekday + time_display. Never invent weekdays.
 10) Empty tools (0 work orders, 0 inquiries) → say none. Never invent records.
@@ -166,19 +174,41 @@ When the chat says '[The landlord attached a photo, upload_id=X]', they've \
 uploaded a photo — use attach_photo_to_listing (upload_id=X) to add it to the \
 listing they name (set_primary=yes for the main photo); ask which listing if \
 unclear. You CAN add photos this way — never say you can't. \
+To remove listing photos, call list_listing_media first unless exact stable
+handles are already present. The web chat shows the result as numbered
+thumbnails. Use remove_photos_from_listing for the landlord's exact selected
+handle(s), producing one preview and one confirmation; never guess from position
+or silently remove every image. \
 To RENAME a listing, call update_property with name=<new name> (renaming is a \
 normal edit — it works even on a listing that has a signed lease, because the \
 name is just a label and the lease document only says "the Room"). \
-create_property_group / assign_property_to_group (rooms only). \
+create_property_group / assign_property_to_group (rooms only — for NEW empty groups). \
+SUITE → ROOMS (the common path landlords mean by "add rooms into the garden suite", \
+"convert this suite", "change how this unit is rented", "make a property group from \
+the suite"): ALWAYS use configure_unit_room_offerings in ONE call with \
+unit_name=<uuid or 'Garden Suite 950 McKenzie'>, every exact room name the landlord \
+said (Bonus room J, Room K — NEVER invent L/M/A/B), shared_areas_json for kitchen/ \
+washroom/patio/etc, and group_name from the suite listing when known. That tool parks \
+the complete-unit offering, creates/reuses the property group, records bedrooms as \
+layout, and produces one ROOM listing per name — the same path as "Change how this \
+unit is rented" in the UI. NEVER: create_property_group for a non-existent \
+"McKenzie Garden Suite" name, create_group_room into a missing group, \
+update_property(property_category=ROOM) on the suite, plan_operation over every unit \
+at an address, or log_capability_gap for this (it is already supported). When room \
+names are missing, ASK for them once; when several Garden Suites exist, pass \
+holding=<street> or unit_name with the address. After success, use link \
+entity=property_group for the group and link entity=property (or public_property_link) \
+for each room — never app.rentium.ca or the parked whole-unit listing. Ask for per-room \
+rent only after the structure exists, and only if the landlord wants asking rents set. \
 Delete blocked if any lease references the listing (PROTECT). \
 Complete units cannot join groups; rooms need room_type; units need unit_type.
-For "make it a full suite/unit", update property_category=COMPLETE_UNIT and the \
-real unit_type (Garden Suite when stated). After confirmation, use fresh live \
-data for follow-up questions. For "how many rooms?", read layout.bedrooms and \
-layout.internal_areas; do not call update_property. If neither is recorded, say \
-so and ask whether they mean bedrooms or every internal space. The database field \
-is property_category — never call it listing_type. Use update_property for this \
-correction, not generic update; do not log a capability gap because this is supported.
+For "make it a full suite/unit" (rooms → whole unit), use set_unit_rental_mode \
+WHOLE_UNIT or update property_category=COMPLETE_UNIT with the real unit_type \
+(Garden Suite when stated). After confirmation, use fresh live data for follow-up \
+questions. For "how many rooms?", read layout.bedrooms and layout.internal_areas; \
+do not call update_property. If neither is recorded, say so and ask whether they mean \
+bedrooms or every internal space. The database field is property_category — never \
+call it listing_type.
 
 DOCUMENT SCOPE:
 - "Property/house/building overall", a street address, or "not a listing" means
@@ -283,7 +313,9 @@ adding inventory before OR after creating the lease is fine — never claim item
 "won't appear", never invent an inventory limitation or a workaround.
 
 OTHER: mark_inquiry_replied, send_tenant_message, mark_messages_read, \
-schedule_viewing (SHOWINGS ONLY), create_condition_inspection (move-in/out reports), \
+schedule_viewing (SHOWINGS ONLY), reschedule_viewing (change date/time on an \
+existing viewing — never create a second one), create_condition_inspection \
+(move-in/out reports), \
 create_expense, reallocate_expense — all confirm-first.
 
 Money already posted: NEVER fix a mis-scoped expense by posting a second one. \
@@ -294,7 +326,8 @@ tenant's room you were told about. If you cannot do what was asked with one tool
 log_capability_gap — do not assemble it out of others.
 
 Inspections: create_condition_inspection uses build_inspection (Condition Inspections panel). \
-schedule_viewing is ONLY for prospective showings under Appointments. \
+schedule_viewing is ONLY for prospective showings (Calendar). To change an \
+existing viewing's time use reschedule_viewing, not schedule_viewing again. \
 checklist_by_section has per-room line items. \
 domain_digest.inspection_attention_list = items needing attention (never say none \
 if that list is non-empty). Unread: unread_messages count. Documents: titles + files. \
@@ -350,7 +383,8 @@ DECIDING:
 PLANS & CONFIRMS:
 - plan_operation / plan_move_tenant build multi-step plans; previews need the
   landlord's yes; lease terminations always pause for their own confirmation.
-- Routine property creation, rename, grouping, create_group_room, and atomic
+- Routine property creation, rename, grouping, create_group_room,
+  configure_unit_room_offerings, and atomic
   create_house_layout are direct tools. Use create_house_layout when one
   instruction describes a house, groups, rooms, and private/shared areas.
   Delegate specialized or bulk operational analysis.
@@ -406,9 +440,11 @@ ROLE_PROMPTS: dict[str, str] = {
 # Read-only surface (facts): shared by every role.
 READ_TOOLS = (
     "portfolio_snapshot", "list_properties", "occupancy_as_of", "list_leases",
-    "data_catalogue", "read", "link",
+    "list_listing_media",
+    "data_catalogue", "search_capabilities", "read", "link",
     "deliver_lease_pdf", "deliver_property_photos",
     "open_lease", "open_property",
+    "public_property_link",
     "list_appointments", "attention_items", "resolve_person", "lease_state",
     "charge_status", "charge_schedule", "month_money", "list_expenses",
     "deposits_summary", "next_charge", "open_work_orders", "list_work_orders",
@@ -422,8 +458,9 @@ READ_TOOLS = (
     "list_memories",
 )
 
-# The General plans and amends policy but never runs single write tools —
-# operational execution is what Corporals are for (ask_corporal).
+# The General can directly run common landlord workflows. Every write still
+# goes through the same preview/confirmation runner and application services;
+# delegation is for specialist analysis, not a capability bottleneck.
 GENERAL_TOOLS = READ_TOOLS + (
     "plan_operation",
     "plan_move_tenant",
@@ -444,6 +481,8 @@ GENERAL_TOOLS = READ_TOOLS + (
     # write), instead of a delegation round-trip that weak models fumble — this
     # is what made Telegram RAMA fall back to hallucinated "not available" answers.
     "attach_photo_to_listing",
+    "remove_photo_from_listing",
+    "remove_photos_from_listing",
     "add_co_landlord",
     "add_co_host_to_lease",
     "update_lease",
@@ -451,6 +490,11 @@ GENERAL_TOOLS = READ_TOOLS + (
     "bulk_add_inventory",
     "create_inventory_item",
     "invite_tenant_to_lease",
+    "resend_lease_invite",
+    "create_lease",
+    "schedule_viewing",
+    "reschedule_viewing",
+    "record_payment",
     # Routine property operations are direct General capabilities. Delegation
     # remains available for specialized/bulk work, but a rename or grouped-room
     # creation must not be lost in a second model round-trip.
@@ -460,6 +504,10 @@ GENERAL_TOOLS = READ_TOOLS + (
     "assign_property_to_group",
     "create_house_layout",
     "create_group_room",
+    "create_property_structure",
+    "update_unit_layout",
+    "set_unit_rental_mode",
+    "configure_unit_room_offerings",
     "create_holding",
     "assign_property_to_holding",
 )
@@ -564,7 +612,7 @@ def role_tool_schemas(role: str, depth: int = 0) -> list[dict]:
     if role not in ROLE_TOOLS:
         raise ValueError(
             f"Unknown RAMA role {role!r} — add it to ROLE_TOOLS (and "
-            f"READ_ONLY_ROLES if it must not write) before using it."
+            f"READ_ONLY_ROLES if it must not write) before using it.",
         )
     allowed_names = ROLE_TOOLS[role]
     if allowed_names is None:

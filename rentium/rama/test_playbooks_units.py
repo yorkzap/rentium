@@ -122,6 +122,9 @@ def test_switching_mode_is_planned_per_unit(landlord, portfolio):
     assert len(steps) == 1
     assert steps[0]["tool"] == "set_unit_rental_mode"
     assert steps[0]["arguments"]["rental_mode"] == PropertyUnit.RentalMode.BY_ROOM
+    # Pin the resolved unit UUID so execution never re-asks "which Garden Suite".
+    assert steps[0]["arguments"]["unit_name"] == str(portfolio["main"].pk)
+    assert steps[0]["arguments"].get("holding")
     # Reshaping the market pauses for its own yes inside a plan.
     assert steps[0]["requires_own_confirm"] is True
 
@@ -249,6 +252,9 @@ WRAPPED = {
     "create_property_structure": "rentium.rama.unit_structure:create_property_structure",
     "update_unit_layout": "rentium.rama.unit_structure:update_unit_layout",
     "set_unit_rental_mode": "rentium.rama.unit_structure:set_unit_rental_mode",
+    "configure_unit_room_offerings": (
+        "rentium.rama.unit_structure:configure_unit_room_offerings"
+    ),
 }
 
 

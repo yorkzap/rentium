@@ -523,6 +523,10 @@ RAMA_MODEL = env("RAMA_MODEL", default="grok-4.3")
 # full set listings never truncate mid-answer.
 RAMA_TEMPERATURE = env.float("RAMA_TEMPERATURE", default=0.0)
 RAMA_MAX_TOKENS = env.int("RAMA_MAX_TOKENS", default=4096)
+# Command-engine v2 retrieves a compact, request-relevant capability set
+# instead of sending the full 100+ operation surface to every model turn.
+RAMA_COMMAND_ENGINE_V2 = env.bool("RAMA_COMMAND_ENGINE_V2", default=True)
+RAMA_TOOL_RETRIEVAL_LIMIT = env.int("RAMA_TOOL_RETRIEVAL_LIMIT", default=12)
 # Per-role platform defaults for the agent hierarchy (General decides, FSA
 # analyzes, Corporals execute on the landlord's cheap chat model). Empty =
 # fall back to the landlord's chat provider with the role's default tier

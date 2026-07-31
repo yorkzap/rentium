@@ -822,8 +822,6 @@ def schedule_viewing(
     """Schedule a viewing. when = ISO datetime or 'YYYY-MM-DD HH:MM' (local Vancouver-ish)."""
     from zoneinfo import ZoneInfo
 
-    from rentium.appointments.models import Appointment
-
     prop, err = _resolve_property(landlord, property_query)
     if err:
         return _prop_err(err)
@@ -861,41 +859,28 @@ def schedule_viewing(
     if not _confirmed(confirm):
         return _preview("schedule_viewing", preview, "Creates a SCHEDULED viewing.")
 
-    from rentium.appointments.services import (
-        current_active_lease,
-        notification_receipt,
-    )
+    from rentium.appointments.services import notification_receipt
+    from rentium.appointments.services import schedule_viewing as schedule_viewing_service
 
     try:
-        active_lease = current_active_lease(prop)
-        appt = Appointment.objects.create(
+        appt = schedule_viewing_service(
             landlord=landlord,
-            property=prop,
-            lease=active_lease,
-            kind=Appointment.Kind.VIEWING,
-            status=Appointment.Status.SCHEDULED,
+            property_obj=prop,
             starts_at=starts,
             contact_name=(contact_name or "")[:200],
             contact_email=(contact_email or "")[:150],
             notes=(notes or "")[:2000],
-            tenant_consent=(
-                Appointment.TenantConsent.PENDING
-                if active_lease
-                else Appointment.TenantConsent.NOT_APPLICABLE
-            ),
         )
-        appt.stamp_time_class()
-        appt.save(update_fields=["time_class"])
-        appt.record_proposal(by="LANDLORD", starts_at=starts, message=notes or "")
-        # Directly scheduling emails the viewer + notices current tenants; if the
-        # unit is occupied the tenant is also asked for consent (advisory).
-        appt.publish_event("appointment.scheduled")
-        if active_lease:
-            appt.publish_event("appointment.tenant_review")
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Could not create viewing: {exc}"}
 
     receipt = notification_receipt(appt)
+    # Pin the real landlord UI path so weak models never invent an
+    # "Appointments" menu. Viewings live on Calendar.
+    from rentium.rama.links import url_for_path
+
+    calendar_link = url_for_path("/dashboard/calendar")
+    status_link = url_for_path(f"/viewing/status/{appt.public_token}")
     return {
         "created": True,
         "appointment": {
@@ -905,10 +890,20 @@ def schedule_viewing(
             "status": appt.status,
             "kind": appt.kind,
             "time_class": appt.time_class,
+            "contact_name": appt.contact_name,
+            "contact_email": appt.contact_email,
         },
         # Grounded delivery facts so RAMA can truthfully answer "how were they
         # notified?" — the exact gap that made it feel not-alive.
         "notified": receipt,
+        "calendar_link": calendar_link,
+        "prospect_status_link": status_link,
+        "note": (
+            f"Viewing is on your Calendar ({calendar_link}). "
+            f"Prospect tracking page: {status_link}. "
+            "Email is sent asynchronously when the appointment.scheduled event "
+            "is processed; if that event has no error, the send was attempted."
+        ),
     }
 
 
@@ -952,7 +947,7 @@ def list_viewing_requests(landlord, scope: str = "pending") -> dict:
     return {"count": len(rows), "requests": rows}
 
 
-def _find_viewing(landlord, request_ref: str):
+def _find_viewing(landlord, request_ref: str, *, any_status: bool = False):
     import uuid as _uuid
 
     from rentium.appointments.models import Appointment
@@ -962,20 +957,182 @@ def _find_viewing(landlord, request_ref: str):
         return None
     qs = Appointment.objects.filter(
         landlord=landlord, kind=Appointment.Kind.VIEWING
-    )
+    ).select_related("property")
     # Full UUID → direct hit; anything else is treated as the short ref.
     try:
-        return qs.filter(pk=_uuid.UUID(ref)).first() or _match_short_ref(qs, ref)
+        hit = qs.filter(pk=_uuid.UUID(ref)).first()
+        if hit is not None:
+            return hit
     except (ValueError, AttributeError):
-        return _match_short_ref(qs, ref)
+        pass
+    return _match_short_ref(qs, ref, any_status=any_status)
 
 
-def _match_short_ref(qs, ref: str):
-    """Match the 8-char reference shown in list_viewing_requests."""
-    for a in qs.filter(status__in=_PENDING_VIEWING):
+def _match_short_ref(qs, ref: str, *, any_status: bool = False):
+    """Match the 8-char reference shown in list tools."""
+    scoped = qs if any_status else qs.filter(status__in=_PENDING_VIEWING)
+    for a in scoped.order_by("-starts_at")[:200]:
         if str(a.pk)[:8].upper() == ref.upper():
             return a
     return None
+
+
+def _resolve_scheduled_viewing(
+    landlord,
+    *,
+    appointment_ref: str = "",
+    property_query: str = "",
+    contact: str = "",
+):
+    """Find one SCHEDULED viewing to reschedule.
+
+    Prefer appointment_ref (uuid or 8-char). Fall back to property + contact
+    email/name so "reschedule Hitakshi's Room D viewing" works without the id.
+    """
+    from rentium.appointments.models import Appointment
+
+    if appointment_ref.strip():
+        appt = _find_viewing(landlord, appointment_ref, any_status=True)
+        if appt is None:
+            return None, {"error": f"No viewing matches ref={appointment_ref!r}."}
+        return appt, None
+
+    qs = Appointment.objects.filter(
+        landlord=landlord,
+        kind=Appointment.Kind.VIEWING,
+    ).exclude(
+        status__in=(Appointment.Status.CANCELLED, Appointment.Status.COMPLETED),
+    ).select_related("property")
+
+    if property_query.strip():
+        prop, err = _resolve_property(landlord, property_query)
+        if err:
+            return None, _prop_err(err)
+        qs = qs.filter(property=prop)
+
+    contact_s = (contact or "").strip()
+    if contact_s:
+        from django.db.models import Q
+
+        qs = qs.filter(
+            Q(contact_email__icontains=contact_s)
+            | Q(contact_name__icontains=contact_s),
+        )
+
+    matches = list(qs.order_by("starts_at")[:6])
+    if not matches:
+        return None, {
+            "error": (
+                "No open viewing matched. Pass appointment_ref from "
+                "list_appointments, or property_query + contact email/name."
+            ),
+        }
+    if len(matches) > 1:
+        return None, {
+            "error": "Several viewings match — which one?",
+            "candidates": [
+                {
+                    "ref": str(a.pk)[:8].upper(),
+                    "id": str(a.pk),
+                    "property": a.property.name,
+                    "when": timezone.localtime(a.starts_at).strftime(
+                        "%Y-%m-%d %H:%M %Z",
+                    ),
+                    "who": a.contact_name or a.contact_email or "—",
+                    "status": a.status,
+                }
+                for a in matches
+            ],
+            "hint": "Pass appointment_ref=<id or 8-char ref>.",
+        }
+    return matches[0], None
+
+
+def reschedule_viewing(
+    landlord,
+    *,
+    when: str,
+    appointment_ref: str = "",
+    property_query: str = "",
+    contact: str = "",
+    notes: str = "",
+    confirm: str = "",
+) -> dict:
+    """Move an existing viewing to a new date/time. Prefer appointment_ref
+    (from list_appointments). Or property_query + contact (email/name).
+    when = 'YYYY-MM-DD HH:MM'. Preview first; confirm=yes to apply. Emails the
+    prospect the new time and keeps their status link working."""
+    from rentium.appointments.services import notification_receipt
+    from rentium.appointments.services import reschedule_viewing as reschedule_service
+    from rentium.rama.links import url_for_path
+
+    new_start = _parse_when(when)
+    if new_start is None:
+        return {"error": f"Could not parse when={when!r}. Use YYYY-MM-DD HH:MM."}
+
+    appt, err = _resolve_scheduled_viewing(
+        landlord,
+        appointment_ref=appointment_ref,
+        property_query=property_query,
+        contact=contact,
+    )
+    if err:
+        return err
+
+    previous_local = timezone.localtime(appt.starts_at)
+    new_local = timezone.localtime(new_start)
+    preview = {
+        "ref": str(appt.pk)[:8].upper(),
+        "appointment_id": str(appt.pk),
+        "property": appt.property.name,
+        "contact_name": appt.contact_name,
+        "contact_email": appt.contact_email,
+        "from": previous_local.strftime("%A, %Y-%m-%d %H:%M %Z"),
+        "to": new_local.strftime("%A, %Y-%m-%d %H:%M %Z"),
+        "status": appt.status,
+        "notes": (notes or "")[:200],
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "reschedule_viewing",
+            preview,
+            "Updates this viewing's start time and emails the contact.",
+        )
+
+    try:
+        appt = reschedule_service(
+            appointment=appt,
+            starts_at=new_start,
+            message=notes or "Rescheduled",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Could not reschedule: {exc}"}
+
+    calendar_link = url_for_path("/dashboard/calendar")
+    status_link = url_for_path(f"/viewing/status/{appt.public_token}")
+    return {
+        "rescheduled": True,
+        "appointment": {
+            "id": str(appt.pk),
+            "ref": str(appt.pk)[:8].upper(),
+            "property": appt.property.name,
+            "starts_at": appt.starts_at.isoformat(),
+            "status": appt.status,
+            "contact_name": appt.contact_name,
+            "contact_email": appt.contact_email,
+        },
+        "from": previous_local.strftime("%A, %Y-%m-%d %H:%M %Z"),
+        "to": timezone.localtime(appt.starts_at).strftime("%A, %Y-%m-%d %H:%M %Z"),
+        "notified": notification_receipt(appt),
+        "calendar_link": calendar_link,
+        "prospect_status_link": status_link,
+        "message": (
+            f"Rescheduled {appt.property.name} viewing from "
+            f"{previous_local.strftime('%b %d %I:%M %p')} to "
+            f"{timezone.localtime(appt.starts_at).strftime('%b %d %I:%M %p')}. "
+            f"See Calendar: {calendar_link}"
+        ),
+    }
 
 
 def respond_to_viewing_request(
@@ -1327,6 +1484,16 @@ def open_property(landlord, *, property_query: str = "") -> dict:
         "link": url_for_path(f"/dashboard/properties/{prop.id}"),
         "note": f"Open this link to view {prop.name} — its photos and full details.",
     }
+
+
+def public_property_link(landlord, *, property_query: str = "") -> dict:
+    """The real logged-out listing route, never a guessed name-based URL."""
+    from .links import public_property_url
+
+    prop, err = _resolve_property(landlord, property_query)
+    if err:
+        return _prop_err(err)
+    return public_property_url(prop)
 
 
 def _place(lease) -> str:
@@ -1806,6 +1973,8 @@ def _active_tenant_slots(lease):
 
 
 def _slot_label(lt) -> dict:
+    from rentium.leases.services import invite_lifecycle
+
     return {
         "id": str(lt.pk),
         "name": lt.display_name,
@@ -1817,6 +1986,7 @@ def _slot_label(lt) -> dict:
         "declined": bool(lt.declined),
         "invite_sent_at": lt.invite_sent_at.isoformat() if lt.invite_sent_at else None,
         "linked": bool(lt.tenant_id),
+        "invite_lifecycle": invite_lifecycle(lt),
     }
 
 
@@ -2272,9 +2442,25 @@ def invite_tenant_to_lease(
         email_sent = bool(send_tenant_invite(lt))
     except Exception as exc:  # noqa: BLE001
         email_error = str(exc)
+    linked = bool(getattr(lt, "tenant_id", None))
+    from rentium.leases.models import LeaseInviteEvent
+    from rentium.leases.services import record_invite_event
+
+    record_invite_event(
+        lt,
+        LeaseInviteEvent.Kind.SENT,
+        actor=getattr(landlord, "user", None),
+        metadata={"email_sent": email_sent, "source": "rama"},
+    )
+    if linked:
+        record_invite_event(
+            lt,
+            LeaseInviteEvent.Kind.ACCOUNT_LINKED,
+            actor=getattr(landlord, "user", None),
+            metadata={"linked_existing_account": True, "source": "rama"},
+        )
 
     roster = [_slot_label(a) for a in _active_tenant_slots(lease)]
-    linked = bool(getattr(lt, "tenant_id", None))
     if linked:
         note = (
             "Linked their existing Rentium account — no invite email needed; "
@@ -2471,6 +2657,15 @@ def resend_lease_invite(
     frontend = canonical_frontend_origin()
     invite_url = lt.get_invite_url(frontend)
     sent = bool(send_tenant_invite(lt))
+    from rentium.leases.models import LeaseInviteEvent
+    from rentium.leases.services import record_invite_event
+
+    record_invite_event(
+        lt,
+        LeaseInviteEvent.Kind.RESENT,
+        actor=getattr(landlord, "user", None),
+        metadata={"email_sent": sent, "source": "rama"},
+    )
     return {
         "resent": True,
         "email_sent": sent,
@@ -2903,4 +3098,186 @@ def bulk_add_inventory(
         "property": prop.name,
         "items": created,
         "property_is_furnished": bool(prop.is_furnished),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Money IN.
+#
+# Until this existed RAMA had 115 tools and not one of them could record that a
+# payment arrived — it could only ever spend. Asked to record $100 of a $425
+# deposit, the General had no tool to reach for and said "Recorded the $100
+# payment" anyway. The reply guard in service.py stops the lie; this is the
+# capability whose absence caused it.
+# ---------------------------------------------------------------------------
+_PAYMENT_METHODS = {
+    "etransfer": "ETRANSFER", "e-transfer": "ETRANSFER", "e transfer": "ETRANSFER",
+    "transfer": "ETRANSFER", "interac": "ETRANSFER",
+    "cash": "CASH", "cheque": "CHEQUE", "check": "CHEQUE",
+}
+
+
+def _open_charges(landlord, query: str = "", property_query: str = ""):
+    """Charges with something still owing, newest first."""
+    from rentium.ledger.models import CHARGE_TYPES, ChargeStatus, LedgerEntry
+
+    rows = (
+        LedgerEntry.objects.not_voided()
+        .filter(landlord=landlord, entry_type__in=CHARGE_TYPES)
+        .select_related("property", "tenant", "tenant__user")
+        .order_by("-effective_date")
+    )
+    for word in (query or "").split():
+        rows = rows.filter(description__icontains=word)
+    if property_query:
+        rows = rows.filter(property__name__icontains=property_query)
+    settled = (ChargeStatus.PAID, ChargeStatus.VOIDED)
+    return [row for row in rows if row.charge_status() not in settled]
+
+
+def _outstanding_on(charge) -> Decimal:
+    from django.db.models import Sum
+
+    from rentium.ledger.models import SETTLEMENT_TYPES
+
+    paid = charge.settlements.filter(
+        entry_type__in=SETTLEMENT_TYPES, reversed_by__isnull=True
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+    return charge.amount - paid
+
+
+def _charge_label(charge) -> str:
+    where = charge.property.name if charge.property_id else "portfolio"
+    return f"{charge.description[:60]} ({where}, ${charge.amount})"
+
+
+def record_payment(
+    landlord,
+    *,
+    amount: str,
+    charge_query: str = "",
+    property_query: str = "",
+    payment_method: str = "",
+    payment_date: str = "",
+    confirm: str = "",
+) -> dict:
+    from rentium.ledger import services as ledger_services
+
+    try:
+        amt = Decimal(str(amount).replace("$", "").replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return {"error": f"Invalid amount {amount!r}."}
+    if amt <= 0:
+        return {"error": "A payment must be a positive amount."}
+
+    candidates = _open_charges(landlord, charge_query, property_query)
+    if not candidates:
+        return {
+            "error": "no_matching_charge",
+            "message": (
+                "I can't find an unpaid charge matching that. Money is always "
+                "recorded against the charge it settles, so tell me which "
+                "charge this was for — or post the charge first."
+            ),
+        }
+    if len(candidates) > 1:
+        return {
+            "question_for_user": (
+                "Which charge was this payment for?\n"
+                + "\n".join(
+                    f"• {_charge_label(c)} — ${_outstanding_on(c)} still owing"
+                    for c in candidates[:6]
+                )
+            ),
+            "candidates": [_charge_label(c) for c in candidates[:6]],
+        }
+
+    charge = candidates[0]
+    outstanding = _outstanding_on(charge)
+
+    day = date.today()
+    if payment_date:
+        try:
+            day = date.fromisoformat(payment_date.strip()[:10])
+        except ValueError:
+            return {
+                "error": f"payment_date must be YYYY-MM-DD, got {payment_date!r}."
+            }
+
+    # Never guessed silently. A default of "e-Transfer" quietly puts a fact on
+    # a financial record that nobody stated, and the landlord only finds out
+    # when they reconcile against a bank statement that shows cash. If the
+    # model could not pick it up from the conversation, ask once.
+    raw_method = (payment_method or "").strip().lower()
+    if not raw_method:
+        return {
+            "question_for_user": (
+                f"How did the ${amt} come in — e-transfer, cash, or cheque?"
+            ),
+            "needs": "payment_method",
+        }
+    method = _PAYMENT_METHODS.get(raw_method)
+    if method is None:
+        return {
+            "question_for_user": (
+                f"I don't recognise {payment_method!r} as a payment method. "
+                f"Was it an e-transfer, cash, or a cheque?"
+            ),
+            "needs": "payment_method",
+        }
+
+    preview = {
+        "charge": _charge_label(charge),
+        "charge_amount": str(charge.amount),
+        "already_paid": str(charge.amount - outstanding),
+        "this_payment": str(amt),
+        # The number the landlord actually wants to see before saying yes.
+        "still_owing_after": str(max(outstanding - amt, Decimal("0.00"))),
+        "method": method,
+        "payment_date": day.isoformat(),
+    }
+    if amt > outstanding:
+        preview["overpayment_warning"] = (
+            f"That is ${amt - outstanding} MORE than the ${outstanding} still "
+            f"owing on this charge. Confirm only if the tenant genuinely "
+            f"overpaid; otherwise re-send with the right amount."
+        )
+    if not _confirmed(confirm):
+        return _preview(
+            "record_payment",
+            preview,
+            "Records money received against this charge. Nothing moves in the "
+            "real world — this is the book entry.",
+        )
+
+    try:
+        entry, created = ledger_services.record_payment(
+            charge=charge,
+            amount=amt,
+            payment_method=method,
+            payment_date=day,
+            # Same amount, same charge, same day is almost certainly a repeat of
+            # one confirmation rather than a second real payment.
+            idempotency_key=f"rama-payment:{charge.pk}:{day}:{amt}",
+        )
+    except Exception as exc:  # noqa: BLE001 — surfaced to the landlord
+        return {"error": str(exc)}
+
+    remaining = _outstanding_on(charge)
+    return {
+        "ok": True,
+        "duplicate": not created,
+        "entry_id": str(entry.pk),
+        "charge": _charge_label(charge),
+        "amount": str(amt),
+        "still_owing": str(remaining),
+        "charge_status": charge.charge_status(),
+        "message": (
+            f"Recorded ${amt} against {charge.description[:60]}. "
+            + (
+                f"${remaining} still owing."
+                if remaining > 0
+                else "That charge is now fully paid."
+            )
+        ),
     }

@@ -7,6 +7,7 @@ model API. The provider adapters' message translation is tested statically.
 from datetime import date
 from decimal import Decimal
 from unittest import mock
+import uuid
 
 import pytest
 from django.utils import timezone
@@ -1441,25 +1442,48 @@ def test_attach_photo_to_listing(landlord):
 
 
 def test_attach_multiple_photos_bulk(landlord):
-    """Bulk: attaching several staged uploads at once — first primary, rest gallery."""
+    """Bulk: one explicit batch — first primary, rest gallery."""
     from django.core.files.base import ContentFile
 
-    from rentium.rama.models import RamaUpload
+    from rentium.rama.models import RamaAttachment, RamaAttachmentBatch
 
     room = _room(landlord, "Bulk Room")
+    batch = RamaAttachmentBatch.objects.create(
+        landlord=landlord,
+        conversation_id=uuid.uuid4(),
+        status=RamaAttachmentBatch.Status.SEALED,
+    )
     for n in range(3):
-        RamaUpload.objects.create(
-            landlord=landlord, image=ContentFile(_TINY_GIF, name=f"b{n}.gif")
+        attachment = RamaAttachment(
+            batch=batch,
+            original_filename=f"b{n}.jpg",
+            content_type="image/jpeg",
+            sha256=f"{n:064d}",
+            size=len(_TINY_GIF),
+            sequence=n,
+        )
+        attachment.original.save(
+            f"b{n}.jpg",
+            ContentFile(_TINY_GIF),
+            save=True,
         )
     res = registry.execute(
         "attach_photo_to_listing",
-        {"property_query": "Bulk Room", "upload_id": "all", "set_primary": "yes", "confirm": "yes"},
+        {
+            "property_query": "Bulk Room",
+            "attachment_batch_id": str(batch.pk),
+            "set_primary": "yes",
+            "confirm": "yes",
+        },
         landlord=landlord,
     )
     assert res.get("attached") is True and res["photos_added"] == 3
     room.refresh_from_db()
     assert bool(room.primary_image) and room.property_images.count() == 2  # 1 primary + 2 gallery
-    assert RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True).count() == 0
+    assert not RamaAttachment.objects.filter(
+        batch=batch,
+        status=RamaAttachment.Status.STAGED,
+    ).exists()
 
 
 def test_co_landlord_gets_portfolio_access(landlord):
@@ -3443,8 +3467,10 @@ def test_tool_meta_covers_every_write_tool():
     from rentium.rama.tool_meta import TOOL_META, meta_for
 
     read_only = {
-        "portfolio_snapshot", "list_properties", "occupancy_as_of",
-        "open_lease", "open_property", "data_catalogue", "read", "link",
+        "portfolio_snapshot", "list_properties", "list_listing_media",
+        "search_capabilities", "occupancy_as_of",
+        "open_lease", "open_property", "public_property_link",
+        "data_catalogue", "read", "link",
         "deliver_lease_pdf", "deliver_property_photos",
         "list_leases", "list_appointments", "attention_items",
         "resolve_person", "lease_state", "charge_status", "charge_schedule",

@@ -541,18 +541,17 @@ def post_deposit_return(
 
 
 def deposits_held(landlord) -> Decimal:
-    """Payments settling DEPOSIT_CHARGEs, minus deposit returns (liability)."""
-    from django.db.models import Sum
+    """Payments settling DEPOSIT_CHARGEs, minus deposit returns (liability).
 
-    received = LedgerEntry.objects.not_voided().filter(
-        landlord=landlord,
-        entry_type=EntryType.PAYMENT,
-        settles__entry_type=EntryType.DEPOSIT_CHARGE,
-    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-    returned = LedgerEntry.objects.not_voided().filter(
-        landlord=landlord, entry_type=EntryType.DEPOSIT_RETURN
-    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-    return received - returned
+    Projected from `position.financial_position` rather than aggregated here:
+    three functions used to compute this one quantity in three scopes, and the
+    tenant-scoped one was wrong. See ledger/position.py for why they are now
+    one computation.
+    """
+    from .position import Scope
+    from .position import financial_position
+
+    return financial_position(landlord, scope=Scope.portfolio()).deposits_held
 
 
 def deposits_collected_between(landlord, start, end, property_id=None) -> Decimal:
@@ -635,18 +634,10 @@ def deposit_position(landlord, *, lease) -> dict:
     can actually be kept — so no caller is tempted to net one off the other and
     call it settled.
     """
-    from django.db.models import Sum
+    from .position import Scope
+    from .position import financial_position
 
-    held = LedgerEntry.objects.not_voided().filter(
-        landlord=landlord,
-        lease=lease,
-        entry_type=EntryType.PAYMENT,
-        settles__entry_type=EntryType.DEPOSIT_CHARGE,
-    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-    returned = LedgerEntry.objects.not_voided().filter(
-        landlord=landlord, lease=lease, entry_type=EntryType.DEPOSIT_RETURN
-    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-    held = held - returned
+    held = financial_position(landlord, scope=Scope.of_lease(lease)).deposits_held
 
     # Everything still owed on this lease — damage claims and unpaid rent alike.
     claims = []
@@ -727,23 +718,26 @@ def tenant_statement(landlord, *, tenant, lease=None) -> dict:
     tenant is liable for the whole household charge, not a share of it; the
     flag says which is which so a conversation about "your rent" is accurate.
     """
-    from django.db.models import Q, Sum
+    from .position import Scope
+    from .position import charges_in_scope
+    from .position import financial_position
 
-    scope = Q(landlord=landlord) & (
-        Q(tenant=tenant)
-        # Household charges on a joint lease carry tenant=None.
-        | Q(tenant__isnull=True, lease__lease_tenants__tenant=tenant)
-    )
-    if lease is not None:
-        scope &= Q(lease=lease)
+    # ONE scope predicate for the rows, the totals and the deposit alike.
+    #
+    # This function used to build the joint-aware predicate here for its
+    # `charges` list and then ignore it thirty lines below, aggregating the
+    # deposit on `tenant=tenant` — which a joint-lease deposit payment never
+    # carries. The result was a payload that contradicted itself:
+    # `paid_to_date: "100.00"` beside `deposit_held: "0.00"`, and a NEGATIVE
+    # deposit once any of it was returned.
+    scope = Scope.of_tenant(tenant, lease=lease)
+    position = financial_position(landlord, scope=scope)
 
     charges, owed, paid = [], Decimal("0.00"), Decimal("0.00")
     for entry in (
-        LedgerEntry.objects.with_settlement()
-        .filter(scope, entry_type__in=CHARGE_TYPES, reversed_by__isnull=True)
+        charges_in_scope(landlord, scope=scope)
         .select_related("work_order", "lease")
         .order_by("due_date")
-        .distinct()
     ):
         outstanding = entry.outstanding or Decimal("0.00")
         settled = entry.settled_amount or Decimal("0.00")
@@ -765,24 +759,6 @@ def tenant_statement(landlord, *, tenant, lease=None) -> dict:
             }
         )
 
-    deposit = (
-        LedgerEntry.objects.not_voided()
-        .filter(
-            landlord=landlord,
-            tenant=tenant,
-            entry_type=EntryType.PAYMENT,
-            settles__entry_type=EntryType.DEPOSIT_CHARGE,
-        )
-        .aggregate(s=Sum("amount"))["s"]
-        or Decimal("0.00")
-    )
-    returned = (
-        LedgerEntry.objects.not_voided()
-        .filter(landlord=landlord, tenant=tenant, entry_type=EntryType.DEPOSIT_RETURN)
-        .aggregate(s=Sum("amount"))["s"]
-        or Decimal("0.00")
-    )
-
     damage = sum(
         (Decimal(c["outstanding"]) for c in charges if c["is_damage"]),
         Decimal("0.00"),
@@ -792,7 +768,7 @@ def tenant_statement(landlord, *, tenant, lease=None) -> dict:
         "owes_now": str(owed),
         "of_which_damage": str(damage),
         "paid_to_date": str(paid),
-        "deposit_held": str(deposit - returned),
+        "deposit_held": str(position.deposits_held),
         "charges": charges,
         # Stated explicitly so nobody reads owes_now against deposit_held and
         # treats the difference as settled. See deposit_position().

@@ -25,7 +25,10 @@ other write:
 from __future__ import annotations
 
 import json
+import re
+import uuid
 
+from django.core.exceptions import ValidationError
 from django.db import transaction
 
 from rentium.properties.models import Property
@@ -205,7 +208,7 @@ def _parse_spaces(raw_spaces, unit_label: str):
                 "kind": kind,
                 "serves": [_norm(s) for s in serves if _norm(s)],
                 "shared_with_landlord": bool(entry.get("shared_with_landlord")),
-            }
+            },
         )
     return out, None
 
@@ -263,7 +266,7 @@ def _parse_units(units_json: str):
                 "spaces": spaces,
                 "listing_name": _norm(raw.get("listing_name")),
                 "missing": _norm(raw.get("missing") or raw.get("unknown")),
-            }
+            },
         )
     return units, None
 
@@ -397,8 +400,8 @@ def _execute(landlord, holding_name, address, city, prov, units) -> dict:
         unit.missing_layout_notes = spec["missing"]
         unit.save(
             update_fields=[
-                "rental_mode", "layout_complete", "missing_layout_notes", "updated_at"
-            ]
+                "rental_mode", "layout_complete", "missing_layout_notes", "updated_at",
+            ],
         )
 
         _write_spaces(unit, spec["spaces"])
@@ -467,11 +470,11 @@ def _ensure_offerings(landlord, holding, unit, spec, address, city, prov, beds, 
             listing.is_active_offering = True
             listing.save(
                 update_fields=[
-                    "bedrooms", "bathrooms", "is_active_offering", "updated_at"
-                ]
+                    "bedrooms", "bathrooms", "is_active_offering", "updated_at",
+                ],
             )
         Property.objects.filter(
-            unit=unit, property_category=Property.PropertyCategory.ROOM
+            unit=unit, property_category=Property.PropertyCategory.ROOM,
         ).update(is_active_offering=False)
         return
 
@@ -495,30 +498,150 @@ def _ensure_offerings(landlord, holding, unit, spec, address, city, prov, beds, 
             },
         )
     Property.objects.filter(
-        unit=unit, property_category=Property.PropertyCategory.COMPLETE_UNIT
+        unit=unit, property_category=Property.PropertyCategory.COMPLETE_UNIT,
     ).update(is_active_offering=False)
 
 
 # ------------------------------------------------------------------ layout
-def _resolve_unit(landlord, unit_name: str):
-    from django.db.models import Q
+def _tokenise(value: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
 
+
+# Street-type noise: useful for display, useless for ranking two "Garden Suite"
+# rows at different addresses.
+_HOLDING_NOISE = frozenset(
+    {
+        "st", "street", "ave", "avenue", "rd", "road", "dr", "drive", "blvd",
+        "boulevard", "ln", "lane", "ct", "court", "pl", "place", "way", "the",
+        "and", "of", "unit", "suite", "floor", "apt", "apartment",
+    },
+)
+
+
+def _unit_match_score(unit: PropertyUnit, query: str) -> int:
+    """Rank how well a free-text unit reference points at one physical unit.
+
+    Prefer address + name over bare name. Two Garden Suites at different houses
+    must not tie when the landlord also said the street.
+    """
+
+    def normalise(value: str) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+
+    wanted = normalise(query)
+    if not wanted:
+        return 0
+    wanted_tokens = set(wanted.split())
+    offering_values = [
+        value
+        for offering in unit.offerings.all()
+        for value in (offering.name, offering.address)
+    ]
+    values = [
+        unit.name,
+        unit.holding.name,
+        unit.holding.address,
+        f"{unit.holding.name} {unit.name}",
+        f"{unit.holding.address} {unit.name}",
+        *offering_values,
+    ]
+    normalised_values = [normalise(value) for value in values if value]
+    combined_tokens = set(" ".join(normalised_values).split())
+    score = 0
+    if wanted == normalise(unit.name):
+        score = 100
+    elif wanted == normalise(str(unit.pk)):
+        score = 200
+    elif wanted in normalised_values:
+        score = 95
+    elif any(wanted and wanted in value for value in normalised_values):
+        score = 85
+    elif wanted_tokens and wanted_tokens <= combined_tokens:
+        score = 75 + min(len(wanted_tokens), 9)
+    elif wanted_tokens & combined_tokens:
+        # Partial overlap: "mckenzie garden suite" against "Garden Suite" at
+        # "950 McKenzie Ave" must beat a same-named unit on another street.
+        overlap = wanted_tokens & combined_tokens
+        score = 40 + min(len(overlap) * 8, 40)
+        if normalise(unit.name) in wanted or any(
+            normalise(unit.name) and normalise(unit.name) in value
+            for value in [wanted]
+        ):
+            score += 15
+    if not score:
+        return 0
+
+    # Address evidence breaks name ties. "950 McKenzie Ave" tokens that appear
+    # in the query lift the correct house above every other "Garden Suite".
+    holding_tokens = (
+        _tokenise(unit.holding.name) | _tokenise(unit.holding.address)
+    ) - _HOLDING_NOISE
+    address_hits = holding_tokens & wanted_tokens
+    if address_hits:
+        score += 20 + min(len(address_hits) * 10, 40)
+    return score
+
+
+def _resolve_unit(landlord, unit_name: str, *, holding: str = ""):
+    """Return (unit|None, error|None). Prefer UUID; never silently pick a twin.
+
+    Optional ``holding`` narrows by holding name OR street address so
+    plan_operation(include='Garden Suite', holding='950 McKenzie') works even
+    when the holding is named "McKenzie House".
+    """
     query = _norm(unit_name)
     if not query:
         return None, {"error": "unit_name is required."}
-    qs = PropertyUnit.objects.filter(landlord=landlord).select_related("holding")
-    matches = list(
-        qs.filter(Q(name__icontains=query) | Q(holding__name__icontains=query))[:6]
+
+    qs = (
+        PropertyUnit.objects.filter(landlord=landlord)
+        .select_related("holding")
+        .prefetch_related("offerings")
     )
-    exact = [u for u in matches if u.name.casefold() == query.casefold()]
-    if len(exact) == 1:
-        return exact[0], None
-    if not matches:
+    holding_q = _norm(holding)
+    if holding_q:
+        from django.db.models import Q
+
+        qs = qs.filter(
+            Q(holding__name__icontains=holding_q)
+            | Q(holding__address__icontains=holding_q),
+        )
+
+    try:
+        unit_id = uuid.UUID(query)
+    except (TypeError, ValueError):
+        unit_id = None
+    if unit_id is not None:
+        exact_id = qs.filter(pk=unit_id).first()
+        if exact_id is not None:
+            return exact_id, None
+
+    ranked: list[tuple[int, PropertyUnit]] = []
+    for unit in qs:
+        score = _unit_match_score(unit, query)
+        if score:
+            ranked.append((score, unit))
+
+    ranked.sort(key=lambda row: (-row[0], row[1].created_at, str(row[1].pk)))
+    if not ranked:
         return None, {"error": f"No unit matching {unit_name!r}."}
+    best_score = ranked[0][0]
+    matches = [unit for score, unit in ranked if score == best_score]
+    # A clear score gap means address evidence already disambiguated twins.
+    if len(matches) > 1 and len(ranked) > 1:
+        second = ranked[1][0]
+        if best_score - second >= 15:
+            matches = [ranked[0][1]]
     if len(matches) > 1:
         return None, {
             "error": f"Several units match {unit_name!r} — which one?",
-            "candidates": [f"{u.name} ({u.holding.name})" for u in matches],
+            "candidates": [
+                f"{u.name} ({u.holding.address or u.holding.name})" for u in matches
+            ],
+            "hint": (
+                "Pass unit_name=<id>, or unit_name with the street "
+                "(e.g. 'Garden Suite 950 McKenzie Ave'), or holding=<address>."
+            ),
         }
     return matches[0], None
 
@@ -561,7 +684,7 @@ def update_unit_layout(
     }
     if not _confirmed(confirm):
         return _preview(
-            "update_unit_layout", preview, "Records this unit's internal spaces."
+            "update_unit_layout", preview, "Records this unit's internal spaces.",
         )
 
     with transaction.atomic():
@@ -569,23 +692,31 @@ def update_unit_layout(
         unit.layout_complete = preview["layout_complete"]
         unit.missing_layout_notes = _norm(missing)
         unit.save(
-            update_fields=["layout_complete", "missing_layout_notes", "updated_at"]
+            update_fields=["layout_complete", "missing_layout_notes", "updated_at"],
         )
     return {"updated": True, **preview}
 
 
 def set_unit_rental_mode(
-    landlord, *, unit_name: str, rental_mode: str, confirm: str = ""
+    landlord,
+    *,
+    unit_name: str,
+    rental_mode: str,
+    holding: str = "",
+    confirm: str = "",
 ) -> dict:
     """Switch a unit between being let as ONE home (WHOLE_UNIT) and let room by
     room (BY_ROOM). Nothing is deleted — listings for the other mode are parked
     and come back if you switch again. Refused while any draft, pending or
-    active lease exists in the unit. Previews first; confirm=yes to apply."""
+    active lease exists in the unit. Previews first; confirm=yes to apply.
+
+    Prefer unit_name=<uuid> when known. For free text, pass holding=<street or
+    house name> whenever the unit name could exist on more than one house."""
     from rentium.properties.services import RentalModeError
     from rentium.properties.services import describe_rental_mode_switch
     from rentium.properties.services import set_rental_mode
 
-    unit, err = _resolve_unit(landlord, unit_name)
+    unit, err = _resolve_unit(landlord, unit_name, holding=holding)
     if err:
         return err
 
@@ -621,3 +752,132 @@ def set_unit_rental_mode(
         return set_rental_mode(unit, mode)
     except RentalModeError as exc:
         return {"error": exc.messages[0] if exc.messages else str(exc)}
+
+
+def configure_unit_room_offerings(
+    landlord,
+    *,
+    unit_name: str,
+    room_names_json: str,
+    group_name: str = "",
+    shared_areas_json: str = "",
+    holding: str = "",
+    confirm: str = "",
+) -> dict:
+    """Turn an existing whole suite/floor into named room-by-room offerings.
+
+    This is the ONE tool for "add rooms into the garden suite / convert this
+    unit to rent by room". It parks the complete-unit listing, creates or
+    reuses the property group, records bedrooms as layout, applies shared
+    areas (kitchen/washroom/patio), and produces one offering per room name.
+    Do NOT invent sequential letters, do NOT create a parallel group, and do
+    NOT update property_category as a fake conversion — use this instead.
+
+    Prefer unit_name=<uuid>. Free-text unit names may include the street
+    ("Garden Suite 950 McKenzie") or pass holding=<address> when names collide.
+    """
+    from rentium.properties.services import RentalModeError
+    from rentium.properties.services import configure_room_offerings
+    from rentium.properties.services import describe_room_offering_configuration
+
+    unit, err = _resolve_unit(landlord, unit_name, holding=holding)
+    if err:
+        return err
+    try:
+        raw_names = json.loads(room_names_json or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return {"error": "room_names_json must be a JSON list of room names."}
+    if not isinstance(raw_names, list) or any(
+        not isinstance(value, str) for value in raw_names
+    ):
+        return {"error": "room_names_json must be a JSON list of room names."}
+    try:
+        shared_areas = json.loads(shared_areas_json or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return {"error": "shared_areas_json must be a JSON list of areas."}
+    if not isinstance(shared_areas, list) or any(
+        not isinstance(value, dict) for value in shared_areas
+    ):
+        return {"error": "shared_areas_json must be a JSON list of area objects."}
+
+    preview = describe_room_offering_configuration(
+        unit,
+        raw_names,
+        group_name=_norm(group_name),
+        shared_areas=shared_areas,
+    )
+    if not preview.get("ok"):
+        if preview.get("blocked_by"):
+            return {
+                "error": (
+                    f"{unit.name} has live leases, so it cannot be changed to "
+                    "room-by-room offerings yet."
+                ),
+                "blocked_by": preview["blocked_by"],
+                "relay_instruction": (
+                    "Tell the landlord exactly which leases block the change and "
+                    "stop. Do not create parallel listings as a workaround."
+                ),
+            }
+        return {"error": preview.get("error") or "The unit cannot be reconfigured."}
+    if not _confirmed(confirm):
+        return _preview(
+            "configure_unit_room_offerings",
+            preview,
+            "Parks the whole-unit offering and creates or reuses every named room "
+            "offering together in one transaction. Nothing is deleted.",
+        )
+    try:
+        result = configure_room_offerings(
+            unit,
+            raw_names,
+            group_name=_norm(group_name),
+            shared_areas=shared_areas,
+        )
+    except (RentalModeError, ValidationError) as exc:
+        return {"error": exc.messages[0] if exc.messages else str(exc)}
+    return _decorate_room_offering_result(result)
+
+
+def _decorate_room_offering_result(result: dict) -> dict:
+    """Attach canonical group + room links so RAMA never invents internal URLs."""
+    if not result.get("configured"):
+        return result
+    from .links import public_property_url
+    from .links import url_for_path
+
+    group = result.get("group") or {}
+    group_id = group.get("id")
+    if group_id:
+        group_link = url_for_path(f"/dashboard/properties/view-group/{group_id}")
+        group = {**group, "link": group_link}
+        result["group"] = group
+    else:
+        group_link = None
+
+    room_links = []
+    for row in result.get("rooms") or []:
+        room = Property.objects.filter(pk=row.get("id")).first()
+        if room is None:
+            continue
+        public = public_property_url(room)
+        room_links.append(
+            {
+                "name": room.name,
+                "id": str(room.pk),
+                "dashboard_link": url_for_path(f"/dashboard/properties/{room.pk}"),
+                "public_link": public.get("link"),
+                "publicly_accessible": bool(public.get("publicly_accessible")),
+            },
+        )
+    result["room_links"] = room_links
+
+    lines = [str(result.get("message") or "").strip()]
+    if group_link and group.get("name"):
+        lines.append(f"Property group: {group['name']} — {group_link}")
+    for item in room_links:
+        # Prefer the public applicant URL; fall back to the dashboard page.
+        href = item.get("public_link") or item["dashboard_link"]
+        lines.append(f"• {item['name']}: {href}")
+    result["message"] = "\n".join(line for line in lines if line)
+    return result

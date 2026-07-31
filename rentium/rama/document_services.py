@@ -551,6 +551,128 @@ def catalog_staged_photo_as_document(
     }
 
 
+@transaction.atomic
+def catalog_batch_attachment_as_document(
+    landlord,
+    *,
+    attachment_id: str,
+    scope_query: str,
+    actor=None,
+    issuer: str = "",
+    document_date=None,
+    confirm: bool = False,
+) -> dict:
+    """Promote one exact attachment-batch item into the document pipeline."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from .models import RamaAttachment
+
+    staged = (
+        RamaAttachment.objects.select_related("batch")
+        .filter(
+            pk=attachment_id,
+            batch__landlord=landlord,
+            status__in=[
+                RamaAttachment.Status.STAGED,
+                RamaAttachment.Status.CLASSIFIED,
+            ],
+        )
+        .first()
+    )
+    if staged is None:
+        already = RamaAttachment.objects.filter(
+            pk=attachment_id,
+            batch__landlord=landlord,
+            status=RamaAttachment.Status.APPLIED,
+            classification=RamaAttachment.Classification.DOCUMENT,
+        ).first()
+        if already is not None:
+            return {
+                "already_done": (
+                    f"{already.original_filename} is already stored as document "
+                    f"{already.target_id}."
+                ),
+                "document_id": already.target_id,
+            }
+        return {"error": "No available attachment with that attachment_id."}
+    resolved = resolve_holding_scope(landlord, scope_query)
+    if resolved.get("error"):
+        return resolved
+    if not confirm:
+        return {
+            "needs_confirm": True,
+            "action": "catalog_business_document",
+            "preview": {
+                "attachment_batch_id": str(staged.batch_id),
+                "attachment_id": str(staged.pk),
+                "document": staged.original_filename,
+                "scope": resolved["address"] or scope_query,
+                "scope_kind": "physical_property_holding",
+                "convert_to_ocr_document": True,
+                "create_holding": resolved["create"],
+                "child_listings": resolved["listings"],
+                "issuer": issuer or None,
+                "document_date": str(document_date or "") or None,
+            },
+            "instruction": (
+                "Show this preview. On approval, call catalog_business_document "
+                "again with the same attachment_id/scope and confirm=yes."
+            ),
+        }
+
+    staged.original.open("rb")
+    try:
+        data = staged.original.read()
+    finally:
+        staged.original.close()
+    upload = SimpleUploadedFile(
+        staged.original_filename,
+        data,
+        content_type=staged.content_type or "application/octet-stream",
+    )
+    document, created = ingest_document(
+        landlord=landlord,
+        upload=upload,
+        created_by=actor,
+    )
+    result = catalog_document_scope(
+        landlord,
+        document_id=str(document.pk),
+        scope_query=scope_query,
+        actor=actor,
+        issuer=issuer,
+        document_date=document_date,
+        confirm=True,
+    )
+    if result.get("error"):
+        return result
+    staged.classification = RamaAttachment.Classification.DOCUMENT
+    staged.status = RamaAttachment.Status.APPLIED
+    staged.target_type = "rama_document"
+    staged.target_id = str(document.pk)
+    staged.result = {"document_id": str(document.pk), "created": created}
+    staged.save(
+        update_fields=[
+            "classification",
+            "status",
+            "target_type",
+            "target_id",
+            "result",
+            "updated_at",
+        ]
+    )
+    if created:
+        from .tasks import process_rama_document
+
+        transaction.on_commit(lambda: process_rama_document.delay(str(document.pk)))
+    return {
+        **result,
+        "promoted_from_attachment_id": str(staged.pk),
+        "attachment_batch_id": str(staged.batch_id),
+        "ocr_enqueued": created,
+    }
+
+
 def document_location(landlord, document_id: str) -> dict:
     """Describe both the logical archive key and its physical storage backend."""
     document = RamaDocument.objects.select_related("holding").filter(

@@ -10,6 +10,7 @@ from .inspections import InspectionTemplate
 from .inspections import InspectionTemplateItem
 from .models import Lease
 from .models import LeaseDocument
+from .models import LeaseInviteEvent
 from .models import LeaseTenant
 from .models import MoveOutRequest
 from .models import Occupancy
@@ -34,6 +35,29 @@ class LeaseTenantInline(admin.TabularInline):
     readonly_fields = ("has_signed", "declined")
     show_change_link = True
     autocomplete_fields = ["tenant", "room"]
+
+
+@admin.register(LeaseInviteEvent)
+class LeaseInviteEventAdmin(admin.ModelAdmin):
+    """Read-only evidence of invite delivery, link access, linking, and signing."""
+
+    list_display = ("created_at", "lease_tenant", "kind", "actor")
+    list_filter = ("kind",)
+    search_fields = (
+        "lease_tenant__lease__lease_number",
+        "lease_tenant__invited_email",
+        "lease_tenant__invited_name",
+    )
+    readonly_fields = ("lease_tenant", "kind", "actor", "metadata", "created_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 class LeaseDocumentInline(admin.TabularInline):

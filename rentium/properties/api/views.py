@@ -27,10 +27,10 @@ from .serializers import InventoryItemSerializer
 from .serializers import PropertyAreaSerializer
 from .serializers import PropertyGroupDetailSerializer
 from .serializers import PropertyGroupSerializer
+from .serializers import PropertyHoldingHierarchySerializer
 from .serializers import PropertyImageSerializer
 from .serializers import PropertyListSerializer
 from .serializers import PropertySerializer
-from .serializers import PropertyHoldingHierarchySerializer
 from .serializers import PropertySummaryForGroupSerializer
 from .serializers import PropertyUnitSerializer
 from .serializers import SharedInventoryItemSerializer
@@ -57,9 +57,7 @@ class IsLandlordOwner(BasePermission):
             owner_profile = obj.property.landlord  # Check primary property owner
             # More complex check needed if editing shared_by involving other landlords?
             # Let serializer/view validation handle cross-landlord sharing rules.
-        elif isinstance(obj, InventoryItem):
-            owner_profile = obj.property.landlord
-        elif isinstance(obj, PropertyImage):
+        elif isinstance(obj, InventoryItem) or isinstance(obj, PropertyImage):
             owner_profile = obj.property.landlord
 
         if owner_profile == request.user.landlord_profile:
@@ -107,7 +105,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
             return (
                 accessible
                 .select_related(
-                    "group", "landlord__user", "unit", "holding"
+                    "group", "landlord__user", "unit", "holding",
                 )  # Select related landlord user for name
                 .prefetch_related(
                     # Prefetch areas owned by the property and the properties sharing them
@@ -119,7 +117,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
                     models.Prefetch(
                         "shared_areas",  # Use new related_name
                         queryset=PropertyArea.objects.select_related(
-                            "property"
+                            "property",
                         ).prefetch_related("shared_by"),
                     ),
                     # Prefetch inventory and images using new related_names
@@ -137,7 +135,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
         # they would otherwise re-appear as if still on the market. Opt in with
         # ?include_inactive=true to see them.
         include_inactive = str(
-            self.request.query_params.get("include_inactive", "")
+            self.request.query_params.get("include_inactive", ""),
         ).lower() in ("1", "true", "yes")
         if not include_inactive:
             queryset = queryset.filter(is_active_offering=True)
@@ -167,7 +165,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
         if email == getattr(request.user, "email", "").lower():
             raise ValidationError("That's your own account.")
         _member, _created, emailed = grant_co_landlord(
-            prop.landlord, name=name, email=email, scope_property=prop
+            prop.landlord, name=name, email=email, scope_property=prop,
         )
         return Response({"invited": True, "emailed": emailed, "email": email})
 
@@ -202,12 +200,12 @@ class PropertyViewSet(viewsets.ModelViewSet):
         if request.method == "GET":
             # Use the updated related_name
             queryset = property_obj.primary_area_associations.prefetch_related(
-                "shared_by"
+                "shared_by",
             )
             serializer = PropertyAreaSerializer(queryset, many=True, context=context)
             return Response(serializer.data)
 
-        elif request.method == "POST":
+        if request.method == "POST":
             serializer = PropertyAreaSerializer(data=request.data, context=context)
             if serializer.is_valid():
                 # Serializer validation already checked group/landlord consistency
@@ -224,13 +222,14 @@ class PropertyViewSet(viewsets.ModelViewSet):
     )
     def area_detail(self, request, pk=None, area_pk=None):
         """Retrieve, Update, or Delete a specific PropertyArea."""
-        property_obj = (
-            self.get_object()
-        )  # Context property (might not be the primary owner)
-        # Fetch the area ensuring it's somehow linked (primarily or via sharing?)
-        # For simplicity, let's fetch based on PK and let serializer validate context.
-        # More robust: Ensure area is either primarily owned OR shared by property_obj?
-        area = get_object_or_404(PropertyArea, pk=area_pk)
+        property_obj = self.get_object()
+        area = get_object_or_404(
+            PropertyArea.objects.filter(
+                models.Q(property=property_obj)
+                | models.Q(shared_by=property_obj),
+            ).distinct(),
+            pk=area_pk,
+        )
         # Check if the user owns the *primary* property of the area being modified
         self.check_object_permissions(request, area)
         context = self.get_serializer_context()  # Includes request
@@ -242,7 +241,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
             serializer = PropertyAreaSerializer(area, context=context)
             return Response(serializer.data)
 
-        elif request.method in ["PUT", "PATCH"]:
+        if request.method in ["PUT", "PATCH"]:
             serializer = PropertyAreaSerializer(
                 area,
                 data=request.data,
@@ -255,7 +254,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
                 return Response(serializer.data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        elif request.method == "DELETE":
+        if request.method == "DELETE":
             # Add logic: What happens when deleting a shared area?
             # Option 1: Delete it entirely (simplest).
             # Option 2: Only remove the 'property_obj' from shared_by? (More complex)
@@ -277,7 +276,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
             queryset = property_obj.inventory_items.all()  # Use updated related_name
             serializer = InventoryItemSerializer(queryset, many=True, context=context)
             return Response(serializer.data)
-        elif request.method == "POST":
+        if request.method == "POST":
             serializer = InventoryItemSerializer(data=request.data, context=context)
             if serializer.is_valid():
                 serializer.save(property=property_obj)
@@ -299,7 +298,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
         if request.method == "GET":
             serializer = InventoryItemSerializer(item, context=context)
             return Response(serializer.data)
-        elif request.method in ["PUT", "PATCH"]:
+        if request.method in ["PUT", "PATCH"]:
             serializer = InventoryItemSerializer(
                 item,
                 data=request.data,
@@ -310,7 +309,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
                 serializer.save()
                 return Response(serializer.data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        elif request.method == "DELETE":
+        if request.method == "DELETE":
             item.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -331,7 +330,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
             queryset = property_obj.property_images.all()
             serializer = PropertyImageSerializer(queryset, many=True, context=context)
             return Response(serializer.data)
-        elif request.method == "POST":
+        if request.method == "POST":
             serializer = PropertyImageSerializer(data=request.data, context=context)
             if serializer.is_valid():
                 # Ensure image file is handled correctly (requires multipart/form-data)
@@ -355,7 +354,7 @@ class PropertyViewSet(viewsets.ModelViewSet):
         if request.method == "GET":
             serializer = PropertyImageSerializer(image, context=context)
             return Response(serializer.data)
-        elif request.method in ["PUT", "PATCH"]:
+        if request.method in ["PUT", "PATCH"]:
             serializer = PropertyImageSerializer(
                 image,
                 data=request.data,
@@ -366,9 +365,48 @@ class PropertyViewSet(viewsets.ModelViewSet):
                 serializer.save()
                 return Response(serializer.data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        elif request.method == "DELETE":
-            image.delete()
+        if request.method == "DELETE":
+            from ..media_services import remove_media
+
+            remove_media(
+                property_obj=property_obj,
+                handle=f"gallery:{image.pk}",
+            )
             return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="media",
+    )
+    def media(self, request, pk=None):
+        """Stable handles shared by the dashboard and RAMA."""
+        from ..media_services import media_manifest
+
+        return Response(media_manifest(self.get_object()))
+
+    @action(
+        detail=True,
+        methods=["delete"],
+        url_path=r"media/(?P<media_handle>[^/.]+)",
+    )
+    def media_detail(self, request, pk=None, media_handle=None):
+        """Remove one exact primary/gallery item while retaining its file."""
+        from ..media_services import PropertyMediaError
+        from ..media_services import remove_media
+
+        property_obj = self.get_object()
+        try:
+            removed = remove_media(
+                property_obj=property_obj,
+                handle=media_handle or "",
+            )
+        except PropertyMediaError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(removed, status=status.HTTP_200_OK)
 
 
 # --- PropertyGroupViewSet (Updated related_names) ---
@@ -385,12 +423,13 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
         if hasattr(user, "landlord_profile"):
             from django.db.models import Q
 
-            from rentium.users.access import accessible_properties, scope_q
+            from rentium.users.access import accessible_properties
+            from rentium.users.access import scope_q
 
             # Own/portfolio groups + any group that contains a property this
             # co-landlord can access (so a room-scoped grant sees its unit).
             grp_q = scope_q(user, landlord_field="landlord") | Q(
-                grouped_properties__in=accessible_properties(user)
+                grouped_properties__in=accessible_properties(user),
             )
             return PropertyGroup.objects.filter(grp_q).distinct().prefetch_related(
                 "grouped_properties",  # Properties primarily in this group
@@ -431,7 +470,7 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
         try:
             # Ensure property exists and is owned by the user
             prop = Property.objects.get(
-                pk=property_id, landlord=request.user.landlord_profile
+                pk=property_id, landlord=request.user.landlord_profile,
             )
         except Property.DoesNotExist:
             raise NotFound("Property not found or not owned by you.")
@@ -446,7 +485,7 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
             )
         if prop.group is not None:
             raise ValidationError(
-                f"Property '{prop.name}' is already assigned to group '{prop.group.name}'. Remove it first."
+                f"Property '{prop.name}' is already assigned to group '{prop.group.name}'. Remove it first.",
             )
 
         try:
@@ -455,12 +494,12 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
             prop = assign_room_to_group(prop, group)
         except DjangoValidationError as e:
             raise ValidationError(
-                serializers.as_serializer_error(e)
+                serializers.as_serializer_error(e),
             )  # Convert to DRF error
 
         # Return summary of the added property
         serializer = PropertySummaryForGroupSerializer(
-            prop, context={"request": request}
+            prop, context={"request": request},
         )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -474,7 +513,7 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
         try:
             # Ensure property is owned and currently in this group
             prop = Property.objects.get(
-                pk=property_id, landlord=request.user.landlord_profile, group=group
+                pk=property_id, landlord=request.user.landlord_profile, group=group,
             )
         except Property.DoesNotExist:
             raise NotFound("Property not found in this group or not owned by you.")
@@ -487,7 +526,7 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
             raise ValidationError(serializers.as_serializer_error(e))
 
         return Response(
-            {"message": "Property removed from group."}, status=status.HTTP_200_OK
+            {"message": "Property removed from group."}, status=status.HTTP_200_OK,
         )
 
     # --- SHARED Inventory Actions (Using updated related_name) ---
@@ -503,12 +542,12 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
         if request.method == "GET":
             queryset = group.group_shared_inventory.all()  # Use updated related_name
             serializer = SharedInventoryItemSerializer(
-                queryset, many=True, context=context
+                queryset, many=True, context=context,
             )
             return Response(serializer.data)
-        elif request.method == "POST":
+        if request.method == "POST":
             serializer = SharedInventoryItemSerializer(
-                data=request.data, context=context
+                data=request.data, context=context,
             )
             if serializer.is_valid():
                 serializer.save(group=group)  # Associate with this group
@@ -531,7 +570,7 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
         if request.method == "GET":
             serializer = SharedInventoryItemSerializer(item, context=context)
             return Response(serializer.data)
-        elif request.method in ["PUT", "PATCH"]:
+        if request.method in ["PUT", "PATCH"]:
             serializer = SharedInventoryItemSerializer(
                 item,
                 data=request.data,
@@ -542,7 +581,7 @@ class PropertyGroupViewSet(viewsets.ModelViewSet):
                 serializer.save()
                 return Response(serializer.data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        elif request.method == "DELETE":
+        if request.method == "DELETE":
             item.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -597,8 +636,8 @@ class PropertyUnitViewSet(viewsets.ModelViewSet):
                         "and live leases are checked: POST "
                         "units/<id>/rental_mode_preview/ then "
                         "units/<id>/set_rental_mode/."
-                    )
-                }
+                    ),
+                },
             )
 
     @action(detail=True, methods=["post"], url_path="rental_mode_preview")
@@ -608,7 +647,7 @@ class PropertyUnitViewSet(viewsets.ModelViewSet):
 
         unit = self.get_object()
         preview = describe_rental_mode_switch(
-            unit, request.data.get("rental_mode", "")
+            unit, request.data.get("rental_mode", ""),
         )
         if "error" in preview:
             return Response(preview, status=status.HTTP_400_BAD_REQUEST)
@@ -650,7 +689,7 @@ class PropertyHierarchyView(viewsets.ViewSet):
             .distinct()
         )
         data = PropertyHoldingHierarchySerializer(
-            holdings, many=True, context={"request": request}
+            holdings, many=True, context={"request": request},
         ).data
 
         # Listings that belong to no unit yet (nothing has claimed them) would
@@ -658,7 +697,7 @@ class PropertyHierarchyView(viewsets.ViewSet):
         from rentium.users.access import accessible_properties
 
         orphans = accessible_properties(request.user).filter(unit__isnull=True)
-        if not str(request.query_params.get("include_inactive", "")).lower() in (
+        if str(request.query_params.get("include_inactive", "")).lower() not in (
             "1",
             "true",
             "yes",
@@ -669,7 +708,7 @@ class PropertyHierarchyView(viewsets.ViewSet):
             {
                 "holdings": data,
                 "unassigned_listings": PropertyListSerializer(
-                    orphans, many=True, context={"request": request}
+                    orphans, many=True, context={"request": request},
                 ).data,
-            }
+            },
         )

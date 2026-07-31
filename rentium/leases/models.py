@@ -1137,6 +1137,11 @@ class LeaseTenant(models.Model):
                 "updated_at",
             ]
         )
+        LeaseInviteEvent.objects.create(
+            lease_tenant=self,
+            kind=LeaseInviteEvent.Kind.SIGNED,
+            actor=self.tenant.user if self.tenant_id else None,
+        )
         self.lease.check_and_activate()
 
     def decline(self, reason=""):
@@ -1153,11 +1158,23 @@ class LeaseTenant(models.Model):
         self.save(
             update_fields=["declined", "declined_at", "decline_reason", "updated_at"]
         )
+        LeaseInviteEvent.objects.create(
+            lease_tenant=self,
+            kind=LeaseInviteEvent.Kind.DECLINED,
+            actor=self.tenant.user if self.tenant_id else None,
+        )
 
     def attach_tenant_profile(self, tenant_profile):
         """Called once an invited email matches/creates a TenantProfile."""
         self.tenant = tenant_profile
-        self.save(update_fields=["tenant", "updated_at"])
+        self.invite_accepted_at = timezone.now()
+        self.save(update_fields=["tenant", "invite_accepted_at", "updated_at"])
+        LeaseInviteEvent.objects.create(
+            lease_tenant=self,
+            kind=LeaseInviteEvent.Kind.ACCOUNT_LINKED,
+            actor=tenant_profile.user,
+            metadata={"source": "model_method"},
+        )
 
     def get_invite_url(self, frontend_base_url):
         """
@@ -1170,6 +1187,52 @@ class LeaseTenant(models.Model):
             return None
         base = frontend_base_url.rstrip("/")
         return f"{base}/invite/{self.id}?token={self.invite_token}"
+
+
+class LeaseInviteEvent(models.Model):
+    """Append-only evidence for the invite/account/signature lifecycle."""
+
+    class Kind(models.TextChoices):
+        SENT = "SENT", _("Invite sent")
+        LINK_OPENED = "LINK_OPENED", _("Invite link opened")
+        ACCOUNT_LINKED = "ACCOUNT_LINKED", _("Account linked")
+        SIGNED = "SIGNED", _("Lease signed")
+        DECLINED = "DECLINED", _("Lease declined")
+        RESENT = "RESENT", _("Invite resent")
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    lease_tenant = models.ForeignKey(
+        LeaseTenant,
+        on_delete=models.CASCADE,
+        related_name="invite_events",
+    )
+    kind = models.CharField(max_length=30, choices=Kind.choices, db_index=True)
+    actor = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="lease_invite_events",
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(
+                fields=["lease_tenant", "kind", "-created_at"],
+                name="lease_invite_event_kind_idx",
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError(_("Lease invite events are immutable."))
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(_("Lease invite events are immutable."))
 
 
 class LeaseLandlordSignatory(models.Model):

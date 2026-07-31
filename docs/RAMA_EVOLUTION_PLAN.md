@@ -6,8 +6,8 @@ anything new goes live.** Security is the hard constraint: RAMA runs a live
 financial + legal + multi-tenant system, so we never let an LLM write and
 activate executable code on its own.
 
-This plan has **three parts**, in increasing ambition. Part 1 is DONE; Parts 2
-and 3 are specced here to build fresh.
+This plan has **three parts**, in increasing ambition. Parts 1 and 2 are done;
+Part 3 remains deliberately human-reviewed.
 
 ---
 
@@ -61,7 +61,7 @@ silently**, turning real usage into a reviewable backlog.
 
 ---
 
-## Part 2 — Decision layer: a smarter General  ⬜ TO BUILD
+## Part 2 — Decision layer: a smarter General  ✅ DONE
 
 The safe way "smarter models" help is **better planning/routing over the
 existing vetted tools**, not codegen. RAMA already has the 3-role structure
@@ -70,7 +70,7 @@ role *can* run a different model (`RamaPreferences.general_provider/general_mode
 resolved in `rama/runtime.py:get_role_config`). Today only the **main** model is
 configurable from the UI, so the General falls back to it.
 
-**To build — "smarter model for the General" picker in Settings:**
+**Shipped — "smarter model for the General" picker in Settings:**
 - Backend: extend the settings serializer/endpoint (`rama/views.py:settings_view`
   + `_settings_payload`) to read/write `general_provider`, `general_model` (and
   an optional separate key). The model fields already exist — no migration.
@@ -79,10 +79,8 @@ configurable from the UI, so the General falls back to it.
   (optional) key, mirroring the existing main-model controls. Default off =
   General uses your main model.
 - Guide: `docs/RAMA_GUIDE.md` §2 already documents the layers — link it there.
-- Decision needed from you: **which provider/model** to offer for the General
-  (e.g. a Claude model, a Grok reasoning model). Pick one and it gets wired.
-
-**Effort:** small–medium (mostly one settings screen + serializer fields).
+Role cards are data-driven from `RAMA_ROLES`; a landlord can configure each
+role independently or let it inherit the main provider/model.
 
 ---
 

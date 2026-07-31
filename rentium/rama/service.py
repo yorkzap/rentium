@@ -16,39 +16,46 @@ backend already knows exactly what ran or was cancelled; weak models asked to
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from dataclasses import field
+from datetime import datetime
+from datetime import timedelta
 
+from django.conf import settings
 from django.utils import timezone
 
-from .models import RamaAudit, RamaPendingPlan
 from . import autonomy as autonomy_policy
 from . import memory
-from .plan_runner import (
-    PENDING_PLAN_TTL_SECONDS,
-    clear_plan,
-    load_fresh_plan,
-    plan_brief,
-    run_plan,
-    save_batch,
-    save_plan,
-    save_single,
-    validate_plan,
-)
+from .capabilities import select_tool_schemas
+from .models import RamaAudit
+from .models import RamaPendingPlan
+from .plan_runner import PENDING_PLAN_TTL_SECONDS
+from .plan_runner import clear_plan
+from .plan_runner import load_fresh_plan
+from .plan_runner import plan_brief
 from .plan_runner import plan_to_payload
-from .providers import ProviderError, Turn, get_provider
-from .registry import REGISTRY, execute
-from .roles import (
-    DELEGATION_TOOL_NAMES,
-    ROLE_PROMPTS,
-    SUB_TURN_MAX_ROUNDS,
-    role_allows_tool,
-    role_context,
-    role_tool_schemas,
-)
+from .plan_runner import run_plan
+from .plan_runner import save_batch
+from .plan_runner import save_single
+from .plan_runner import validate_plan
+from .providers import ProviderError
+from .providers import Turn
+from .providers import get_provider
+from .registry import REGISTRY
+from .registry import execute
+from .roles import DELEGATION_TOOL_NAMES
+from .roles import ROLE_PROMPTS
+from .roles import SUB_TURN_MAX_ROUNDS
+from .roles import role_allows_tool
+from .roles import role_context
+from .roles import role_tool_schemas
 from .runtime import get_role_config
+from .tool_meta import already_done_for
+
+logger = logging.getLogger(__name__)
 from .union import live_context
 
 MAX_TOOL_ROUNDS = 20  # multi-step room/lease/invite needs headroom
@@ -133,7 +140,7 @@ _MEMORY_LEAD = re.compile(
     re.IGNORECASE,
 )
 _MEMORY_STANDING = re.compile(
-    r"^(?P<fact>(?:from now on|going forward|as a rule)\b.+)$", re.IGNORECASE
+    r"^(?P<fact>(?:from now on|going forward|as a rule)\b.+)$", re.IGNORECASE,
 )
 _MEMORY_FORGET = re.compile(
     r"^(?:please\s+)?forget\s+(?:that\s+|about\s+|the\s+)?(?P<subject>.+)$",
@@ -204,7 +211,7 @@ def _undo_hint(auto_executed: list[dict]) -> str:
     """
     if not any(item.get("undoable") for item in auto_executed):
         return ""
-    return "\n\n(I did that automatically under your Constitution — say \"undo\" to reverse it.)"
+    return '\n\n(I did that automatically under your Constitution — say "undo" to reverse it.)'
 
 
 def _recent_confirmed_reply(landlord, conversation_id) -> str:
@@ -262,7 +269,7 @@ def _write_label(result: dict) -> str:
                 or obj.get("lease_number")
                 or obj.get("scope")
                 or obj.get("id")
-                or ""
+                or "",
             ).strip()
     return ""
 
@@ -300,7 +307,7 @@ def _plan_fallback_reply(progress: dict) -> str:
                 str(it.get("tool") or ""),
                 result,
                 str(it.get("target") or ""),
-            )
+            ),
         )
         if result.get("documents_page"):
             parts.append(f"Open document: {result['documents_page']}")
@@ -313,7 +320,7 @@ def _plan_fallback_reply(progress: dict) -> str:
     if awaiting:
         parts.append(
             f"Next: {awaiting.get('target') or awaiting.get('tool')} needs its "
-            "own confirmation — reply yes to run it, or no to stop here."
+            "own confirmation — reply yes to run it, or no to stop here.",
         )
     return "\n".join(parts) or "Done."
 
@@ -356,7 +363,7 @@ def _rename_intent(landlord, message: str) -> dict | None:
                 landlord=landlord,
                 property_category=Property.PropertyCategory.ROOM,
                 name__iendswith=suffix,
-            ).order_by("created_at")[:3]
+            ).order_by("created_at")[:3],
         )
         if len(candidates) == 1:
             prop, err = candidates[0], None
@@ -370,10 +377,20 @@ def _rename_intent(landlord, message: str) -> dict | None:
 
 
 def _dashboard_collection_intent(message: str) -> str | None:
+    """Map “where do I check X in the UI?” to a real nav destination.
+
+    Never invent menu names. There is no “Appointments” item — viewings live
+    under Calendar. Also answer “how do I check viewings via UI?” without
+    requiring the word “dashboard”.
+    """
     text = " ".join((message or "").casefold().split())
-    if "dashboard" not in text or not re.search(
-        r"\b(link|open|view|show|go|take|send|where)\b", text
-    ):
+    wants_nav = bool(
+        re.search(
+            r"\b(link|open|view|show|go|take|send|where|check|find|see)\b",
+            text,
+        )
+    )
+    if not wants_nav:
         return None
     for pattern, collection in (
         (r"\bproperty groups?\b", "property_groups"),
@@ -382,11 +399,21 @@ def _dashboard_collection_intent(message: str) -> str | None:
         (r"\bleases?\b", "leases"),
         (r"\bfinances?\b|\bfinancial\b", "finances"),
         (r"\bmaintenance\b|\brepairs?\b", "maintenance"),
+        (
+            r"\bcalendar\b|\bappointments?\b|\bviewings?\b|\bshowings?\b|\bvisits?\b",
+            "calendar",
+        ),
+        (r"\binquir(?:y|ies)\b|\bleads?\b", "inquiries"),
+        (r"\bmessages?\b", "messages"),
         (r"\bsettings?\b", "settings"),
     ):
         if re.search(pattern, text):
-            return collection
-    return "dashboard"
+            # "how do I check viewings" has no "dashboard" word — still answer.
+            if collection == "calendar" or "dashboard" in text or "ui" in text:
+                return collection
+    if "dashboard" in text:
+        return "dashboard"
+    return None
 
 
 def _show_all_rooms_intent(message: str) -> bool:
@@ -394,7 +421,7 @@ def _show_all_rooms_intent(message: str) -> bool:
     return bool(
         re.search(r"\b(show|list|view)\b", text)
         and re.search(r"\b(all|every|my)\b", text)
-        and re.search(r"\brooms?\b", text)
+        and re.search(r"\brooms?\b", text),
     )
 
 
@@ -524,6 +551,455 @@ def _group_room_intent(landlord, message: str) -> dict | None:
             "shared_with_landlord": classification,
         },
     }
+
+
+def _mentioned_room_names(text: str) -> list[str]:
+    """Extract explicit room labels without inventing sequential letters."""
+    matches: list[tuple[int, str, str]] = []
+    pattern = re.compile(
+        r"\b(?P<kind>bonus\s+room|private\s+room|bedroom|room)"
+        r"\s+(?:named\s+|called\s+)?"
+        r"(?:(?P<quote>[\"'])\s*(?P<quoted>[^\"']+?)\s*(?P=quote)"
+        r"|(?P<label>[A-Za-z0-9][A-Za-z0-9_-]{0,30}))",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(text or ""):
+        label = " ".join(
+            str(match.group("quoted") or match.group("label") or "").split(),
+        )
+        if not label or label.casefold() in {"in", "inside", "into", "to"}:
+            continue
+        kind = match.group("kind").casefold()
+        name = (
+            f"Bonus room {label}"
+            if kind.startswith("bonus")
+            else f"Room {label}"
+        )
+        matches.append((match.start(), name, name.casefold()))
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for _position, name, key in sorted(matches):
+        if key not in seen:
+            ordered.append(name)
+            seen.add(key)
+    return ordered
+
+
+def _mentioned_shared_areas(text: str) -> list[dict]:
+    lowered = (text or "").casefold()
+    specs: list[dict] = []
+    aliases = (
+        (("washroom", "bathroom"), "Washroom", "BATHROOM"),
+        (("kitchen",), "Kitchen", "KITCHEN"),
+        (("patio",), "Patio", "BALCONY"),
+        (("balcony",), "Balcony", "BALCONY"),
+        (("living room",), "Living room", "LIVING_ROOM"),
+        (("entry room", "entryway"), "Entryway", "HALLWAY"),
+        (("laundry",), "Laundry", "LAUNDRY"),
+    )
+    used_types: set[str] = set()
+    landlord_shares = bool(
+        re.search(
+            r"\b(?:landlord|owner|landlord'?s (?:son|daughter|children|family))"
+            r".{0,50}\b(?:share|shares|use|uses|live|lives)\b"
+            r"|\bshared?\s+with\s+(?:the\s+)?(?:landlord|owner)",
+            lowered,
+        ),
+    )
+    for words, name, area_type in aliases:
+        if area_type in used_types or not any(
+            re.search(rf"\b{re.escape(word)}s?\b", lowered) for word in words
+        ):
+            continue
+        used_types.add(area_type)
+        specs.append(
+            {
+                "name": name,
+                "area_type": area_type,
+                "count": 1,
+                "shared_with_landlord": landlord_shares,
+            },
+        )
+    return specs
+
+
+def _unit_phrase_from_message(message: str) -> str:
+    """Pull the suite/unit target phrase out of a convert/add-rooms request."""
+    text = message or ""
+    patterns = (
+        r"\b(?:into|inside|in|to)\s+(?:the\s+)?(?P<target>[^?.!,;]+?)(?=\s+that\b|\s+which\b|\s+it\b|[?.!,;]|$)",
+        r"\b(?:convert|turn)\s+(?:the\s+)?(?P<target>[^?.!,;]+?)"
+        r"(?:\s+(?:into|to)\s+(?:rooms?|room[- ]by[- ]room|a property group))?",
+        r"\b(?:change how)\s+(?:the\s+)?(?P<target>[^?.!,;]+?)\s+(?:is\s+)?rented",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            phrase = " ".join(match.group("target").split()).strip(" \"'")
+            # Drop trailing filler the landlord used as description, not name.
+            phrase = re.sub(
+                r"\b(?:has|with|and then|and also)\b.*$",
+                "",
+                phrase,
+                flags=re.IGNORECASE,
+            ).strip(" ,.-")
+            if phrase and len(phrase) <= 120:
+                return phrase
+    return ""
+
+
+def _score_unit_for_message(unit, message: str) -> int:
+    """Address-aware unit ranking for deterministic suite routing."""
+    from .unit_structure import _unit_match_score
+
+    phrase = _unit_phrase_from_message(message)
+    score = 0
+    if phrase:
+        score = max(score, _unit_match_score(unit, phrase))
+    # Whole-message scoring catches "mckenzie ave garden suite" even when the
+    # capture group is messy ("the mckenzie ave garden suite that suite has…").
+    score = max(score, _unit_match_score(unit, message))
+    lowered = (message or "").casefold()
+    for offering in unit.offerings.all():
+        name = (offering.name or "").casefold()
+        if name and name in lowered:
+            score = max(score, 90 + min(len(name), 30))
+    return score
+
+
+def _resolve_unit_from_message(landlord, message: str):
+    """Pick one physical unit for a convert/add-rooms request.
+
+    Returns (unit|None, disambiguation_dict|None). When multiple same-named
+    suites exist, street evidence in the message must decide; if it cannot,
+    return candidates so the caller can ask — never invent a second group.
+    """
+    from rentium.properties.models import Property
+    from rentium.properties.models import PropertyUnit
+
+    from .unit_structure import _resolve_unit
+
+    units = list(
+        PropertyUnit.objects.filter(landlord=landlord)
+        .select_related("holding")
+        .prefetch_related("offerings"),
+    )
+    ranked = [
+        (score, unit)
+        for unit in units
+        if (score := _score_unit_for_message(unit, message)) > 0
+    ]
+    ranked.sort(key=lambda row: (-row[0], str(row[1].pk)))
+    if ranked:
+        best = ranked[0][0]
+        top = [unit for score, unit in ranked if score == best]
+        if len(top) == 1:
+            return top[0], None
+        if len(ranked) > 1 and best - ranked[1][0] >= 15:
+            return ranked[0][1], None
+        return None, {
+            "error": "Several units match — which one?",
+            "candidates": [
+                f"{u.name} ({u.holding.address or u.holding.name})"
+                for _score, u in ranked[:6]
+            ],
+            "question_for_user": (
+                "I found more than one matching unit. Which one do you mean?\n"
+                + "\n".join(
+                    f"• {u.name} at {u.holding.address or u.holding.name}"
+                    for _score, u in ranked[:6]
+                )
+            ),
+        }
+
+    # Fall back to free-text resolve on the captured target phrase, then to
+    # complete-unit listing names (older portfolios sometimes lack unit rows
+    # that match the landlord's wording but still have the listing).
+    phrase = _unit_phrase_from_message(message)
+    if phrase:
+        unit, err = _resolve_unit(landlord, phrase)
+        if unit is not None:
+            return unit, None
+        if isinstance(err, dict) and err.get("candidates"):
+            return None, {
+                **err,
+                "question_for_user": (
+                    f"{err.get('error')}\n"
+                    + "\n".join(f"• {c}" for c in err.get("candidates") or [])
+                ),
+            }
+
+    lowered = (message or "").casefold()
+    listings = list(
+        Property.objects.filter(
+            landlord=landlord,
+            property_category=Property.PropertyCategory.COMPLETE_UNIT,
+            unit__isnull=False,
+        )
+        .select_related("unit", "unit__holding", "holding")
+        .prefetch_related("unit__offerings"),
+    )
+    listing_hits = [
+        prop
+        for prop in listings
+        if prop.name and prop.name.casefold() in lowered
+    ]
+    listing_hits.sort(key=lambda prop: (-len(prop.name), prop.pk))
+    if len(listing_hits) == 1 and listing_hits[0].unit_id:
+        return listing_hits[0].unit, None
+    if len(listing_hits) > 1:
+        # Prefer the listing whose holding address also appears in the message.
+        from .unit_structure import _tokenise, _HOLDING_NOISE
+
+        msg_tokens = _tokenise(message) - _HOLDING_NOISE
+        scored = []
+        for prop in listing_hits:
+            holding = prop.unit.holding if prop.unit_id else prop.holding
+            hits = (
+                (_tokenise(holding.name if holding else "")
+                 | _tokenise(holding.address if holding else ""))
+                - _HOLDING_NOISE
+            ) & msg_tokens
+            scored.append((len(hits), prop))
+        scored.sort(key=lambda row: (-row[0], row[1].pk))
+        if scored and scored[0][0] > 0 and (
+            len(scored) == 1 or scored[0][0] > scored[1][0]
+        ):
+            return scored[0][1].unit, None
+        return None, {
+            "error": "Several complete-unit listings match — which one?",
+            "candidates": [
+                f"{p.name} ({(p.unit.holding.address if p.unit_id else p.address) or p.name})"
+                for p in listing_hits[:6]
+            ],
+            "question_for_user": (
+                "I found more than one matching suite listing. Which one?\n"
+                + "\n".join(
+                    f"• {p.name} at "
+                    f"{(p.unit.holding.address if p.unit_id else p.address) or 'unknown address'}"
+                    for p in listing_hits[:6]
+                )
+            ),
+        }
+    return None, None
+
+
+def _unit_room_layout_intent(landlord, message: str) -> dict | None:
+    """High-confidence suite-to-rooms request with its full stated layout.
+
+    This is the path that must own "add rooms into the garden suite" and
+    "convert this suite to rent by room". Falling through to the model is what
+    produced invented room letters, fake property groups, and wrong links.
+    """
+    lowered = (message or "").casefold()
+    if not re.search(
+        r"\b(?:add|create|make|turn|convert|divide|split|change how)\b",
+        lowered,
+    ):
+        return None
+    # "add rooms into suite" / "convert suite to rooms" / "rent by room"
+    is_convert = bool(
+        re.search(
+            r"\b(?:turn|convert|divide|split)\b.+\b(?:room|rooms|by[- ]room|property group)\b"
+            r"|\bchange how\b.+\brented\b"
+            r"|\brent\b.+\b(?:by room|room by room|room-by-room)\b"
+            r"|\b(?:suite|unit|floor)\b.+\b(?:into|as)\b.+\brooms?\b",
+            lowered,
+        )
+    )
+    is_add_rooms = bool(
+        re.search(r"\b(?:add|create|make)\b", lowered)
+        and re.search(r"\brooms?\b", lowered)
+        and re.search(r"\b(?:suite|unit|floor|into|inside)\b", lowered)
+    )
+    if not (is_convert or is_add_rooms):
+        return None
+
+    room_names = _mentioned_room_names(message)
+    shared_areas = _mentioned_shared_areas(message)
+    unit, ambiguity = _resolve_unit_from_message(landlord, message)
+
+    if unit is None and ambiguity:
+        return {
+            "tool": None,
+            "deterministic_reply": ambiguity.get("question_for_user")
+            or ambiguity.get("error"),
+        }
+    if unit is None:
+        return None
+
+    # Landlord asked to convert but did not name the rooms yet — ask once,
+    # keep the unit pinned, do not invent L/M.
+    if len(room_names) < 1 and is_convert:
+        label = f"{unit.name} at {unit.holding.address or unit.holding.name}"
+        return {
+            "tool": None,
+            "deterministic_reply": (
+                f"I'll convert {label} from a complete unit to room-by-room "
+                "rentals (property group + one listing per room). What should "
+                "each rentable room be called? Example: Bonus room J and Room K. "
+                "Also list any shared areas (kitchen, washroom, patio) if you "
+                "haven't already."
+            ),
+        }
+    if len(room_names) < 2 and is_add_rooms and not is_convert:
+        # "add two rooms" without names is incomplete — ask, don't invent.
+        if len(room_names) < 1:
+            label = f"{unit.name} at {unit.holding.address or unit.holding.name}"
+            return {
+                "tool": None,
+                "deterministic_reply": (
+                    f"I can turn {label} into room-by-room rentals. What should "
+                    "the rooms be named (e.g. Bonus room J, Room K), and which "
+                    "shared areas does the suite have (kitchen, washroom, patio)?"
+                ),
+            }
+
+    if len(room_names) < 1:
+        return None
+
+    from rentium.properties.models import Property
+
+    attached_group = getattr(unit, "room_group", None)
+    complete_listing = (
+        unit.offerings.filter(
+            property_category=Property.PropertyCategory.COMPLETE_UNIT,
+        )
+        .order_by("-is_active_offering", "created_at", "pk")
+        .first()
+    )
+    group_name = (
+        attached_group.name
+        if attached_group is not None
+        else (
+            complete_listing.name
+            if complete_listing is not None
+            else f"{unit.holding.name} {unit.name}"
+        )
+    )
+    return {
+        "tool": "configure_unit_room_offerings",
+        "arguments": {
+            "unit_name": str(unit.pk),
+            "room_names_json": json.dumps(room_names),
+            "group_name": group_name,
+            "shared_areas_json": json.dumps(shared_areas),
+            "holding": unit.holding.address or unit.holding.name,
+        },
+    }
+
+
+def _recent_media_manifest(landlord, conversation_id) -> dict | None:
+    row = (
+        RamaAudit.objects.filter(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            kind=RamaAudit.Kind.TOOL_CALL,
+            content__tool="list_listing_media",
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if row is None:
+        return None
+    result = row.content.get("result") or {}
+    return result if result.get("listing_id") and result.get("media") else None
+
+
+def _mentioned_media_property(landlord, message: str):
+    from rentium.properties.models import Property
+
+    lowered = (message or "").casefold()
+    id_match = re.search(
+        r"\b(?:property|listing)\s*#?\s*(\d+)\b",
+        lowered,
+    )
+    if id_match:
+        return Property.objects.filter(
+            landlord=landlord,
+            pk=id_match.group(1),
+        ).first()
+    matches = [
+        prop
+        for prop in Property.objects.filter(landlord=landlord)
+        if prop.name and prop.name.casefold() in lowered
+    ]
+    if not matches:
+        return None
+    matches.sort(key=lambda prop: (-len(prop.name), prop.created_at, prop.pk))
+    longest = len(matches[0].name)
+    top = [prop for prop in matches if len(prop.name) == longest]
+    return top[0] if len(top) == 1 else None
+
+
+def _media_management_intent(landlord, conversation_id, message: str) -> dict | None:
+    lowered = (message or "").casefold()
+    if not re.search(r"\b(?:remove|delete|take off|get rid of)\b", lowered):
+        return None
+    if not re.search(r"\b(?:photo|photos|image|images|picture|pictures)\b", lowered):
+        return None
+
+    recent = _recent_media_manifest(landlord, conversation_id)
+    direct_handles = re.findall(r"\bgallery:\d+\b|\bprimary\b", lowered)
+    prop = _mentioned_media_property(landlord, message)
+    if prop is None and recent is not None:
+        from rentium.properties.models import Property
+
+        prop = Property.objects.filter(
+            landlord=landlord,
+            pk=recent["listing_id"],
+        ).first()
+
+    handles = list(dict.fromkeys(direct_handles))
+    if not handles and recent is not None:
+        numbers = [
+            int(value)
+            for value in re.findall(r"(?:#|\b)(\d{1,2})(?=\b)", lowered)
+        ]
+        by_number = {
+            int(row["selection_number"]): row["handle"]
+            for row in recent.get("media") or []
+            if row.get("selection_number")
+        }
+        handles = list(
+            dict.fromkeys(
+                by_number[number] for number in numbers if number in by_number
+            ),
+        )
+
+    if prop is not None and handles:
+        return {
+            "tool": "remove_photos_from_listing",
+            "arguments": {
+                "property_query": str(prop.pk),
+                "media_handles_json": json.dumps(handles),
+            },
+        }
+    if prop is not None:
+        return {
+            "tool": "list_listing_media",
+            "arguments": {"property_query": str(prop.pk)},
+        }
+    return None
+
+
+def _media_manifest_reply(result: dict) -> str:
+    media = result.get("media") or []
+    if not media:
+        return f"{result.get('listing') or 'That listing'} has no photos."
+    lines = [f"Photos currently on {result.get('listing')}:"]
+    for row in media:
+        kind = "main photo" if row.get("kind") == "primary" else "gallery"
+        caption = str(row.get("caption") or "").strip()
+        detail = caption or row.get("filename") or row.get("handle")
+        lines.append(
+            f"{row.get('selection_number')}. {kind} — {detail}",
+        )
+    lines.append(
+        "Select the exact thumbnail(s), or say “remove photos 2 and 4”. "
+        "I’ll show one final preview before anything changes.",
+    )
+    return "\n".join(lines)
 
 
 def _group_room_clarification(landlord, conversation_id) -> dict | None:
@@ -956,6 +1432,47 @@ def _preview_reply(tool: str, result: dict) -> str:
                 conflict["name"] for conflict in conflicts
             ) + "."
         return text + "\nReply yes to confirm the complete operation, or no to cancel."
+    if tool == "configure_unit_room_offerings":
+        rooms = preview.get("rooms") or []
+        room_lines = ", ".join(
+            f"{row.get('name')} ({row.get('action')})" for row in rooms
+        )
+        areas = preview.get("shared_areas") or []
+        area_lines = ", ".join(
+            f"{row.get('name')} ({row.get('action')})" for row in areas
+        )
+        text = (
+            f"Preview: convert {preview.get('unit')} at "
+            f"{preview.get('holding')} from a complete unit into room-by-room "
+            f"rentals under one property group.\n"
+            f"Property group: {preview.get('group')} "
+            f"({preview.get('group_action')}).\n"
+            f"Room offerings (each gets its own listing): "
+            f"{room_lines or 'none'}.\n"
+            f"Shared areas kept on the group: {area_lines or 'none'}."
+        )
+        parked = preview.get("will_park") or []
+        if parked:
+            text += "\nParked (not deleted): " + ", ".join(parked) + "."
+        revived = preview.get("will_reactivate_other_rooms") or []
+        if revived:
+            text += "\nExisting room offerings reactivated: " + ", ".join(revived) + "."
+        text += (
+            "\nAfter this, each room can have its own rent — say the amounts "
+            "when you want them set. Reply yes to confirm, or no to cancel."
+        )
+        return text
+    if tool == "remove_photos_from_listing":
+        media = preview.get("media") or []
+        labels = ", ".join(
+            f"#{row.get('selection_number')} ({row.get('filename') or row.get('handle')})"
+            for row in media
+        )
+        return (
+            f"Preview: remove {len(media)} exact photo(s) from "
+            f"{preview.get('listing')}: {labels}. No other photos will change.\n"
+            "Reply yes to confirm, or no to cancel."
+        )
     return (
         f"Preview for {tool.replace('_', ' ')}: "
         f"{json.dumps(preview, default=str)}. Reply yes to confirm, or no to cancel."
@@ -1002,7 +1519,7 @@ def _remove_executed_preview(
     and avoids the old behaviour of clearing every preview for the same tool.
     """
     wanted = _pending_spec_key(
-        {"kind": "single", "tool": tool, "arguments": arguments}
+        {"kind": "single", "tool": tool, "arguments": arguments},
     )
     pending_specs[:] = [
         spec for spec in pending_specs if _pending_spec_key(spec) != wanted
@@ -1015,12 +1532,12 @@ def _batch_preview_reply(
 ) -> str:
     """Truthful deterministic preview for a collected multi-write turn."""
     lines = [
-        f"Preview — one “Yes” will run all {plan.steps.count()} changes:"
+        f"Preview — one “Yes” will run all {plan.steps.count()} changes:",
     ]
     for index, step in enumerate(plan.steps.order_by("order"), start=1):
         args = step.arguments or {}
         target = step.target_label or str(
-            args.get("property_query") or args.get("name") or "item"
+            args.get("property_query") or args.get("name") or "item",
         )
         if step.tool == "create_property":
             detail = f"Create {args.get('name') or target}"
@@ -1088,7 +1605,7 @@ def _replacement_request(message: str) -> bool:
             r"like\s+this\b|it\s+should\b|the\s+correct\b).+",
             message or "",
             flags=re.IGNORECASE | re.DOTALL,
-        )
+        ),
     )
 
 
@@ -1134,7 +1651,7 @@ def _recent_creation_defaults(landlord, conversation_id) -> list[dict]:
                             "city": listing.get("city"),
                             "province": listing.get("province"),
                             "group_name": listing.get("group"),
-                        }
+                        },
                     )
         if content.get("tool") == "create_property":
             planned_defaults.append(dict(content.get("arguments") or {}))
@@ -1169,13 +1686,13 @@ def _enrich_empty_group_room_arguments(
     ):
         return enriched
     group_key = " ".join(
-        str(enriched.get("group_name") or "").casefold().split()
+        str(enriched.get("group_name") or "").casefold().split(),
     )
     if not group_key:
         return enriched
     for candidate in _recent_creation_defaults(landlord, conversation_id):
         candidate_group = " ".join(
-            str(candidate.get("group_name") or "").casefold().split()
+            str(candidate.get("group_name") or "").casefold().split(),
         )
         if candidate_group != group_key:
             continue
@@ -1186,7 +1703,7 @@ def _enrich_empty_group_room_arguments(
             PropertyHolding.objects.filter(
                 landlord=landlord,
                 address__iexact=address,
-            )[:2]
+            )[:2],
         )
         if len(holdings) != 1:
             continue
@@ -1217,7 +1734,7 @@ def _explicit_room_creation_rows(
     from rentium.properties.models import PropertyGroup
 
     groups = list(
-        PropertyGroup.objects.filter(landlord=landlord).order_by("-name")
+        PropertyGroup.objects.filter(landlord=landlord).order_by("-name"),
     )
     if not groups:
         return None
@@ -1262,17 +1779,17 @@ def _explicit_room_creation_rows(
         address_key = " ".join(address.casefold().split())
         for candidate in defaults:
             candidate_group = " ".join(
-                str(candidate.get("group_name") or "").casefold().split()
+                str(candidate.get("group_name") or "").casefold().split(),
             )
             candidate_address = " ".join(
-                str(candidate.get("address") or "").casefold().split()
+                str(candidate.get("address") or "").casefold().split(),
             )
             if candidate_group == group_key and candidate_address == address_key:
                 if candidate.get("city") and candidate.get("province"):
                     return candidate
         for candidate in defaults:
             candidate_address = " ".join(
-                str(candidate.get("address") or "").casefold().split()
+                str(candidate.get("address") or "").casefold().split(),
             )
             if candidate_address == address_key:
                 if candidate.get("city") and candidate.get("province"):
@@ -1295,7 +1812,7 @@ def _explicit_room_creation_rows(
                 "property_category": "ROOM",
                 "room_type": "PRIVATE",
                 "group_name": group.name,
-            }
+            },
         )
     return rows
 
@@ -1309,8 +1826,212 @@ def _looks_like_confirmation_request(text: str) -> bool:
             r"|\bone\s+[“\"']?yes[”\"']?\s+will\s+run\b",
             text or "",
             flags=re.IGNORECASE,
-        )
+        ),
     )
+
+
+# A first-person claim that a write ALREADY happened. Deliberately narrow: it
+# must be the model saying it did the thing, not the ledger being described.
+# "no layout recorded" and "the deposit is recorded as $425" are readings, not
+# claims, and this must never fire on them.
+_DID = (
+    r"(recorded|created|added|posted|logged|saved|updated|deleted|removed"
+    r"|cancelled|canceled|scheduled|voided|refunded|issued|sent|marked"
+    r"|invited|terminated|renamed)"
+)
+# "recorded AS $425" describes the books; "recorded THE payment" claims a write.
+_NOT_AN_ACTION = r"(?!\s+(?:as|in|under|on the ledger\b))"
+_CLAIMED_WRITE = re.compile(
+    # "...— I updated the rent": first person, anywhere in the sentence.
+    r"\bi(?:'ve|’ve| have| just)?\s+" + _DID + r"\b" + _NOT_AN_ACTION
+    # "Recorded the $100 payment...": bare past tense opening a sentence.
+    + r"|(?:^|[.!?]\s+|\n\s*|—\s*)" + _DID + r"\b" + _NOT_AN_ACTION,
+    re.IGNORECASE,
+)
+_NOT_A_CLAIM = re.compile(
+    r"\b(?:not|never|no|nothing|isn't|isn’t|wasn't|wasn’t|hasn't|hasn’t"
+    r"|haven't|haven’t|cannot|can't|can’t|won't|won’t|couldn't|couldn’t)\b",
+    re.IGNORECASE,
+)
+
+
+def _sentences(text: str) -> list[str]:
+    return [part for part in re.split(r"(?<=[.!?])\s+|\n+", text or "") if part.strip()]
+
+
+def claims_completed_write(text: str) -> bool:
+    """True when the model says, in its own voice, that it already wrote.
+
+    Checked per SENTENCE so a negation elsewhere in a long reply cannot excuse
+    a claim, and a claim elsewhere cannot condemn an honest "I haven't recorded
+    that yet".
+    """
+    for sentence in _sentences(text):
+        if _NOT_A_CLAIM.search(sentence):
+            continue
+        if "?" in sentence:  # "Shall I record it?" is an offer, not a claim
+            continue
+        if _CLAIMED_WRITE.search(sentence):
+            return True
+    return False
+
+
+# A reply that ANNOUNCES work instead of reporting it. The landlord asked
+# whether the $100 was in the ledger and got "I'll verify the deposit payment
+# is recorded correctly. Checking the ledger now." — and the turn ended there.
+# Twice. They had to reply "ok and?" and "why do u make me guess" to get an
+# answer that the engine had already had the tools to produce.
+#
+# Narrow on purpose: it must fire on a turn that promised and stopped, and
+# never on a turn that promised something genuinely LATER ("I'll check again
+# tomorrow") or that already delivered alongside the promise.
+_PROMISE = re.compile(
+    r"\b(?:i'?ll|i will|let me|i'?m going to|i am going to|going to|about to)\s+"
+    # Up to three filler words between the promise and the verb, so "I'll go
+    # and check" and "I'll just quickly verify" are caught. Non-greedy and
+    # bounded: unbounded, "I'll record the $100 payment ... " would eventually
+    # reach some verb further down the sentence and condemn a normal preview.
+    r"(?:[\w,.-]+\s+){0,3}?"
+    r"(?:re-)?"
+    r"(check|verify|look|confirm|review|pull up|find out|see|take a look|dig)\b"
+    r"|\b(checking|verifying|looking|reviewing|pulling up|taking a look)\b",
+    re.IGNORECASE,
+)
+# "I'll check tomorrow / next week / when they reply" is a real commitment
+# about the future, not a stall — it must not be caught.
+_LATER = re.compile(
+    r"\b(tomorrow|next week|next month|later today|on monday|once |after |when )\b",
+    re.IGNORECASE,
+)
+
+
+def promises_without_delivering(text: str, tools_used) -> bool:
+    """True when the reply announces work it did not then do.
+
+    Checked per SENTENCE, like claims_completed_write, so a promise in one
+    clause is not excused by an answer elsewhere — and so an answer that merely
+    CONTAINS the word "checking" is not condemned.
+
+    `tools_used` is not sufficient on its own: the model may call a read tool
+    and STILL reply "let me look into that", which is the same failure with a
+    tool call in front of it. So the test is on what the landlord was told, and
+    the remedy is to make the model finish the thought.
+    """
+    for sentence in _sentences(text):
+        if _LATER.search(sentence):
+            continue
+        if "?" in sentence:  # "Shall I check?" is an offer, not a stall
+            continue
+        if _PROMISE.search(sentence):
+            return True
+    return False
+
+
+# What a stalled turn is told to do instead. Deliberately imperative and
+# specific about the shape of the answer, because "be more helpful" does not
+# survive a weak model.
+_DELIVER_NOW = (
+    "You just told the landlord you would check something, and then stopped "
+    "without telling them what you found. Do it NOW in this turn: call the "
+    "tool you need, then state the result AND what it means for them, in the "
+    "same message. Never announce that you are about to look something up — "
+    "look it up and report it. If you cannot, say plainly what is blocking you."
+)
+
+
+def _capability_gap_hint(landlord, message: str, conversation_id) -> str:
+    """What to say after refusing a fabricated claim.
+
+    A bare "that didn't happen" leaves the landlord no better off, so this logs
+    the gap (the same backlog the "learn now" flow reads) and says plainly what
+    to do next.
+    """
+    try:
+        execute(
+            "log_capability_gap",
+            {
+                "request": (message or "")[:400],
+                "note": "Model claimed this was done without calling any write tool.",
+            },
+            landlord=landlord,
+        )
+    except Exception:
+        logger.exception("capability gap logging failed")
+    return (
+        "Either I have no tool for that yet, or I lost track of the step. Say "
+        "it once more and I'll either show you a preview to confirm, or tell "
+        "you straight that I can't do it."
+    )
+
+
+def _refuse_if_already_done(tool_name, arguments, result, landlord):
+    """Replace a preview with a refusal when the write is already on the books.
+
+    This is the FIRST of the two sites `already_done` runs at (the second is
+    plan_runner.validate_plan, which covers the window between the landlord
+    seeing a preview and confirming it). Here, so that a duplicate is never
+    shown as a proposal at all — the landlord should not have to notice that
+    what RAMA is offering to record already happened.
+
+    Deliberately placed on the generic path rather than inside the three money
+    tools that had hand-written checks: a new write tool inherits this by
+    declaring `already_done`, and cannot forget to call it.
+    """
+    if not isinstance(result, dict) or not result.get("needs_confirm"):
+        return None
+    tool = REGISTRY.get(tool_name)
+    if tool is None:
+        return None
+    allowed = set(tool.parameters.get("properties") or ())
+    safe_args = {
+        k: v for k, v in (arguments or {}).items() if k in allowed and k != "confirm"
+    }
+    detail = already_done_for(tool_name, landlord, **safe_args)
+    if not detail:
+        return None
+    return {
+        "already_done": True,
+        "error": detail,
+        "instruction": (
+            "Do NOT offer to record this. Tell the landlord plainly that it is "
+            "already on the books, and say which record holds it."
+        ),
+    }
+
+
+def _is_write_result(result) -> bool:
+    """Whether a tool result represents a change that actually landed.
+
+    Keyed on the RESULT, not on the tool's signature. The previous version
+    asked whether the tool takes a `confirm` — but every model-issued call has
+    its `confirm` blanked before dispatch, so such a call returns a PREVIEW and
+    writes nothing. That made "did this turn write?" answer yes for a turn that
+    had only proposed, which is exactly the case the claimed-write guard exists
+    to catch: preview `record_payment`, then say "Recorded the payment."
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("needs_confirm") or result.get("error"):
+        return False
+    return bool(
+        result.get("created")
+        or result.get("updated")
+        or result.get("deleted")
+        or result.get("terminated")
+        or result.get("done")
+        or result.get("ok")
+        or result.get("recorded"),
+    )
+
+
+def _turn_wrote_anything(turn_writes, auto_executed) -> bool:
+    """Whether this turn actually changed anything.
+
+    `turn_writes` is the list of tools whose RESULT said so — see
+    _is_write_result. Auto-executed plans count because run_plan really did
+    run them.
+    """
+    return bool(auto_executed) or bool(turn_writes)
 
 
 def _persist_pending(
@@ -1332,7 +2053,7 @@ def _persist_pending(
 
 
 def _tool_facts_note(
-    landlord, conversation_id, limit: int = 8, budget_chars: int = 2000
+    landlord, conversation_id, limit: int = 8, budget_chars: int = 2000,
 ) -> list[str]:
     """Compact fact lines from this conversation's earlier tool calls.
 
@@ -1391,6 +2112,23 @@ def _recent_writes_note(landlord, conversation_id, limit: int = 10) -> list[str]
         elif res.get("workflow") and res.get("done"):
             ident = res.get("lease_number") or res.get("property_name") or ""
             notes.append(f"{tool}: completed {ident}".strip())
+        # Money writes report {ok/recorded, entry_id, amount, still_owing} and
+        # matched none of the verbs above, so recording $100 left NO trace in
+        # the next turn's prompt and the model denied it had happened. The
+        # amount is carried because "a payment was recorded" without the figure
+        # does not answer "is the $100 in?".
+        elif (res.get("ok") or res.get("recorded")) and (
+            res.get("entry_id") or res.get("subject")
+        ):
+            amount = res.get("amount")
+            target = res.get("charge") or res.get("subject") or ""
+            money = f"${amount} " if amount else ""
+            owing = (
+                f" ({res['still_owing']} still owing)"
+                if res.get("still_owing") is not None
+                else ""
+            )
+            notes.append(f"{tool}: recorded {money}{target}{owing}".strip())
     seen: set[str] = set()
     deduped: list[str] = []
     for n in notes:
@@ -1506,7 +2244,7 @@ def _conversation_focus(
 
 
 def _contextualize_tool_arguments(
-    tool_name: str, arguments: dict | None, focus: dict
+    tool_name: str, arguments: dict | None, focus: dict,
 ) -> dict:
     """Replace pronoun placeholders with the grounded conversation target."""
     args = dict(arguments or {})
@@ -1568,27 +2306,59 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         kind=RamaAudit.Kind.USER_MESSAGE,
     ).order_by("-created_at")[:12]
     raw_texts = [str((row.content or {}).get("text") or "") for row in rows]
-    # Ids are extracted from the RAW text (the marker is where they live);
-    # intent is read only from what the landlord wrote.
+    # IDs are extracted from explicit message markers only. Never scan the
+    # landlord's global unused-upload pool: that was the 11-files-became-28 bug.
+    joined_raw = "\n".join(raw_texts)
     document_ids = set(
-        re.findall(r"Business document ([0-9a-fA-F-]{32,36})", "\n".join(raw_texts))
+        re.findall(r"Business document ([0-9a-fA-F-]{32,36})", joined_raw),
+    )
+    legacy_upload_ids = set(
+        re.findall(r"upload_id=([0-9a-fA-F-]{32,36})", joined_raw),
+    )
+    batch_ids = re.findall(
+        r"RAMA attachment batch ([0-9a-fA-F-]{32,36})",
+        joined_raw,
     )
     texts = [_landlord_words(t) for t in raw_texts]
     combined = "\n".join(texts)
-    # The DB is the source of truth for what is still attachable, not the
-    # transcript. Scraping ids out of the last N messages meant a burst of
-    # photos scrolled out of the window as the conversation continued, so 12
-    # attachments were offered to the model as 2, then 1 — while all 12 sat
-    # unused in the table. Anything the landlord uploaded and has not spent is
-    # still theirs to place.
+    from .models import RamaAttachment
+    from .models import RamaAttachmentBatch
     from .models import RamaUpload
 
-    pending = list(
-        RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True)
-        .order_by("created_at")
-        .values_list("pk", flat=True)[:60]
-    )
-    upload_ids = {str(pk) for pk in pending}
+    upload_ids = {
+        str(pk)
+        for pk in RamaUpload.objects.filter(
+            landlord=landlord,
+            used_at__isnull=True,
+            pk__in=legacy_upload_ids,
+        ).values_list("pk", flat=True)
+    }
+    attachment_batch = None
+    attachment_ids: list[str] = []
+    # raw_texts are newest first and each marker is unique; use the newest
+    # still-actionable batch only. A correction never silently merges batches.
+    for batch_id in batch_ids:
+        candidate = RamaAttachmentBatch.objects.filter(
+            pk=batch_id,
+            landlord=landlord,
+            conversation_id=conversation_id,
+        ).first()
+        if candidate is None:
+            continue
+        pending_ids = list(
+            candidate.attachments.filter(
+                status__in=[
+                    RamaAttachment.Status.STAGED,
+                    RamaAttachment.Status.CLASSIFIED,
+                ],
+            )
+            .order_by("sequence")
+            .values_list("pk", flat=True),
+        )
+        if pending_ids:
+            attachment_batch = candidate
+            attachment_ids = [str(pk) for pk in pending_ids]
+            break
 
     if document_ids:
         from .models import RamaDocument
@@ -1600,7 +2370,7 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
                 pk__in=document_ids,
             ).values_list("pk", flat=True)
         }
-    if not upload_ids and not document_ids:
+    if not upload_ids and not document_ids and not attachment_ids:
         return {}
     lowered = combined.casefold()
     business_terms = (
@@ -1622,9 +2392,7 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
     # was being corrected for. Both overrides below are checked against the
     # LATEST message only — the landlord's most recent words win.
     latest = (texts[0] if texts else "").casefold()
-    if _DENIES_BUSINESS_RECORD.search(latest):
-        business_record = False
-    elif _CLAIMS_LISTING_PHOTO.search(latest):
+    if _DENIES_BUSINESS_RECORD.search(latest) or _CLAIMS_LISTING_PHOTO.search(latest):
         business_record = False
     issuer = "Scotiabank" if "scotiabank" in lowered else ""
     document_date = ""
@@ -1642,15 +2410,20 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
             continue
     return {
         "unresolved_upload_ids": sorted(upload_ids),
+        "attachment_batch_id": (
+            str(attachment_batch.pk) if attachment_batch is not None else None
+        ),
+        "attachment_ids": attachment_ids,
         "document_ids": sorted(document_ids),
         "landlord_described_as_business_record": business_record,
         # Stated explicitly because the model was guessing at how many photos
         # it had and consistently guessing low.
-        "pending_photo_count": len(upload_ids),
+        "pending_photo_count": len(upload_ids) + len(attachment_ids),
         "issuer": issuer or None,
         "document_date": document_date or None,
         "instruction": (
-            f"The landlord has {len(upload_ids)} attached photo(s) not yet "
+            f"The landlord has {len(upload_ids) + len(attachment_ids)} attached "
+            "file(s) in this request not yet "
             f"placed. "
             + (
                 "Treat them as business documents. Use "
@@ -1658,10 +2431,9 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
                 if business_record
                 else (
                     "To put them on a listing call attach_photo_to_listing "
-                    "ONCE and leave upload_id BLANK — that attaches every "
-                    "pending photo in one step. Never call it once per photo, "
-                    "and never pass a subset unless the landlord named "
-                    "particular ones."
+                    "ONCE with attachment_batch_id from this focus. That uses "
+                    "only this message's ordered batch. Never substitute an "
+                    "older batch or global pending uploads."
                 )
             )
         ),
@@ -1714,7 +2486,7 @@ def _document_location_request(message: str) -> bool:
 
 def _recent_document_id(landlord, conversation_id, message: str) -> str:
     explicit = re.search(
-        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,28}\b", message or ""
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,28}\b", message or "",
     )
     if explicit:
         return explicit.group(0)
@@ -1746,14 +2518,14 @@ def _document_location_reply(result: dict) -> str:
         parts.append(f"Container path: {result['container_path']}")
     else:
         parts.append(
-            "Container path: none — production stores this file in object storage."
+            "Container path: none — production stores this file in object storage.",
         )
     parts.extend(
         [
             f"Documents page: {result.get('documents_page')}",
             "Authenticated download endpoint: "
             f"{result.get('authenticated_download_path')}",
-        ]
+        ],
     )
     return "\n".join(parts)
 
@@ -1767,19 +2539,19 @@ def _delegate(landlord, tool_name: str, arguments: dict) -> dict:
     the same deterministic confirm machine.
     """
     sub_role = {"ask_fsa": "fsa", "ask_treasurer": "treasurer"}.get(
-        tool_name, "corporal"
+        tool_name, "corporal",
     )
     instruction = str(
         (arguments or {}).get("instruction")
         or (arguments or {}).get("question")
-        or ""
+        or "",
     ).strip()
     if not instruction:
         return {"error": "instruction is required."}
 
     sub_cid = uuid.uuid4()
     sub = run_turn(
-        landlord, instruction, sub_cid, role=sub_role, channel="system", depth=1
+        landlord, instruction, sub_cid, role=sub_role, channel="system", depth=1,
     )
     if sub.error is not None:
         return {"error": f"{sub_role} unavailable: {sub.error['detail']}"}
@@ -1912,7 +2684,7 @@ def run_turn(
         + json.dumps(safe_context, indent=None, separators=(",", ":"))
     )
     focus = _conversation_focus(
-        landlord, conversation_id, message, safe_context
+        landlord, conversation_id, message, safe_context,
     )
     if focus:
         system += (
@@ -1976,8 +2748,20 @@ def run_turn(
     )
 
     schemas = role_tool_schemas(role, depth)
+    if getattr(settings, "RAMA_COMMAND_ENGINE_V2", True):
+        schemas = select_tool_schemas(
+            message,
+            schemas,
+            limit=max(6, int(getattr(settings, "RAMA_TOOL_RETRIEVAL_LIMIT", 12))),
+        )
     max_rounds = SUB_TURN_MAX_ROUNDS if depth >= 1 else MAX_TOOL_ROUNDS
     tools_used: list[str] = ["_live_context"]
+    # Tools whose RESULT said a change landed. Distinct from tools_used: a
+    # model-issued write call has its confirm blanked, so it previews and
+    # writes nothing — see _is_write_result.
+    turn_writes: list[str] = []
+    # Warnings carried by previews this turn, appended to the reply verbatim.
+    preview_warnings: list[str] = []
     # Receipts for anything this turn ran unattended — populated by the
     # deterministic memory router and by delegated sub-turns, both of which can
     # fire before the main tool loop's own autonomy check.
@@ -1995,7 +2779,7 @@ def run_turn(
             return {
                 "error": (
                     f"The {role} agent is not permitted to call {tool_name}."
-                )
+                ),
             }
         result = execute(tool_name, arguments, landlord=landlord)
         safe_result = json.loads(json.dumps(result, default=str))
@@ -2029,7 +2813,7 @@ def run_turn(
                         "tool": "create_property",
                         "arguments": stable_arguments,
                         "target": arguments["name"],
-                    }
+                    },
                 )
             elif result.get("needs_input"):
                 questions.append(str(result.get("question_for_user") or ""))
@@ -2038,16 +2822,16 @@ def run_turn(
                     {
                         "target": arguments["name"],
                         "error": str(
-                            result.get("message") or "No change is needed."
+                            result.get("message") or "No change is needed.",
                         ),
-                    }
+                    },
                 )
             else:
                 excluded.append(
                     {
                         "target": arguments["name"],
                         "error": str(result.get("error") or result),
-                    }
+                    },
                 )
         if specs:
             plan = save_batch(landlord, conversation_id, specs)
@@ -2055,7 +2839,7 @@ def run_turn(
         clear_plan(landlord, conversation_id)
         if questions:
             return "\n".join(
-                dict.fromkeys(question for question in questions if question)
+                dict.fromkeys(question for question in questions if question),
             )
         if excluded:
             return "Nothing is waiting for confirmation.\n" + "\n".join(
@@ -2173,7 +2957,7 @@ def run_turn(
 
                     progress = run_plan(plan, landlord, audit=_mem_audit)
                     receipts = autonomy_policy.record_auto_actions(
-                        landlord, conversation_id, progress, auto.policy
+                        landlord, conversation_id, progress, auto.policy,
                     )
                     delegated_auto.extend(receipts)
                     deterministic_reply = (
@@ -2181,7 +2965,7 @@ def run_turn(
                     )
                 else:
                     save_single(
-                        landlord, conversation_id, intent["tool"], intent["arguments"]
+                        landlord, conversation_id, intent["tool"], intent["arguments"],
                     )
                     deterministic_reply = _preview_reply(intent["tool"], preview)
 
@@ -2242,7 +3026,7 @@ def run_turn(
                     result.get("error")
                     or result.get("question_for_user")
                     or result.get("message")
-                    or result
+                    or result,
                 )
 
     # A bare repeated confirmation immediately after an audited plan execution
@@ -2316,7 +3100,7 @@ def run_turn(
                 deterministic_reply = str(
                     result.get("error")
                     or result.get("message")
-                    or result
+                    or result,
                 )
 
     # Explicit numbered creation batches are executable syntax, not prose for
@@ -2338,7 +3122,7 @@ def run_turn(
         intent = _rename_intent(landlord, message)
         if intent is not None:
             result = _run_deterministic_tool(
-                intent["tool"], intent["arguments"]
+                intent["tool"], intent["arguments"],
             )
             if result.get("needs_confirm"):
                 save_single(
@@ -2350,18 +3134,18 @@ def run_turn(
                 deterministic_reply = _preview_reply(intent["tool"], result)
             else:
                 deterministic_reply = str(
-                    result.get("error") or result.get("message") or result
+                    result.get("error") or result.get("message") or result,
                 )
 
     if deterministic_reply is None and pending_plan is None:
         collection = _dashboard_collection_intent(message)
         if collection is not None:
             result = _run_deterministic_tool(
-                "link", {"entity": collection, "query": ""}
+                "link", {"entity": collection, "query": ""},
             )
             deterministic_reply = str(
                 result.get("error")
-                or f"{result.get('label')}: {result.get('link')}"
+                or f"{result.get('label')}: {result.get('link')}",
             )
 
     if (
@@ -2375,10 +3159,65 @@ def run_turn(
         )
 
     if deterministic_reply is None and pending_plan is None:
+        intent = _media_management_intent(landlord, conversation_id, message)
+        if intent is not None:
+            result = _run_deterministic_tool(
+                intent["tool"],
+                intent["arguments"],
+            )
+            attachment = result.get("_attachment")
+            if isinstance(attachment, dict):
+                turn_attachments.append(attachment)
+            if result.get("needs_confirm"):
+                save_single(
+                    landlord,
+                    conversation_id,
+                    intent["tool"],
+                    intent["arguments"],
+                )
+                deterministic_reply = _preview_reply(intent["tool"], result)
+            elif result.get("error"):
+                deterministic_reply = str(result["error"])
+            elif intent["tool"] == "list_listing_media":
+                deterministic_reply = _media_manifest_reply(result)
+            else:
+                deterministic_reply = str(result.get("note") or result)
+
+    # A request to turn one existing suite into several named offerings must
+    # keep every explicitly stated room and common area together. Sending this
+    # through create_group_room loses the unit identity and forces a fragile
+    # sequence of group writes; sending it to the model has historically
+    # changed J/K into invented L/M. This router prepares one atomic preview
+    # with the unit's stable UUID — or asks one focused question when the unit
+    # or room names are still ambiguous. Never invent sequential letters.
+    if deterministic_reply is None and pending_plan is None:
+        intent = _unit_room_layout_intent(landlord, message)
+        if intent is not None:
+            if intent.get("deterministic_reply") and not intent.get("tool"):
+                deterministic_reply = str(intent["deterministic_reply"])
+            else:
+                result = _run_deterministic_tool(
+                    intent["tool"],
+                    intent["arguments"],
+                )
+                if result.get("needs_confirm"):
+                    save_single(
+                        landlord,
+                        conversation_id,
+                        intent["tool"],
+                        intent["arguments"],
+                    )
+                    deterministic_reply = _preview_reply(intent["tool"], result)
+                else:
+                    deterministic_reply = str(
+                        result.get("error") or result.get("message") or result,
+                    )
+
+    if deterministic_reply is None and pending_plan is None:
         intent = _group_room_intent(landlord, message)
         if intent is not None:
             result = _run_deterministic_tool(
-                intent["tool"], intent["arguments"]
+                intent["tool"], intent["arguments"],
             )
             if result.get("needs_input"):
                 deterministic_reply = str(result.get("question_for_user"))
@@ -2392,7 +3231,7 @@ def run_turn(
                 deterministic_reply = _preview_reply(intent["tool"], result)
             else:
                 deterministic_reply = str(
-                    result.get("error") or result.get("message") or result
+                    result.get("error") or result.get("message") or result,
                 )
 
     # Deterministic document routing: weak models repeatedly treated photographed
@@ -2404,21 +3243,26 @@ def run_turn(
         and attachment_focus.get("landlord_described_as_business_record")
     ):
         attachment_ids = (
-            attachment_focus.get("unresolved_upload_ids") or []
-        ) + (attachment_focus.get("document_ids") or [])
+            (attachment_focus.get("attachment_ids") or [])
+            + (attachment_focus.get("unresolved_upload_ids") or [])
+            + (attachment_focus.get("document_ids") or [])
+        )
         scope_query = _address_scope_from_message(message, safe_context)
         if len(attachment_ids) == 1 and scope_query:
+            is_batch_attachment = bool(attachment_focus.get("attachment_ids"))
             is_upload = bool(attachment_focus.get("unresolved_upload_ids"))
             arguments = {
                 "scope_query": scope_query,
                 "issuer": attachment_focus.get("issuer") or "",
                 "document_date": attachment_focus.get("document_date") or "",
                 (
-                    "upload_id" if is_upload else "document_id"
+                    "attachment_id"
+                    if is_batch_attachment
+                    else ("upload_id" if is_upload else "document_id")
                 ): attachment_ids[0],
             }
             result = execute(
-                "catalog_business_document", arguments, landlord=landlord
+                "catalog_business_document", arguments, landlord=landlord,
             )
             safe_result = json.loads(json.dumps(result, default=str))
             tools_used.append("catalog_business_document")
@@ -2507,6 +3351,7 @@ def run_turn(
             tools_used=tools_used,
             pending_plan=plan_brief(outstanding) if outstanding else None,
             deterministic=True,
+            attachments=turn_attachments,
             auto_executed=delegated_auto,
         )
 
@@ -2543,11 +3388,11 @@ def run_turn(
                         }
                         for c in turn.tool_calls
                     ],
-                }
+                },
             )
             for call in turn.tool_calls:
                 effective_arguments = _contextualize_tool_arguments(
-                    call.name, call.arguments, focus
+                    call.name, call.arguments, focus,
                 )
                 if call.name == "create_group_room":
                     effective_arguments = _enrich_empty_group_room_arguments(
@@ -2556,10 +3401,10 @@ def run_turn(
                         effective_arguments,
                     )
                 original_property_query = str(
-                    effective_arguments.get("property_query") or ""
+                    effective_arguments.get("property_query") or "",
                 ).strip()
                 alias_id = planned_property_aliases.get(
-                    " ".join(original_property_query.casefold().split())
+                    " ".join(original_property_query.casefold().split()),
                 )
                 if alias_id:
                     # A later step may refer to the name an earlier preview
@@ -2587,13 +3432,23 @@ def run_turn(
                             delegated_auto.append(receipt)
                 else:
                     result = execute(call.name, effective_arguments, landlord=landlord)
+                # Before this preview can become a proposal: is it already done?
+                # A preview is side-effect free, so replacing it here costs
+                # nothing and means the duplicate is never shown at all.
+                duplicate = _refuse_if_already_done(
+                    call.name, effective_arguments, result, landlord,
+                )
+                if duplicate is not None:
+                    result = duplicate
                 # JSON-safe for audit + tool message content (UUIDs, Decimals).
                 safe_result = json.loads(json.dumps(result, default=str))
                 if isinstance(result, dict) and isinstance(
-                    result.get("_attachment"), dict
+                    result.get("_attachment"), dict,
                 ):
                     turn_attachments.append(result["_attachment"])
                 tools_used.append(call.name)
+                if _is_write_result(result):
+                    turn_writes.append(call.name)
                 audit(
                     RamaAudit.Kind.TOOL_CALL,
                     {
@@ -2603,6 +3458,19 @@ def run_turn(
                     },
                 )
                 if isinstance(result, dict) and result.get("needs_confirm"):
+                    # A preview's warnings must reach the landlord verbatim.
+                    # For a SINGLE write the reply is the model's own prose
+                    # (only batches get a deterministic renderer), so a
+                    # duplicate_warning / double_count_warning / overpayment
+                    # _warning sitting in the payload could simply be left out
+                    # of the sentence they actually read. Collected generically
+                    # on `*_warning` so a new one is carried without anybody
+                    # remembering to wire it.
+                    for key, value in (result.get("preview") or {}).items():
+                        if key.endswith("_warning") and str(value or "").strip():
+                            text = str(value).strip()
+                            if text not in preview_warnings:
+                                preview_warnings.append(text)
                     if isinstance(result.get("plan"), dict):
                         # A playbook plan (plan_operation / plan_move_tenant).
                         spec = {"kind": "plan", "payload": result["plan"]}
@@ -2617,11 +3485,11 @@ def run_turn(
                             call.name == "update_property"
                             and preview.get("id")
                             and str(
-                                effective_arguments.get("name") or ""
+                                effective_arguments.get("name") or "",
                             ).strip()
                         ):
                             stable_arguments["property_query"] = str(
-                                preview["id"]
+                                preview["id"],
                             )
                         target = str(
                             (
@@ -2632,7 +3500,7 @@ def run_turn(
                             or stable_arguments.get("property_query")
                             or stable_arguments.get("room_name")
                             or stable_arguments.get("name")
-                            or ""
+                            or "",
                         )
                         spec = {
                             "kind": "single",
@@ -2648,7 +3516,7 @@ def run_turn(
                     if call.name == "update_property":
                         preview = result.get("preview") or {}
                         future_name = str(
-                            effective_arguments.get("name") or ""
+                            effective_arguments.get("name") or "",
                         ).strip()
                         if preview.get("id") and future_name:
                             planned_property_aliases[
@@ -2679,7 +3547,7 @@ def run_turn(
                         or call.name.replace("_", " ")
                     )
                     excluded_preview_errors.append(
-                        {"target": target, "error": str(result["error"])}
+                        {"target": target, "error": str(result["error"])},
                     )
                 elif (
                     isinstance(result, dict)
@@ -2696,7 +3564,7 @@ def run_turn(
                         "tool_call_id": call.id,
                         "name": call.name,
                         "content": json.dumps(safe_result),
-                    }
+                    },
                 )
         else:
             partial = (turn.text or "").strip()
@@ -2712,7 +3580,7 @@ def run_turn(
                         "That took more steps than I can do in one turn — ask me to "
                         "continue, or break it into smaller steps."
                     )
-                )
+                ),
             )
     except ProviderError as exc:
         audit(RamaAudit.Kind.ERROR, {"error": str(exc)})
@@ -2779,7 +3647,7 @@ def run_turn(
         else:
             progress = run_plan(auto_plan, landlord, audit=_auto_audit)
             auto_executed = autonomy_policy.record_auto_actions(
-                landlord, conversation_id, progress, auto.policy
+                landlord, conversation_id, progress, auto.policy,
             )
             # The model's "reply yes to confirm" prose described a proposal
             # that has now already happened, so it is discarded exactly as the
@@ -2808,6 +3676,89 @@ def run_turn(
                 auto_executed=delegated_auto + auto_executed,
             )
 
+    # ---- turn contract: a promise is not an answer ------------------------
+    # `if not turn.tool_calls: break` treats ANY tool-call-free turn as
+    # finished, so "Checking the ledger now." shipped as a complete reply. One
+    # continuation round is pushed back through the model before the landlord
+    # is made to ask "and?". Only on the stall path, so the ordinary turn costs
+    # nothing extra.
+    if (
+        not pending_specs
+        and turn.text
+        and promises_without_delivering(turn.text, tools_used)
+    ):
+        audit(RamaAudit.Kind.ERROR, {"error": "promised_without_delivering",
+                                     "text": turn.text[:500]})
+        messages.append({"role": "assistant", "text": turn.text})
+        messages.append({"role": "user", "text": _DELIVER_NOW})
+        try:
+            follow_up = provider.complete(
+                model=model,
+                system=system,
+                messages=messages,
+                tools=turn_tools,
+                api_key=api_key,
+            )
+        except ProviderError:
+            follow_up = None
+        if follow_up is not None and not follow_up.tool_calls:
+            # Took the nudge and answered in prose — use it.
+            if (follow_up.text or "").strip():
+                turn = follow_up
+        elif follow_up is not None:
+            # It wants tools. Run them, then let it speak once more.
+            for call in follow_up.tool_calls:
+                args = dict(call.arguments or {})
+                registered = REGISTRY.get(call.name)
+                if registered is not None and "confirm" in registered.parameters.get(
+                    "properties", {},
+                ):
+                    # The confirm invariant holds here exactly as in the main
+                    # loop: a model may prepare a write, never approve one.
+                    args["confirm"] = ""
+                result = execute(call.name, args, landlord=landlord)
+                tools_used.append(call.name)
+                audit(
+                    RamaAudit.Kind.TOOL_CALL,
+                    {"tool": call.name, "arguments": args,
+                     "result": json.loads(json.dumps(result, default=str))},
+                )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "text": follow_up.text,
+                        "tool_calls": [
+                            {
+                                "id": call.id,
+                                "name": call.name,
+                                "arguments": args,
+                            },
+                        ],
+                    },
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "name": call.name,
+                        "content": json.dumps(
+                            json.loads(json.dumps(result, default=str)),
+                        ),
+                    },
+                )
+            try:
+                final = provider.complete(
+                    model=model,
+                    system=system,
+                    messages=messages,
+                    tools=turn_tools,
+                    api_key=api_key,
+                )
+                if (final.text or "").strip():
+                    turn = final
+            except ProviderError:
+                pass
+
     _persist_pending(landlord, conversation_id, pending_specs)
     outstanding = load_fresh_plan(landlord, conversation_id)
     if outstanding is not None and outstanding.operation == "preview_batch":
@@ -2818,6 +3769,24 @@ def run_turn(
             or "I wasn't able to produce an answer — try rephrasing."
         )
     response_deterministic = False
+
+    # If it stalled again, do not ship a second promise. Say what the turn's
+    # tools actually found, or admit the stall — either beats making the
+    # landlord prompt for an answer a third time.
+    if promises_without_delivering(reply, tools_used):
+        audit(RamaAudit.Kind.ERROR, {"error": "promised_twice", "text": reply[:500]})
+        facts = _tool_facts_note(landlord, conversation_id)
+        response_deterministic = True
+        reply = (
+            "Here's what I have, rather than another promise to go and look:\n"
+            + "\n".join(f"• {line}" for line in facts[-4:])
+            if facts
+            else (
+                "I said I'd check and then didn't — that's my fault, not "
+                "something you should have to chase. Ask me once more and "
+                "I'll give you the answer instead of the intention."
+            )
+        )
     if outstanding is None and _looks_like_confirmation_request(reply):
         # A model cannot create a confirmation contract with prose. If no
         # persisted plan backs its "reply yes", replace that claim with the
@@ -2838,6 +3807,45 @@ def run_turn(
                 "for confirmation. Please resend the changes; I will only ask "
                 "for Yes after the complete plan is saved."
             )
+
+    # A model cannot create a completed write with prose either. The General,
+    # asked to record $100 of a $425 deposit, replied "Recorded the $100
+    # payment against the deposit charge for Room C" having called nothing but
+    # a read — so the landlord believed the money was on the books for days.
+    #
+    # This is the worst failure the engine can have: every other kind of wrong
+    # answer is visibly wrong, and this one looks exactly like success. So the
+    # claim is refused whenever nothing was actually written.
+    #
+    # Note this no longer skips when a plan is outstanding. A pending preview
+    # for one thing must not excuse a false claim about another — "I recorded
+    # the payment; shall I also update the rent?" is precisely the shape where
+    # a proposal and a fabrication travel in the same message. A truthful
+    # preview says "I'll record", which is future tense and never matches.
+    if (
+        not response_deterministic
+        and claims_completed_write(reply)
+        and not _turn_wrote_anything(turn_writes, delegated_auto)
+    ):
+        response_deterministic = True
+        audit(
+            RamaAudit.Kind.ERROR,
+            {"error": "claimed_write_without_writing", "claim": reply[:500]},
+        )
+        gap = _capability_gap_hint(landlord, message, conversation_id)
+        reply = (
+            "I said that as though it were done — it isn't. Nothing was "
+            "written, so please don't rely on that.\n\n" + gap
+        )
+
+    # A warning the tool computed is not advice the model may edit out. Only
+    # appended when the reply does not already carry it, so a model that DID
+    # relay it is not made to repeat itself.
+    if outstanding is not None and preview_warnings:
+        missing = [w for w in preview_warnings if w not in reply]
+        if missing:
+            reply = reply.rstrip() + "\n\n" + "\n\n".join(f"⚠️ {w}" for w in missing)
+
     audit(
         RamaAudit.Kind.ASSISTANT_MESSAGE,
         {

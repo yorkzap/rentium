@@ -69,6 +69,54 @@ def _digest_plan(arguments: dict, result: dict) -> str:
     return "; ".join(bits)
 
 
+def _digest_money(arguments: dict, result: dict) -> str:
+    """What a money write actually did, with the numbers kept.
+
+    `_digest_generic` looks for created/updated/deleted/done and then falls
+    back to list SIZES. A money write matches neither: `record_payment` returns
+    {ok, duplicate, entry_id, amount, still_owing}, so it digested to "" and
+    `_recent_writes_note` skipped it too. The consequence was that on the turn
+    AFTER recording $100, the prompt held no trace that it had happened — and
+    the model had to re-derive the answer from live_context, whose top-level
+    outstanding_total excludes deposits. It said the payment wasn't there.
+
+    So this keeps the amounts. A digest that drops the number is worse than
+    none for financial questions: it proves a call happened while losing the
+    only fact the landlord asked about.
+    """
+    if not isinstance(result, dict):
+        return ""
+    if result.get("error"):
+        return f"error: {result['error']}"
+    if result.get("needs_confirm"):
+        return ""  # a preview is not a fact yet
+    if result.get("already_done"):
+        return "not recorded — already on the books"
+
+    bits = []
+    amount = result.get("amount") or result.get("value") or arguments.get("amount")
+    if amount:
+        bits.append(f"${amount}")
+    target = (
+        result.get("charge")
+        or result.get("subject")
+        or result.get("property")
+        or result.get("vendor")
+        or ""
+    )
+    if isinstance(target, dict):
+        target = target.get("name") or target.get("scope") or ""
+    if target:
+        bits.append(f"→ {target}")
+    if result.get("duplicate"):
+        bits.append("(already recorded, no second entry)")
+    if result.get("still_owing") is not None:
+        bits.append(f"{result['still_owing']} still owing")
+    if result.get("counted_in_totals") is False:
+        bits.append("kept OUT of totals (already in the books)")
+    return " ".join(str(b) for b in bits if b)
+
+
 def _digest_generic(arguments: dict, result: dict) -> str:
     if not isinstance(result, dict):
         return ""
@@ -101,6 +149,12 @@ _DIGESTERS = {
     "find_leases": _digest_find_leases,
     "plan_operation": _digest_plan,
     "plan_move_tenant": _digest_plan,
+    # Money writes: keep the amounts. See _digest_money.
+    "record_payment": _digest_money,
+    "create_expense": _digest_money,
+    "record_treasurer_fact": _digest_money,
+    "post_deposit_return": _digest_money,
+    "reallocate_expense": _digest_money,
 }
 
 

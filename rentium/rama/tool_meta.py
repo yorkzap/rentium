@@ -19,6 +19,11 @@ Every mutating tool gets one declarative entry:
 - ``undo``: the tool's deterministic inverse. REQUIRED for OPT_IN.
 - ``auto_guard``: extra per-argument refusal, for arguments that make an
   otherwise-reversible call irreversible.
+- ``already_done``: optional ``fn(landlord, **step_args) -> str | None``
+  naming an existing record that makes this write unnecessary. Runs at the
+  same two sites as ``blockers``. A blocker means "cannot"; this means
+  "need not" — and it is what stops one real-world event being recorded twice
+  in two different stores.
 
 Tools registered in registry.py but missing here are treated as
 own_confirm=True, autonomy=NEVER — new write tools are maximally cautious
@@ -45,6 +50,7 @@ setting and should not be given one.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
@@ -54,6 +60,9 @@ from .domain_crud import (
     delete_property_blockers,
     terminate_lease_blockers,
 )
+from .domain_treasurer import treasurer_fact_already_done
+
+logger = logging.getLogger(__name__)
 
 
 class Autonomy(str, Enum):
@@ -152,6 +161,18 @@ class ToolMeta:
     auto_category: str = ""
     undo: Callable[[dict, dict], tuple[str, dict] | None] | None = None
     auto_guard: Callable[..., str | None] | None = None
+    # "This is already on the books." Returns a sentence naming the existing
+    # record, or None to proceed. Runs at BOTH preview time and plan-validation
+    # time, exactly like `blockers` — the difference is that a blocker says the
+    # write CANNOT happen, and this says it does not NEED to.
+    #
+    # Why it lives here rather than inside each tool: RAMA proposed recording a
+    # $100 deposit payment as a Treasurer fact when that same $100 was already
+    # a ledger PAYMENT. Three tools had hand-written duplicate checks, each
+    # blind to the others' store, and the one that mattered short-circuited on
+    # an inferred direction. Duplicate-detection is a property of a write, not
+    # a favour each tool does for itself.
+    already_done: Callable[..., str | None] | None = None
     # True when each call creates a NEW record and sibling calls cannot
     # interfere. plan_runner groups steps by item_key so that a failed rename
     # skips the group-assignment that depended on it — but that grouping keys
@@ -196,6 +217,11 @@ TOOL_META: dict[str, ToolMeta] = {
     # ------------------------------------------------------------ money
     # Two expenses on one address are two separate costs, not a chain.
     "create_expense": ToolMeta(risk="medium", independent_writes=True),
+    # Money in. Never autonomous: an invented payment makes a debt disappear,
+    # and unlike an expense there is nobody on the other side to notice.
+    "record_payment": ToolMeta(
+        risk="high", independent_writes=True, autonomy=Autonomy.NEVER
+    ),
     # Voids a posted expense and re-posts it elsewhere. Never autonomous: the
     # landlord decides where a cost belongs, and the whole reason this tool
     # exists is that guessing produced a mis-scoped charge to a tenant.
@@ -224,6 +250,14 @@ TOOL_META: dict[str, ToolMeta] = {
     "duplicate_listing": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
     # Changes what the public sees and consumes a single-use RamaUpload.
     "attach_photo_to_listing": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    # Removes one public-facing image by a stable handle. Storage is retained by
+    # the backend, but restoring it is not yet a first-class inverse.
+    "remove_photo_from_listing": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
+    "remove_photos_from_listing": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
     # Takes no confirm at all, so it is already frictionless and never reaches
     # the autonomy gate — we WANT RAMA to record what it can't do rather than
     # fail silently.
@@ -256,7 +290,9 @@ TOOL_META: dict[str, ToolMeta] = {
     # Reshapes what is on the market, so it pauses for its own confirmation
     # inside a multi-step plan even though it deletes nothing.
     "set_unit_rental_mode": ToolMeta(risk="high", own_confirm=True),
+    "configure_unit_room_offerings": ToolMeta(risk="high", own_confirm=True),
     "create_group_room": ToolMeta(risk="medium"),
+    "reschedule_viewing": ToolMeta(risk="medium", own_confirm=True),
     # ----------------------------------------------------------- leases
     "create_lease": ToolMeta(risk="medium"),
     "update_lease": ToolMeta(risk="medium"),
@@ -286,7 +322,13 @@ TOOL_META: dict[str, ToolMeta] = {
     # than edits, so neither destroys what came before.
     # Records a belief, not a transaction — nothing posts to the ledger, and
     # the reconciliation check means it cannot silently inflate a total.
-    "record_treasurer_fact": ToolMeta(risk="low"),
+    # Records a belief, not a transaction — nothing posts to the ledger. Which
+    # is exactly why it needs `already_done`: a fact restating money the ledger
+    # already holds creates a SECOND store of one event, and nothing outside a
+    # Monday deliberation ever reads it, so the divergence stays invisible.
+    "record_treasurer_fact": ToolMeta(
+        risk="low", already_done=treasurer_fact_already_done
+    ),
     "record_holding_financials": ToolMeta(risk="low"),
     "record_valuation": ToolMeta(risk="low"),
     "record_mortgage": ToolMeta(risk="medium"),
@@ -323,3 +365,21 @@ def blockers_for(tool_name: str, landlord, **step_args) -> list[dict]:
     if meta.blockers is None:
         return []
     return meta.blockers(landlord, **step_args)
+
+
+def already_done_for(tool_name: str, landlord, **step_args) -> str | None:
+    """Why this write is unnecessary, or None to proceed.
+
+    Never raises: a duplicate check that errors must not block a legitimate
+    write, so an exception here means "no opinion" and the write goes ahead
+    under the normal confirm. Silence is the safe direction because every
+    caller of this still previews and still asks.
+    """
+    meta = meta_for(tool_name)
+    if meta.already_done is None:
+        return None
+    try:
+        return meta.already_done(landlord, **step_args)
+    except Exception:  # noqa: BLE001 — a dedupe check must never break a write
+        logger.exception("already_done check failed for %s", tool_name)
+        return None

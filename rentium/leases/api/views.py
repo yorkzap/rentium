@@ -1099,16 +1099,33 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
 
         # Send the invite. This used to be a `# TODO: fire invite email`, which meant
         # the invite link only worked if the landlord copy-pasted it by hand.
+        email_sent = False
         if instance.invited_email and not instance.tenant_id:
             try:
                 from rentium.showcase.emails import send_tenant_invite
 
-                send_tenant_invite(instance)
+                email_sent = send_tenant_invite(instance)
             except Exception:
                 # send() never raises — it logs and returns False — but an import-time
                 # failure shouldn't cost the landlord the LeaseTenant row they just
                 # created. They can resend from the lease page.
                 pass
+        from rentium.leases.models import LeaseInviteEvent
+        from rentium.leases.services import record_invite_event
+
+        record_invite_event(
+            instance,
+            LeaseInviteEvent.Kind.SENT,
+            actor=user,
+            metadata={"email_sent": email_sent},
+        )
+        if instance.tenant_id:
+            record_invite_event(
+                instance,
+                LeaseInviteEvent.Kind.ACCOUNT_LINKED,
+                actor=user,
+                metadata={"linked_existing_account": True},
+            )
 
         if lease.status == Lease.LeaseStatus.DRAFT and lease.lease_tenants.count() > 0:
             lease.status = Lease.LeaseStatus.PENDING_SIGNATURES
@@ -1161,6 +1178,16 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
 
         if not token or str(lease_tenant.invite_token) != token:
             raise PermissionDenied("Invalid or missing invite token.")
+        from rentium.leases.models import LeaseInviteEvent
+        from rentium.leases.services import record_invite_event
+
+        record_invite_event(
+            lease_tenant,
+            LeaseInviteEvent.Kind.LINK_OPENED,
+            metadata={
+                "user_agent": str(request.headers.get("User-Agent") or "")[:300],
+            },
+        )
 
         return Response(
             {
@@ -1198,6 +1225,15 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
         lease_tenant.tenant = tenant_profile
         lease_tenant.invite_accepted_at = timezone.now()
         lease_tenant.save(update_fields=["tenant", "invite_accepted_at", "updated_at"])
+        from rentium.leases.models import LeaseInviteEvent
+        from rentium.leases.services import record_invite_event
+
+        record_invite_event(
+            lease_tenant,
+            LeaseInviteEvent.Kind.ACCOUNT_LINKED,
+            actor=request.user,
+            metadata={"source": "claim"},
+        )
 
         return Response(self.get_serializer(lease_tenant).data)
 
@@ -1294,6 +1330,15 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
         lease_tenant.tenant = tenant_profile
         lease_tenant.invite_accepted_at = timezone.now()
         lease_tenant.save(update_fields=["tenant", "invite_accepted_at", "updated_at"])
+        from rentium.leases.models import LeaseInviteEvent
+        from rentium.leases.services import record_invite_event
+
+        record_invite_event(
+            lease_tenant,
+            LeaseInviteEvent.Kind.ACCOUNT_LINKED,
+            actor=user,
+            metadata={"source": "activate_account"},
+        )
 
         auth_token, _ = Token.objects.get_or_create(user=user)
 
@@ -1348,6 +1393,7 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
         user = request.user
 
         # --- Identity check -------------------------------------------------
+        linked_during_sign = lease_tenant.tenant_id is None
         if lease_tenant.tenant_id is not None:
             if (
                 not hasattr(user, "tenant_profile")
@@ -1408,6 +1454,21 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
         lease_tenant.has_signed = True
         lease_tenant.signed_date = timezone.now()
         lease_tenant.save()
+        from rentium.leases.models import LeaseInviteEvent
+        from rentium.leases.services import record_invite_event
+
+        if linked_during_sign:
+            record_invite_event(
+                lease_tenant,
+                LeaseInviteEvent.Kind.ACCOUNT_LINKED,
+                actor=user,
+                metadata={"source": "sign"},
+            )
+        record_invite_event(
+            lease_tenant,
+            LeaseInviteEvent.Kind.SIGNED,
+            actor=user,
+        )
 
         # This is what activates the lease and generates the deposit/fee/rent charges.
         lease_tenant.lease.check_and_activate()
@@ -1438,6 +1499,7 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("This lease is already fully executed.")
 
         user = request.user
+        linked_during_decline = lease_tenant.tenant_id is None
         if lease_tenant.tenant_id is not None:
             if (
                 not hasattr(user, "tenant_profile")
@@ -1464,6 +1526,21 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
         lease_tenant.save(
             update_fields=["declined", "declined_at", "decline_reason", "updated_at"]
         )
+        from rentium.leases.models import LeaseInviteEvent
+        from rentium.leases.services import record_invite_event
+
+        if linked_during_decline:
+            record_invite_event(
+                lease_tenant,
+                LeaseInviteEvent.Kind.ACCOUNT_LINKED,
+                actor=request.user,
+                metadata={"source": "decline"},
+            )
+        record_invite_event(
+            lease_tenant,
+            LeaseInviteEvent.Kind.DECLINED,
+            actor=request.user,
+        )
 
         return Response(self.get_serializer(lease_tenant).data)
 
@@ -1483,6 +1560,15 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
         from rentium.showcase.emails import send_tenant_invite
 
         sent = send_tenant_invite(lease_tenant)
+        from rentium.leases.models import LeaseInviteEvent
+        from rentium.leases.services import record_invite_event
+
+        record_invite_event(
+            lease_tenant,
+            LeaseInviteEvent.Kind.RESENT,
+            actor=request.user,
+            metadata={"email_sent": sent},
+        )
         return Response(
             {
                 "detail": "Invite resent."

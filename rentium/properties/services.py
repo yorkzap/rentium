@@ -224,6 +224,7 @@ def create_group_common_area(
     group: PropertyGroup,
     *,
     area_type: str,
+    name: str = "",
     count: int = 1,
     description: str = "",
     shared_with_landlord: bool,
@@ -252,6 +253,7 @@ def create_group_common_area(
     if created:
         area = PropertyArea(
             property=rooms[0],
+            name=(name or "")[:100],
             area_type=area_type,
             count=max(int(count), 1),
             description=(description or "").strip(),
@@ -259,6 +261,8 @@ def create_group_common_area(
             is_group_common=True,
         )
     else:
+        if name:
+            area.name = name[:100]
         area.count = max(int(count), 1)
         area.description = (description or area.description or "").strip()
         area.shared_with_landlord = shared_with_landlord
@@ -335,7 +339,7 @@ def blocking_leases_for_unit(unit: PropertyUnit) -> list:
     return list(
         Lease.objects.filter(scope, status__in=BLOCKING_LEASE_STATUSES)
         .select_related("property")
-        .distinct()
+        .distinct(),
     )
 
 
@@ -368,8 +372,8 @@ def describe_rental_mode_switch(unit: PropertyUnit, new_mode: str) -> dict:
     )
     to_revive = list(
         _unit_listings(unit).filter(
-            is_active_offering=False, property_category=wanted_category
-        )
+            is_active_offering=False, property_category=wanted_category,
+        ),
     )
 
     return {
@@ -411,14 +415,14 @@ def set_rental_mode(unit: PropertyUnit, new_mode: str) -> dict:
         )
         raise RentalModeError(
             f"{unit.name} has live leases and cannot be restructured: {names}. "
-            "End or complete them first."
+            "End or complete them first.",
         )
 
     new_mode = preview["to_mode"]
 
     # Park the outgoing offerings — never delete.
     _unit_listings(unit).filter(is_active_offering=True).update(
-        is_active_offering=False
+        is_active_offering=False,
     )
     # Bring back whatever this unit used to offer in the mode it is entering.
     wanted_category = (
@@ -427,7 +431,7 @@ def set_rental_mode(unit: PropertyUnit, new_mode: str) -> dict:
         else Property.PropertyCategory.ROOM
     )
     reactivated = _unit_listings(unit).filter(
-        is_active_offering=False, property_category=wanted_category
+        is_active_offering=False, property_category=wanted_category,
     )
     reactivated_names = [p.name for p in reactivated]
     reactivated.update(is_active_offering=True)
@@ -442,4 +446,365 @@ def set_rental_mode(unit: PropertyUnit, new_mode: str) -> dict:
         "parked": preview["will_park"],
         "reactivated": reactivated_names,
         "needs_new_listing": not reactivated_names,
+    }
+
+
+def _room_offering_group_name(unit: PropertyUnit, requested: str = "") -> str:
+    return (requested or f"{unit.holding.name} {unit.name}").strip()[:100]
+
+
+def _room_offering_template(unit: PropertyUnit) -> Property | None:
+    """Best location source for a new offering in an existing physical unit."""
+    return (
+        _unit_listings(unit)
+        .order_by("-is_active_offering", "created_at", "pk")
+        .first()
+    )
+
+
+def _normalise_room_configuration_areas(shared_areas: list[dict] | None) -> list[dict]:
+    """Validate the common spaces included in a room-offering conversion."""
+    clean: list[dict] = []
+    seen: set[str] = set()
+    for raw in shared_areas or []:
+        if not isinstance(raw, dict):
+            message = "Every shared area must be an object."
+            raise RentalModeError(message)
+        raw_type = str(raw.get("area_type") or raw.get("type") or "").strip()
+        canonical = raw_type.upper().replace(" ", "_").replace("-", "_")
+        if canonical not in PropertyArea.AreaType.values:
+            canonical = AREA_ALIASES.get(raw_type.casefold(), "")
+        if canonical not in PropertyArea.AreaType.values:
+            message = f"Unknown shared area type {raw_type!r}."
+            raise RentalModeError(message)
+        if canonical in seen:
+            message = f"Shared area type {canonical!r} was provided more than once."
+            raise RentalModeError(message)
+        seen.add(canonical)
+        try:
+            count = max(int(raw.get("count") or 1), 1)
+        except (TypeError, ValueError) as exc:
+            message = f"Invalid count for shared area {raw_type!r}."
+            raise RentalModeError(message) from exc
+        shared_value = raw.get("shared_with_landlord", False)
+        if isinstance(shared_value, str):
+            shared_with_landlord = shared_value.strip().casefold() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+            }
+        else:
+            shared_with_landlord = bool(shared_value)
+        default_name = str(PropertyArea.AreaType(canonical).label)
+        clean.append(
+            {
+                "name": (
+                    " ".join(str(raw.get("name") or default_name).split())[:100]
+                ),
+                "area_type": canonical,
+                "count": count,
+                "description": str(raw.get("description") or "").strip(),
+                "shared_with_landlord": shared_with_landlord,
+            },
+        )
+    return clean
+
+
+def describe_room_offering_configuration(
+    unit: PropertyUnit,
+    room_names: list[str],
+    *,
+    group_name: str = "",
+    shared_areas: list[dict] | None = None,
+) -> dict:
+    """Describe a complete WHOLE_UNIT -> BY_ROOM configuration without writes."""
+    clean_names: list[str] = []
+    seen: set[str] = set()
+    for raw_name in room_names:
+        name = " ".join(str(raw_name or "").split())
+        key = name.casefold()
+        if name and key not in seen:
+            clean_names.append(name[:255])
+            seen.add(key)
+    if not clean_names:
+        return {"ok": False, "error": "At least one room name is required."}
+
+    blockers = blocking_leases_for_unit(unit)
+    desired_group_name = _room_offering_group_name(unit, group_name)
+    attached_group = getattr(unit, "room_group", None)
+    conflicting_group = (
+        PropertyGroup.objects.filter(
+            landlord=unit.landlord,
+            name__iexact=desired_group_name,
+        )
+        .exclude(unit=unit)
+        .first()
+    )
+    if conflicting_group is not None:
+        return {
+            "ok": False,
+            "error": (
+                f"A different property group already uses {desired_group_name!r}. "
+                "Choose another group name."
+            ),
+        }
+
+    try:
+        clean_areas = _normalise_room_configuration_areas(shared_areas)
+    except RentalModeError as exc:
+        return {"ok": False, "error": exc.messages[0] if exc.messages else str(exc)}
+
+    listings = list(_unit_listings(unit))
+    existing_by_name = {
+        listing.name.casefold(): listing
+        for listing in listings
+        if listing.property_category == Property.PropertyCategory.ROOM
+    }
+    rooms = [
+        {
+            "name": name,
+            "action": "reuse" if name.casefold() in existing_by_name else "create",
+        }
+        for name in clean_names
+    ]
+    active_whole = [
+        listing.name
+        for listing in listings
+        if listing.is_active_offering
+        and listing.property_category == Property.PropertyCategory.COMPLETE_UNIT
+    ]
+    other_room_offerings = [
+        listing.name
+        for listing in listings
+        if listing.property_category == Property.PropertyCategory.ROOM
+        and listing.name.casefold() not in seen
+    ]
+    existing_areas = (
+        {
+            row.area_type: row
+            for row in group_common_areas(attached_group)
+        }
+        if attached_group is not None
+        else {}
+    )
+    return {
+        "ok": not blockers,
+        "unit": unit.name,
+        "holding": unit.holding.name,
+        "from_mode": unit.rental_mode,
+        "to_mode": PropertyUnit.RentalMode.BY_ROOM,
+        "group": attached_group.name if attached_group else desired_group_name,
+        "group_action": "reuse" if attached_group else "create",
+        "rooms": rooms,
+        "shared_areas": [
+            {
+                **area,
+                "action": (
+                    "update" if area["area_type"] in existing_areas else "create"
+                ),
+            }
+            for area in clean_areas
+        ],
+        "will_park": active_whole,
+        "will_reactivate_other_rooms": other_room_offerings,
+        "blocked_by": [
+            {
+                "lease_number": lease.lease_number,
+                "status": lease.status,
+                "listing": lease.property.name if lease.property_id else None,
+            }
+            for lease in blockers
+        ],
+        "note": (
+            "The complete-unit listing is parked, not deleted. Each named bedroom "
+            "is recorded as unit layout and receives one reusable room offering. "
+            "Every listed common space is applied to the resulting room group."
+        ),
+    }
+
+
+@transaction.atomic
+def configure_room_offerings(
+    unit: PropertyUnit,
+    room_names: list[str],
+    *,
+    group_name: str = "",
+    shared_areas: list[dict] | None = None,
+) -> dict:
+    """Make named bedrooms rentable separately in one reversible transaction.
+
+    This is the application-owned composite operation used by REST/RAMA callers.
+    It keeps physical layout, room grouping, and active offerings consistent.
+    """
+    locked_unit = (
+        PropertyUnit.objects.select_for_update()
+        .select_related("holding", "landlord")
+        .get(pk=unit.pk)
+    )
+    preview = describe_room_offering_configuration(
+        locked_unit,
+        room_names,
+        group_name=group_name,
+        shared_areas=shared_areas,
+    )
+    if not preview.get("ok"):
+        raise RentalModeError(preview.get("error") or "The unit cannot be reconfigured.")
+    if preview["blocked_by"]:
+        names = ", ".join(
+            f"{row['lease_number']} ({row['status']})"
+            for row in preview["blocked_by"]
+        )
+        raise RentalModeError(
+            f"{locked_unit.name} has live leases and cannot be restructured: "
+            f"{names}. End or complete them first.",
+        )
+
+    desired_group_name = _room_offering_group_name(locked_unit, group_name)
+    group = getattr(locked_unit, "room_group", None)
+    group_created = group is None
+    if group is None:
+        group = PropertyGroup.objects.filter(
+            landlord=locked_unit.landlord,
+            name__iexact=desired_group_name,
+            unit__isnull=True,
+        ).first()
+        if group is None:
+            group = PropertyGroup.objects.create(
+                landlord=locked_unit.landlord,
+                unit=locked_unit,
+                name=desired_group_name,
+                description=f"Room-by-room offerings inside {locked_unit.name}.",
+            )
+        else:
+            group_created = False
+            group.unit = locked_unit
+            group.save(update_fields=["unit", "updated_at"])
+    elif group.landlord_id != locked_unit.landlord_id:
+        raise RentalModeError("The unit's property group belongs to another landlord.")
+
+    # A mode switch reactivates previous room offerings and parks the complete
+    # unit. If already BY_ROOM, leave the active room set alone and simply
+    # ensure the requested names exist.
+    parked: list[str] = []
+    reactivated: list[str] = []
+    if locked_unit.rental_mode != PropertyUnit.RentalMode.BY_ROOM:
+        switched = set_rental_mode(locked_unit, PropertyUnit.RentalMode.BY_ROOM)
+        parked = switched["parked"]
+        reactivated = switched["reactivated"]
+
+    template = _room_offering_template(locked_unit)
+    created_names: list[str] = []
+    reused_names: list[str] = []
+    offering_rows: list[dict] = []
+    for row in preview["rooms"]:
+        name = row["name"]
+        room = (
+            _unit_listings(locked_unit)
+            .filter(
+                property_category=Property.PropertyCategory.ROOM,
+                name__iexact=name,
+            )
+            .first()
+        )
+        if room is None:
+            room = Property(
+                landlord=locked_unit.landlord,
+                holding=locked_unit.holding,
+                unit=locked_unit,
+                group=group,
+                name=name,
+                address=(template.address if template else locked_unit.holding.address),
+                city=(template.city if template else locked_unit.holding.city),
+                province=(template.province if template else ""),
+                postal_code=(template.postal_code if template else ""),
+                country=(template.country if template else "Canada"),
+                address_verified=bool(template and template.address_verified),
+                status=Property.PropertyStatus.AVAILABLE,
+                property_category=Property.PropertyCategory.ROOM,
+                room_type=Property.RoomType.PRIVATE,
+                is_publicly_visible=False,
+                is_active_offering=True,
+            )
+            room.full_clean()
+            room.save()
+            created_names.append(room.name)
+        else:
+            if room.group_id != group.pk:
+                assign_room_to_group(room, group)
+            changed_fields: list[str] = []
+            if not room.is_active_offering:
+                room.is_active_offering = True
+                changed_fields.append("is_active_offering")
+            if room.holding_id != locked_unit.holding_id:
+                room.holding = locked_unit.holding
+                changed_fields.append("holding")
+            if room.unit_id != locked_unit.pk:
+                room.unit = locked_unit
+                changed_fields.append("unit")
+            if changed_fields:
+                room.full_clean()
+                room.save(update_fields=[*changed_fields, "updated_at"])
+            reused_names.append(room.name)
+
+        area, _area_created = PropertyArea.objects.update_or_create(
+            unit=locked_unit,
+            name=name[:100],
+            defaults={
+                "area_type": PropertyArea.AreaType.BEDROOM,
+                "kind": PropertyArea.Kind.EXCLUSIVE,
+                "exclusive_to": room,
+                "shared_with_landlord": False,
+                "is_seeded_default": False,
+            },
+        )
+        area.full_clean()
+        offering_rows.append(
+            {"id": str(room.pk), "name": room.name, "area_id": str(area.pk)},
+        )
+
+    configured_areas: list[dict] = []
+    for area_spec in preview["shared_areas"]:
+        area, created = create_group_common_area(
+            group,
+            name=area_spec["name"],
+            area_type=area_spec["area_type"],
+            count=area_spec["count"],
+            description=area_spec["description"],
+            shared_with_landlord=area_spec["shared_with_landlord"],
+        )
+        configured_areas.append(
+            {
+                "id": str(area.pk),
+                "name": area.name or str(area.get_area_type_display()),
+                "area_type": area.area_type,
+                "count": area.count,
+                "created": created,
+                "shared_with_landlord": area.shared_with_landlord,
+            },
+        )
+
+    sync_group_common_areas(group)
+    room_names = ", ".join(row["name"] for row in offering_rows)
+    return {
+        "configured": True,
+        "unit": locked_unit.name,
+        "holding": locked_unit.holding.name,
+        "rental_mode": locked_unit.rental_mode,
+        "group": {
+            "id": str(group.pk),
+            "name": group.name,
+            "created": group_created,
+        },
+        "rooms": offering_rows,
+        "shared_areas": configured_areas,
+        "created": created_names,
+        "reused": reused_names,
+        "parked": parked,
+        "reactivated": reactivated,
+        "message": (
+            f"{locked_unit.name} is now room-by-room under “{group.name}” with "
+            f"{room_names}. The whole-unit listing was parked (not deleted). "
+            "Each room can have its own rent — set amounts when ready."
+        ),
     }

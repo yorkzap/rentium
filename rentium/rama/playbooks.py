@@ -138,44 +138,61 @@ def _enumerate_unit_targets(landlord, *, include: str = "", holding: str = ""):
     """(units, unresolved, match_rule) for unit-scoped playbooks.
 
     Units resolve by their own name ("Main Floor"), optionally narrowed by
-    holding, because a landlord almost always has several "Main Floor"s across
-    a portfolio. An ambiguous name is reported as unresolved WITH its
-    candidates rather than silently taking the first — picking the wrong floor
-    to restructure is not recoverable by re-running.
+    holding name OR street address, because a landlord almost always has
+    several "Main Floor"s / "Garden Suite"s across a portfolio. An ambiguous
+    name is reported as unresolved WITH its candidates rather than silently
+    taking the first — picking the wrong floor to restructure is not
+    recoverable by re-running.
     """
+    from django.db.models import Q
+
     from rentium.properties.models import PropertyUnit
 
+    from .unit_structure import _resolve_unit
+
     qs = PropertyUnit.objects.filter(landlord=landlord).select_related("holding")
-    if holding.strip():
-        qs = qs.filter(holding__name__icontains=holding.strip())
+    holding_q = (holding or "").strip()
+    if holding_q:
+        # Holding display names ("McKenzie House") often differ from the street
+        # the landlord types ("950 McKenzie Ave"). Match both.
+        qs = qs.filter(
+            Q(holding__name__icontains=holding_q)
+            | Q(holding__address__icontains=holding_q),
+        )
 
     tokens = [t.strip() for t in (include or "").split(",") if t.strip()]
     if not tokens:
         units = list(qs.order_by("holding__name", "name"))
-        rule = f"All units{f' in {holding}' if holding.strip() else ''}: {len(units)}."
+        rule = f"All units{f' in {holding}' if holding_q else ''}: {len(units)}."
         return units, [], rule
 
     units, unresolved = [], []
     for tok in tokens:
-        matches = list(qs.filter(name__icontains=tok)[:6])
-        exact = [u for u in matches if u.name.casefold() == tok.casefold()]
-        if len(exact) == 1:
-            units.append(exact[0])
-        elif len(matches) == 1:
-            units.append(matches[0])
-        elif not matches:
-            unresolved.append(
-                _blocked(tok, "unresolved", f"No unit matching {tok!r}.",
-                         ["give the exact unit name, or narrow with holding="])
-            )
-        else:
+        # Prefer the shared scorer so "Garden Suite 950 McKenzie" and bare
+        # "Garden Suite" + holding= both resolve the same way tools do.
+        unit, err = _resolve_unit(landlord, tok, holding=holding_q)
+        if unit is not None:
+            units.append(unit)
+            continue
+        if isinstance(err, dict) and err.get("candidates"):
             unresolved.append(
                 _blocked(
                     tok,
                     "ambiguous",
-                    f"{tok!r} matches {len(matches)} units: "
-                    + "; ".join(f"{u.name} ({u.holding.name})" for u in matches),
-                    ["narrow with holding=<address or house name>"],
+                    err.get("error") or f"{tok!r} matches several units.",
+                    ["narrow with holding=<address or house name>",
+                     "pass the unit id"],
+                    candidates=err.get("candidates"),
+                )
+            )
+        else:
+            msg = err.get("error", "") if isinstance(err, dict) else str(err or "")
+            unresolved.append(
+                _blocked(
+                    tok,
+                    "unresolved",
+                    msg or f"No unit matching {tok!r}.",
+                    ["give the exact unit name, or narrow with holding="],
                 )
             )
     seen, deduped = set(), []
@@ -502,10 +519,17 @@ def _compose_switch_rental_mode(landlord, units, params) -> Composition:
                 )
             )
             continue
+        # Always pin the resolved unit UUID. Re-resolving by bare name at
+        # execution time is what produced "Several units match 'Garden Suite'"
+        # after the landlord already confirmed a plan that named the address.
         comp.steps.append(
             Step(
                 tool="set_unit_rental_mode",
-                arguments={"unit_name": unit.name, "rental_mode": mode},
+                arguments={
+                    "unit_name": str(unit.pk),
+                    "rental_mode": mode,
+                    "holding": unit.holding.address or unit.holding.name,
+                },
                 target_label=f"{label} -> {mode}",
                 item_key=str(unit.pk),
                 note=(
@@ -650,6 +674,12 @@ def _narrow_same_name_collisions(op, props, pick, match_rule):
 # ----------------------------------------------------------- plan payload
 def _plan_payload(operation: str, summary: str, comp: Composition) -> dict:
     steps = [s.to_dict(i + 1) for i, s in enumerate(comp.steps)]
+    # "Already in that mode" is informational, not a decision. Don't make the
+    # landlord re-confirm skipping basements that were never asked for.
+    informational = {"already"}
+    actionable_blocked = [
+        b for b in comp.blocked if b.get("reason") not in informational
+    ]
     payload: dict = {
         "operation": operation,
         "summary": summary,
@@ -659,11 +689,17 @@ def _plan_payload(operation: str, summary: str, comp: Composition) -> dict:
     out: dict = {"plan": payload}
     if comp.steps:
         out["needs_confirm"] = True
-    if comp.blocked:
-        names = ", ".join(b["target"] for b in comp.blocked[:8])
+    if actionable_blocked:
+        names = ", ".join(b["target"] for b in actionable_blocked[:8])
         payload["question_for_user"] = (
             f"These are blocked: {names}. Should I skip them, or do you want "
             "to handle them differently (see each item's options)?"
+        )
+    elif comp.blocked and not comp.steps:
+        # Everything was already done — report that, no yes needed.
+        payload["question_for_user"] = (
+            "Nothing to change — every matched unit is already in the "
+            "requested state (see blocked items)."
         )
     own = [s for s in steps if s["requires_own_confirm"]]
     relay = [
@@ -679,7 +715,7 @@ def _plan_payload(operation: str, summary: str, comp: Composition) -> dict:
             f"{len(own)} step(s) are lease terminations or similar — the "
             "system will pause at each for its own confirmation. "
         )
-    if comp.blocked:
+    if actionable_blocked or (comp.blocked and not comp.steps):
         relay.append("Ask question_for_user verbatim. ")
     relay.append("Then STOP and wait.")
     out["relay_instruction"] = "".join(relay)

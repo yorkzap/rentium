@@ -15,7 +15,6 @@ Rules (same as the dashboard / API):
 from __future__ import annotations
 
 import datetime as _dt
-
 import re
 from datetime import date
 from datetime import datetime
@@ -120,7 +119,7 @@ def lease_protect_blockers(prop) -> list[dict]:
                 "UI). Terminate/delete draft leases first."
             ),
             "leases": [{"lease_number": ln, "status": st} for ln, st in sample],
-        }
+        },
     ]
 
 
@@ -142,7 +141,7 @@ def work_order_protect_blockers(prop) -> list[dict]:
                 "NOT_AVAILABLE."
             ),
             "open_work_orders": open_n,
-        }
+        },
     ]
 
 
@@ -152,7 +151,7 @@ def property_delete_blockers(prop) -> list[dict]:
 
 
 def delete_property_blockers(
-    landlord, *, property_query: str = "", pick: str = "", **_
+    landlord, *, property_query: str = "", pick: str = "", **_,
 ) -> list[dict]:
     """Blockers for delete_property, keyed by the same args the tool takes."""
     prop, err = _resolve_property(landlord, property_query, pick=pick)
@@ -174,7 +173,7 @@ def lease_terminate_blockers(lease) -> list[dict]:
             {
                 "reason": "already_final",
                 "detail": f"Lease is already final ({lease.status}).",
-            }
+            },
         ]
     if lease.status == Lease.LeaseStatus.DRAFT:
         return [
@@ -184,17 +183,17 @@ def lease_terminate_blockers(lease) -> list[dict]:
                     "Draft leases should be deleted with delete_draft_lease, "
                     "not terminated."
                 ),
-            }
+            },
         ]
     return []
 
 
 def terminate_lease_blockers(
-    landlord, *, property_query: str = "", lease_number: str = "", **_
+    landlord, *, property_query: str = "", lease_number: str = "", **_,
 ) -> list[dict]:
     """Blockers for terminate_lease, keyed by the same args the tool takes."""
     lease, err = _resolve_lease(
-        landlord, property_query=property_query, lease_number=lease_number
+        landlord, property_query=property_query, lease_number=lease_number,
     )
     if err:
         return [{"reason": "unresolved", "detail": str(err)}]
@@ -202,13 +201,13 @@ def terminate_lease_blockers(
 
 
 def delete_draft_lease_blockers(
-    landlord, *, property_query: str = "", lease_number: str = "", **_
+    landlord, *, property_query: str = "", lease_number: str = "", **_,
 ) -> list[dict]:
     """Blockers for delete_draft_lease: only DRAFT leases are deletable."""
     from rentium.leases.models import Lease
 
     lease, err = _resolve_lease(
-        landlord, property_query=property_query, lease_number=lease_number
+        landlord, property_query=property_query, lease_number=lease_number,
     )
     if err:
         return [{"reason": "unresolved", "detail": str(err)}]
@@ -220,7 +219,7 @@ def delete_draft_lease_blockers(
                     f"Only DRAFT leases can be deleted (this is {lease.status}). "
                     "Use terminate_lease instead."
                 ),
-            }
+            },
         ]
     return []
 
@@ -233,7 +232,7 @@ def _prop_err(err):
 
 
 def _resolve_lease(
-    landlord, *, property_query: str = "", lease_number: str = "", pick: str = ""
+    landlord, *, property_query: str = "", lease_number: str = "", pick: str = "",
 ):
     from rentium.leases.models import Lease
 
@@ -259,7 +258,7 @@ def _resolve_lease(
             status__in=[
                 Lease.LeaseStatus.TERMINATED,
                 Lease.LeaseStatus.EXPIRED,
-            ]
+            ],
         )
         .order_by("-created_at")
         .select_related("property", "group")
@@ -458,7 +457,7 @@ def _parse_item_names(inventory_items: str) -> list[str]:
 def _group_property_consensus(group) -> tuple[dict | None, dict | None]:
     """Derive room-level location/container fields from a group's members."""
     members = list(
-        group.grouped_properties.select_related("holding").order_by("created_at", "pk")
+        group.grouped_properties.select_related("holding").order_by("created_at", "pk"),
     )
     if not members:
         return None, {
@@ -529,7 +528,7 @@ def _group_property_consensus(group) -> tuple[dict | None, dict | None]:
                     }
                     for member in members
                 ],
-            }
+            },
         )
     else:
         derived["holding"] = members[0].holding
@@ -549,7 +548,7 @@ def _group_property_consensus(group) -> tuple[dict | None, dict | None]:
                     }
                     for member in members
                 ],
-            }
+            },
         )
     if problems:
         fields = ", ".join(problem["field"] for problem in problems)
@@ -684,7 +683,7 @@ def _group_room_property_data(
                 "error": (
                     f"Invalid province {raw_province!r}. Use a two-letter "
                     "Canadian province code."
-                )
+                ),
             }
     else:
         canonical_province = ""
@@ -742,7 +741,9 @@ def create_property(
     private inventory rows are created in the same confirm step so 'What's in it'
     is not empty after the user mentioned furniture.
     Rejects exact-name duplicates unless allow_duplicate_name=yes."""
-    from rentium.properties.models import InventoryItem, Property, Province
+    from rentium.properties.models import InventoryItem
+    from rentium.properties.models import Property
+    from rentium.properties.models import Province
     from rentium.properties.services import listing_name_conflicts
 
     name = (name or "").strip()
@@ -755,7 +756,7 @@ def create_property(
     from .resolve import _candidate_row
 
     dup_qs = Property.objects.filter(landlord=landlord, name__iexact=name).order_by(
-        "created_at"
+        "created_at",
     )
     if dup_qs.exists() and not _truthy(allow_duplicate_name):
         # Unlike groups, listings are NOT idempotent by name alone — two real
@@ -805,7 +806,7 @@ def create_property(
     if cat is None:
         return {
             "error": "property_category must be one of "
-            f"{[l for _, l in Property.PropertyCategory.choices]}"
+            f"{[l for _, l in Property.PropertyCategory.choices]}",
         }
 
     st = _choice_code(Property.PropertyStatus.choices, status or "AVAILABLE") \
@@ -817,20 +818,20 @@ def create_property(
     prov = normalise_province(prov_raw) or prov_raw[:2]
     if prov not in Province.values:
         return {
-            "error": f"Invalid province {province!r}. Use BC, ON, AB, … (two-letter)."
+            "error": f"Invalid province {province!r}. Use BC, ON, AB, … (two-letter).",
         }
 
     ut = _choice_code(Property.UnitType.choices, unit_type)
     if unit_type.strip() and ut is None:
         return {
             "error": "unit_type must be one of: "
-            + ", ".join(str(l) for _, l in Property.UnitType.choices)
+            + ", ".join(str(l) for _, l in Property.UnitType.choices),
         }
     rt = _choice_code(Property.RoomType.choices, room_type)
     if room_type.strip() and rt is None:
         return {
             "error": "room_type must be one of: "
-            + ", ".join(str(l) for _, l in Property.RoomType.choices)
+            + ", ".join(str(l) for _, l in Property.RoomType.choices),
         }
     # Safety net for a mis-classified category. Unambiguous "complete home"
     # phrases in the name (or an explicit unit_type) mean COMPLETE_UNIT — so a
@@ -884,13 +885,13 @@ def create_property(
                 ("province", prov),
             ):
                 if _normalise_location(supplied) != _normalise_location(
-                    str(group_data.get(field) or "")
+                    str(group_data.get(field) or ""),
                 ):
                     return {
                         "error": (
                             f"{field}={supplied!r} conflicts with the recorded "
                             f"{group.name} value {group_data.get(field)!r}."
-                        )
+                        ),
                     }
             holding = group_data["holding"]
 
@@ -1051,7 +1052,9 @@ def duplicate_listing(
     + gallery images and its private inventory rows. new_name defaults to the
     same name (it's a deliberate duplicate). Leases are NOT copied. Preview;
     confirm=yes."""
-    from rentium.properties.models import InventoryItem, Property, PropertyImage
+    from rentium.properties.models import InventoryItem
+    from rentium.properties.models import Property
+    from rentium.properties.models import PropertyImage
 
     src, err = _resolve_property(landlord, property_query, pick=pick)
     if err:
@@ -1118,13 +1121,13 @@ def duplicate_listing(
     copied_images = 0
     if do_images:
         if src.primary_image and _copy_image_field(
-            src.primary_image, lambda n, c: dup.primary_image.save(n, c, save=True)
+            src.primary_image, lambda n, c: dup.primary_image.save(n, c, save=True),
         ):
             copied_images += 1
         for img in src.property_images.all().order_by("order", "created_at"):
             new_img = PropertyImage(property=dup, caption=img.caption, order=img.order)
             if _copy_image_field(
-                img.image, lambda n, c: new_img.image.save(n, c, save=True)
+                img.image, lambda n, c: new_img.image.save(n, c, save=True),
             ):
                 copied_images += 1
 
@@ -1163,43 +1166,187 @@ def attach_photo_to_listing(
     landlord,
     *,
     property_query: str,
+    attachment_batch_id: str = "",
+    attachment_ids: str = "",
     upload_id: str = "",
     set_primary: str = "",
     pick: str = "",
     confirm: str = "",
 ) -> dict:
-    """Attach photo(s) the landlord uploaded in the chat to a listing. Handles
-    ONE OR MANY: `upload_id` may be a single id, a comma-separated list, 'all',
-    or blank (= every photo they've attached and not yet used). The chat provides
-    ids as '[The landlord attached a photo, upload_id=…]'. set_primary=yes makes
-    the FIRST one the main photo (the rest go to the gallery). Landlord-scoped.
-    Preview; confirm=yes."""
+    """Attach only the explicitly named batch (or explicit legacy upload IDs).
+
+    The old blank/``all`` fallback selected every unused photo in the landlord's
+    account.  That made one 11-photo message consume 28 files from unrelated
+    conversations.  A batch is now the unit of intent and ordering.
+    """
     import os
+    from pathlib import Path
 
     from django.core.files.base import ContentFile
 
+    from rentium.properties.media_services import attach_media
     from rentium.properties.models import PropertyImage
+    from rentium.rama.attachment_services import resolve_batch_attachments
+    from rentium.rama.models import RamaAttachment
     from rentium.rama.models import RamaUpload
 
     prop, err = _resolve_property(landlord, property_query, pick=pick)
     if err:
         return _prop_err(err)
 
+    batch_id = (attachment_batch_id or "").strip()
+    requested_ids = [
+        value.strip()
+        for value in (attachment_ids or "").replace(";", ",").split(",")
+        if value.strip()
+    ]
+    if batch_id:
+        batch, attachments = resolve_batch_attachments(
+            landlord=landlord,
+            batch_id=batch_id,
+            attachment_ids=requested_ids or None,
+        )
+        if batch is None:
+            return {"error": "That attachment batch does not exist in this portfolio."}
+        if requested_ids and len(attachments) != len(set(requested_ids)):
+            return {
+                "error": (
+                    "One or more selected attachments are not available in that batch. "
+                    "No photos were changed."
+                ),
+            }
+        image_suffixes = {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".tif",
+            ".tiff",
+            ".webp",
+            ".heic",
+            ".heif",
+        }
+        image_attachments = [
+            row
+            for row in attachments
+            if Path(row.original_filename).suffix.casefold() in image_suffixes
+        ]
+        if len(image_attachments) != len(attachments):
+            rejected = [
+                row.original_filename
+                for row in attachments
+                if row not in image_attachments
+            ]
+            return {
+                "error": (
+                    "The selected batch includes non-image files, so nothing was "
+                    "attached. Select only the property photos."
+                ),
+                "non_images": rejected,
+            }
+        if not image_attachments:
+            already = list(
+                batch.attachments.filter(
+                    status=RamaAttachment.Status.APPLIED,
+                    target_type="property",
+                    target_id=str(prop.pk),
+                ).values_list("pk", flat=True),
+            )
+            if already:
+                return {
+                    "already_done": (
+                        f"This batch was already attached to {prop.name}; no action "
+                        "was repeated."
+                    ),
+                    "attachment_ids": [str(pk) for pk in already],
+                }
+            return {"error": "That batch has no available property photos."}
+
+        make_primary = _truthy(set_primary)
+        if not _confirmed(confirm):
+            return _preview(
+                "attach_photo_to_listing",
+                {
+                    "listing": prop.name,
+                    "listing_id": str(prop.pk),
+                    "attachment_batch_id": str(batch.pk),
+                    "attachment_ids": [str(row.pk) for row in image_attachments],
+                    "filenames": [row.original_filename for row in image_attachments],
+                    "photos": len(image_attachments),
+                    "first_as": "primary photo" if make_primary else "gallery photo",
+                    "rest_as": "gallery photos" if len(image_attachments) > 1 else None,
+                },
+                (
+                    f"Adds exactly {len(image_attachments)} photo(s) from attachment "
+                    f"batch {batch.pk} to the listing. confirm=yes to apply."
+                ),
+            )
+
+        handles = attach_media(
+            property_obj=prop,
+            sources=[row.original for row in image_attachments],
+            make_first_primary=make_primary,
+        )
+        for row, handle in zip(image_attachments, handles, strict=True):
+            row.classification = RamaAttachment.Classification.PROPERTY_PHOTO
+            row.status = RamaAttachment.Status.APPLIED
+            row.target_type = "property"
+            row.target_id = str(prop.pk)
+            row.result = handle
+            row.save(
+                update_fields=[
+                    "classification",
+                    "status",
+                    "target_type",
+                    "target_id",
+                    "result",
+                    "updated_at",
+                ],
+            )
+        remaining = batch.attachments.filter(
+            status__in=[
+                RamaAttachment.Status.STAGED,
+                RamaAttachment.Status.CLASSIFIED,
+            ],
+        ).exists()
+        if not remaining:
+            from rentium.rama.models import RamaAttachmentBatch
+
+            batch.status = RamaAttachmentBatch.Status.COMPLETED
+            batch.completed_at = timezone.now()
+            batch.save(update_fields=["status", "completed_at"])
+        prop.refresh_from_db()
+        return {
+            "attached": True,
+            "listing": prop.name,
+            "listing_id": str(prop.pk),
+            "attachment_batch_id": str(batch.pk),
+            "photos_added": len(handles),
+            "media": handles,
+            "image_count": prop.image_count,
+            "note": f"Added {len(handles)} photo(s) to {prop.name}.",
+        }
+
+    # Legacy clients may still send upload IDs, but they must be explicit.  A
+    # blank value or the old magic word "all" is intentionally rejected.
     uid = (upload_id or "").strip()
+    if not uid or uid.casefold() == "all":
+        return {
+            "error": (
+                "An explicit attachment_batch_id is required. RAMA will not use "
+                "unrelated pending uploads from other messages."
+            ),
+        }
     qs = RamaUpload.objects.filter(landlord=landlord, used_at__isnull=True).order_by(
-        "created_at"
+        "created_at",
     )
-    if uid and uid.lower() != "all":
-        ids = [x.strip() for x in uid.replace(";", ",").split(",") if x.strip()]
-        uploads = list(qs.filter(pk__in=ids))
-    else:
-        uploads = list(qs)  # 'all' or blank → every pending photo
+    ids = [x.strip() for x in uid.replace(";", ",").split(",") if x.strip()]
+    uploads = list(qs.filter(pk__in=ids))
     if not uploads:
         return {
             "error": (
                 "No attached photo to add. The landlord needs to attach a photo "
                 "in the chat first (the paperclip, or send it to the Telegram bot)."
-            )
+            ),
         }
 
     make_primary = _truthy(set_primary)
@@ -1242,6 +1389,151 @@ def attach_photo_to_listing(
     }
 
 
+def list_listing_media(
+    landlord,
+    *,
+    property_query: str,
+    pick: str = "",
+) -> dict:
+    """List stable media handles so a later remove targets an exact image."""
+    from rentium.properties.media_services import media_manifest
+
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+    media = media_manifest(prop)
+    return {
+        "listing": prop.name,
+        "listing_id": str(prop.pk),
+        "media": media,
+        "selection_help": (
+            "Choose the numbered photo(s) to remove. No image changes until "
+            "the exact selection is previewed and confirmed."
+        ),
+        "_attachment": {
+            "kind": "property_media",
+            "property_id": str(prop.pk),
+            "label": prop.name,
+            "media": media,
+        },
+    }
+
+
+def remove_photo_from_listing(
+    landlord,
+    *,
+    property_query: str,
+    media_handle: str,
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Remove one exact listing image by the handle returned by the manifest."""
+    from rentium.properties.media_services import media_manifest
+    from rentium.properties.media_services import remove_media
+
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+    handle = (media_handle or "").strip()
+    media = {row["handle"]: row for row in media_manifest(prop)}
+    target = media.get(handle)
+    if target is None:
+        return {
+            "error": (
+                f"{prop.name} has no media item {handle!r}. "
+                "Call list_listing_media to get current handles."
+            ),
+        }
+    if not _confirmed(confirm):
+        return _preview(
+            "remove_photo_from_listing",
+            {
+                "listing": prop.name,
+                "listing_id": str(prop.pk),
+                "media": target,
+            },
+            "Removes this exact listing image. The operation is audited.",
+        )
+    removed = remove_media(property_obj=prop, handle=handle)
+    return {
+        "removed": True,
+        "listing": prop.name,
+        "listing_id": str(prop.pk),
+        "media_handle": handle,
+        "effect": removed,
+        "remaining_media": media_manifest(prop),
+        "note": f"Removed {handle} from {prop.name}.",
+    }
+
+
+def remove_photos_from_listing(
+    landlord,
+    *,
+    property_query: str,
+    media_handles_json: str,
+    pick: str = "",
+    confirm: str = "",
+) -> dict:
+    """Remove several specifically selected listing images in one operation."""
+    import json
+
+    from rentium.properties.media_services import media_manifest
+    from rentium.properties.media_services import remove_media_many
+
+    prop, err = _resolve_property(landlord, property_query, pick=pick)
+    if err:
+        return _prop_err(err)
+    try:
+        raw_handles = json.loads(media_handles_json or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return {"error": "media_handles_json must be a JSON list of media handles."}
+    if not isinstance(raw_handles, list) or any(
+        not isinstance(handle, str) for handle in raw_handles
+    ):
+        return {"error": "media_handles_json must be a JSON list of media handles."}
+    handles = list(
+        dict.fromkeys(handle.strip() for handle in raw_handles if handle.strip()),
+    )
+    current = {row["handle"]: row for row in media_manifest(prop)}
+    if not handles:
+        return {
+            "error": (
+                "Select at least one exact image. Call list_listing_media to see "
+                "the numbered gallery."
+            ),
+        }
+    missing = [handle for handle in handles if handle not in current]
+    if missing:
+        return {
+            "error": (
+                f"{prop.name} does not have: {', '.join(missing)}. "
+                "No images were changed."
+            ),
+        }
+    selected = [current[handle] for handle in handles]
+    if not _confirmed(confirm):
+        return _preview(
+            "remove_photos_from_listing",
+            {
+                "listing": prop.name,
+                "listing_id": str(prop.pk),
+                "media": selected,
+                "count": len(selected),
+            },
+            "Removes exactly the selected listing images in one audited operation.",
+        )
+    removed = remove_media_many(property_obj=prop, handles=handles)
+    return {
+        "removed": True,
+        "listing": prop.name,
+        "listing_id": str(prop.pk),
+        "media_handles": handles,
+        "effects": removed,
+        "remaining_media": media_manifest(prop),
+        "note": f"Removed {len(removed)} selected photo(s) from {prop.name}.",
+    }
+
+
 def update_property(
     landlord,
     *,
@@ -1264,7 +1556,9 @@ def update_property(
     pick: str = "",
     confirm: str = "",
 ) -> dict:
-    from rentium.properties.models import Property, Province, normalise_province
+    from rentium.properties.models import Property
+    from rentium.properties.models import Province
+    from rentium.properties.models import normalise_province
     from rentium.properties.services import listing_name_conflicts
 
     prop, err = _resolve_property(landlord, property_query, pick=pick)
@@ -1277,7 +1571,7 @@ def update_property(
         new_name = name.strip()[:255]
         if new_name != prop.name:
             rename_conflicts = listing_name_conflicts(
-                landlord, new_name, exclude_id=prop.pk
+                landlord, new_name, exclude_id=prop.pk,
             )
             exact_conflicts = [
                 conflict
@@ -1298,7 +1592,7 @@ def update_property(
         if st is None:
             return {
                 "error": "status must be one of: "
-                + ", ".join(str(l) for _, l in Property.PropertyStatus.choices)
+                + ", ".join(str(l) for _, l in Property.PropertyStatus.choices),
             }
         changes["status"] = st
     if description != "":
@@ -1319,14 +1613,14 @@ def update_property(
             target_category = Property.PropertyCategory.COMPLETE_UNIT
         else:
             target_category = _choice_code(
-                Property.PropertyCategory.choices, property_category
+                Property.PropertyCategory.choices, property_category,
             )
         if target_category is None:
             return {
                 "error": "property_category must be one of: "
                 + ", ".join(
                     str(label) for _, label in Property.PropertyCategory.choices
-                )
+                ),
             }
         if target_category != prop.property_category and prop.leases.exists():
             return {
@@ -1334,7 +1628,7 @@ def update_property(
                     f"Cannot reclassify {prop.name} while lease records reference it. "
                     "Its room/unit classification affects the legal agreement. "
                     "Correct the lease history first or create a new listing."
-                )
+                ),
             }
         changes["property_category"] = target_category
 
@@ -1343,7 +1637,7 @@ def update_property(
         if ut is None:
             return {
                 "error": "unit_type must be one of: "
-                + ", ".join(str(l) for _, l in Property.UnitType.choices)
+                + ", ".join(str(l) for _, l in Property.UnitType.choices),
             }
         if target_category != Property.PropertyCategory.COMPLETE_UNIT:
             return {"error": "unit_type only applies to COMPLETE_UNIT listings."}
@@ -1353,7 +1647,7 @@ def update_property(
         if rt is None:
             return {
                 "error": "room_type must be one of: "
-                + ", ".join(str(l) for _, l in Property.RoomType.choices)
+                + ", ".join(str(l) for _, l in Property.RoomType.choices),
             }
         if target_category != Property.PropertyCategory.ROOM:
             return {"error": "room_type only applies to ROOM listings."}
@@ -1391,7 +1685,7 @@ def update_property(
         if any(v != "" for v in (bedrooms, bathrooms, max_occupancy, square_footage)):
             return {
                 "error": "bedrooms/bathrooms/max_occupancy/square_footage "
-                "only apply to COMPLETE_UNIT listings."
+                "only apply to COMPLETE_UNIT listings.",
             }
         if prop.property_category != target_category:
             changes.update(
@@ -1403,9 +1697,9 @@ def update_property(
                     "square_footage": None,
                     "building_amenities": [],
                     "room_type": _choice_code(
-                        Property.RoomType.choices, room_type or "PRIVATE"
+                        Property.RoomType.choices, room_type or "PRIVATE",
                     ),
-                }
+                },
             )
     if asking_rent != "":
         if asking_rent.strip() == "":
@@ -1447,7 +1741,7 @@ def update_property(
     if not changes:
         return {
             "error": "No fields to update. Pass a structured field; never change "
-            "description as a substitute for property type or layout."
+            "description as a substitute for property type or layout.",
         }
 
     preview = {
@@ -1503,7 +1797,7 @@ def update_property(
 
 
 def delete_property(
-    landlord, *, property_query: str, pick: str = "", confirm: str = ""
+    landlord, *, property_query: str, pick: str = "", confirm: str = "",
 ) -> dict:
     """Delete listing. Blocked if any lease still references it (Lease.property PROTECT).
     On name collisions pass property_query=<id> or pick=first|no_group|with_group|2."""
@@ -1538,7 +1832,7 @@ def delete_property(
 
 
 def create_property_group(
-    landlord, *, name: str, description: str = "", confirm: str = ""
+    landlord, *, name: str, description: str = "", confirm: str = "",
 ) -> dict:
     from rentium.properties.models import PropertyGroup
 
@@ -1552,7 +1846,7 @@ def create_property_group(
     # harmless restatement into a dead step and pushes the model into
     # improvising a recovery.
     existing = PropertyGroup.objects.filter(
-        landlord=landlord, name__iexact=name
+        landlord=landlord, name__iexact=name,
     ).first()
     if existing is not None:
         return {
@@ -1571,7 +1865,7 @@ def create_property_group(
         )
 
     g = PropertyGroup.objects.create(
-        landlord=landlord, name=name[:100], description=(description or "")[:2000]
+        landlord=landlord, name=name[:100], description=(description or "")[:2000],
     )
     return {"created": True, "group": {"id": str(g.pk), "name": g.name}}
 
@@ -1595,7 +1889,7 @@ def assign_property_to_group(
     if prop.property_category != Property.PropertyCategory.ROOM:
         return {
             "error": "Only ROOM listings can belong to a property group "
-            "(complete units must stay standalone)."
+            "(complete units must stay standalone).",
         }
 
     if _truthy(clear) or not group_name.strip():
@@ -1687,7 +1981,9 @@ def create_group_room(
     city/province. Private inventory, group membership, and group-wide common
     areas commit together.
     """
-    from rentium.properties.models import InventoryItem, Property, PropertyArea
+    from rentium.properties.models import InventoryItem
+    from rentium.properties.models import Property
+    from rentium.properties.models import PropertyArea
     from rentium.properties.services import create_group_common_area
     from rentium.properties.services import group_common_areas
     from rentium.properties.services import listing_name_conflicts
@@ -1717,7 +2013,7 @@ def create_group_room(
             "error": (
                 "No recognized shared area. Use names such as bathroom, kitchen, "
                 "living room, laundry, hallway, or yard."
-            )
+            ),
         }
 
     classification_raw = (shared_with_landlord or "").strip().casefold()
@@ -1729,7 +2025,7 @@ def create_group_room(
             "error": (
                 "shared_with_landlord must be yes or no. It means whether the "
                 "landlord or immediate relatives also use the common areas."
-            )
+            ),
         }
     classification = classification_raw in truth_values
 
@@ -1772,7 +2068,7 @@ def create_group_room(
                     "keep_existing" if existing else "create"
                 ),
                 "shared_with_landlord": desired_classification,
-            }
+            },
         )
 
     def existing_is_complete(prop) -> bool:
@@ -1791,7 +2087,7 @@ def create_group_room(
         for row in area_preview:
             area = current.get(row["type"])
             if area is None or bool(area.shared_with_landlord) != bool(
-                row["shared_with_landlord"]
+                row["shared_with_landlord"],
             ):
                 return False
         return True
@@ -1869,14 +2165,14 @@ def create_group_room(
                 raise ValidationError(
                     locked_error.get("question_for_user")
                     or locked_error.get("error")
-                    or "The group property data is no longer valid."
+                    or "The group property data is no longer valid.",
                 )
             if any(
                 row["match"] == "exact"
                 for row in listing_name_conflicts(landlord, room_name)
             ):
                 raise ValidationError(
-                    f"A listing matching {room_name!r} appeared after the preview."
+                    f"A listing matching {room_name!r} appeared after the preview.",
                 )
 
             prop = Property(
@@ -1919,7 +2215,7 @@ def create_group_room(
                         "name": area.get_area_type_display(),
                         "created": was_created,
                         "shared_with_landlord": area.shared_with_landlord,
-                    }
+                    },
                 )
     except ValidationError as exc:
         return _validation_error_payload(exc)
@@ -2001,7 +2297,7 @@ def assign_property_to_holding(
         }
         if not _confirmed(confirm):
             return _preview(
-                "assign_property_to_holding", preview, "Removes listing from its holding."
+                "assign_property_to_holding", preview, "Removes listing from its holding.",
             )
         prop.holding = None
         try:
@@ -2022,7 +2318,7 @@ def assign_property_to_holding(
     }
     if not _confirmed(confirm):
         return _preview(
-            "assign_property_to_holding", preview, "Puts a listing into a holding."
+            "assign_property_to_holding", preview, "Puts a listing into a holding.",
         )
 
     prop.holding = holding
@@ -2052,7 +2348,7 @@ def list_holdings(landlord) -> dict:
                 "address": h.address,
                 "city": h.city,
                 "listings": [p.name for p in h.listings.all()],
-            }
+            },
         )
     return {"holdings": out, "count": len(out)}
 
@@ -2221,7 +2517,7 @@ def create_lease(
             else [
                 "Property has no inventory items — roommate agreement / "
                 "condition inspection will show empty furnishings. "
-                "Add via create_inventory_item or pass inventory_items on create_property."
+                "Add via create_inventory_item or pass inventory_items on create_property.",
             ]
         ),
         "note": (
@@ -2238,39 +2534,30 @@ def create_lease(
             "Omit security_deposit to default to half monthly rent; pass 0 for none.",
         )
 
-    lease = Lease(
-        landlord=landlord,
-        property=prop,
-        group=None,
-        lease_type=lease_type,
-        status=Lease.LeaseStatus.DRAFT,
-        start_date=start,
-        end_date=end,
-        is_month_to_month=mtm,
-        move_in_date=start,
-        total_rent=rent,
-        security_deposit=deposit,
-        pet_deposit=pet_dep,
-        cleaning_fee=clean_fee,
-        pets_allowed=pets,
-        smoking_allowed=smoking,
-        special_terms=(special_terms or "")[:5000],
-        etransfer_email=e_email,
-        bills_included=bills or {},
-    )
-    # Roommate + landlord-shared common areas clause (same as serializer.create)
-    if "ROOMMATE" in lease_type:
-        try:
-            from rentium.leases.tenancy_rules import landlord_shares_common_areas
-
-            if landlord_shares_common_areas(lease):
-                lease.common_space_shared_with = ["LANDLORD"]
-        except Exception:  # noqa: BLE001
-            pass
-
+    from rentium.leases.services import create_lease_record
     try:
-        lease.full_clean()
-        lease.save()
+        lease = create_lease_record(
+            landlord=landlord,
+            values={
+                "property": prop,
+                "group": None,
+                "lease_type": lease_type,
+                "status": Lease.LeaseStatus.DRAFT,
+                "start_date": start,
+                "end_date": end,
+                "is_month_to_month": mtm,
+                "move_in_date": start,
+                "total_rent": rent,
+                "security_deposit": deposit,
+                "pet_deposit": pet_dep,
+                "cleaning_fee": clean_fee,
+                "pets_allowed": pets,
+                "smoking_allowed": smoking,
+                "special_terms": (special_terms or "")[:5000],
+                "etransfer_email": e_email,
+                "bills_included": bills or {},
+            },
+        )
     except ValidationError as exc:
         return _validation_error_payload(exc)
 
@@ -2323,10 +2610,9 @@ def update_lease(
     is_month_to_month: str = "",
     confirm: str = "",
 ) -> dict:
-    from rentium.leases.models import Lease
 
     lease, err = _resolve_lease(
-        landlord, property_query=property_query, lease_number=lease_number
+        landlord, property_query=property_query, lease_number=lease_number,
     )
     if err:
         return _prop_err(err)
@@ -2338,7 +2624,7 @@ def update_lease(
                 f"Lease {lease.lease_number} is locked (status={lease.status}). "
                 "ACTIVE/EXPIRED/TERMINATED/RENEWED leases cannot be field-edited "
                 "(same as UI LeaseNotLocked). Use terminate_lease or admin."
-            )
+            ),
         }
 
     changes: dict = {}
@@ -2467,19 +2753,19 @@ def update_lease(
 
 
 def delete_draft_lease(
-    landlord, *, property_query: str = "", lease_number: str = "", confirm: str = ""
+    landlord, *, property_query: str = "", lease_number: str = "", confirm: str = "",
 ) -> dict:
     from rentium.leases.models import Lease
 
     lease, err = _resolve_lease(
-        landlord, property_query=property_query, lease_number=lease_number
+        landlord, property_query=property_query, lease_number=lease_number,
     )
     if err:
         return _prop_err(err)
 
     if lease.status != Lease.LeaseStatus.DRAFT:
         blocker = delete_draft_lease_blockers(
-            landlord, lease_number=lease.lease_number
+            landlord, lease_number=lease.lease_number,
         )[0]
         return {"error": blocker["detail"]}
 
@@ -2500,7 +2786,7 @@ def delete_draft_lease(
             "error": (
                 "This draft can't be deleted because it already has payment "
                 "records attached (same as UI)."
-            )
+            ),
         }
     return {"deleted": True, "lease_number": ln}
 
@@ -2520,7 +2806,7 @@ def terminate_lease(
     from rentium.ledger.billing import void_open_charges_for_lease
 
     lease, err = _resolve_lease(
-        landlord, property_query=property_query, lease_number=lease_number
+        landlord, property_query=property_query, lease_number=lease_number,
     )
     if err:
         return _prop_err(err)
@@ -2605,7 +2891,7 @@ def landlord_sign_lease(
 ) -> dict:
     """Mirror LeaseViewSet.landlord_sign — requires full rent allocation."""
     lease, err = _resolve_lease(
-        landlord, property_query=property_query, lease_number=lease_number
+        landlord, property_query=property_query, lease_number=lease_number,
     )
     if err:
         return _prop_err(err)
@@ -2620,7 +2906,7 @@ def landlord_sign_lease(
                 f"Rent isn't fully assigned — "
                 f"${lease.get_unallocated_rent()} of ${lease.total_rent} still "
                 f"unassigned. Adjust tenant shares (rebalance_lease_rents) first."
-            )
+            ),
         }
 
     preview = {
@@ -2641,7 +2927,7 @@ def landlord_sign_lease(
     lease.landlord_signed = True
     lease.landlord_signed_date = timezone.now()
     lease.save(
-        update_fields=["landlord_signed", "landlord_signed_date", "updated_at"]
+        update_fields=["landlord_signed", "landlord_signed_date", "updated_at"],
     )
     activated = lease.check_and_activate()
     return {
@@ -2673,7 +2959,7 @@ def _resolve_work_order(landlord, *, work_order_id: str = "", title_query: str =
             return None, f"No work order {work_order_id!r}."
     if title_query:
         qs = WorkOrder.objects.for_landlord(landlord).filter(
-            title__icontains=title_query.strip()
+            title__icontains=title_query.strip(),
         )
         if qs.count() != 1:
             return None, (
@@ -2702,14 +2988,14 @@ def update_work_order(
     from rentium.maintenance.models import WorkOrder
 
     wo, err = _resolve_work_order(
-        landlord, work_order_id=work_order_id, title_query=title_query
+        landlord, work_order_id=work_order_id, title_query=title_query,
     )
     if err:
         return _prop_err(err)
 
     if wo.status in (WorkOrder.Status.COMPLETED, WorkOrder.Status.CANCELLED):
         return {
-            "error": f"Cannot edit a {wo.status} work order (terminal status)."
+            "error": f"Cannot edit a {wo.status} work order (terminal status).",
         }
 
     changes: dict = {}
@@ -2739,7 +3025,7 @@ def update_work_order(
 
     if not changes:
         return {
-            "error": "No fields to update. For status use transition_work_order."
+            "error": "No fields to update. For status use transition_work_order.",
         }
 
     preview = {
@@ -2790,7 +3076,7 @@ def complete_work_order(
     from rentium.maintenance.models import WorkOrder
 
     wo, err = _resolve_work_order(
-        landlord, work_order_id=work_order_id, title_query=title_query
+        landlord, work_order_id=work_order_id, title_query=title_query,
     )
     if err:
         return _prop_err(err)
@@ -2908,7 +3194,7 @@ def add_work_order_comment(
     from rentium.maintenance.models import WorkOrderComment
 
     wo, err = _resolve_work_order(
-        landlord, work_order_id=work_order_id, title_query=title_query
+        landlord, work_order_id=work_order_id, title_query=title_query,
     )
     if err:
         return _prop_err(err)
@@ -2925,7 +3211,7 @@ def add_work_order_comment(
         return _preview("add_work_order_comment", preview, "Adds a landlord comment.")
 
     c = WorkOrderComment.objects.create(
-        work_order=wo, author=landlord.user, body=body[:5000]
+        work_order=wo, author=landlord.user, body=body[:5000],
     )
     return {
         "created": True,
@@ -2965,7 +3251,7 @@ def create_inventory_item(
     cond = (condition or "GOOD").strip().upper()
     if cond and cond not in InventoryItem.ItemCondition.values:
         return {
-            "error": f"Invalid condition. Use {list(InventoryItem.ItemCondition.values)}"
+            "error": f"Invalid condition. Use {list(InventoryItem.ItemCondition.values)}",
         }
 
     preview = {
@@ -3082,7 +3368,7 @@ def update_inventory_item(
 
 
 def delete_inventory_item(
-    landlord, *, property_query: str, item_name: str, confirm: str = ""
+    landlord, *, property_query: str, item_name: str, confirm: str = "",
 ) -> dict:
     prop, err = _resolve_property(landlord, property_query)
     if err:
@@ -3136,7 +3422,7 @@ def create_shared_inventory_item(
     cond = (condition or "GOOD").strip().upper()
     if cond and cond not in SharedInventoryItem.ItemCondition.values:
         return {
-            "error": f"Invalid condition. Use {list(SharedInventoryItem.ItemCondition.values)}"
+            "error": f"Invalid condition. Use {list(SharedInventoryItem.ItemCondition.values)}",
         }
 
     preview = {
@@ -3174,7 +3460,7 @@ def create_shared_inventory_item(
 
 
 def delete_shared_inventory_item(
-    landlord, *, group_name: str, item_name: str, confirm: str = ""
+    landlord, *, group_name: str, item_name: str, confirm: str = "",
 ) -> dict:
     group, err = _resolve_group(landlord, group_name)
     if err:
@@ -3191,7 +3477,7 @@ def delete_shared_inventory_item(
     preview = {"group": group.name, "item": item.name}
     if not _confirmed(confirm):
         return _preview(
-            "delete_shared_inventory_item", preview, "Deletes shared inventory item."
+            "delete_shared_inventory_item", preview, "Deletes shared inventory item.",
         )
     nm = item.name
     item.delete()
@@ -3254,8 +3540,8 @@ def setup_room_tenancy(
 
     existing = list(
         Property.objects.filter(landlord=landlord, name__iexact=room_name).order_by(
-            "created_at"
-        )
+            "created_at",
+        ),
     )
     from .resolve import _candidate_row
 
@@ -3296,7 +3582,7 @@ def setup_room_tenancy(
     }
     if not start:
         plan["warnings"] = [
-            "start_date missing — will create room (+ inventory) only; pass start_date for lease."
+            "start_date missing — will create room (+ inventory) only; pass start_date for lease.",
         ]
 
     # Smart gating (before preview): don't silently produce a half-done setup
@@ -3335,7 +3621,7 @@ def setup_room_tenancy(
         else:
             prop = existing[-1]
         results["steps_done"].append(
-            {"reuse_property": True, "property_id": str(prop.pk), "name": prop.name}
+            {"reuse_property": True, "property_id": str(prop.pk), "name": prop.name},
         )
         if group_name.strip() and not prop.group_id:
             assign_property_to_group(
@@ -3521,7 +3807,7 @@ def _resolve_tenant_profile(landlord, query: str):
             Q(invited_name__icontains=q)
             | Q(invited_email__icontains=q)
             | Q(tenant__user__name__icontains=q)
-            | Q(tenant__user__email__icontains=q)
+            | Q(tenant__user__email__icontains=q),
         )
         .select_related("tenant__user")
     )
@@ -3547,7 +3833,7 @@ def attribute_work_order(
 ) -> dict:
     """Record who caused a repair, and whether they are being charged for it."""
     wo, err = _resolve_work_order(
-        landlord, work_order_id=work_order_id, title_query=title_query
+        landlord, work_order_id=work_order_id, title_query=title_query,
     )
     if err:
         return _prop_err(err)
@@ -3561,7 +3847,7 @@ def attribute_work_order(
     wants_charge = _truthy(chargeable)
     if wants_charge and person is None and wo.responsible_tenant_id is None:
         return {
-            "error": "Say which tenant is being charged before marking it chargeable."
+            "error": "Say which tenant is being charged before marking it chargeable.",
         }
 
     target = person or wo.responsible_tenant

@@ -938,8 +938,13 @@ def charge_schedule(
                 "paid": str(charge.settled_amount),
                 "balance_on_charge": str(outstanding),
                 "due_now": str(due_now),
-                # only money due as of today (future scheduled = 0)
-                "outstanding": str(due_now),
+                # NO `outstanding` key here, deliberately. It used to alias
+                # due_now, while the same key in charge_status and
+                # tenant_statement means balance_on_charge — so one word meant
+                # two opposite things across three tools the model chooses
+                # between for the same question. The alias was redundant
+                # (due_now already carries it) and it is the ambiguity that
+                # let "is the $100 in?" be answered both ways.
                 "status": status,
                 "property": prop,
                 "lease_id": str(charge.lease_id) if charge.lease_id else None,
@@ -958,7 +963,6 @@ def charge_schedule(
         "totals": {
             "amount": str(total_amount),
             "due_now": str(total_due_now),
-            "outstanding": str(total_due_now),
             "note": (
                 "totals.due_now is only unpaid with due_date<=as_of. "
                 "Future scheduled rent has status=scheduled and due_now=0."
@@ -969,7 +973,9 @@ def charge_schedule(
             "person": (
                 "status=scheduled means future — say scheduled, not outstanding. "
                 "Use due_now for money owed today; balance_on_charge is unpaid "
-                "line balance including future. Copy due_date and amount exactly."
+                "line balance including future. Copy due_date and amount exactly. "
+                "These two names exist because they are different numbers: never "
+                "report one as the other."
             ),
             "outstanding_vs_schedule": (
                 "Portfolio outstanding_total is only unpaid charges due on or before as_of. "
