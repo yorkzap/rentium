@@ -32,24 +32,63 @@ The script:
 
 When you add a composite, update `COVERAGE_MAP` in the same PR.
 
+## Status model
+
+| Status | Meaning |
+|---|---|
+| **covered** | Curated map points at registered RAMA tool(s) |
+| **missing_tool** | Map names a tool that is not in REGISTRY — fix immediately |
+| **intentional** | Explicitly out of chat scope (auth, public, webhooks, tenant-only) |
+| **unmapped** | Not yet reviewed; many are list/retrieve noise |
+
 ## Phase 1 composites (July 2026)
 
 | API | RAMA tool |
 |---|---|
 | `LeaseViewSet.renew` | `renew_lease` |
-| `MoveOutViewSet.create` / `settle_deposit` | `settle_moveout` |
+| `MoveOutViewSet.create` / `settle_deposit` / cancel / decline | `settle_moveout` |
 | `ConditionInspectionViewSet` package | `complete_inspection_package` |
 | `RentAdjustmentViewSet.create` | `apply_rent_adjustment` |
 | `POST /api/ledger/utility-bills/` | `record_utility_bill` |
 | `InquiryViewSet.to_appointment` | `convert_inquiry_to_viewing` |
 
-All six are confirm-gated write tools on the General + Corporal surfaces,
-wired through `domain_composites.py` → `tools.py` → `REGISTRY`.
+## Gap-close batch (July 2026)
+
+| API | RAMA tool |
+|---|---|
+| `LedgerEntryViewSet.void` | `void_ledger_entry` |
+| `LedgerEntryViewSet.mark_paid` | `mark_ledger_paid` |
+| `LedgerEntryViewSet.correct` | `correct_ledger_entry` |
+| `LedgerEntryViewSet.credit` | `post_ledger_credit` |
+| `LedgerEntryViewSet.charge` | `post_one_off_charge` |
+| Inspection items/suggestions/delivered | `update_inspection_items`, `approve_inspection_suggestion`, `dismiss_inspection_suggestion`, `mark_inspection_delivered` |
+| Appointment destroy / cancel | `cancel_viewing` |
+| Appointment confirm/counter/decline | `respond_to_viewing_request` |
+| Payment reminders | `create_payment_reminder`, `mark_payment_reminder_sent`, `list_payment_reminders` |
+| Cleaning fee paid | `mark_cleaning_fee_paid` |
+| Inquiry notes/archive | `update_inquiry` |
+| Import commit/discard | `commit_import_batch`, `discard_import_batch` |
+| Notifications | `list_notifications`, `mark_notifications_read` |
+
+Implementation: `rentium/rama/domain_gap_tools.py` + extensions in
+`domain_composites.py`.
+
+## Intentional non-coverage
+
+- Public marketing / SEO endpoints  
+- Auth, registration, password reset  
+- Webhooks (Telegram/WhatsApp)  
+- Tenant-only actions (tenant sign, claim, tenant_respond)  
+- RAMA HTTP meta (chat, settings, uploads) — already tools elsewhere  
+- Hard-delete of permanent records (work orders cancel via transition)  
+- Agenda CRUD — primary scheduling is appointments/calendar  
+- Showcase settings slug editor — rare; use dashboard  
 
 ## Rules
 
 - Composites call the **same services** as the REST views (no parallel
   business rules).
 - Preview / `confirm=yes` is mandatory for money and legal actions.
+- Ledger voids/corrections are **append-only** (`void_entry` / `correct_entry`).
 - Capability-gap logging must not claim “unsupported” for phrases that
   already map via `supported_tool_for_request`.

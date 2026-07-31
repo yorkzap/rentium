@@ -269,6 +269,7 @@ def settle_moveout(
     reason: str = "",
     rent_handling: str = "NONE",
     moveout_id: str = "",
+    action: str = "",
     forwarding_address: str = "",
     forwarding_address_received_on: str = "",
     deposit_settlement: str = "",
@@ -280,8 +281,8 @@ def settle_moveout(
 
     Without moveout_id: create a landlord move-out request
     (LANDLORD_NOTICE auto-applies when date is valid; MUTUAL_AGREEMENT waits
-    for the tenant). With moveout_id or after create: record forwarding
-    address / deposit settlement evidence.
+    for the tenant). With moveout_id: settle deposit, or action=
+    accept|decline|cancel on a pending request.
     """
     from rentium.leases.api.moveout_views import ENDABLE_STATUSES
     from rentium.leases.models import Lease, MoveOutRequest
@@ -306,6 +307,59 @@ def settle_moveout(
         )
         if err:
             return _prop_err(err)
+
+    act = (action or "").strip().lower()
+    if act in ("cancel", "decline", "accept") and existing is None:
+        # Resolve latest pending move-out on the lease
+        existing = (
+            lease.moveout_requests.filter(status=MoveOutRequest.Status.PENDING)
+            .order_by("-created_at")
+            .first()
+        )
+        if not existing:
+            return {
+                "error": (
+                    f"No pending move-out on lease {lease.lease_number} to {act}."
+                ),
+            }
+
+    if act in ("cancel", "decline", "accept") and existing is not None:
+        preview = {
+            "action": act,
+            "moveout_id": str(existing.pk),
+            "lease_number": lease.lease_number,
+            "kind": existing.kind,
+            "status": existing.status,
+            "requested_end_date": str(existing.requested_end_date),
+            "reason": (reason or "")[:200] or None,
+        }
+        if not _confirmed(confirm):
+            return _preview(
+                "settle_moveout",
+                preview,
+                f"{act.title()}s the pending move-out request.",
+            )
+        try:
+            if act == "cancel":
+                existing.cancel()
+            elif act == "decline":
+                existing.decline(reason=(reason or "").strip())
+            else:
+                existing.sign(as_landlord=True)
+                existing.accept()
+        except ValidationError as exc:
+            return _validation_error_payload(exc)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+        existing.refresh_from_db()
+        return {
+            "settled": True,
+            "action": act,
+            "moveout_id": str(existing.pk),
+            "status": existing.status,
+            "lease_number": lease.lease_number,
+            "message": f"Move-out {act} on lease {lease.lease_number} → {existing.status}.",
+        }
 
     place = (
         lease.property.name

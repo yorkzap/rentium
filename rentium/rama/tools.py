@@ -2079,6 +2079,7 @@ def settle_moveout(
     reason: str = "",
     rent_handling: str = "NONE",
     moveout_id: str = "",
+    action: str = "",
     forwarding_address: str = "",
     forwarding_address_received_on: str = "",
     deposit_settlement: str = "",
@@ -2087,8 +2088,8 @@ def settle_moveout(
     confirm: str = "",
 ) -> dict:
     """End a tenancy (landlord notice or mutual agreement) and/or record
-    deposit settlement with evidence — same as UI move-out flow. Preview;
-    confirm=yes."""
+    deposit settlement with evidence — same as UI move-out flow.
+    action=accept|decline|cancel on a pending move-out. Preview; confirm=yes."""
     from .domain_composites import settle_moveout as _fn
 
     return _fn(
@@ -2100,6 +2101,7 @@ def settle_moveout(
         reason=reason,
         rent_handling=rent_handling,
         moveout_id=moveout_id,
+        action=action,
         forwarding_address=forwarding_address,
         forwarding_address_received_on=forwarding_address_received_on,
         deposit_settlement=deposit_settlement,
@@ -2247,6 +2249,337 @@ def convert_inquiry_to_viewing(
         inquiry_id=inquiry_id,
         name_query=name_query,
         when=when,
+        confirm=confirm,
+    )
+
+
+# ---------------------------------------------------------------------------
+# API gap-close tools (ledger, inspection, viewing, collection)
+# ---------------------------------------------------------------------------
+
+
+def void_ledger_entry(
+    landlord,
+    entry_id: str = "",
+    description_query: str = "",
+    reason: str = "",
+    confirm: str = "",
+) -> dict:
+    """Void a ledger entry via REVERSAL (never deletes). reason required.
+    Preview; confirm=yes."""
+    from .domain_gap_tools import void_ledger_entry as _fn
+
+    return _fn(
+        landlord,
+        entry_id=entry_id,
+        description_query=description_query,
+        reason=reason,
+        confirm=confirm,
+    )
+
+
+def mark_ledger_paid(
+    landlord,
+    entry_id: str = "",
+    description_query: str = "",
+    paid_on: str = "",
+    unmark: str = "0",
+    confirm: str = "",
+) -> dict:
+    """Mark expense bank-cleared (paid_on) or unmark=yes. Preview; confirm=yes."""
+    from .domain_gap_tools import mark_ledger_paid as _fn
+
+    return _fn(
+        landlord,
+        entry_id=entry_id,
+        description_query=description_query,
+        paid_on=paid_on,
+        unmark=unmark,
+        confirm=confirm,
+    )
+
+
+def correct_ledger_entry(
+    landlord,
+    entry_id: str = "",
+    description_query: str = "",
+    amount: str = "",
+    description: str = "",
+    category: str = "",
+    vendor: str = "",
+    reason: str = "Correction",
+    confirm: str = "",
+) -> dict:
+    """Correct a posted entry by void+repost. Preview; confirm=yes."""
+    from .domain_gap_tools import correct_ledger_entry as _fn
+
+    return _fn(
+        landlord,
+        entry_id=entry_id,
+        description_query=description_query,
+        amount=amount,
+        description=description,
+        category=category,
+        vendor=vendor,
+        reason=reason,
+        confirm=confirm,
+    )
+
+
+def post_ledger_credit(
+    landlord,
+    entry_id: str = "",
+    description_query: str = "",
+    amount: str = "",
+    reason: str = "Credit",
+    confirm: str = "",
+) -> dict:
+    """Post goodwill/discount credit against a charge. Preview; confirm=yes."""
+    from .domain_gap_tools import post_ledger_credit as _fn
+
+    return _fn(
+        landlord,
+        entry_id=entry_id,
+        description_query=description_query,
+        amount=amount,
+        reason=reason,
+        confirm=confirm,
+    )
+
+
+def post_one_off_charge(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    amount: str = "",
+    due_date: str = "",
+    description: str = "Charge",
+    entry_type: str = "OTHER_CHARGE",
+    tenant_email: str = "",
+    confirm: str = "",
+) -> dict:
+    """One-off charge (damage, late fee) on a lease. Preview; confirm=yes."""
+    from .domain_gap_tools import post_one_off_charge as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        amount=amount,
+        due_date=due_date,
+        description=description,
+        entry_type=entry_type,
+        tenant_email=tenant_email,
+        confirm=confirm,
+    )
+
+
+def update_inspection_items(
+    landlord,
+    inspection_id: str = "",
+    lease_number: str = "",
+    items_json: str = "",
+    fill_empty_move_in_good: str = "0",
+    confirm: str = "",
+) -> dict:
+    """Bulk-update condition inspection item codes. Preview; confirm=yes."""
+    from .domain_gap_tools import update_inspection_items as _fn
+
+    return _fn(
+        landlord,
+        inspection_id=inspection_id,
+        lease_number=lease_number,
+        items_json=items_json,
+        fill_empty_move_in_good=fill_empty_move_in_good,
+        confirm=confirm,
+    )
+
+
+def approve_inspection_suggestion(
+    landlord, item_id: str = "", inspection_id: str = "", confirm: str = "",
+) -> dict:
+    """Approve inspection damage suggestion → work order. Preview; confirm=yes."""
+    from .domain_gap_tools import approve_inspection_suggestion as _fn
+
+    return _fn(
+        landlord,
+        item_id=item_id,
+        inspection_id=inspection_id,
+        confirm=confirm,
+    )
+
+
+def dismiss_inspection_suggestion(
+    landlord, item_id: str = "", confirm: str = "",
+) -> dict:
+    """Dismiss inspection maintenance suggestion. Preview; confirm=yes."""
+    from .domain_gap_tools import dismiss_inspection_suggestion as _fn
+
+    return _fn(landlord, item_id=item_id, confirm=confirm)
+
+
+def mark_inspection_delivered(
+    landlord,
+    inspection_id: str = "",
+    lease_number: str = "",
+    inspection_pass: str = "MOVE_IN",
+    confirm: str = "",
+) -> dict:
+    """Stamp that the tenant received their inspection report copy.
+    Preview; confirm=yes."""
+    from .domain_gap_tools import mark_inspection_delivered as _fn
+
+    return _fn(
+        landlord,
+        inspection_id=inspection_id,
+        lease_number=lease_number,
+        inspection_pass=inspection_pass,
+        confirm=confirm,
+    )
+
+
+def cancel_viewing(
+    landlord,
+    appointment_id: str = "",
+    request_ref: str = "",
+    property_query: str = "",
+    reason: str = "",
+    confirm: str = "",
+) -> dict:
+    """Cancel a pending or scheduled viewing. Preview; confirm=yes."""
+    from .domain_gap_tools import cancel_viewing as _fn
+
+    return _fn(
+        landlord,
+        appointment_id=appointment_id,
+        request_ref=request_ref,
+        property_query=property_query,
+        reason=reason,
+        confirm=confirm,
+    )
+
+
+def mark_cleaning_fee_paid(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    tenant_email: str = "",
+    confirm: str = "",
+) -> dict:
+    """Mark cleaning fee paid for a lease tenant. Preview; confirm=yes."""
+    from .domain_gap_tools import mark_cleaning_fee_paid as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        tenant_email=tenant_email,
+        confirm=confirm,
+    )
+
+
+def list_payment_reminders(
+    landlord, lease_number: str = "", pending_only: str = "1",
+) -> dict:
+    """List payment reminders (pending by default)."""
+    from .domain_gap_tools import list_payment_reminders as _fn
+
+    return _fn(landlord, lease_number=lease_number, pending_only=pending_only)
+
+
+def create_payment_reminder(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    reminder_date: str = "",
+    message: str = "",
+    send_method: str = "EMAIL",
+    confirm: str = "",
+) -> dict:
+    """Schedule a payment reminder on an open legacy Payment. Preview; confirm=yes."""
+    from .domain_gap_tools import create_payment_reminder as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        reminder_date=reminder_date,
+        message=message,
+        send_method=send_method,
+        confirm=confirm,
+    )
+
+
+def mark_payment_reminder_sent(
+    landlord, reminder_id: str = "", confirm: str = "",
+) -> dict:
+    """Mark a payment reminder as sent. Preview; confirm=yes."""
+    from .domain_gap_tools import mark_payment_reminder_sent as _fn
+
+    return _fn(landlord, reminder_id=reminder_id, confirm=confirm)
+
+
+def update_inquiry(
+    landlord,
+    inquiry_id: str = "",
+    name_query: str = "",
+    status: str = "",
+    landlord_notes: str = "",
+    confirm: str = "",
+) -> dict:
+    """Update inquiry status (e.g. ARCHIVED) or landlord notes. Preview; confirm=yes."""
+    from .domain_gap_tools import update_inquiry as _fn
+
+    return _fn(
+        landlord,
+        inquiry_id=inquiry_id,
+        name_query=name_query,
+        status=status,
+        landlord_notes=landlord_notes,
+        confirm=confirm,
+    )
+
+
+def commit_import_batch(
+    landlord, batch_id: str = "", confirm: str = "",
+) -> dict:
+    """Commit a DRAFT ledger import batch into live ledger rows. Preview; confirm=yes."""
+    from .domain_gap_tools import commit_import_batch as _fn
+
+    return _fn(landlord, batch_id=batch_id, confirm=confirm)
+
+
+def discard_import_batch(
+    landlord, batch_id: str = "", confirm: str = "",
+) -> dict:
+    """Discard a DRAFT import batch without posting. Preview; confirm=yes."""
+    from .domain_gap_tools import discard_import_batch as _fn
+
+    return _fn(landlord, batch_id=batch_id, confirm=confirm)
+
+
+def list_notifications(
+    landlord, unread_only: str = "1", limit: str = "30",
+) -> dict:
+    """List in-app notifications for this landlord."""
+    from .domain_gap_tools import list_notifications as _fn
+
+    return _fn(landlord, unread_only=unread_only, limit=limit)
+
+
+def mark_notifications_read(
+    landlord,
+    notification_id: str = "",
+    all_unread: str = "0",
+    confirm: str = "",
+) -> dict:
+    """Mark one notification or all unread as read. Preview; confirm=yes."""
+    from .domain_gap_tools import mark_notifications_read as _fn
+
+    return _fn(
+        landlord,
+        notification_id=notification_id,
+        all_unread=all_unread,
         confirm=confirm,
     )
 

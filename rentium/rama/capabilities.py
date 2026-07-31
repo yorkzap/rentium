@@ -108,6 +108,62 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "turn lead into viewing",
         "schedule from inquiry",
     ),
+    "void_ledger_entry": (
+        "void charge",
+        "void expense",
+        "cancel ledger entry",
+        "reverse entry",
+    ),
+    "mark_ledger_paid": (
+        "expense paid",
+        "marked paid",
+        "cleared bank",
+        "left my account",
+    ),
+    "correct_ledger_entry": (
+        "fix expense",
+        "correct charge",
+        "wrong amount",
+        "typo on ledger",
+    ),
+    "post_ledger_credit": (
+        "give credit",
+        "goodwill credit",
+        "discount on charge",
+    ),
+    "post_one_off_charge": (
+        "damage charge",
+        "late fee",
+        "one off charge",
+        "charge tenant for",
+    ),
+    "cancel_viewing": (
+        "cancel viewing",
+        "cancel showing",
+        "cancel appointment",
+    ),
+    "update_inspection_items": (
+        "fill inspection",
+        "condition codes",
+        "inspection items",
+    ),
+    "mark_cleaning_fee_paid": (
+        "cleaning fee paid",
+        "paid cleaning fee",
+    ),
+    "create_payment_reminder": (
+        "payment reminder",
+        "remind about rent",
+        "rent reminder",
+    ),
+    "update_inquiry": (
+        "archive inquiry",
+        "inquiry notes",
+    ),
+    "commit_import_batch": (
+        "commit import",
+        "finalize import batch",
+    ),
     "update_lease": (
         "edit lease terms",
         "change rent",
@@ -394,6 +450,53 @@ def supported_tool_for_request(request: str) -> str | None:
         text,
     ):
         return "convert_inquiry_to_viewing"
+    if re.search(
+        r"\bvoid\b.+\b(charge|expense|entry|payment)\b"
+        r"|\breverse\b.+\b(ledger|charge|expense)\b",
+        text,
+    ):
+        return "void_ledger_entry"
+    if re.search(
+        r"\b(mark|marked)\b.+\b(expense|bill)\b.+\bpaid\b"
+        r"|\b(paid|cleared)\b.+\b(from )?(my )?(bank|account)\b"
+        r"|\bexpense (is )?paid\b",
+        text,
+    ):
+        return "mark_ledger_paid"
+    if re.search(
+        r"\b(correct|fix)\b.+\b(expense|charge|ledger|entry|amount)\b"
+        r"|\bwrong (amount|description)\b.+\b(expense|charge)\b",
+        text,
+    ):
+        return "correct_ledger_entry"
+    if re.search(
+        r"\b(damage|late fee|one[- ]?off)\b.+\bcharge\b"
+        r"|\bcharge (the )?tenant\b.+\b(for|damage|fee)\b",
+        text,
+    ):
+        return "post_one_off_charge"
+    if re.search(
+        r"\bcancel\b.+\b(viewing|showing|appointment)\b"
+        r"|\b(viewing|showing)\b.+\bcancel",
+        text,
+    ):
+        return "cancel_viewing"
+    if re.search(
+        r"\b(cleaning fee)\b.+\bpaid\b|\bpaid\b.+\bcleaning fee\b",
+        text,
+    ):
+        return "mark_cleaning_fee_paid"
+    if re.search(
+        r"\b(payment|rent)\b.+\breminder\b|\bremind\b.+\b(rent|payment)\b",
+        text,
+    ):
+        return "create_payment_reminder"
+    if re.search(
+        r"\barchive\b.+\binquir"
+        r"|\binquir(y|ies)\b.+\b(archive|notes)\b",
+        text,
+    ):
+        return "update_inquiry"
     # Leases — the most common false "I can't create a lease" gap.
     # Deliberately exclude co-landlord / co-host / invite-only phrasings.
     if not re.search(

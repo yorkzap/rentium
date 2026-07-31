@@ -313,6 +313,36 @@ TOOL_META: dict[str, ToolMeta] = {
     "convert_inquiry_to_viewing": ToolMeta(
         risk="high", autonomy=Autonomy.NEVER
     ),
+    # Ledger control — append-only services only; never autonomous.
+    "void_ledger_entry": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
+    "mark_ledger_paid": ToolMeta(
+        risk="medium", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
+    "correct_ledger_entry": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
+    "post_ledger_credit": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
+    "post_one_off_charge": ToolMeta(
+        risk="high", independent_writes=True, autonomy=Autonomy.NEVER
+    ),
+    "update_inspection_items": ToolMeta(risk="medium", own_confirm=True),
+    "approve_inspection_suggestion": ToolMeta(risk="medium", own_confirm=True),
+    "dismiss_inspection_suggestion": ToolMeta(risk="low"),
+    "mark_inspection_delivered": ToolMeta(risk="low"),
+    "cancel_viewing": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
+    "mark_cleaning_fee_paid": ToolMeta(risk="low"),
+    "create_payment_reminder": ToolMeta(risk="medium"),
+    "mark_payment_reminder_sent": ToolMeta(risk="low"),
+    "update_inquiry": ToolMeta(risk="low"),
+    "commit_import_batch": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
+    "discard_import_batch": ToolMeta(risk="medium", own_confirm=True),
+    "mark_notifications_read": ToolMeta(risk="low"),
     "delete_draft_lease": ToolMeta(
         risk="medium", blockers=delete_draft_lease_blockers
     ),
