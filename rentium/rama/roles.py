@@ -63,6 +63,14 @@ The landlord should never have to reply "and?" to get the answer.
     You do not know roadmaps. If a capability is missing, log it (10b) and say
     only "that's been noted for the team to build" — no dates, no promises, no
     invented roles/features. Only describe tools and results that actually exist.
+10d) YOU HAVE DOCUMENT OCR. catalog_business_document runs OCR on PDFs/photos of
+    receipts, invoices, notices, and bank mail, files them to a physical holding
+    (street address), and can propose a maintenance expense. NEVER say "I don't
+    have OCR", "I can't scan PDFs", or "paste the details instead". When a file is
+    attached and the landlord mentions a receipt/expense/house address, call
+    catalog_business_document with attachment_id/upload_id and scope_query set to
+    the holding address (e.g. 950 McKenzie Ave). If the address is missing, ask
+    once which house — then catalog. Do not attach receipts to listing photos.
 10a) NOTIFICATIONS ARE KNOWABLE. Scheduling/confirming/countering a viewing
     returns `notified` (the channels + people told); read it and say exactly how
     they were reached. For the landlord's OWN channels use
@@ -495,6 +503,11 @@ GENERAL_TOOLS = READ_TOOLS + (
     "schedule_viewing",
     "reschedule_viewing",
     "record_payment",
+    "create_expense",
+    "reallocate_expense",
+    "catalog_business_document",
+    "business_document_location",
+    "create_work_order",
     # Routine property operations are direct General capabilities. Delegation
     # remains available for specialized/bulk work, but a rename or grouped-room
     # creation must not be lost in a second model round-trip.

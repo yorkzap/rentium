@@ -30,6 +30,7 @@ from django.utils import timezone
 from . import autonomy as autonomy_policy
 from . import memory
 from .capabilities import select_tool_schemas
+from .capabilities import supported_tool_for_request
 from .models import RamaAudit
 from .models import RamaPendingPlan
 from .plan_runner import PENDING_PLAN_TTL_SECONDS
@@ -2384,8 +2385,30 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         "paperwork",
         "scotiabank",
         "bank",
+        "ocr",
+        "scan",
+        "scanned",
+        "pdf",
+        "expense",
+        "maintenance expense",
+        "bill",
     )
     business_record = any(term in lowered for term in business_terms)
+    # File shape also forces the document path — a PDF receipt is not gallery media.
+    if attachment_batch is not None:
+        for row in attachment_batch.attachments.filter(pk__in=attachment_ids):
+            name = str(row.original_filename or "").casefold()
+            ctype = str(row.content_type or "").casefold()
+            if (
+                ctype.startswith("application/pdf")
+                or name.endswith((".pdf", ".tif", ".tiff"))
+                or any(
+                    token in name
+                    for token in ("receipt", "invoice", "statement", "notice", "bill")
+                )
+            ):
+                business_record = True
+                break
     # A bare substring test read "these are NOT business documents" as a
     # business document, because it matched "document" and never looked at the
     # word in front of it. Correcting RAMA therefore reinforced the mistake it
@@ -2426,14 +2449,19 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
             "file(s) in this request not yet "
             f"placed. "
             + (
-                "Treat them as business documents. Use "
-                "catalog_business_document; do not use attach_photo_to_listing."
+                "Treat them as business documents. Call catalog_business_document "
+                "with attachment_id/upload_id and scope_query=street address "
+                "(holding). That path runs OCR and can propose a maintenance "
+                "expense. NEVER claim you lack OCR or a PDF scanner — that is false. "
+                "If the address is unclear, ask once which holding/address. "
+                "Do not use attach_photo_to_listing for receipts/PDFs."
                 if business_record
                 else (
                     "To put them on a listing call attach_photo_to_listing "
                     "ONCE with attachment_batch_id from this focus. That uses "
                     "only this message's ordered batch. Never substitute an "
-                    "older batch or global pending uploads."
+                    "older batch or global pending uploads. If they meant a "
+                    "receipt/expense, use catalog_business_document instead."
                 )
             )
         ),
@@ -2441,17 +2469,57 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
 
 
 def _address_scope_from_message(message: str, live_portfolio: dict) -> str:
-    """Return one exact known legal address mentioned in the current message."""
+    """Return one known legal address mentioned in the current message.
+
+    Accepts exact normalised containment ("950 mckenzie ave" inside the note)
+    and distinctive street tokens ("mckenzie") when only one portfolio address
+    matches — so a receipt for "950 McKenzie ave house" scopes without forcing
+    a room listing.
+    """
     from .document_services import _normalise_address
 
     needle = _normalise_address(message or "")
-    addresses = {
-        str(row.get("address") or "").strip()
-        for row in (live_portfolio.get("listings") or [])
-        if row.get("address")
-        and _normalise_address(str(row.get("address"))) in needle
-    }
-    return next(iter(addresses)) if len(addresses) == 1 else ""
+    if not needle:
+        return ""
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for row in (live_portfolio.get("listings") or []):
+        address = str(row.get("address") or "").strip()
+        if not address:
+            continue
+        key = _normalise_address(address)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if key in needle or all(
+            token in needle for token in key.split() if len(token) > 2
+        ):
+            candidates.append(address)
+            continue
+        # Distinctive street name only (e.g. "mckenzie") when unique in portfolio.
+        tokens = [t for t in key.split() if t.isalpha() and len(t) >= 5]
+        if any(token in needle for token in tokens):
+            candidates.append(address)
+    # De-dupe while preserving order.
+    ordered: list[str] = []
+    seen_addr: set[str] = set()
+    for address in candidates:
+        k = _normalise_address(address)
+        if k in seen_addr:
+            continue
+        seen_addr.add(k)
+        ordered.append(address)
+    if len(ordered) == 1:
+        return ordered[0]
+    # Prefer the longest exact containment match when several share a street.
+    exact = [
+        address
+        for address in ordered
+        if _normalise_address(address) in needle
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    return ""
 
 
 def _document_preview_reply(result: dict) -> str:
@@ -3235,12 +3303,17 @@ def run_turn(
                 )
 
     # Deterministic document routing: weak models repeatedly treated photographed
-    # bank mail as a listing photo. Once intent=document and an exact known legal
-    # address are present, the backend itself creates the holding-level preview.
+    # bank mail as a listing photo, or denied OCR exists. Once intent=document
+    # (or the file is a PDF/receipt) and a known legal address is present, the
+    # backend itself creates the holding-level preview with OCR.
     if (
         deterministic_reply is None
         and pending_plan is None
-        and attachment_focus.get("landlord_described_as_business_record")
+        and (
+            attachment_focus.get("landlord_described_as_business_record")
+            or supported_tool_for_request(message) == "catalog_business_document"
+        )
+        and attachment_focus
     ):
         attachment_ids = (
             (attachment_focus.get("attachment_ids") or [])

@@ -213,11 +213,42 @@ def batch_chat_note(batch: RamaAttachmentBatch) -> str:
     labels = ", ".join(
         f"{row.sequence + 1}:{row.pk}:{row.original_filename}" for row in rows
     )
+    looks_document = any(
+        (
+            (row.content_type or "").casefold().startswith("application/pdf")
+            or str(row.original_filename or "").casefold().endswith(
+                (".pdf", ".tif", ".tiff", ".heic", ".heif")
+            )
+            or any(
+                token in str(row.original_filename or "").casefold()
+                for token in (
+                    "receipt",
+                    "invoice",
+                    "statement",
+                    "notice",
+                    "bill",
+                )
+            )
+        )
+        for row in rows
+    )
+    routing = (
+        "These files look like business documents (PDF/receipt/invoice). "
+        "Call catalog_business_document with attachment_id for each file and "
+        "scope_query=the street address or holding. That path runs OCR, files "
+        "the archival PDF, and can propose a maintenance expense against the "
+        "holding — never say you lack OCR or a PDF scanner. "
+        if looks_document
+        else (
+            "Determine whether the landlord means property media or business "
+            "documents from their words. For a receipt/invoice/notice/PDF use "
+            "catalog_business_document (OCR). For listing media use "
+            "attach_photo_to_listing with attachment_batch_id. "
+        )
+    )
     return (
         f"\n\n[RAMA attachment batch {batch.pk}; exactly {len(rows)} file(s); "
         f"items={labels}]\n"
-        "Use only this batch for this request. Determine whether the landlord "
-        "means property media or business documents from their words. For listing "
-        "media call attach_photo_to_listing with attachment_batch_id set to "
-        "this batch ID. Never substitute older uploads or an unmentioned batch."
+        f"Use only this batch for this request. {routing}"
+        "Never substitute older uploads or an unmentioned batch."
     )

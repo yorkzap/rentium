@@ -109,6 +109,22 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "change from july to august",
         "new time for viewing",
     ),
+    "catalog_business_document": (
+        "ocr",
+        "scan receipt",
+        "pdf receipt",
+        "invoice document",
+        "maintenance expense receipt",
+        "file against holding",
+        "business document",
+        "scanned bill",
+    ),
+    "create_expense": (
+        "maintenance expense",
+        "record expense",
+        "log receipt cost",
+        "post expense",
+    ),
     "link": (
         "public link",
         "listing url",
@@ -259,6 +275,15 @@ def supported_tool_for_request(request: str) -> str | None:
         text,
     ):
         return "reallocate_expense"
+    # Receipts / PDFs / OCR — never allow a false "I can't scan" gap.
+    if re.search(
+        r"\b(ocr|scan|scanned|scanner)\b"
+        r"|\b(receipt|invoice|pdf|statement|notice|paperwork)\b.+\b(expense|maintenance|holding|address|house|property)\b"
+        r"|\b(maintenance expense|record (an? )?expense|log (an? )?(receipt|expense|bill))\b"
+        r"|\b(file|catalog|archive)\b.+\b(document|receipt|invoice|pdf)\b",
+        text,
+    ):
+        return "catalog_business_document"
     # Leases — the most common false "I can't create a lease" gap.
     # Deliberately exclude co-landlord / co-host / invite-only phrasings.
     if not re.search(

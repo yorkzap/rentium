@@ -220,6 +220,14 @@ from rentium.rama.capabilities import supported_tool_for_request
             "send me the public link for that listing",
             "public_property_link",
         ),
+        (
+            "scan this pdf receipt as a maintenance expense for 950 McKenzie",
+            "catalog_business_document",
+        ),
+        (
+            "you should have used OCR on that receipt",
+            "catalog_business_document",
+        ),
     ],
 )
 def test_common_landlord_asks_map_to_existing_tools(phrase, tool):
