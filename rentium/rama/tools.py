@@ -1763,16 +1763,19 @@ def update_property(
     max_occupancy: str = "",
     square_footage: str = "",
     is_publicly_visible: str = "",
+    furnishing_status: str = "",
+    furnishing_details: str = "",
     pick: str = "",
     confirm: str = "",
 ) -> dict:
     """Update (edit) an existing listing's fields — this includes RENAMING it:
     to rename a listing, call update_property with name=<the new name>. Also
-    sets status/description/address/city/province/asking_rent/visibility and
-    structured category/layout fields. For "full suite/unit", set
-    property_category=COMPLETE_UNIT (and unit_type when known); do not rewrite
-    the description. Questions such as "how many rooms?" are read-only and must
-    use list_properties, not this tool.
+    sets status/description/address/city/province/asking_rent/visibility,
+    furnishing_status (furnished|semi_furnished|unfurnished) and optional
+    furnishing_details, and structured category/layout fields. For "full suite/
+    unit", set property_category=COMPLETE_UNIT (and unit_type when known); do not
+    rewrite the description. Questions such as "how many rooms?" are read-only
+    and must use list_properties, not this tool.
     Renaming works even if the listing has a signed lease (the name is just a
     label; nothing about the tenancy changes). If the name/id matches two
     listings (duplicates), add pick=oldest|newest|1|2. Preview first, then
@@ -1785,7 +1788,10 @@ def update_property(
         unit_type=unit_type, room_type=room_type, bedrooms=bedrooms,
         bathrooms=bathrooms, max_occupancy=max_occupancy,
         square_footage=square_footage,
-        is_publicly_visible=is_publicly_visible, pick=pick, confirm=confirm,
+        is_publicly_visible=is_publicly_visible,
+        furnishing_status=furnishing_status,
+        furnishing_details=furnishing_details,
+        pick=pick, confirm=confirm,
     )
 
 

@@ -631,12 +631,12 @@ class RoommateFormat(LeaseFormat):
                 room_rows.append(
                     Row("Approximate size", f"{room.square_footage} sq ft")
                 )
+            from rentium.properties.furnishing import furnishing_label
+
             room_rows.append(
                 Row(
-                    "Furnished",
-                    "Yes — see what's included below."
-                    if room.is_furnished
-                    else "No — the room comes unfurnished.",
+                    "Furnishing",
+                    furnishing_label(room),
                 )
             )
             out.append(Section(id="your_room", title="2. Your Room", rows=room_rows))
@@ -646,16 +646,24 @@ class RoommateFormat(LeaseFormat):
             contents = (
                 summary["sleeping"] + summary["furniture"] + summary["appliances"]
             )
+            detail_rows = []
+            if (getattr(room, "furnishing_details", None) or "").strip():
+                detail_rows.append(
+                    Row("Details", room.furnishing_details.strip(), block=True)
+                )
             if contents:
+                detail_rows.append(Row("Included items", ", ".join(contents), block=True))
+            if detail_rows:
                 out.append(
                     Section(
                         id="room_contents",
                         title="3. What Comes With Your Room",
                         note=(
-                            "Taken from the property's inventory. Condition is recorded "
-                            "in the move-in inspection."
+                            "Furnishing status is set on the listing. Specific items "
+                            "come from inventory; condition is recorded in the "
+                            "move-in inspection."
                         ),
-                        rows=[Row("Included", ", ".join(contents), block=True)],
+                        rows=detail_rows,
                     )
                 )
 

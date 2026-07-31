@@ -75,10 +75,13 @@ def test_pending_lease_start_date_and_semi_furnished(pending_lease, landlord):
     pending_lease.property.refresh_from_db()
     assert pending_lease.start_date == date(2026, 9, 1)
     assert pending_lease.end_date == date(2026, 12, 31)
+    assert pending_lease.property.furnishing_status == "SEMI_FURNISHED"
     assert pending_lease.property.is_furnished is True
     assert InventoryItem.objects.filter(
         property=pending_lease.property, name__icontains="bed"
     ).exists()
+    assert "lease" in done["message"].casefold()
+    assert "RMT415536-0617" in done["message"]
 
 
 def test_update_lease_alone_can_change_pending_start(pending_lease, landlord):

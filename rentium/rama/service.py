@@ -286,7 +286,15 @@ def _write_result_message(tool: str, result: dict, target: str = "") -> str:
         if before and after and before != after:
             return f"Renamed {before} to {after}."
         if after:
-            return f"Updated {after}."
+            return f"Updated listing {after}."
+    lease_number = str(result.get("lease_number") or "").strip()
+    prop_name = str(result.get("property") or "").strip()
+    if result.get("updated") and lease_number:
+        applied = result.get("applied") or []
+        detail = f" ({', '.join(str(a) for a in applied)})" if applied else ""
+        if prop_name:
+            return f"Updated lease {lease_number} for {prop_name}{detail}."
+        return f"Updated lease {lease_number}{detail}."
     label = _write_label(result) or target
     if result.get("created") and label:
         return f"Created {label}."

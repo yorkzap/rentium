@@ -72,11 +72,30 @@ def _recompute_furnishing(prop) -> None:
     from .models import Property
 
     try:
-        value = compute_is_furnished(prop)
-        if prop.is_furnished != value:
+        # Reload status/details so inventory saves see the latest declaration.
+        fresh = (
+            Property.objects.filter(pk=prop.pk)
+            .only("pk", "furnishing_status", "furnishing_details", "property_category", "is_furnished")
+            .first()
+        )
+        if fresh is None:
+            return
+        value = compute_is_furnished(fresh)
+        if fresh.is_furnished != value:
             Property.objects.filter(pk=prop.pk).update(is_furnished=value)
     except Exception:  # a derived flag must never break an inventory save
         logger.exception("Furnishing recompute failed for property %s", prop.pk)
+
+
+@receiver(
+    post_save,
+    sender="properties.Property",
+    dispatch_uid="recompute_furnishing_on_property_save",
+)
+def recompute_furnishing_on_property_save(sender, instance, raw=False, **kwargs):
+    if raw:
+        return
+    _recompute_furnishing(instance)
 
 
 @receiver(

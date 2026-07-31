@@ -268,9 +268,11 @@ ONLY when they explicitly want zero security deposit. \
 update_lease / adjust_lease on DRAFT and PENDING (awaiting signatures) leases — \
 start_date, end_date, rent, terms are editable until ACTIVE. NEVER refuse a \
 PENDING start-date change or invent "terminate + recreate". For furnished / \
-semi-furnished / unfurnished use adjust_lease (furnishing is inventory on the \
-listing: a bed → furnished on the PDF), not a fake lease flag. Only ACTIVE / \
-EXPIRED / TERMINATED / RENEWED are locked. \
+semi-furnished / unfurnished use adjust_lease (sets listing furnishing_status \
+shown on the roommate PDF, and can seed inventory). update_property also accepts \
+furnishing_status + furnishing_details. Only ACTIVE / EXPIRED / TERMINATED / \
+RENEWED leases are locked. After a lease edit, report "Updated lease <number> \
+for <listing>" — never just "Updated Room D". \
 delete_draft_lease = DRAFT only; else terminate_lease (voids open charges). \
 landlord_sign_lease requires fully allocated rent. \
 Roster: list_lease_roster first. ADD roommate → add_roommate_to_lease (never replace). \

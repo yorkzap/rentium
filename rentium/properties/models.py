@@ -619,15 +619,46 @@ class Property(models.Model):
         help_text=_("Blank = available now."),
     )
 
+    class FurnishingStatus(models.TextChoices):
+        """What the landlord advertises / puts on the lease for this offering.
+
+        Distinct from inventory (what's physically listed) and from
+        is_furnished (SQL cache for public filters). Semi-furnished is a
+        real marketing choice: bed may be included without a full suite.
+        """
+
+        UNFURNISHED = "UNFURNISHED", _("Unfurnished")
+        SEMI_FURNISHED = "SEMI_FURNISHED", _("Semi-furnished")
+        FURNISHED = "FURNISHED", _("Furnished")
+
+    furnishing_status = models.CharField(
+        _("Furnishing"),
+        max_length=20,
+        choices=FurnishingStatus.choices,
+        default=FurnishingStatus.UNFURNISHED,
+        help_text=_(
+            "What you advertise and put on the lease: unfurnished, "
+            "semi-furnished, or furnished. Inventory still lists specific "
+            "items; this is the one-word choice for the agreement."
+        ),
+    )
+    furnishing_details = models.TextField(
+        _("Furnishing details"),
+        blank=True,
+        help_text=_(
+            "Optional note for the lease/listing, e.g. 'bed and dresser only' "
+            "or 'tenant must supply mattress'."
+        ),
+    )
+
     is_furnished = models.BooleanField(
-        _("Furnished"),
+        _("Furnished (filter cache)"),
         default=False,
         editable=False,
         help_text=_(
-            "DERIVED, never entered by hand — computed from this property's "
-            "inventory (see properties/furnishing.py) and refreshed by signal "
-            "whenever inventory changes. Denormalised only so the public city "
-            "page can filter on it in SQL."
+            "DERIVED cache for public SQL filters. True when furnishing_status "
+            "is furnished/semi-furnished, or inventory contains a bed "
+            "(see properties/furnishing.py). Not entered by hand."
         ),
     )
 

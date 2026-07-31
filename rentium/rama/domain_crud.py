@@ -1553,6 +1553,8 @@ def update_property(
     max_occupancy: str = "",
     square_footage: str = "",
     is_publicly_visible: str = "",
+    furnishing_status: str = "",
+    furnishing_details: str = "",
     pick: str = "",
     confirm: str = "",
 ) -> dict:
@@ -1711,6 +1713,39 @@ def update_property(
                 return {"error": str(exc)}
     if is_publicly_visible != "":
         changes["is_publicly_visible"] = _truthy(is_publicly_visible)
+    if furnishing_status.strip():
+        raw = (
+            furnishing_status.strip()
+            .upper()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        alias = {
+            "SEMI": "SEMI_FURNISHED",
+            "SEMI_FURNISHED": "SEMI_FURNISHED",
+            "SEMIFURNISHED": "SEMI_FURNISHED",
+            "PARTIAL": "SEMI_FURNISHED",
+            "PARTIALLY_FURNISHED": "SEMI_FURNISHED",
+            "FULL": "FURNISHED",
+            "FULLY_FURNISHED": "FURNISHED",
+            "FURNISHED": "FURNISHED",
+            "UNFURNISHED": "UNFURNISHED",
+            "NONE": "UNFURNISHED",
+            "EMPTY": "UNFURNISHED",
+        }
+        code = alias.get(raw) or _choice_code(
+            Property.FurnishingStatus.choices, furnishing_status,
+        )
+        if code is None:
+            return {
+                "error": (
+                    "furnishing_status must be furnished, semi_furnished, "
+                    "or unfurnished."
+                ),
+            }
+        changes["furnishing_status"] = code
+    if furnishing_details != "":
+        changes["furnishing_details"] = furnishing_details.strip()[:2000]
 
     requested_a_field = any(
         value != ""
@@ -1730,6 +1765,8 @@ def update_property(
             max_occupancy,
             square_footage,
             is_publicly_visible,
+            furnishing_status,
+            furnishing_details,
         )
     )
     if not changes and requested_a_field:
@@ -2743,12 +2780,20 @@ def update_lease(
 
         rebalance_lease_rent_shares(lease, force_equal_unsigned=True)
 
+    prop_name = lease.property.name if lease.property_id else ""
     return {
         "updated": True,
         "lease_number": lease.lease_number,
         "status": lease.status,
         "total_rent": str(lease.total_rent),
+        "property": prop_name,
         "applied": list(changes.keys()),
+        "message": (
+            f"Updated lease {lease.lease_number} for {prop_name}: "
+            f"{', '.join(changes.keys())}."
+            if prop_name
+            else f"Updated lease {lease.lease_number}: {', '.join(changes.keys())}."
+        ),
     }
 
 
@@ -2827,6 +2872,8 @@ def adjust_lease(
             ),
         }
 
+    from rentium.properties.models import Property as PropModel
+
     mode = (
         (furnishing or "")
         .strip()
@@ -2834,12 +2881,16 @@ def adjust_lease(
         .replace("-", "_")
         .replace(" ", "_")
     )
+    status_code = ""
     if mode in ("furnished", "fully_furnished", "full"):
         mode = "furnished"
+        status_code = PropModel.FurnishingStatus.FURNISHED
     elif mode in ("semi", "semi_furnished", "semifurnished", "partially_furnished"):
         mode = "semi_furnished"
+        status_code = PropModel.FurnishingStatus.SEMI_FURNISHED
     elif mode in ("unfurnished", "un_furnished", "none", "empty"):
         mode = "unfurnished"
+        status_code = PropModel.FurnishingStatus.UNFURNISHED
     elif mode:
         return {
             "error": (
@@ -2882,31 +2933,13 @@ def adjust_lease(
         _need("Mattress")
         _need("Dresser")
         _need("Nightstand")
-        furnishing_note = "Room is furnished."
+        furnishing_note = ""
     elif mode == "semi_furnished":
         _need("Queen bed")
         _need("Mattress")
-        furnishing_note = "Room is semi-furnished (bed included; other items limited)."
+        furnishing_note = "Bed and mattress included; other furniture limited."
     elif mode == "unfurnished":
-        furnishing_note = (
-            "Landlord asked for unfurnished. Existing inventory is left as-is "
-            "(removing beds would change the listing for all future leases — "
-            "say remove inventory items if you want that)."
-        )
-
-    # Surface furnishing note in special_terms when not already present.
-    if furnishing_note and mode in ("furnished", "semi_furnished"):
-        current_terms = changes.get("special_terms", lease.special_terms or "")
-        if "semi-furnished" not in current_terms.casefold() and mode == "semi_furnished":
-            changes["special_terms"] = (
-                (current_terms + "\n\n" if current_terms else "")
-                + furnishing_note
-            ).strip()[:5000]
-        elif "furnished" not in current_terms.casefold() and mode == "furnished":
-            changes["special_terms"] = (
-                (current_terms + "\n\n" if current_terms else "")
-                + furnishing_note
-            ).strip()[:5000]
+        furnishing_note = ""
 
     if not changes and not inventory_to_add and not (mode == "unfurnished"):
         return {
@@ -2916,31 +2949,31 @@ def adjust_lease(
             ),
         }
 
-    will_be_furnished = bool(prop.is_furnished) or bool(inventory_to_add)
     preview = {
         "lease_number": lease.lease_number,
         "property": prop.name,
         "status": lease.status,
         "editable": True,
         "note": (
-            "PENDING/DRAFT leases can be field-edited. Furnishing is derived "
-            "from inventory on the listing (a bed → furnished on the PDF)."
+            "PENDING/DRAFT leases can be field-edited. Furnishing status is "
+            "stored on the listing and shown on the roommate agreement PDF."
         ),
         "lease_changes": {
             k: (str(v) if not isinstance(v, (list, dict)) else v)
             for k, v in changes.items()
         },
+        "listing_furnishing_status": status_code or None,
+        "listing_furnishing_details": furnishing_note or None,
         "inventory_to_add": inventory_to_add or None,
         "furnishing": mode or None,
+        "property_furnishing_status_now": prop.furnishing_status,
         "property_is_furnished_now": bool(prop.is_furnished),
-        "property_will_read_as_furnished": will_be_furnished if mode else bool(prop.is_furnished),
-        "unfurnished_note": furnishing_note if mode == "unfurnished" else None,
     }
     if not _confirmed(confirm):
         return _preview(
             "adjust_lease",
             preview,
-            "Updates the unlocked lease and listing inventory in one step.",
+            "Updates the unlocked lease and listing furnishing in one step.",
         )
 
     applied: list[str] = []
@@ -2954,6 +2987,17 @@ def adjust_lease(
             return _validation_error_payload(exc)
         applied.extend(changes.keys())
 
+    if status_code:
+        prop.furnishing_status = status_code
+        if furnishing_note:
+            prop.furnishing_details = furnishing_note[:2000]
+        elif mode == "unfurnished":
+            prop.furnishing_details = ""
+        prop.save(
+            update_fields=["furnishing_status", "furnishing_details", "updated_at"],
+        )
+        applied.append("furnishing_status")
+
     created_items = []
     for name in inventory_to_add:
         item = InventoryItem.objects.create(
@@ -2965,7 +3009,9 @@ def adjust_lease(
         created_items.append({"id": str(item.pk), "name": item.name})
     if created_items:
         applied.append("inventory")
-        prop.refresh_from_db()
+    prop.refresh_from_db()
+
+    from rentium.properties.furnishing import furnishing_label
 
     return {
         "updated": True,
@@ -2975,17 +3021,14 @@ def adjust_lease(
         "end_date": str(lease.end_date) if lease.end_date else None,
         "property": prop.name,
         "property_is_furnished": bool(prop.is_furnished),
+        "furnishing_status": prop.furnishing_status,
+        "furnishing_label": furnishing_label(prop),
         "inventory_added": created_items,
         "applied": applied,
         "message": (
-            f"Updated {lease.lease_number}: "
-            + ", ".join(applied)
-            + (
-                f". Listing now reads "
-                f"{'furnished' if prop.is_furnished else 'unfurnished'}."
-                if "inventory" in applied or mode
-                else "."
-            )
+            f"Updated lease {lease.lease_number} for {prop.name}: "
+            f"{', '.join(applied)}. "
+            f"Furnishing on the listing/PDF: {furnishing_label(prop)}."
         ),
     }
 

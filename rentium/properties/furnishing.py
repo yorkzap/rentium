@@ -210,11 +210,21 @@ def summarise_inventory(items) -> dict:
 
 def compute_is_furnished(prop) -> bool:
     """
-    The single source of truth for the derived flag. Called by the signal in
-    properties/signals.py and by the `recompute_furnishing` management command.
+    Cache for public filters. True when the landlord declared furnished or
+    semi-furnished, OR inventory still has a bed (legacy path). Called by the
+    signal in properties/signals.py and recompute_furnishing.
     """
     from .models import InventoryItem
     from .models import Property
+
+    status = getattr(prop, "furnishing_status", None) or ""
+    if status in (
+        Property.FurnishingStatus.FURNISHED,
+        Property.FurnishingStatus.SEMI_FURNISHED,
+        "FURNISHED",
+        "SEMI_FURNISHED",
+    ):
+        return True
 
     items = list(InventoryItem.objects.filter(property=prop).only("name", "quantity"))
     if not items:
@@ -235,3 +245,28 @@ def compute_is_furnished(prop) -> bool:
         1 for c in categories if c in (CATEGORY_FURNITURE, CATEGORY_APPLIANCE)
     )
     return supporting >= 2
+
+
+def furnishing_label(prop) -> str:
+    """Human line for lease PDFs and RAMA."""
+    from .models import Property
+
+    status = getattr(prop, "furnishing_status", None) or Property.FurnishingStatus.UNFURNISHED
+    try:
+        label = prop.get_furnishing_status_display()
+    except Exception:  # noqa: BLE001
+        label = {
+            Property.FurnishingStatus.FURNISHED: "Furnished",
+            Property.FurnishingStatus.SEMI_FURNISHED: "Semi-furnished",
+            Property.FurnishingStatus.UNFURNISHED: "Unfurnished",
+        }.get(status, "Unfurnished")
+    details = (getattr(prop, "furnishing_details", None) or "").strip()
+    if details:
+        return f"{label} — {details}"
+    if status == Property.FurnishingStatus.UNFURNISHED and not prop.is_furnished:
+        return "Unfurnished — the room comes without furniture."
+    if status == Property.FurnishingStatus.SEMI_FURNISHED:
+        return "Semi-furnished — see inventory and details below."
+    if status == Property.FurnishingStatus.FURNISHED or prop.is_furnished:
+        return "Furnished — see what's included below."
+    return label

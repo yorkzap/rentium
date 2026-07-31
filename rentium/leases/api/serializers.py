@@ -662,6 +662,13 @@ class LeaseSerializer(serializers.ModelSerializer):
     property_address = serializers.CharField(
         source="property.address", read_only=True, allow_null=True
     )
+    property_furnishing_status = serializers.CharField(
+        source="property.furnishing_status", read_only=True, allow_null=True
+    )
+    property_furnishing_details = serializers.CharField(
+        source="property.furnishing_details", read_only=True, allow_null=True
+    )
+    property_furnishing_label = serializers.SerializerMethodField()
     group_name = serializers.CharField(
         source="group.name", read_only=True, allow_null=True
     )
@@ -717,6 +724,9 @@ class LeaseSerializer(serializers.ModelSerializer):
             "property",
             "property_name",
             "property_address",
+            "property_furnishing_status",
+            "property_furnishing_details",
+            "property_furnishing_label",
             "group_id",
             "group",
             "group_name",
@@ -811,6 +821,13 @@ class LeaseSerializer(serializers.ModelSerializer):
 
     def get_is_locked(self, obj):
         return obj.is_locked()
+
+    def get_property_furnishing_label(self, obj):
+        if not obj.property_id:
+            return None
+        from rentium.properties.furnishing import furnishing_label
+
+        return furnishing_label(obj.property)
 
     def get_unallocated_rent(self, obj):
         return obj.get_unallocated_rent()

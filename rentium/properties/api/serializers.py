@@ -461,7 +461,9 @@ class PropertySerializer(serializers.ModelSerializer):
             "public_slug",
             "asking_rent",
             "available_from",
-            "is_furnished",  # read-only: derived from inventory
+            "furnishing_status",
+            "furnishing_details",
+            "is_furnished",  # read-only cache for filters
             "neighbourhood",
             "building_amenities",
             "default_bills_included",
