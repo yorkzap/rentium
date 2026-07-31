@@ -292,6 +292,11 @@ def _write_result_message(tool: str, result: dict, target: str = "") -> str:
         if paid:
             bits.append(f"(paid {paid})")
         return " ".join(bits) + "."
+    if tool == "void_ledger_entry" and result.get("voided"):
+        return str(
+            result.get("message")
+            or f"Voided {result.get('count') or 1} ledger entry(ies)."
+        )
     if tool == "update_property":
         before = str(result.get("previous_name") or target or "").strip()
         prop = result.get("property") or {}
@@ -1409,6 +1414,20 @@ def _preview_reply(tool: str, result: dict) -> str:
         if preview.get("duplicate_warning"):
             lines.append(f"• Note: {preview['duplicate_warning']}")
         lines.append("Reply yes to post this expense, or no to cancel.")
+        return "\n".join(lines)
+    if tool == "void_ledger_entry":
+        entries = preview.get("entries") or []
+        lines = [
+            f"Void {preview.get('count') or len(entries)} expense(s) "
+            f"(reversal — originals stay for audit):",
+        ]
+        for e in entries[:10]:
+            lines.append(
+                f"• ${e.get('amount')} — {(e.get('description') or '')[:90]}"
+            )
+        if preview.get("reason"):
+            lines.append(f"Reason: {preview['reason']}")
+        lines.append("Reply yes to void, or no to cancel.")
         return "\n".join(lines)
     if tool == "create_house_layout":
         holding = preview.get("holding") or {}
@@ -2574,6 +2593,14 @@ _NO_RECEIPT_RE = re.compile(
     r"already been recorded|already recorded)",
     re.IGNORECASE,
 )
+# "void the expense" must NEVER become create_expense with description "void…".
+_VOID_EXPENSE_RE = re.compile(
+    r"\b(void|reverse|undo|cancel|delete|remove)\b.{0,40}\b("
+    r"expense|charge|entry|ledger|posting|cost|bill)\b"
+    r"|\bvoid\b.{0,20}\b(the |this |that |wrong |both |two )?"
+    r"|\b(void|reverse) (it|them|both|those)\b",
+    re.IGNORECASE,
+)
 
 
 def _message_has_new_file(message: str) -> bool:
@@ -2583,6 +2610,56 @@ def _message_has_new_file(message: str) -> bool:
         or re.search(r"RAMA attachment batch", text)
         or re.search(r"Business document [0-9a-fA-F-]{32,36}", text)
     )
+
+
+def _void_expense_intent(landlord, message: str) -> dict | None:
+    """Parse 'void the $125 window screens expense' → void_ledger_entry."""
+    if _message_has_new_file(message):
+        return None
+    text = _landlord_words(message or "").strip()
+    if not text or not _VOID_EXPENSE_RE.search(text):
+        return None
+    money = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)", text)
+    if not money:
+        money = re.search(r"\b(\d+\.\d{2})\b", text)
+    amount = money.group(1) if money else ""
+    # Prefer distinctive words from the message for description_query.
+    # Strip void-command noise so we match the ORIGINAL expense text.
+    q = text
+    q = re.sub(
+        r"\b(void|reverse|undo|cancel|delete|remove|the wrong|wrong|both|two|"
+        r"these|those|please|expense|charge|entry|ledger|not yet taken|"
+        r"already paid|paid)\b",
+        " ",
+        q,
+        flags=re.IGNORECASE,
+    )
+    q = re.sub(r"\$\s*\d+(?:\.\d{1,2})?", " ", q)
+    q = re.sub(r"[−–—-]\s*\$?", " ", q)
+    q = re.sub(r"\s+", " ", q).strip(" .,;:\"'")
+    # Fallback keywords for common cases.
+    if len(q) < 4 and "screen" in text.casefold():
+        q = "window screens"
+    if len(q) < 4 and amount:
+        q = amount
+    if not q and not amount:
+        return None
+    reason = "Landlord requested void via chat"
+    if "wrong" in text.casefold():
+        reason = "Posted in error / wrong expense"
+    # void_all when they say both/two/all of these $X
+    void_all = bool(
+        re.search(r"\b(both|two|all|every|each)\b", text, re.IGNORECASE)
+    )
+    return {
+        "tool": "void_ledger_entry",
+        "arguments": {
+            "description_query": q[:120] if q else "",
+            "amount": amount,
+            "reason": reason,
+            "void_all": "yes" if void_all else "",
+        },
+    }
 
 
 def _verbal_expense_intent(landlord, message: str, live_portfolio: dict) -> dict | None:
@@ -2595,6 +2672,9 @@ def _verbal_expense_intent(landlord, message: str, live_portfolio: dict) -> dict
         return None
     text = _landlord_words(message or "").strip()
     if not text:
+        return None
+    # Void/reverse is a ledger control — never create_expense.
+    if _VOID_EXPENSE_RE.search(text) or text.casefold().startswith("void "):
         return None
     # Explicit "no receipt / something new" is enough even without "bought".
     looks_expense = bool(_VERBAL_EXPENSE_RE.search(text)) or bool(
@@ -3477,39 +3557,74 @@ def run_turn(
                     result.get("error") or result.get("message") or result,
                 )
 
+    def _run_money_intent(intent: dict) -> str | None:
+        result = execute(
+            intent["tool"], intent["arguments"], landlord=landlord,
+        )
+        safe_result = json.loads(json.dumps(result, default=str))
+        tools_used.append(intent["tool"])
+        audit(
+            RamaAudit.Kind.TOOL_CALL,
+            {
+                "tool": intent["tool"],
+                "arguments": intent["arguments"],
+                "result": safe_result,
+                "deterministic_routing": True,
+            },
+        )
+        if result.get("needs_confirm"):
+            save_single(
+                landlord,
+                conversation_id,
+                intent["tool"],
+                intent["arguments"],
+            )
+            return _preview_reply(intent["tool"], result)
+        if result.get("error"):
+            # Multi-match for void → offer void_all path in plain language.
+            if isinstance(result, dict) and result.get("matches"):
+                lines = [str(result.get("error") or "Multiple matches:")]
+                for m in result["matches"][:8]:
+                    lines.append(
+                        f"• ${m.get('amount')} — {m.get('description')} "
+                        f"(id {m.get('id')})"
+                    )
+                lines.append(
+                    "Say “void both $AMOUNT …” or pass a specific id."
+                )
+                return "\n".join(lines)
+            return str(result["error"] if isinstance(result, dict) else result)
+        if result.get("created") or result.get("voided"):
+            return _write_result_message(intent["tool"], result)
+        return str(result.get("message") or result)
+
+    # Void/reverse expenses BEFORE create_expense — "void the $125…" must not
+    # post a new expense named "void the $125…".
+    if deterministic_reply is None and pending_plan is None:
+        intent = _void_expense_intent(landlord, message)
+        if intent is not None:
+            # If several match and they didn't say both, still try amount-only
+            # void_all when the message clearly wants the wrong duplicates gone.
+            text_l = _landlord_words(message).casefold()
+            if (
+                not intent["arguments"].get("void_all")
+                and "wrong" in text_l
+                and intent["arguments"].get("amount")
+            ):
+                # Preview without void_all first; if multi-match, retry as all.
+                first = execute(
+                    intent["tool"], intent["arguments"], landlord=landlord,
+                )
+                if isinstance(first, dict) and first.get("matches"):
+                    intent["arguments"]["void_all"] = "yes"
+            deterministic_reply = _run_money_intent(intent)
+
     # Verbal cash expense with no receipt this turn — before document OCR path,
     # so an old pending receipt cannot steal "I bought Draino for $18".
     if deterministic_reply is None and pending_plan is None:
         intent = _verbal_expense_intent(landlord, message, safe_context)
         if intent is not None:
-            result = execute(
-                intent["tool"], intent["arguments"], landlord=landlord,
-            )
-            safe_result = json.loads(json.dumps(result, default=str))
-            tools_used.append(intent["tool"])
-            audit(
-                RamaAudit.Kind.TOOL_CALL,
-                {
-                    "tool": intent["tool"],
-                    "arguments": intent["arguments"],
-                    "result": safe_result,
-                    "deterministic_routing": True,
-                },
-            )
-            if result.get("needs_confirm"):
-                save_single(
-                    landlord,
-                    conversation_id,
-                    intent["tool"],
-                    intent["arguments"],
-                )
-                deterministic_reply = _preview_reply(intent["tool"], result)
-            elif result.get("error"):
-                deterministic_reply = str(result["error"])
-            elif result.get("created"):
-                deterministic_reply = _write_result_message(
-                    intent["tool"], result,
-                )
+            deterministic_reply = _run_money_intent(intent)
 
     # Deterministic document routing: weak models repeatedly treated photographed
     # invoices as listing photos, or claimed OCR does not exist. Once intent is

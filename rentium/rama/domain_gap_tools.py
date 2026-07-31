@@ -34,31 +34,75 @@ from .domain_crud import (
 # ---------------------------------------------------------------------------
 
 
-def _resolve_ledger_entry(landlord, entry_id: str = "", description_query: str = ""):
+def _resolve_ledger_entries(
+    landlord,
+    entry_id: str = "",
+    description_query: str = "",
+    amount: str = "",
+    *,
+    allow_multiple: bool = False,
+):
+    """Find live (non-voided) ledger rows by id, description, and/or amount."""
+    from decimal import Decimal
+    from decimal import InvalidOperation
+
+    from rentium.ledger.models import EntryType
     from rentium.ledger.models import LedgerEntry
 
     eid = (entry_id or "").strip()
     if eid:
         entry = (
             LedgerEntry.objects.filter(landlord=landlord, pk=eid)
-            .select_related("lease", "property", "tenant")
+            .select_related("lease", "property", "tenant", "holding")
             .first()
         )
         if not entry:
             return None, f"No ledger entry {eid!r}."
-        return entry, None
+        if entry.voided:
+            return None, f"Entry {eid} is already voided."
+        return [entry], None
+
     q = (description_query or "").strip()
-    if not q:
-        return None, "Pass entry_id or description_query."
+    amt = None
+    raw_amt = (amount or "").strip().replace("$", "").replace(",", "")
+    if raw_amt:
+        try:
+            amt = Decimal(raw_amt)
+        except (InvalidOperation, ValueError):
+            return None, f"Invalid amount {amount!r}."
+
+    if not q and amt is None:
+        return None, "Pass entry_id, description_query, and/or amount."
+
     qs = (
-        LedgerEntry.objects.filter(landlord=landlord, description__icontains=q)
+        LedgerEntry.objects.filter(landlord=landlord)
         .filter(reversed_by__isnull=True)
+        .select_related("lease", "property", "tenant", "holding")
         .order_by("-effective_date", "-created_at")
     )
-    n = qs.count()
+    # Prefer expenses when voiding costs; still allow other types by id.
+    if q or amt is not None:
+        qs = qs.filter(entry_type=EntryType.EXPENSE)
+    if q:
+        # Token AND: "window screens" matches description containing both words.
+        tokens = [t for t in q.replace('"', " ").split() if len(t) >= 3]
+        if not tokens:
+            tokens = [q]
+        for token in tokens[:6]:
+            qs = qs.filter(description__icontains=token)
+    if amt is not None:
+        qs = qs.filter(amount=amt)
+
+    rows = list(qs[:20])
+    # Drop any already voided (property may exist even with reversed_by null edge).
+    rows = [e for e in rows if not e.voided]
+    n = len(rows)
     if n == 0:
-        return None, f"No ledger entry matching {description_query!r}."
-    if n > 1:
+        return None, (
+            f"No open expense matching "
+            f"{description_query or amount or entry_id!r}."
+        )
+    if n > 1 and not allow_multiple:
         sample = [
             {
                 "id": str(e.pk),
@@ -67,13 +111,25 @@ def _resolve_ledger_entry(landlord, entry_id: str = "", description_query: str =
                 "description": (e.description or "")[:80],
                 "date": str(e.effective_date or e.due_date or ""),
             }
-            for e in qs[:8]
+            for e in rows[:8]
         ]
         return None, {
-            "error": f"Multiple entries match {description_query!r}; pass entry_id.",
+            "error": (
+                f"Multiple expenses match ({n}). Pass entry_id, or say "
+                f"'void both/all' with the amount so I void every match."
+            ),
             "matches": sample,
         }
-    return qs.first(), None
+    return rows, None
+
+
+def _resolve_ledger_entry(landlord, entry_id: str = "", description_query: str = ""):
+    rows, err = _resolve_ledger_entries(
+        landlord, entry_id=entry_id, description_query=description_query
+    )
+    if err:
+        return None, err
+    return rows[0], None
 
 
 def void_ledger_entry(
@@ -81,13 +137,25 @@ def void_ledger_entry(
     *,
     entry_id: str = "",
     description_query: str = "",
+    amount: str = "",
     reason: str = "",
+    void_all: str = "",
     confirm: str = "",
 ) -> dict:
-    """Void a ledger entry via equal-and-opposite REVERSAL (append-only)."""
+    """Void a ledger entry via equal-and-opposite REVERSAL (append-only).
+
+    Pass void_all=yes to void every open match (e.g. two mistaken $125 posts).
+    """
     from rentium.ledger import services as ledger_services
 
-    entry, err = _resolve_ledger_entry(landlord, entry_id, description_query)
+    allow_multiple = _truthy(void_all)
+    rows, err = _resolve_ledger_entries(
+        landlord,
+        entry_id=entry_id,
+        description_query=description_query,
+        amount=amount,
+        allow_multiple=allow_multiple,
+    )
     if err:
         return err if isinstance(err, dict) else {"error": err}
     why = (reason or "").strip()
@@ -95,12 +163,18 @@ def void_ledger_entry(
         return {"error": "reason is required — it goes on the audit trail."}
 
     preview = {
-        "entry_id": str(entry.pk),
-        "entry_type": entry.entry_type,
-        "amount": str(entry.amount),
-        "description": entry.description,
+        "count": len(rows),
+        "entries": [
+            {
+                "entry_id": str(e.pk),
+                "entry_type": e.entry_type,
+                "amount": str(e.amount),
+                "description": (e.description or "")[:120],
+            }
+            for e in rows
+        ],
         "reason": why[:200],
-        "side_effects": ["Post REVERSAL row; original row stays for audit"],
+        "side_effects": ["Post REVERSAL row(s); original row(s) stay for audit"],
     }
     if not _confirmed(confirm):
         return _preview(
@@ -108,17 +182,35 @@ def void_ledger_entry(
             preview,
             "Voids via reversal (never deletes the original row).",
         )
+    voided = []
     try:
-        reversal = ledger_services.void_entry(
-            entry, reason=why, created_by=landlord.user
-        )
+        for entry in rows:
+            reversal = ledger_services.void_entry(
+                entry, reason=why, created_by=landlord.user
+            )
+            voided.append(
+                {
+                    "entry_id": str(entry.pk),
+                    "reversal_id": str(reversal.pk),
+                    "amount": str(entry.amount),
+                    "description": (entry.description or "")[:80],
+                }
+            )
     except ledger_services.LedgerError as exc:
-        return {"error": str(exc)}
+        return {"error": str(exc), "voided_so_far": voided}
+    if len(voided) == 1:
+        v = voided[0]
+        msg = f"Voided expense ${v['amount']}: {v['description']}."
+    else:
+        total = sum(float(v["amount"]) for v in voided)
+        msg = f"Voided {len(voided)} expenses (total ${total:.2f})."
     return {
         "voided": True,
-        "entry_id": str(entry.pk),
-        "reversal_id": str(reversal.pk),
-        "message": f"Voided {entry.entry_type} ${entry.amount}: {entry.description[:80]}.",
+        "count": len(voided),
+        "entries": voided,
+        "entry_id": voided[0]["entry_id"],
+        "reversal_id": voided[0]["reversal_id"],
+        "message": msg,
     }
 
 

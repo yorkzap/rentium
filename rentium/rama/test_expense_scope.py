@@ -136,6 +136,69 @@ def test_verbal_expense_intent_parses_bought_paid(landlord):
     assert "Created 950" not in msg
 
 
+def test_void_message_never_creates_expense(landlord):
+    from rentium.rama.service import _verbal_expense_intent
+    from rentium.rama.service import _void_expense_intent
+
+    live = {"listings": [{"address": "950 McKenzie Ave", "name": "Room A"}]}
+    text = (
+        'void the wrong "Jul 31 Maintenance expense for adding new window '
+        'screensExpense 950 McKenzie Ave −$125.00 Not yet taken"'
+    )
+    assert _verbal_expense_intent(landlord, text, live) is None
+    void_intent = _void_expense_intent(landlord, text)
+    assert void_intent is not None
+    assert void_intent["tool"] == "void_ledger_entry"
+    assert void_intent["arguments"]["amount"] == "125.00"
+
+
+def test_void_both_duplicate_expenses_by_amount(landlord):
+    from decimal import Decimal
+
+    from rentium.ledger import services as ledger_services
+    from rentium.ledger.models import ExpenseCategory
+    from rentium.rama import registry
+
+    holding = _holding(landlord)
+    for desc in (
+        "Maintenance expense for adding new window screens",
+        'void the wrong "Jul 31 Maintenance expense for adding new window screens"',
+    ):
+        ledger_services.post_expense(
+            landlord=landlord,
+            amount=Decimal("125.00"),
+            category=ExpenseCategory.MAINTENANCE,
+            description=desc,
+            holding=holding,
+            created_by=landlord.user,
+        )
+    preview = registry.execute(
+        "void_ledger_entry",
+        {
+            "amount": "125.00",
+            "description_query": "window screens",
+            "reason": "Duplicates",
+            "void_all": "yes",
+        },
+        landlord=landlord,
+    )
+    assert preview.get("needs_confirm"), preview
+    assert preview["preview"]["count"] == 2
+    done = registry.execute(
+        "void_ledger_entry",
+        {
+            "amount": "125.00",
+            "description_query": "window screens",
+            "reason": "Duplicates",
+            "void_all": "yes",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert done.get("voided") is True
+    assert done.get("count") == 2
+
+
 def test_naming_the_address_resolves_to_the_holding_not_its_only_unit(landlord):
     """The exact regression: "950 McKenzie Ave" in property_query must mean the
     whole property, not the single unit that happens to live inside it."""

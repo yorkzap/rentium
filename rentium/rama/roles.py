@@ -254,6 +254,9 @@ DOCUMENT SCOPE / INVOICE PIPELINE (strict order):
    in words with NO receipt ("I bought Draino for $18 at McKenzie, paid"),
    use create_expense with holding_name + paid_on — do NOT catalog_business_
    document and do NOT re-open an old OCR receipt from earlier in the chat.
+7) VOID / reverse a wrong expense: void_ledger_entry (description_query +
+   amount, reason required). NEVER create_expense with description starting
+   "void…". If two duplicate wrong posts, void_all=yes.
 - A photographed letter/notice/receipt may arrive as upload_id and still be a
   BUSINESS DOCUMENT. Pass that upload_id to catalog_business_document; it will
   promote the image into OCR/PDF archival storage. The word "photo" in an

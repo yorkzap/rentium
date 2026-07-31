@@ -2449,14 +2449,26 @@ def convert_inquiry_to_viewing(
 # ---------------------------------------------------------------------------
 
 
+@_params(
+    entry_id="Exact ledger entry UUID when known.",
+    description_query="Words from the expense description, e.g. 'window screens'.",
+    amount="Optional amount to narrow the match, e.g. '125' or '125.00'.",
+    reason="Why it is voided — stored on the audit trail.",
+    void_all="yes to void EVERY open match (use when two duplicate wrong posts).",
+    confirm="Leave empty to preview; yes to void.",
+)
 def void_ledger_entry(
     landlord,
     entry_id: str = "",
     description_query: str = "",
+    amount: str = "",
     reason: str = "",
+    void_all: str = "",
     confirm: str = "",
 ) -> dict:
-    """Void a ledger entry via REVERSAL (never deletes). reason required.
+    """Void an expense/ledger entry via REVERSAL (never deletes). Use when the
+    landlord says void/cancel/undo a wrong expense — NEVER create_expense with
+    description 'void…'. reason required. Pass void_all=yes for duplicates.
     Preview; confirm=yes."""
     from .domain_gap_tools import void_ledger_entry as _fn
 
@@ -2464,7 +2476,9 @@ def void_ledger_entry(
         landlord,
         entry_id=entry_id,
         description_query=description_query,
+        amount=amount,
         reason=reason,
+        void_all=void_all,
         confirm=confirm,
     )
 
