@@ -147,6 +147,23 @@ class Appointment(models.Model):
     # A prospective tenant has no account; whoever holds this token may read
     # this ONE appointment's status — nothing else. Never shown to tenants.
     public_token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    # Prospect open-tracking for /viewing/status/<token> (and public status API).
+    # First/last open + count answer "have they seen the invite link?" without
+    # email-pixel tracking (which is unreliable and privacy-hostile).
+    prospect_link_first_opened_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_("First time the prospect opened their status/invite link."),
+    )
+    prospect_link_last_opened_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_("Most recent time the prospect opened their status/invite link."),
+    )
+    prospect_link_open_count = models.PositiveIntegerField(
+        default=0,
+        help_text=_("How many times the status/invite page was loaded."),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -173,6 +190,29 @@ class Appointment(models.Model):
         from .services import classify_time
 
         self.time_class = classify_time(self.landlord, self.property, self.starts_at)
+
+    def record_prospect_link_open(self):
+        """Stamp that the prospect loaded their status page (invite link)."""
+        from django.db.models import F
+        from django.utils import timezone
+
+        now = timezone.now()
+        updates = {
+            "prospect_link_last_opened_at": now,
+            "prospect_link_open_count": F("prospect_link_open_count") + 1,
+            "updated_at": now,
+        }
+        if self.prospect_link_first_opened_at is None:
+            updates["prospect_link_first_opened_at"] = now
+        type(self).objects.filter(pk=self.pk).update(**updates)
+        self.refresh_from_db(
+            fields=[
+                "prospect_link_first_opened_at",
+                "prospect_link_last_opened_at",
+                "prospect_link_open_count",
+                "updated_at",
+            ]
+        )
 
     def record_proposal(self, *, by: str, starts_at, message: str = ""):
         """Append one turn to the negotiation trail."""

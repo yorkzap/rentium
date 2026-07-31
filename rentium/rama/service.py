@@ -3765,6 +3765,85 @@ def run_turn(
                     result.get("error") or result.get("message") or result,
                 )
 
+    # "Have they seen the viewing link?" — never claim we cannot track opens.
+    if deterministic_reply is None and pending_plan is None:
+        low_msg = (message or "").casefold()
+        if re.search(
+            r"\b(seen|opened|clicked|viewed)\b.+\b(viewing|invite|link|status)\b"
+            r"|\b(viewing|invite)\b.+\b(seen|opened|clicked)\b"
+            r"|\bhave they (seen|opened)\b",
+            low_msg,
+        ):
+            # Prefer contact email/name from recent schedule or the message.
+            contact = ""
+            em = re.search(
+                r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+                message or "",
+            )
+            if em:
+                contact = em.group(1)
+            else:
+                nm = re.search(
+                    r"\bfor\s+([A-Z][a-zA-Z'’-]+(?:\s+[A-Z][a-zA-Z'’-]+)?)",
+                    message or "",
+                )
+                # Fallback: any capitalised name token after "has/have"
+                if not nm:
+                    nm = re.search(
+                        r"\b(?:has|have)\s+([A-Z][a-zA-Z'’-]+)",
+                        message or "",
+                    )
+                if nm:
+                    contact = nm.group(1)
+            # From recent audit if still blank
+            if not contact:
+                for row in RamaAudit.objects.filter(
+                    landlord=landlord,
+                    conversation_id=conversation_id,
+                    kind=RamaAudit.Kind.TOOL_CALL,
+                ).order_by("-created_at")[:20]:
+                    content = row.content or {}
+                    if content.get("tool") != "schedule_viewing":
+                        continue
+                    args = content.get("arguments") or {}
+                    res = content.get("result") or {}
+                    contact = (
+                        args.get("contact_email")
+                        or args.get("contact_name")
+                        or (res.get("appointment") or {}).get("contact_email")
+                        or (res.get("appointment") or {}).get("contact_name")
+                        or ""
+                    )
+                    if contact:
+                        break
+            result = execute(
+                "viewing_invite_status",
+                {"contact": contact, "property_query": "", "appointment_ref": ""},
+                landlord=landlord,
+            )
+            tools_used.append("viewing_invite_status")
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": "viewing_invite_status",
+                    "arguments": {"contact": contact},
+                    "result": json.loads(json.dumps(result, default=str)),
+                    "deterministic_routing": True,
+                },
+            )
+            if result.get("error") and result.get("matches"):
+                lines = [str(result["error"])]
+                for m in result["matches"][:6]:
+                    lines.append(
+                        f"• {m.get('contact_name')} {m.get('property')} "
+                        f"{m.get('starts_at')} opened={m.get('opened')}"
+                    )
+                deterministic_reply = "\n".join(lines)
+            else:
+                deterministic_reply = str(
+                    result.get("message") or result.get("error") or result
+                )
+
     # Schedule viewing (with prospect email) BEFORE calendar nav link — "make a
     # viewing… send her an email" used to only return the Calendar URL.
     if deterministic_reply is None and pending_plan is None:

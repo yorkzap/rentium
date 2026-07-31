@@ -942,6 +942,122 @@ def schedule_viewing(
 _PENDING_VIEWING = ("REQUESTED", "AWAITING_REQUESTER")
 
 
+def viewing_invite_status(
+    landlord,
+    *,
+    contact: str = "",
+    property_query: str = "",
+    appointment_ref: str = "",
+) -> dict:
+    """Has the prospect opened their viewing status/invite link?
+
+    Tracks loads of /viewing/status/<token> (not email pixels). Useful for
+    "have they seen the link?" after schedule_viewing.
+    """
+    from rentium.appointments.models import Appointment
+    from rentium.rama.links import url_for_path
+
+    qs = (
+        Appointment.objects.filter(
+            landlord=landlord,
+            kind=Appointment.Kind.VIEWING,
+        )
+        .exclude(status=Appointment.Status.CANCELLED)
+        .select_related("property")
+        .order_by("-starts_at")
+    )
+    contact_q = (contact or "").strip()
+    if contact_q:
+        from django.db.models import Q
+
+        qs = qs.filter(
+            Q(contact_name__icontains=contact_q)
+            | Q(contact_email__icontains=contact_q)
+        )
+    prop_q = (property_query or "").strip()
+    if prop_q:
+        qs = qs.filter(property__name__icontains=prop_q)
+
+    ref = (appointment_ref or "").strip()
+    candidates = list(qs[:40])
+    if ref:
+        ref_l = ref.casefold()
+        rows = [
+            a
+            for a in candidates
+            if str(a.pk).casefold().startswith(ref_l)
+            or str(a.public_token).casefold().startswith(ref_l)
+            or ref_l in str(a.pk).casefold()
+        ]
+    else:
+        rows = candidates[:10]
+    if not rows:
+        return {
+            "error": (
+                "No viewing found for that contact/property. "
+                "Try list_appointments first."
+            ),
+        }
+    if len(rows) > 1 and not ref:
+        return {
+            "error": "Multiple viewings match — pass appointment_ref or a fuller contact.",
+            "matches": [
+                {
+                    "id": str(a.pk),
+                    "property": a.property.name if a.property_id else "",
+                    "starts_at": a.starts_at.isoformat(),
+                    "contact_name": a.contact_name,
+                    "contact_email": a.contact_email,
+                    "opened": bool(a.prospect_link_open_count),
+                }
+                for a in rows
+            ],
+        }
+
+    appt = rows[0]
+    opened = bool(appt.prospect_link_open_count)
+    status_link = url_for_path(f"/viewing/status/{appt.public_token}")
+    if opened:
+        msg = (
+            f"{appt.contact_name or 'The prospect'} has opened the viewing link "
+            f"{appt.prospect_link_open_count} time(s). "
+            f"First open: {appt.prospect_link_first_opened_at.isoformat() if appt.prospect_link_first_opened_at else '—'}; "
+            f"last open: {appt.prospect_link_last_opened_at.isoformat() if appt.prospect_link_last_opened_at else '—'}."
+        )
+    else:
+        msg = (
+            f"{appt.contact_name or 'The prospect'} has not opened the viewing "
+            f"status link yet (invite may still be unread, in spam, or not clicked)."
+        )
+    return {
+        "ok": True,
+        "appointment_id": str(appt.pk),
+        "property": appt.property.name if appt.property_id else "",
+        "starts_at": appt.starts_at.isoformat(),
+        "status": appt.status,
+        "contact_name": appt.contact_name or "",
+        "contact_email": appt.contact_email or "",
+        "prospect_status_link": status_link,
+        "link_opened": opened,
+        "open_count": appt.prospect_link_open_count or 0,
+        "first_opened_at": (
+            appt.prospect_link_first_opened_at.isoformat()
+            if appt.prospect_link_first_opened_at
+            else None
+        ),
+        "last_opened_at": (
+            appt.prospect_link_last_opened_at.isoformat()
+            if appt.prospect_link_last_opened_at
+            else None
+        ),
+        "message": msg,
+        "note": (
+            "Open tracking is page loads of the status link, not email pixels. "
+            "Email may be delivered without them clicking the link."
+        ),
+    }
+
+
 def list_viewing_requests(landlord, scope: str = "pending") -> dict:
     """List viewing requests with negotiation state. scope=pending (default) is
     what's awaiting action; scope=all includes scheduled/cancelled."""

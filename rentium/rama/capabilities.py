@@ -215,6 +215,14 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "divide suite into rooms",
         "mckenzie garden suite rooms",
     ),
+    "viewing_invite_status": (
+        "have they seen the link",
+        "did they open the invite",
+        "viewing link opened",
+        "prospect opened viewing",
+        "seen the viewing",
+        "opened the status page",
+    ),
     "schedule_viewing": (
         "book showing",
         "property tour",
@@ -549,6 +557,14 @@ def supported_tool_for_request(request: str) -> str | None:
         text,
     ):
         return "reschedule_viewing"
+    if re.search(
+        r"\b(seen|opened|clicked|viewed)\b.+\b(viewing|invite|link|status)\b"
+        r"|\b(viewing|invite|status)\b.+\b(seen|opened|clicked|viewed)\b"
+        r"|\bhave they (seen|opened)\b"
+        r"|\bdid they open\b",
+        text,
+    ):
+        return "viewing_invite_status"
     if re.search(
         r"\b(schedule|book|set up|make|create|arrange)\b.+\b"
         r"(viewing|showing|tour|appointment)\b"

@@ -386,6 +386,8 @@ log_capability_gap — do not assemble it out of others.
 Inspections: create_condition_inspection uses build_inspection (Condition Inspections panel). \
 schedule_viewing is ONLY for prospective showings (Calendar). To change an \
 existing viewing's time use reschedule_viewing, not schedule_viewing again. \
+"Have they seen the invite/link?" → viewing_invite_status (status-page opens, \
+not email pixels). Never claim open-tracking is impossible. \
 checklist_by_section has per-room line items. \
 domain_digest.inspection_attention_list = items needing attention (never say none \
 if that list is non-empty). Unread: unread_messages count. Documents: titles + files. \
@@ -513,7 +515,7 @@ READ_TOOLS = (
     "find_listings", "find_leases", "read_constitution",
     "list_vendors", "list_holdings", "list_bank_balances",
     "lease_pdf_info", "list_lease_roster", "crud_capabilities",
-    "list_viewing_requests", "get_viewing_availability",
+    "list_viewing_requests", "get_viewing_availability", "viewing_invite_status",
     "get_notification_channels", "list_capability_gaps", "list_co_landlords",
     "list_memories",
     "list_payment_reminders", "list_notifications",
@@ -581,6 +583,8 @@ GENERAL_TOOLS = READ_TOOLS + (
     "mark_notifications_read",
     "schedule_viewing",
     "reschedule_viewing",
+    "viewing_invite_status",
+    "viewing_invite_status",
     "respond_to_viewing_request",
     "record_payment",
     "create_expense",

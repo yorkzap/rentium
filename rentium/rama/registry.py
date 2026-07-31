@@ -100,6 +100,7 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.mark_messages_read,
     tool_functions.schedule_viewing,
     tool_functions.reschedule_viewing,
+    tool_functions.viewing_invite_status,
     tool_functions.adjust_lease,
     tool_functions.renew_lease,
     tool_functions.settle_moveout,

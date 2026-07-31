@@ -73,6 +73,9 @@ class AppointmentSerializer(serializers.ModelSerializer):
             "contact_email",
             "contact_phone",
             "notes",
+            "prospect_link_first_opened_at",
+            "prospect_link_last_opened_at",
+            "prospect_link_open_count",
             "proposals",
             "created_at",
             "updated_at",
@@ -82,6 +85,9 @@ class AppointmentSerializer(serializers.ModelSerializer):
             "status",
             "time_class",
             "tenant_consent",
+            "prospect_link_first_opened_at",
+            "prospect_link_last_opened_at",
+            "prospect_link_open_count",
             "created_at",
             "updated_at",
         ]
@@ -95,6 +101,9 @@ class AppointmentSerializer(serializers.ModelSerializer):
         if request and not hasattr(request.user, "landlord_profile"):
             data["contact_email"] = ""
             data["contact_phone"] = ""
+            data["prospect_link_first_opened_at"] = None
+            data["prospect_link_last_opened_at"] = None
+            data["prospect_link_open_count"] = 0
         return data
 
     def validate(self, data):

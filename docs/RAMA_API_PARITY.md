@@ -52,6 +52,40 @@ When you add a composite, update `COVERAGE_MAP` in the same PR.
 | `POST /api/ledger/utility-bills/` | `record_utility_bill` |
 | `InquiryViewSet.to_appointment` | `convert_inquiry_to_viewing` |
 
+## Viewing invite open tracking (July 2026)
+
+| Need | Implementation |
+|---|---|
+| “Have they seen the viewing link?” | `Appointment.prospect_link_*` stamped on `GET /api/public/viewing-status/<token>/` |
+| RAMA | `viewing_invite_status` (+ fields on `list_appointments`) |
+| Calendar UI | Shows open count / last opened on day appointments |
+
+Not email-pixel tracking (unreliable); **status page loads only**.
+
+## Other known product gaps (prioritise)
+
+| Gap | Notes |
+|---|---|
+| Email delivery confirmation | SES/SendGrid webhooks → “delivered/bounced” on appointment |
+| Reschedule emails when only ends_at changes | Mostly works via `appointment.rescheduled` |
+| Document reallocate/paid from Documents UI | Finance/RAMA only today |
+| Soft-delete / trash for documents | Phase C in document library plan |
+| Saved document views | Phase C |
+| `rama:document_reocr` / tags in COVERAGE_MAP | Unmapped in parity script — wire map |
+| Bulk document actions | Multi-select tag/move/delete |
+| Prospect email open (pixel) | Explicitly deferred; page-load tracking is enough for v1 |
+
+## Learning as we go
+
+RAMA does **not** silently rewrite production code from chat. Learning path:
+
+1. `log_capability_gap` (or “learn now”) → `RamaCapabilityGap` backlog  
+2. Engineers build a tool/service + tests  
+3. `supported_tool_for_request` + roles so the model uses it  
+4. Optional: `remember` for landlord preferences (not new capabilities)
+
+False “I can’t” should hit `supported_tool_for_request` and refuse to log a gap when a tool already exists.
+
 ## Gap-close batch (July 2026)
 
 | API | RAMA tool |

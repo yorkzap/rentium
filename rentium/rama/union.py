@@ -1720,6 +1720,18 @@ def list_appointments(
             "contact_email": appt.contact_email or "",
             "notes": (appt.notes or "")[:200],
             "lease_id": str(appt.lease_id) if appt.lease_id else None,
+            "prospect_link_opened": bool(appt.prospect_link_open_count),
+            "prospect_link_open_count": appt.prospect_link_open_count or 0,
+            "prospect_link_first_opened_at": (
+                appt.prospect_link_first_opened_at.isoformat()
+                if appt.prospect_link_first_opened_at
+                else None
+            ),
+            "prospect_link_last_opened_at": (
+                appt.prospect_link_last_opened_at.isoformat()
+                if appt.prospect_link_last_opened_at
+                else None
+            ),
         }
         rows.append(row)
         counts["total_returned"] += 1
@@ -1742,7 +1754,9 @@ def list_appointments(
                 "Viewings/showings are appointments with kind=VIEWING. "
                 "Scheduled and Requested are the live ones. "
                 "Use date + weekday + time_local when the user says 'Thursday' "
-                "or a calendar date."
+                "or a calendar date. "
+                "prospect_link_opened / first/last_opened_at answer "
+                "'have they seen the invite link?' (status page loads only)."
             ),
         },
     }

@@ -1050,6 +1050,31 @@ def mark_messages_read(
     return _fn(landlord, conversation_id=conversation_id, confirm=confirm)
 
 
+@_params(
+    contact="Prospect name or email, e.g. 'Ishupreet' or 'ishu@gmail.com'.",
+    property_query="Optional listing name to narrow, e.g. 'Garden Suite'.",
+    appointment_ref="Optional appointment id/prefix from list_appointments.",
+)
+def viewing_invite_status(
+    landlord,
+    contact: str = "",
+    property_query: str = "",
+    appointment_ref: str = "",
+) -> dict:
+    """Has the prospect opened their viewing invite/status link?
+
+    Use for 'have they seen the link?', 'did they open the invite?', 'viewing
+    link opened?'. Tracks status-page loads (not email open pixels). Read-only."""
+    from .domain_actions import viewing_invite_status as _fn
+
+    return _fn(
+        landlord,
+        contact=contact,
+        property_query=property_query,
+        appointment_ref=appointment_ref,
+    )
+
+
 def schedule_viewing(
     landlord,
     property_query: str,

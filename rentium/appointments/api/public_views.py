@@ -282,12 +282,16 @@ def public_viewing_status(request, token):
     except (Appointment.DoesNotExist, ValueError, ValidationError):
         raise NotFound("No viewing request found for this link.")
 
+    # Landlord can later ask "have they seen the link?" via RAMA/calendar.
+    appt.record_prospect_link_open()
+
     prop = appt.property
     return Response(
         {
             "status": appt.status,
             "status_display": appt.get_status_display(),
             "starts_at": appt.starts_at.isoformat(),
+            "ends_at": appt.ends_at.isoformat() if appt.ends_at else None,
             "requested_by": appt.contact_name,
             "property": {
                 "name": prop.name,

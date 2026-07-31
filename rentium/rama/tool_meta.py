@@ -212,6 +212,7 @@ TOOL_META: dict[str, ToolMeta] = {
     # Publishes appointment.scheduled / appointment.tenant_review — emails the
     # viewer and asks the sitting tenant for consent. Irreversible outbound.
     "schedule_viewing": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
+    "viewing_invite_status": ToolMeta(risk="low"),
     "respond_to_viewing_request": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
     "set_viewing_availability": ToolMeta(risk="low"),
     # ------------------------------------------------------------ money
