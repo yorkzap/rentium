@@ -514,3 +514,166 @@ def test_generic_link_resolves_business_document_uuid(landlord):
     assert result["link"].endswith(
         f"/dashboard/documents?document={document.pk}"
     )
+
+
+def test_catalog_accepts_telegram_upload_id_in_attachment_id_slot(landlord):
+    """Telegram stages RamaUpload; models often pass that UUID as attachment_id."""
+    from django.core.files.base import ContentFile
+
+    from rentium.rama.models import RamaUpload
+    from rentium.rama.tools import catalog_business_document
+
+    upload = RamaUpload(landlord=landlord)
+    upload.image.save("receipt.jpg", ContentFile(b"fake-jpeg-bytes"), save=True)
+
+    # Wrong arg name on purpose — must still OCR/prepare, not "file gone".
+    with patch(
+        "rentium.rama.document_services._pdf_and_text",
+        return_value=(b"%PDF-archival", "INVOICE PNR Screens Total $50.00"),
+    ):
+        result = catalog_business_document(
+            landlord,
+            attachment_id=str(upload.pk),
+            upload_id="",
+        )
+    assert result.get("error") is None, result
+    assert result.get("document_id") or result.get("prepared") or result.get(
+        "needs_input"
+    ), result
+    assert "no longer available" not in str(result).casefold()
+    assert "No attachment" not in str(result.get("error") or "")
+
+
+def test_pdf_and_text_uses_force_ocr_not_skip_text(landlord, monkeypatch):
+    """Ghostscript 10.0.0 rejects --skip-text; pipeline must force-ocr."""
+    from pathlib import Path
+
+    from rentium.rama import document_services as ds
+
+    upload = SimpleUploadedFile(
+        "invoice.jpg", b"fake-jpeg-bytes", content_type="image/jpeg"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=240, check=False):
+        calls.append(list(cmd))
+        # Simulate successful force-ocr + pdfa
+        out = Path(cmd[-1])
+        side = Path(cmd[cmd.index("--sidecar") + 1])
+        out.write_bytes(b"%PDF-ok")
+        side.write_text("INVOICE Window screens Total $331.80\n")
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        return R()
+
+    monkeypatch.setattr(ds.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        ds,
+        "_image_bytes_to_pdf",
+        lambda source, media_type: b"%PDF-from-image",
+    )
+    pdf, text = ds._pdf_and_text(document)
+    assert pdf == b"%PDF-ok"
+    assert "screens" in text.casefold()
+    assert calls, "ocrmypdf should have been invoked"
+    assert "--force-ocr" in calls[0]
+    assert "--skip-text" not in calls[0]
+
+
+def test_delete_document_cascades_events(landlord):
+    """DELETE must not 500 on RamaDocumentEvent PROTECT; events go with the doc."""
+    from rentium.rama.document_services import delete_document
+    from rentium.rama.models import RamaDocumentEvent
+
+    upload = SimpleUploadedFile(
+        "junk.pdf", b"%PDF-delete-me-unique", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    # ingest already records UPLOADED; add more custody rows so PROTECT would fire.
+    RamaDocumentEvent.objects.create(
+        document=document, kind=RamaDocumentEvent.Kind.OCR_COMPLETED, detail={}
+    )
+    RamaDocumentEvent.objects.create(
+        document=document, kind=RamaDocumentEvent.Kind.CLASSIFIED, detail={}
+    )
+    assert document.events.count() >= 2
+
+    result = delete_document(landlord=landlord, document=document)
+    assert result["deleted"] is True
+    assert not RamaDocument.objects.filter(pk=document.pk).exists()
+    assert not RamaDocumentEvent.objects.filter(
+        document_id=result["document_id"]
+    ).exists()
+
+
+def test_delete_document_refuses_ledger_link(landlord):
+    from datetime import date
+
+    from rentium.rama.document_services import DocumentError
+    from rentium.rama.document_services import delete_document
+
+    holding = _holding(landlord)
+    upload = SimpleUploadedFile(
+        "paid.pdf", b"%PDF-linked-unique", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    entry = LedgerEntry.objects.create(
+        landlord=landlord,
+        holding=holding,
+        entry_type=EntryType.EXPENSE,
+        amount=10,
+        description="linked expense",
+        category=ExpenseCategory.MAINTENANCE,
+        effective_date=date(2026, 7, 1),
+    )
+    document.ledger_entry = entry
+    document.save(update_fields=["ledger_entry", "updated_at"])
+    with pytest.raises(DocumentError, match="ledger expense"):
+        delete_document(landlord=landlord, document=document)
+    assert RamaDocument.objects.filter(pk=document.pk).exists()
+
+
+def test_query_and_tag_business_documents(landlord):
+    from datetime import date
+
+    from rentium.rama.document_services import query_business_documents
+    from rentium.rama.document_services import search_business_documents_for_chat
+    from rentium.rama.document_services import set_document_tags
+
+    holding = _holding(landlord)
+    upload = SimpleUploadedFile(
+        "screens.pdf", b"%PDF-screens-unique", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.title = "Window screens invoice"
+    document.issuer = "Victoria Screens Co"
+    document.ocr_text = "Window screens installation 950 McKenzie Ave Total $331.80"
+    document.kind = RamaDocument.Kind.MAINTENANCE
+    document.holding = holding
+    document.document_date = date(2026, 7, 15)
+    document.status = RamaDocument.Status.FILED
+    document.save()
+    set_document_tags(document, ["hvac", "tax-2026"])
+
+    found = query_business_documents(landlord, q="window screens", page=1)
+    assert found["pagination"]["total"] >= 1
+    assert any(row.pk == document.pk for row in found["documents"])
+
+    by_tag = query_business_documents(landlord, tag="hvac")
+    assert any(row.pk == document.pk for row in by_tag["documents"])
+
+    by_year = query_business_documents(landlord, year=2026, holding_id=str(holding.pk))
+    assert any(row.pk == document.pk for row in by_year["documents"])
+
+    chat = search_business_documents_for_chat(
+        landlord, query="screens", holding_query="McKenzie"
+    )
+    assert chat["ok"] is True
+    assert chat["count"] >= 1
+    assert chat["documents"][0]["title"] == "Window screens invoice"
+    assert "hvac" in chat["documents"][0]["tags"]

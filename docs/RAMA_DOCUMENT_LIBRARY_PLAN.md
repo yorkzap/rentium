@@ -143,12 +143,14 @@ POST /api/rama/documents/bulk/               # tag, move holding, delete
 
 ## Implementation phases
 
-### Phase A — Search & structure (high leverage)
+### Phase A — Search & structure (high leverage) ✅ landed
 
-- Postgres full-text on `ocr_text`, title, issuer, reference  
-- Query params: `q`, `holding`, `kind`, `year`, `status`  
-- Tags model + UI chips  
-- Title always preferred over original filename in lists  
+- Postgres full-text on `ocr_text`, title, issuer, reference (`q=`)  
+- Query params: `q`, `holding`, `kind`, `year`, `status`, `tag`, `payment_state`, `has_expense`  
+- `DocumentTag` M2M + `/api/rama/document-tags/` + UI chips / filter bar  
+- Title / `display_title` preferred over original filename in lists  
+- `search_business_documents` RAMA tool (read-only)  
+- DELETE document: events CASCADE + bulk cleanup (no ProtectedError)  
 
 ### Phase B — RAMA organize
 

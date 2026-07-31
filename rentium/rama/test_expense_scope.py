@@ -68,10 +68,72 @@ def test_holding_scoped_expense_posts_against_the_holding(landlord):
     )
     assert out["created"] is True
     assert out["expense"]["scope"] == "950 McKenzie Ave — whole property"
+    assert "Logged" in (out.get("message") or "")
 
     entry = LedgerEntry.objects.get(pk=out["expense"]["id"])
     assert entry.property_id is None
     assert entry.holding_id == holding.pk
+
+
+def test_paid_verbal_expense_sets_paid_on(landlord):
+    from datetime import date
+
+    from rentium.ledger.models import LedgerEntry
+
+    holding = _holding(landlord)
+    out = _expense(
+        landlord,
+        amount="18.41",
+        description="Draino for 950 McKenzie house",
+        holding_name="950 McKenzie Ave",
+        paid_on="today",
+        category="SUPPLIES",
+        confirm="yes",
+    )
+    assert out["created"] is True
+    entry = LedgerEntry.objects.get(pk=out["expense"]["id"])
+    assert entry.holding_id == holding.pk
+    assert entry.paid_on == date.today()
+    assert entry.category == "SUPPLIES"
+    assert "18.41" in out["message"]
+    assert "Logged" in out["message"]
+
+
+def test_verbal_expense_intent_parses_bought_paid(landlord):
+    from rentium.rama.service import _verbal_expense_intent
+    from rentium.rama.service import _write_result_message
+
+    _holding(landlord)
+    live = {
+        "listings": [
+            {"address": "950 McKenzie Ave", "name": "Room A"},
+        ]
+    }
+    intent = _verbal_expense_intent(
+        landlord,
+        "I bought draino for 950 mckenzie house for $18.41 today and its paid",
+        live,
+    )
+    assert intent is not None
+    assert intent["tool"] == "create_expense"
+    assert intent["arguments"]["amount"] == "18.41"
+    assert intent["arguments"]["paid_on"] == "today"
+    assert "mckenzie" in intent["arguments"]["holding_name"].casefold()
+
+    msg = _write_result_message(
+        "create_expense",
+        {
+            "created": True,
+            "expense": {
+                "amount": "18.41",
+                "description": "Draino",
+                "scope": "950 McKenzie Ave — whole property",
+                "paid_on": "2026-07-31",
+            },
+        },
+    )
+    assert msg.startswith("Logged $18.41")
+    assert "Created 950" not in msg
 
 
 def test_naming_the_address_resolves_to_the_holding_not_its_only_unit(landlord):

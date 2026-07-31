@@ -78,12 +78,12 @@ def _stage_telegram_photo(landlord, file_id: str) -> str:
         return ""
     return (
         f"\n\n[The landlord attached a photo, upload_id={upload.pk}]\n"
-        "Determine intent from the caption/message. If this is a document, mail, "
-        "letter, receipt, invoice, notice, statement, or paperwork, it is NOT a "
-        "listing photo: use catalog_business_document with this upload_id. If the "
-        "landlord later gives a street address/property overall, file it against "
-        "that physical holding and never ask them to choose a room or unit. Use "
-        "attach_photo_to_listing only for actual property/inspection photos."
+        "DEFAULT: business document. Call catalog_business_document with this "
+        "upload_id ONLY first (no scope_query) so OCR runs. Do NOT assume this "
+        "is a listing or inspection photo. Do NOT say it 'looks like a property "
+        "photo'. Use attach_photo_to_listing ONLY if the caption clearly says "
+        "gallery/listing/main photo/for Room X. If they later give a street "
+        "address, file against that physical holding — never a room/unit."
     )
 
 

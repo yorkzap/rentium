@@ -1,6 +1,7 @@
 from django.contrib import admin
 
 from .models import (
+    DocumentTag,
     RamaActionReceipt,
     RamaAttachment,
     RamaAttachmentBatch,
@@ -13,6 +14,13 @@ from .models import (
     RamaPreferences,
     RamaTask,
 )
+
+
+@admin.register(DocumentTag)
+class DocumentTagAdmin(admin.ModelAdmin):
+    list_display = ("name", "slug", "landlord", "created_at")
+    search_fields = ("name", "slug", "landlord__user__email")
+    list_filter = ("landlord",)
 
 
 @admin.register(RamaDocument)
@@ -34,6 +42,7 @@ class RamaDocumentAdmin(admin.ModelAdmin):
         "original_filename",
         "ocr_text",
     )
+    filter_horizontal = ("tags",)
     readonly_fields = ("sha256", "created_at", "updated_at", "filed_at")
 
 

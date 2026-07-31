@@ -101,6 +101,21 @@ def test_genuine_business_document_is_still_detected(landlord):
     assert "catalog_business_document" in focus["instruction"]
 
 
+def test_bare_photo_attachment_defaults_to_business_document_not_listing(landlord):
+    """Empty/vague caption must NOT become 'looks like inspection photo'."""
+    conversation = uuid.uuid4()
+    _batch(landlord, conversation, 1, "file")
+    # Only the synthetic attach note — no "receipt"/"invoice" words from landlord.
+    focus = _conversation_attachment_focus(landlord, conversation)
+
+    assert focus["landlord_described_as_business_record"] is True
+    assert focus.get("landlord_claims_listing_photo") is False
+    assert "catalog_business_document" in focus["instruction"]
+    assert "Do NOT say this 'looks like a property/inspection photo'" in focus[
+        "instruction"
+    ]
+
+
 def test_batches_are_landlord_scoped(landlord, other_landlord):
     conversation = uuid.uuid4()
     batch, _ = _batch(other_landlord, conversation, 2)

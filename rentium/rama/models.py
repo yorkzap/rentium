@@ -699,6 +699,32 @@ class RamaUpload(models.Model):
         return f"RamaUpload {self.pk} for {self.landlord_id}"
 
 
+class DocumentTag(models.Model):
+    """Per-landlord label for filing cabinet organization (paperless-style tags)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="document_tags",
+    )
+    name = models.CharField(max_length=64)
+    slug = models.SlugField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["landlord", "slug"],
+                name="rama_documenttag_landlord_slug_unique",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
 class RamaDocument(models.Model):
     """A durable, searchable business record ingested by RAMA.
 
@@ -812,6 +838,12 @@ class RamaDocument(models.Model):
         max_length=20, choices=Status.choices, default=Status.QUEUED, db_index=True
     )
     failure_reason = models.TextField(blank=True, default="")
+    tags = models.ManyToManyField(
+        DocumentTag,
+        blank=True,
+        related_name="documents",
+        help_text="Filing labels (tax-2026, insurance, hvac, …).",
+    )
     created_by = models.ForeignKey(
         "users.User",
         on_delete=models.SET_NULL,
@@ -840,6 +872,10 @@ class RamaDocument(models.Model):
                 fields=["landlord", "holding", "document_date"],
                 name="rama_doc_holding_idx",
             ),
+            models.Index(
+                fields=["landlord", "kind", "-document_date"],
+                name="rama_doc_kind_idx",
+            ),
         ]
 
     def clean(self):
@@ -863,12 +899,32 @@ class RamaDocument(models.Model):
                 {"portfolio_wide": "Portfolio-wide records cannot name a property."}
             )
 
+    def get_display_title(self) -> str:
+        """Human label: never lead with a camera dump name when a title exists.
+
+        Method (not @property): this model has a ForeignKey named ``property``,
+        which shadows the built-in decorator in the class body.
+        """
+        title = (self.title or "").strip()
+        if title:
+            return title
+        canonical = (self.canonical_filename or "").strip()
+        if canonical:
+            return canonical
+        return (self.original_filename or "Untitled document").strip()
+
     def __str__(self):
-        return self.title or self.original_filename
+        return self.get_display_title()
 
 
 class RamaDocumentEvent(models.Model):
-    """Append-only chain of custody for an ingested business document."""
+    """Append-only chain of custody for an ingested business document.
+
+    Instance-level delete/update is refused so the trail cannot be rewritten in
+    place.  When the parent document is intentionally removed (inbox mis-upload),
+    CASCADE bulk-deletes events with the row — the document is gone, so custody
+    of that file is no longer meaningful.
+    """
 
     class Kind(models.TextChoices):
         UPLOADED = "UPLOADED", "Uploaded"
@@ -881,7 +937,7 @@ class RamaDocumentEvent(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     document = models.ForeignKey(
-        RamaDocument, on_delete=models.PROTECT, related_name="events"
+        RamaDocument, on_delete=models.CASCADE, related_name="events"
     )
     kind = models.CharField(max_length=24, choices=Kind.choices)
     actor = models.ForeignKey(

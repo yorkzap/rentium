@@ -307,6 +307,7 @@ def mark_expense_paid(
 
     entry.paid_on = when
     entry.save(update_fields=["paid_on"])
+    _sync_source_document_payment_state(entry)
 
     publish(
         "ledger.expense_settled",
@@ -322,7 +323,30 @@ def unmark_expense_paid(entry: LedgerEntry) -> LedgerEntry:
         raise LedgerError("Only an expense has a bank-clearing date.")
     entry.paid_on = None
     entry.save(update_fields=["paid_on"])
+    _sync_source_document_payment_state(entry)
     return entry
+
+
+def _sync_source_document_payment_state(entry: LedgerEntry) -> None:
+    """Keep linked RamaDocument.payment_state aligned with ledger paid_on."""
+    try:
+        from rentium.rama.models import RamaDocument
+
+        doc = getattr(entry, "source_document", None)
+        if doc is None:
+            doc = RamaDocument.objects.filter(ledger_entry_id=entry.pk).first()
+        if doc is None:
+            return
+        wanted = (
+            RamaDocument.PaymentState.PAID
+            if entry.paid_on
+            else RamaDocument.PaymentState.UNPAID
+        )
+        if doc.payment_state != wanted:
+            doc.payment_state = wanted
+            doc.save(update_fields=["payment_state", "updated_at"])
+    except Exception:  # noqa: BLE001 — ledger must not fail if rama is mid-migrate
+        return
 
 
 def void_entry(entry: LedgerEntry, *, reason, created_by=None) -> LedgerEntry:
@@ -481,6 +505,17 @@ def reallocate_entry(
             "holding_name": hold.name if hold else None,
         }
 
+    # Capture receipt link before void (OneToOne may only point at the old row).
+    source_doc = None
+    try:
+        from rentium.rama.models import RamaDocument
+
+        source_doc = getattr(entry, "source_document", None)
+        if source_doc is None:
+            source_doc = RamaDocument.objects.filter(ledger_entry_id=entry.pk).first()
+    except Exception:  # noqa: BLE001
+        source_doc = None
+
     replacement = correct_entry(
         entry,
         created_by=created_by,
@@ -498,6 +533,26 @@ def reallocate_entry(
             },
         },
     )
+
+    if source_doc is not None:
+        try:
+            source_doc.ledger_entry = replacement
+            if new_holding is not None:
+                source_doc.holding = new_holding
+            if new_property is not None:
+                source_doc.property = new_property
+            elif new_holding is not None:
+                source_doc.property = None
+            source_doc.save(
+                update_fields=[
+                    "ledger_entry",
+                    "holding",
+                    "property",
+                    "updated_at",
+                ]
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     publish(
         "ledger.entry_reallocated",

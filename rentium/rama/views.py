@@ -432,12 +432,14 @@ def _attachment_note(request, landlord) -> str:
         return ""
     tags = " ".join(f"[The landlord attached a photo, upload_id={u}]" for u in valid)
     return (
-        f"\n\n{tags}\nFirst determine intent from the landlord's words. If this is "
-        "a property marketing/inspection photo, use attach_photo_to_listing. If "
-        "they call it a document, mail, letter, receipt, invoice, notice, statement, "
-        "or paperwork, use catalog_business_document with upload_id so it enters "
-        "OCR/archive storage. For an address/property overall, set scope_query to "
-        "that address and NEVER ask them to choose a child listing."
+        f"\n\n{tags}\n"
+        "DEFAULT: treat attached photo(s) as a business document (receipt/"
+        "invoice/notice/mail). Call catalog_business_document with upload_id "
+        "ONLY first (no scope_query) so OCR runs. Do NOT assume listing or "
+        "inspection photo. Do NOT say it 'looks like a property photo'. "
+        "Use attach_photo_to_listing ONLY if the landlord clearly said gallery/"
+        "listing/main photo/for Room X. After OCR, if they name a street "
+        "address, set scope_query to that address — NEVER force a room/unit."
     )
 
 
@@ -596,12 +598,21 @@ def _document_payload(document, request=None):
         url = field.url
         return request.build_absolute_uri(url) if request else url
 
+    try:
+        tag_rows = list(document.tags.all())
+    except Exception:  # noqa: BLE001 — not prefetched / pre-migration
+        tag_rows = []
+
+    display = document.get_display_title()
+
     return {
         "id": str(document.pk),
         "status": document.status,
         "kind": document.kind,
         "kind_display": document.get_kind_display(),
-        "title": document.title,
+        # Prefer semantic title over camera dump names in the UI.
+        "title": document.title or display,
+        "display_title": display,
         "issuer": document.issuer,
         "reference_number": document.reference_number,
         "document_date": str(document.document_date) if document.document_date else None,
@@ -625,6 +636,7 @@ def _document_payload(document, request=None):
         "archival_pdf": file_url(document.archival_pdf),
         "ledger_entry_id": str(document.ledger_entry_id) if document.ledger_entry_id else None,
         "failure_reason": document.failure_reason,
+        "tags": [{"id": str(t.pk), "name": t.name, "slug": t.slug} for t in tag_rows],
         "created_at": document.created_at.isoformat(),
         "filed_at": document.filed_at.isoformat() if document.filed_at else None,
     }
@@ -635,11 +647,12 @@ def _document_payload(document, request=None):
 def documents_view(request):
     """Upload or list the acting landlord's OCR-backed business records.
 
-    GET supports pagination: ?page=1&page_size=25 (max 100) and optional status=.
+    GET supports pagination and library filters:
+    ?page=&page_size=&q=&holding=&kind=&year=&status=&tag=&payment_state=&has_expense=
     """
     from .document_services import DocumentError
     from .document_services import ingest_document
-    from .models import RamaDocument
+    from .document_services import query_business_documents
     from .tasks import process_rama_document
 
     landlord = _landlord(request)
@@ -649,30 +662,39 @@ def documents_view(request):
         except ValueError:
             page = 1
         try:
-            page_size = min(100, max(1, int(request.query_params.get("page_size") or "25")))
+            page_size = min(
+                100, max(1, int(request.query_params.get("page_size") or "25"))
+            )
         except ValueError:
             page_size = 25
-        queryset = (
-            RamaDocument.objects.filter(landlord=landlord)
-            .select_related("holding", "property", "ledger_entry")
-            .order_by("-created_at")
-        )
-        status_filter = str(request.query_params.get("status") or "").upper()
-        if status_filter:
-            queryset = queryset.filter(status=status_filter)
-        total = queryset.count()
-        start = (page - 1) * page_size
-        rows = list(queryset[start : start + page_size])
+        try:
+            result = query_business_documents(
+                landlord,
+                q=request.query_params.get("q") or "",
+                holding_id=(
+                    request.query_params.get("holding")
+                    or request.query_params.get("holding_id")
+                    or ""
+                ),
+                kind=request.query_params.get("kind") or "",
+                year=request.query_params.get("year") or None,
+                status=request.query_params.get("status") or "",
+                tag=request.query_params.get("tag") or "",
+                payment_state=request.query_params.get("payment_state") or "",
+                has_expense=request.query_params.get("has_expense"),
+                page=page,
+                page_size=page_size,
+            )
+        except DocumentError as exc:
+            return Response(
+                {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+            )
         return Response(
             {
-                "documents": [_document_payload(row, request) for row in rows],
-                "pagination": {
-                    "page": page,
-                    "page_size": page_size,
-                    "total": total,
-                    "has_next": start + page_size < total,
-                    "has_prev": page > 1,
-                },
+                "documents": [
+                    _document_payload(row, request) for row in result["documents"]
+                ],
+                "pagination": result["pagination"],
             }
         )
 
@@ -698,6 +720,43 @@ def documents_view(request):
     )
 
 
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def document_tags_view(request):
+    """List landlord tags or create one (for autocomplete / library chips)."""
+    from .document_services import DocumentError
+    from .document_services import get_or_create_document_tag
+    from .document_services import list_document_tags
+
+    landlord = _landlord(request)
+    if request.method == "GET":
+        tags = list_document_tags(landlord)
+        return Response(
+            {
+                "tags": [
+                    {
+                        "id": str(t.pk),
+                        "name": t.name,
+                        "slug": t.slug,
+                        "document_count": getattr(t, "document_count", 0),
+                    }
+                    for t in tags
+                ]
+            }
+        )
+    name = (request.data or {}).get("name") or ""
+    try:
+        tag = get_or_create_document_tag(landlord, name)
+    except DocumentError as exc:
+        return Response(
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(
+        {"id": str(tag.pk), "name": tag.name, "slug": tag.slug},
+        status=http_status.HTTP_201_CREATED,
+    )
+
+
 @api_view(["GET", "POST", "DELETE"])
 @permission_classes([IsAuthenticated])
 def document_detail_view(request, document_id):
@@ -707,13 +766,16 @@ def document_detail_view(request, document_id):
 
     from .document_services import DocumentError
     from .document_services import DuplicateExpenseError
+    from .document_services import delete_document
     from .document_services import file_document
+    from .document_services import set_document_tags
     from .models import RamaDocument
 
     landlord = _landlord(request)
     document = (
         RamaDocument.objects.filter(pk=document_id, landlord=landlord)
         .select_related("holding", "property", "ledger_entry")
+        .prefetch_related("tags")
         .first()
     )
     if document is None:
@@ -721,29 +783,13 @@ def document_detail_view(request, document_id):
             {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
         )
     if request.method == "DELETE":
-        # Soft-safe delete: refuse only if you need to keep legal evidence?
-        # Landlords may remove mis-uploads; ledger rows are not deleted.
-        if document.ledger_entry_id:
+        try:
+            result = delete_document(landlord=landlord, document=document)
+        except DocumentError as exc:
             return Response(
-                {
-                    "detail": (
-                        "This document is linked to a ledger expense. Unlink or "
-                        "void the expense first if you truly need the file gone; "
-                        "the expense itself stays as audit history."
-                    ),
-                },
-                status=http_status.HTTP_400_BAD_REQUEST,
+                {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
             )
-        # Remove storage files best-effort, then the row.
-        for field in (document.original_file, document.archival_pdf):
-            if field:
-                try:
-                    field.delete(save=False)
-                except Exception:  # noqa: BLE001
-                    pass
-        pk = str(document.pk)
-        document.delete()
-        return Response({"deleted": True, "document_id": pk})
+        return Response(result)
     if request.method == "GET":
         payload = _document_payload(document, request)
         payload["ocr_text"] = document.ocr_text
@@ -758,6 +804,35 @@ def document_detail_view(request, document_id):
         return Response(payload)
 
     data = request.data or {}
+    if "tags" in data:
+        raw_tags = data.get("tags") or []
+        if isinstance(raw_tags, str):
+            raw_tags = [part.strip() for part in raw_tags.split(",") if part.strip()]
+        try:
+            set_document_tags(document, list(raw_tags), replace=True)
+        except DocumentError as exc:
+            return Response(
+                {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        # Tag-only update (no re-file).
+        if not any(
+            key in data
+            for key in (
+                "holding_id",
+                "property_id",
+                "portfolio_wide",
+                "kind",
+                "title",
+                "issuer",
+                "amount",
+                "expense_category",
+                "payment_state",
+                "clarification_answer",
+            )
+        ):
+            document.refresh_from_db()
+            return Response(_document_payload(document, request))
+
     holding = None
     property_obj = None
     if data.get("holding_id"):
@@ -850,6 +925,42 @@ def document_download_view(request, document_id):
         filename=document.canonical_filename or document.original_filename,
         content_type="application/pdf" if document.archival_pdf else document.media_type,
     )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def document_reocr_view(request, document_id):
+    """Re-run OCR after a FAILED pass (or to refresh text for search)."""
+    from .document_services import DocumentError
+    from .document_services import reocr_document
+    from .models import RamaDocument
+
+    landlord = _landlord(request)
+    document = (
+        RamaDocument.objects.filter(pk=document_id, landlord=landlord)
+        .select_related("holding", "property", "ledger_entry")
+        .prefetch_related("tags")
+        .first()
+    )
+    if document is None:
+        return Response(
+            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
+        )
+    try:
+        document = reocr_document(landlord=landlord, document=document)
+    except DocumentError as exc:
+        return Response(
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    document = (
+        RamaDocument.objects.filter(pk=document.pk)
+        .select_related("holding", "property", "ledger_entry")
+        .prefetch_related("tags")
+        .first()
+    )
+    payload = _document_payload(document, request)
+    payload["ocr_text"] = (document.ocr_text or "")[:2000]
+    return Response(payload)
 
 
 @api_view(["GET", "POST"])

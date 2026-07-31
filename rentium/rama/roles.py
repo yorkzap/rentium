@@ -140,6 +140,8 @@ property → charge_schedule; one lease month → charge_status
 - Furniture/inventory → list_inventory
 - Tenants & history → list_tenants / tenant_history (people across leases)
 - Documents/PDFs metadata → list_documents (titles only, no file contents)
+- Find invoices/receipts/notices by words, year, holding, tag, unpaid →
+  search_business_documents (OCR + title full-text). Prefer this over guessing.
 - Uploaded business record + address/property overall →
   catalog_business_document (physical holding, never a forced child listing)
 - Business document directory/path/manual location/download →
@@ -228,25 +230,34 @@ bedrooms or every internal space. The database field is property_category — ne
 call it listing_type.
 
 DOCUMENT SCOPE / INVOICE PIPELINE (strict order):
-1) When a PDF/photo is attached, call catalog_business_document with
-   attachment_id or upload_id ONLY — do NOT pass scope_query and do NOT ask
-   for the address yet. That step hashes + OCRs and detects duplicates.
-2) If the result has already_done/is_duplicate=true: tell the landlord this
+1) When a PDF/photo is attached with NO clear "listing/gallery/main photo"
+   wording, it is a BUSINESS DOCUMENT by default — even if the caption is
+   empty. Call catalog_business_document with attachment_id or upload_id ONLY
+   — do NOT pass scope_query and do NOT ask for the address yet. That step
+   hashes + OCRs and detects duplicates.
+2) NEVER invent "this looks like a property/inspection photo" for a bare
+   attachment. That guess was wrong for clear receipts repeatedly. Listing
+   media is ONLY when they said gallery/listing/main photo/for Room X (or
+   denied business document).
+3) If the result has already_done/is_duplicate=true: tell the landlord this
    exact file is ALREADY catalogued (document_id, when, holding). Do NOT ask
    for the address again. Do NOT re-preview "store as business document".
    If expense_like and no ledger_entry, offer file_business_document.
-3) If needs_input for address: FIRST relay OCR intelligence (kind, amount),
+4) If needs_input for address: FIRST relay OCR intelligence (kind, amount),
    THEN ask which physical property address. Then catalog again with
    document_id + scope_query (preview → confirm=yes).
-4) Expense invoices: if payment_state UNKNOWN, ASK paid vs unpaid. Then
+5) Expense invoices: if payment_state UNKNOWN, ASK paid vs unpaid. Then
    file_business_document. PAID sets paid_on; UNPAID leaves open. NEVER void
    because something was paid. NEVER invent amounts — use intelligence.amount.
-5) Prefer file_business_document over bare create_expense so the receipt
-   stays linked to the ledger row.
+6) Prefer file_business_document over bare create_expense ONLY when a receipt
+   photo/PDF is attached (or an existing document_id). If they state a cost
+   in words with NO receipt ("I bought Draino for $18 at McKenzie, paid"),
+   use create_expense with holding_name + paid_on — do NOT catalog_business_
+   document and do NOT re-open an old OCR receipt from earlier in the chat.
 - A photographed letter/notice/receipt may arrive as upload_id and still be a
   BUSINESS DOCUMENT. Pass that upload_id to catalog_business_document; it will
   promote the image into OCR/PDF archival storage. The word "photo" in an
-  attachment note does not make it a listing photo—the landlord's intent wins.
+  attachment note does not make it a listing photo.
 - If the holding does not exist, catalog_business_document can propose creating
   it from listings with the exact same legal address and attach the record above
   those children in one confirmed operation.
@@ -495,6 +506,7 @@ READ_TOOLS = (
     "list_inquiries", "list_conversations", "list_messages", "list_inspections",
     "list_move_events", "list_inventory", "list_tenants", "tenant_history",
     "list_documents", "business_document_status", "business_document_location",
+    "search_business_documents",
     "find_listings", "find_leases", "read_constitution",
     "list_vendors", "list_holdings", "list_bank_balances",
     "lease_pdf_info", "list_lease_roster", "crud_capabilities",
@@ -573,6 +585,7 @@ GENERAL_TOOLS = READ_TOOLS + (
     "catalog_business_document",
     "business_document_location",
     "business_document_status",
+    "search_business_documents",
     "file_business_document",
     "create_work_order",
     # Routine property operations are direct General capabilities. Delegation

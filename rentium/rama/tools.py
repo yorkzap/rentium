@@ -746,24 +746,63 @@ def catalog_business_document(
         "document_date": parsed_date,
         "confirm": str(confirm).strip().lower() in {"yes", "y", "true", "1"},
     }
-    if attachment_id.strip():
+    aid = (attachment_id or "").strip()
+    uid = (upload_id or "").strip()
+    did = (document_id or "").strip()
+
+    # Telegram photos are staged as RamaUpload (upload_id=…). Weak models (and
+    # confused tool arg binding) often put that UUID in attachment_id. Resolve
+    # by what actually exists for this landlord — never invent "file gone".
+    if aid or uid or did:
+        from .models import RamaAttachment
+        from .models import RamaDocument
+        from .models import RamaUpload
+
+        candidates = [x for x in (aid, uid, did) if x]
+        resolved_aid = resolved_uid = resolved_did = ""
+        for cand in candidates:
+            if (
+                not resolved_aid
+                and RamaAttachment.objects.filter(
+                    pk=cand, batch__landlord=landlord
+                ).exists()
+            ):
+                resolved_aid = cand
+            elif (
+                not resolved_uid
+                and RamaUpload.objects.filter(pk=cand, landlord=landlord).exists()
+            ):
+                resolved_uid = cand
+            elif (
+                not resolved_did
+                and RamaDocument.objects.filter(pk=cand, landlord=landlord).exists()
+            ):
+                resolved_did = cand
+        # Prefer the most specific handle the caller meant.
+        if aid and resolved_aid == aid:
+            pass
+        elif uid and resolved_uid == uid:
+            resolved_aid = resolved_aid  # keep
+        aid, uid, did = resolved_aid, resolved_uid, resolved_did
+
+    if aid:
         return catalog_batch_attachment_as_document(
-            attachment_id=attachment_id.strip(),
+            attachment_id=aid,
             **common,
         )
-    if upload_id.strip():
+    if uid:
         return catalog_staged_photo_as_document(
-            upload_id=upload_id.strip(),
+            upload_id=uid,
             **common,
         )
-    if document_id.strip():
+    if did:
         # document_id path (preferred after prepare): status or scope+confirm.
         if not (scope_query or "").strip():
             from .document_services import business_document_status as status_fn
 
-            return status_fn(landlord, document_id=document_id.strip())
+            return status_fn(landlord, document_id=did)
         return catalog_document_scope(
-            document_id=document_id.strip(),
+            document_id=did,
             **common,
         )
     # Bare address after prepare: pick the newest unscoped document for this
@@ -815,6 +854,55 @@ def business_document_status(landlord, document_id: str) -> dict:
     from .document_services import business_document_status as _fn
 
     return _fn(landlord, document_id=document_id)
+
+
+@_params(
+    query="Free-text search: vendor, address, invoice words, OCR content, e.g. "
+    "'window screens McKenzie' or 'property tax 2026'.",
+    holding_query="Optional physical address or holding name to narrow the shelf.",
+    kind="Optional kind: EXPENSE, MAINTENANCE, TAX, INSURANCE, MORTGAGE, NOTICE, "
+    "LEASE, BANK_STATEMENT, OTHER.",
+    year="Optional calendar year of document_date, e.g. '2026'.",
+    tag="Optional tag slug, e.g. 'tax-2026' or 'insurance'.",
+    status="Optional status: QUEUED, PROCESSING, NEEDS_REVIEW, READY, FILED, FAILED.",
+    payment_state="Optional: PAID, UNPAID, UNKNOWN, NOT_APPLICABLE.",
+    has_expense="yes/no — only docs linked (or not) to a ledger expense.",
+    limit="Max rows to return (default 20, max 50).",
+)
+def search_business_documents(
+    landlord,
+    query: str = "",
+    holding_query: str = "",
+    kind: str = "",
+    year: str = "",
+    tag: str = "",
+    status: str = "",
+    payment_state: str = "",
+    has_expense: str = "",
+    limit: str = "20",
+) -> dict:
+    """Search the landlord's business document library (OCR text, title, issuer,
+    tags, holding, year, kind). Use for 'find the window screens invoice',
+    'any tax notices for McKenzie 2026?', 'unpaid invoices', 'what's unfiled?'.
+    Returns titles, amounts, links — never invents amounts or files. Read-only."""
+    from .document_services import search_business_documents_for_chat as _fn
+
+    try:
+        lim = int(limit or "20")
+    except ValueError:
+        lim = 20
+    return _fn(
+        landlord,
+        query=(query or "").strip(),
+        holding_query=(holding_query or "").strip(),
+        kind=(kind or "").strip(),
+        year=(year or "").strip(),
+        tag=(tag or "").strip(),
+        status=(status or "").strip(),
+        payment_state=(payment_state or "").strip(),
+        has_expense=(has_expense or "").strip(),
+        limit=lim,
+    )
 
 
 @_params(
@@ -1158,14 +1246,18 @@ def bulk_add_inventory(
 
 
 @_params(
-    amount="The cost, e.g. '75.00'.",
-    description="What the money was spent on.",
+    amount="The cost, e.g. '75.00' or '18.41'.",
+    description="What the money was spent on, e.g. 'Draino for 950 McKenzie'.",
     property_query="The LISTING this belongs to, or the UNIT when the cost is "
     "for shared space inside one ('McKenzie Basement') — never pick one of the "
     "rooms that share it. Leave blank for a whole-property or portfolio cost.",
     holding_name="The whole physical property, when the cost belongs to the "
-    "building rather than to anything inside it (roof, property tax, mulch for "
-    "the yard) — e.g. '950 McKenzie Ave'. Use this INSTEAD of property_query.",
+    "building rather than to anything inside it (roof, property tax, mulch, "
+    "Draino for the house) — e.g. '950 McKenzie Ave'. Use this INSTEAD of "
+    "property_query when they name the street/house.",
+    paid_on="If already paid: 'paid', 'today', or YYYY-MM-DD. Leave blank if "
+    "not yet taken from the bank.",
+    category="Optional: SUPPLIES, MAINTENANCE, UTILITIES, OTHER, …",
 )
 def create_expense(
     landlord,
@@ -1174,13 +1266,15 @@ def create_expense(
     property_query: str = "",
     holding_name: str = "",
     effective_date: str = "",
+    paid_on: str = "",
+    category: str = "",
     confirm: str = "",
 ) -> dict:
-    """Record a landlord expense. Four scopes, narrowest first: a LISTING
-    (property_query), the SHARED space of a unit (property_query), the WHOLE
-    physical property (holding_name), or portfolio-wide (leave both blank).
-    Use holding_name when the landlord says "the whole house" or names the
-    address rather than a listing. Preview first; confirm=yes."""
+    """Record a landlord expense with NO receipt photo. Use when they say they
+    bought/spent/paid something and did NOT attach a receipt — do NOT call
+    catalog_business_document. Four scopes: LISTING (property_query), unit
+    shared space, WHOLE property (holding_name=address), or portfolio-wide.
+    Pass paid_on when they said it is already paid. Preview first; confirm=yes."""
     from .domain_actions import create_expense as _fn
 
     return _fn(
@@ -1190,6 +1284,8 @@ def create_expense(
         property_query=property_query,
         holding_name=holding_name,
         effective_date=effective_date,
+        paid_on=paid_on,
+        category=category,
         confirm=confirm,
     )
 

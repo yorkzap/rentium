@@ -2808,9 +2808,12 @@ def create_expense(
     property_query: str = "",
     holding_name: str = "",
     effective_date: str = "",
+    paid_on: str = "",
+    category: str = "",
     confirm: str = "",
 ) -> dict:
     from rentium.ledger import services as ledger_services
+    from rentium.ledger.models import ExpenseCategory
 
     try:
         amt = Decimal(str(amount).replace("$", "").replace(",", "").strip())
@@ -2842,12 +2845,59 @@ def create_expense(
         except ValueError:
             return {"error": f"effective_date must be YYYY-MM-DD, got {effective_date!r}."}
 
+    paid_day = None
+    paid_raw = (paid_on or "").strip().lower()
+    if paid_raw in {"yes", "y", "true", "1", "paid", "today"}:
+        paid_day = day
+    elif paid_raw:
+        try:
+            paid_day = date.fromisoformat(paid_raw[:10])
+        except ValueError:
+            return {"error": f"paid_on must be YYYY-MM-DD or 'paid'/'today', got {paid_on!r}."}
+
+    cat = (category or "").strip().upper()
+    valid_cats = {c.value for c in ExpenseCategory}
+    if cat and cat not in valid_cats:
+        # Soft map common chat words.
+        soft = {
+            "SUPPLY": ExpenseCategory.SUPPLIES,
+            "CLEANING": ExpenseCategory.SUPPLIES,
+            "REPAIR": ExpenseCategory.MAINTENANCE,
+            "REPAIRS": ExpenseCategory.MAINTENANCE,
+        }
+        cat = soft.get(cat, ExpenseCategory.OTHER)
+    if not cat:
+        low = desc.casefold()
+        if any(
+            w in low
+            for w in (
+                "draino",
+                "drano",
+                "cleaner",
+                "supplies",
+                "hardware",
+                "home depot",
+                "canadian tire",
+            )
+        ):
+            cat = ExpenseCategory.SUPPLIES
+        elif any(
+            w in low
+            for w in ("repair", "plumber", "electrician", "hvac", "furnace")
+        ):
+            cat = ExpenseCategory.MAINTENANCE
+        else:
+            cat = ExpenseCategory.OTHER
+
     where = _expense_scope_label(prop, unit, holding)
     preview = {
         "amount": str(amt),
         "description": desc[:200],
         "property": where,
         "effective_date": day.isoformat(),
+        "category": cat,
+        "paid_on": paid_day.isoformat() if paid_day else None,
+        "bank_status": "paid" if paid_day else "not yet taken from bank",
     }
     # Shown in the preview so the landlord decides BEFORE the money is on the
     # books, rather than discovering the double entry in a month-end total.
@@ -2868,13 +2918,11 @@ def create_expense(
     if not _confirmed(confirm):
         return _preview("create_expense", preview, "Posts a landlord expense to the ledger.")
 
-    from rentium.ledger.models import ExpenseCategory
-
     try:
         result = ledger_services.post_expense(
             landlord=landlord,
             amount=amt,
-            category=ExpenseCategory.OTHER,
+            category=cat,
             description=desc[:255],
             incurred_date=day,
             property=prop,
@@ -2888,14 +2936,21 @@ def create_expense(
                 else (unit.holding if unit is not None else holding)
             ),
             vendor="",
+            paid_on=paid_day,
             created_by=landlord.user,
         )
         entry = result[0] if isinstance(result, tuple) else result
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Could not post expense: {exc}"}
 
+    scope = where or "portfolio-wide"
+    paid_bit = f" (paid {paid_day.isoformat()})" if paid_day else " (not yet taken from bank)"
     return {
         "created": True,
+        "message": (
+            f"Logged ${amt} {cat.replace('_', ' ').title().lower()} expense "
+            f"“{desc[:80]}” at {scope}{paid_bit}."
+        ),
         "expense": {
             "id": str(getattr(entry, "pk", "")),
             "amount": str(amt),
@@ -2905,8 +2960,10 @@ def create_expense(
             # (service._write_label), so a holding-wide cost is reported as the
             # whole property rather than falling back to whichever unit label
             # happened to be on the plan step.
-            "scope": where or "portfolio-wide",
+            "scope": scope,
             "effective_date": day.isoformat(),
+            "paid_on": paid_day.isoformat() if paid_day else None,
+            "category": cat,
         },
     }
 

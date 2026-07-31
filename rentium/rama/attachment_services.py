@@ -234,16 +234,16 @@ def batch_chat_note(batch: RamaAttachmentBatch) -> str:
     )
     routing = (
         "These files look like business documents (PDF/receipt/invoice). "
-        "Call catalog_business_document with attachment_id for each file and "
-        "scope_query=the street address or holding. That path runs OCR, files "
-        "the archival PDF, and can propose a maintenance expense against the "
-        "holding — never say you lack OCR or a PDF scanner. "
+        "Call catalog_business_document with attachment_id for each file "
+        "(OCR first, no scope_query required on the first call). That path "
+        "runs OCR, files the archival PDF, and can propose a maintenance "
+        "expense against the holding — never say you lack OCR or a PDF scanner. "
         if looks_document
         else (
-            "Determine whether the landlord means property media or business "
-            "documents from their words. For a receipt/invoice/notice/PDF use "
-            "catalog_business_document (OCR). For listing media use "
-            "attach_photo_to_listing with attachment_batch_id. "
+            "DEFAULT: business document path. Call catalog_business_document "
+            "with attachment_id ONLY first (OCR). Do NOT assume listing/"
+            "inspection photos and do NOT call attach_photo_to_listing unless "
+            "the landlord clearly said gallery/listing/main photo/for Room X. "
         )
     )
     return (

@@ -228,6 +228,8 @@ TOOL_META: dict[str, ToolMeta] = {
     "reallocate_expense": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
     # Can post an immutable ledger expense.
     "catalog_business_document": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    # Read-only library search (OCR/title/tags/filters).
+    "search_business_documents": ToolMeta(risk="low"),
     # Posts an immutable ledger expense from a catalogued invoice/receipt.
     "file_business_document": ToolMeta(
         risk="high", own_confirm=True, autonomy=Autonomy.NEVER

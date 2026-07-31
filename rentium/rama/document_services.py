@@ -155,17 +155,84 @@ def ingest_document(*, landlord, upload, created_by=None) -> tuple[RamaDocument,
     return document, True
 
 
+def _image_bytes_to_pdf(source: bytes, media_type: str) -> bytes:
+    """Raster image → single/multi-page PDF for the OCR pipeline."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise DocumentError("Document conversion support is not installed.") from exc
+
+    try:
+        if media_type in {"image/heic", "image/heif"}:
+            from pillow_heif import register_heif_opener
+
+            register_heif_opener()
+        image = Image.open(io.BytesIO(source))
+        frames = []
+        index = 0
+        while True:
+            frames.append(image.copy().convert("RGB"))
+            index += 1
+            try:
+                image.seek(index)
+            except EOFError:
+                break
+        buf = io.BytesIO()
+        frames[0].save(
+            buf,
+            "PDF",
+            save_all=True,
+            append_images=frames[1:],
+            resolution=300,
+        )
+        return buf.getvalue()
+    except DocumentError:
+        raise
+    except Exception as exc:
+        raise DocumentError(f"Could not convert this image: {exc}") from exc
+
+
+def _run_ocrmypdf(
+    input_path: Path,
+    output_path: Path,
+    sidecar_path: Path,
+    *,
+    force_ocr: bool,
+    output_type: str,
+) -> subprocess.CompletedProcess:
+    """Run ocrmypdf once. See _pdf_and_text for why force_ocr is the default."""
+    command = [
+        "ocrmypdf",
+        "--force-ocr" if force_ocr else "--skip-text",
+        "--rotate-pages",
+        "--deskew",
+        "--output-type",
+        output_type,
+        "--language",
+        "eng+fra",
+        "--sidecar",
+        str(sidecar_path),
+        str(input_path),
+        str(output_path),
+    ]
+    return subprocess.run(
+        command, capture_output=True, text=True, timeout=240, check=False
+    )
+
+
 def _pdf_and_text(document: RamaDocument) -> tuple[bytes, str]:
+    """Produce a searchable archival PDF + plain text.
+
+    Ghostscript 10.0.0–10.02.0 (Debian bookworm's package) refuses ocrmypdf's
+    ``--skip-text`` / PDF/A path and fails every photo invoice. Prefer
+    ``--force-ocr`` (always re-OCR — correct for camera receipts) with PDF/A;
+    fall back to plain PDF output if GS still chokes.
+    """
     document.original_file.open("rb")
     try:
         source = document.original_file.read()
     finally:
         document.original_file.close()
-
-    try:
-        from PIL import Image
-    except ImportError as exc:
-        raise DocumentError("Document conversion support is not installed.") from exc
 
     with tempfile.TemporaryDirectory(prefix="rentium-ocr-") as tmp:
         input_path = Path(tmp) / "input.pdf"
@@ -174,53 +241,48 @@ def _pdf_and_text(document: RamaDocument) -> tuple[bytes, str]:
         if document.media_type == "application/pdf":
             input_path.write_bytes(source)
         else:
-            try:
-                if document.media_type in {"image/heic", "image/heif"}:
-                    from pillow_heif import register_heif_opener
+            input_path.write_bytes(_image_bytes_to_pdf(source, document.media_type))
 
-                    register_heif_opener()
-                image = Image.open(io.BytesIO(source))
-                frames = []
-                index = 0
-                while True:
-                    frames.append(image.copy().convert("RGB"))
-                    index += 1
-                    try:
-                        image.seek(index)
-                    except EOFError:
-                        break
-                frames[0].save(
+        # Order matters: force-ocr + pdfa works on broken GS; skip-text does not.
+        attempts = (
+            (True, "pdfa"),
+            (True, "pdf"),
+            (False, "pdf"),  # born-digital text PDFs if force somehow fails
+        )
+        last_detail = ""
+        completed = None
+        for force_ocr, output_type in attempts:
+            if output_path.exists():
+                output_path.unlink()
+            if sidecar_path.exists():
+                sidecar_path.unlink()
+            try:
+                completed = _run_ocrmypdf(
                     input_path,
-                    "PDF",
-                    save_all=True,
-                    append_images=frames[1:],
-                    resolution=300,
+                    output_path,
+                    sidecar_path,
+                    force_ocr=force_ocr,
+                    output_type=output_type,
                 )
-            except Exception as exc:
-                raise DocumentError(f"Could not convert this image: {exc}") from exc
-        command = [
-            "ocrmypdf",
-            "--skip-text",
-            "--rotate-pages",
-            "--deskew",
-            "--output-type",
-            "pdfa",
-            "--language",
-            "eng+fra",
-            "--sidecar",
-            str(sidecar_path),
-            str(input_path),
-            str(output_path),
-        ]
-        try:
-            completed = subprocess.run(
-                command, capture_output=True, text=True, timeout=240, check=False
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            raise DocumentError(f"OCR engine unavailable: {exc}") from exc
-        if completed.returncode not in {0, 6}:  # 6 = already has text
-            detail = (completed.stderr or completed.stdout).strip()[-1200:]
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                raise DocumentError(f"OCR engine unavailable: {exc}") from exc
+            # 0 = ok, 6 = already has text (skip-text path only)
+            if completed.returncode in {0, 6}:
+                break
+            last_detail = (completed.stderr or completed.stdout or "").strip()[-1200:]
+            low = last_detail.casefold()
+            # Retry only the known Ghostscript / mode failures.
+            if (
+                "ghostscript" not in low
+                and "skip-text" not in low
+                and "force-ocr" not in low
+            ):
+                break
+
+        if completed is None or completed.returncode not in {0, 6}:
+            detail = last_detail or "unknown OCR error"
             raise DocumentError(f"OCR failed: {detail}")
+
         pdf = (
             output_path.read_bytes()
             if output_path.exists()
@@ -250,18 +312,40 @@ def _normalise_address(value: str) -> str:
 
 
 def _holding_match(landlord, text: str):
-    haystack = _normalise_address(text)
+    """Match OCR text to a physical holding.
+
+    Invoices often print the landlord's home address *and* the service address.
+    Prefer an explicit SERVICE ADDRESS block when present so we do not file
+    McKenzie work against a Wascana holding (or the reverse).
+    """
+    raw = text or ""
+    service_block = ""
+    m = re.search(
+        r"service\s+address\s*[:\n]+(.{0,200})",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        service_block = m.group(1)
+
+    haystack_full = _normalise_address(raw)
+    haystack_service = _normalise_address(service_block) if service_block else ""
+
     matches = []
     for holding in PropertyHolding.objects.filter(landlord=landlord):
         address = _normalise_address(holding.address)
         name = _normalise_address(holding.name)
-        score = 0
-        if address and address in haystack:
-            score = 1
-        elif name and name in haystack:
+        score = Decimal("0")
+        if address:
+            if haystack_service and address in haystack_service:
+                score = Decimal("1.0")
+            elif address in haystack_full:
+                # Present somewhere on the page, but not in the service block.
+                score = Decimal("0.70") if haystack_service else Decimal("1.0")
+        if score == 0 and name and name in haystack_full:
             score = Decimal("0.85")
         if score:
-            matches.append((holding, Decimal(score)))
+            matches.append((holding, score))
     matches.sort(key=lambda row: row[1], reverse=True)
     if not matches:
         return None, Decimal("0")
@@ -550,6 +634,21 @@ def promote_chat_file_to_document(
     if not aid and not uid:
         return {"error": "Pass attachment_id or upload_id."}
 
+    # Telegram photos are RamaUpload rows. Weak models often put that UUID in
+    # attachment_id; resolve to the table that actually has the row.
+    if aid and not RamaAttachment.objects.filter(
+        pk=aid, batch__landlord=landlord
+    ).exists():
+        if RamaUpload.objects.filter(pk=aid, landlord=landlord).exists():
+            uid = uid or aid
+            aid = ""
+    if uid and not RamaUpload.objects.filter(pk=uid, landlord=landlord).exists():
+        if RamaAttachment.objects.filter(
+            pk=uid, batch__landlord=landlord
+        ).exists():
+            aid = aid or uid
+            uid = ""
+
     staged_attachment = None
     staged_upload = None
     data = None
@@ -563,7 +662,12 @@ def promote_chat_file_to_document(
             .first()
         )
         if staged_attachment is None:
-            return {"error": f"No attachment {aid!r}."}
+            return {
+                "error": (
+                    f"No attachment {aid!r}. For Telegram photos use upload_id "
+                    "(or pass the same UUID — we resolve uploads automatically)."
+                ),
+            }
         # Already linked to a document from a prior prepare/catalog step.
         if staged_attachment.target_id:
             existing = RamaDocument.objects.filter(
@@ -1271,6 +1375,25 @@ def _classify(text: str, filename: str) -> dict:
             if phrase in value:
                 title = f"Maintenance — {phrase.title()}"
                 break
+        else:
+            # Vendor-style OCR: "PNR Screens Ltd" without the word "window".
+            if re.search(r"\bscreens?\b", value):
+                title = "Maintenance — Window Screens"
+    # Prefer a company-looking vendor (… Ltd / Inc) over a personal name line.
+    vendor = re.search(
+        r"([A-Z][A-Za-z0-9&.' -]{1,40}\s(?:Ltd|Inc|LLC|Co\.?|Company)\.?)",
+        text or "",
+    )
+    if vendor and kind in {
+        RamaDocument.Kind.MAINTENANCE,
+        RamaDocument.Kind.EXPENSE,
+    }:
+        vendor_name = re.sub(r"\s+", " ", vendor.group(1)).strip(" .,")
+        if 4 <= len(vendor_name) <= 48:
+            if title.startswith("Maintenance —"):
+                title = f"{title} ({vendor_name})"
+            else:
+                title = f"{vendor_name} Invoice"
 
     return {
         "kind": kind,
@@ -1356,10 +1479,18 @@ def document_intelligence_payload(document: RamaDocument) -> dict:
             "before filing, then pass it as amount= on file_business_document."
         )
     elif document.status == RamaDocument.Status.FAILED:
-        next_steps.append(
-            f"OCR failed: {document.failure_reason or 'unknown'}. "
-            "Ask the landlord to re-send a clearer photo/PDF."
-        )
+        reason = (document.failure_reason or "").casefold()
+        if "ghostscript" in reason or "skip-text" in reason:
+            next_steps.append(
+                "OCR hit a server Ghostscript bug (not a blurry photo). "
+                "Retry OCR on this document_id (or the Documents page Retry "
+                "button) — do NOT ask the landlord to re-photograph a clear invoice."
+            )
+        else:
+            next_steps.append(
+                f"OCR failed: {document.failure_reason or 'unknown'}. "
+                "Retry OCR once; only ask for a re-send if Retry also fails."
+            )
     return {
         "document_id": str(document.pk),
         "status": document.status,
@@ -1402,18 +1533,41 @@ def document_intelligence_payload(document: RamaDocument) -> dict:
     }
 
 
-def _ensure_ocr(document: RamaDocument) -> RamaDocument:
-    """Run OCR now if still pending (chat path needs facts before the reply)."""
+def _ensure_ocr(document: RamaDocument, *, force: bool = False) -> RamaDocument:
+    """Run OCR now if still pending (chat path needs facts before the reply).
+
+    FAILED rows with empty OCR (typical Ghostscript misconfig) are always
+    retried. Pass force=True to re-run after a successful but wrong pass.
+    """
     document.refresh_from_db()
-    if document.status == RamaDocument.Status.FILED:
+    if document.status == RamaDocument.Status.FILED and not force:
         return document
-    if document.status == RamaDocument.Status.FAILED and (document.ocr_text or ""):
+    if (
+        not force
+        and document.status == RamaDocument.Status.FAILED
+        and (document.ocr_text or "").strip()
+    ):
         return document
-    if document.status in {
-        RamaDocument.Status.READY,
-        RamaDocument.Status.NEEDS_REVIEW,
-    } and (document.ocr_text or "").strip():
+    if (
+        not force
+        and document.status
+        in {
+            RamaDocument.Status.READY,
+            RamaDocument.Status.NEEDS_REVIEW,
+        }
+        and (document.ocr_text or "").strip()
+    ):
         return document
+    return process_document(document.pk)
+
+
+def reocr_document(*, landlord, document) -> RamaDocument:
+    """Re-run OCR on a document the landlord still owns (inbox Retry button)."""
+    if document.landlord_id != landlord.pk:
+        raise DocumentError("Document not found.")
+    if document.status == RamaDocument.Status.FILED and document.ledger_entry_id:
+        # Still allow re-OCR for better text search; filing stays linked.
+        pass
     return process_document(document.pk)
 
 
@@ -1862,3 +2016,339 @@ def business_document_status(landlord, *, document_id: str = "") -> dict:
     }:
         document = _ensure_ocr(document)
     return {"ok": True, **document_intelligence_payload(document)}
+
+
+# ---------------------------------------------------------------------------
+# Library: search, tags, intentional delete
+# ---------------------------------------------------------------------------
+
+
+def _search_token_filter(q: str):
+    """Match any significant token across title/issuer/OCR (landlord-friendly).
+
+    OCR often reads 'PNR Screens' not 'window screens' — requiring every word
+    (websearch AND) would miss the real invoice. Any token ≥3 chars is enough.
+    """
+    from django.db.models import Q
+
+    tokens = [t for t in re.findall(r"[a-zA-Z0-9]+", q) if len(t) >= 3]
+    if not tokens:
+        tokens = [q]
+    token_q = Q()
+    for token in tokens:
+        token_q |= (
+            Q(title__icontains=token)
+            | Q(issuer__icontains=token)
+            | Q(reference_number__icontains=token)
+            | Q(ocr_text__icontains=token)
+            | Q(canonical_filename__icontains=token)
+            | Q(original_filename__icontains=token)
+        )
+    # Also try the full phrase when useful (exact vendor names, etc.).
+    if len(q) >= 3:
+        token_q |= (
+            Q(title__icontains=q)
+            | Q(issuer__icontains=q)
+            | Q(ocr_text__icontains=q)
+        )
+    return token_q
+
+
+def _apply_document_search(queryset, q: str):
+    """Full-text on Postgres plus token icontains (OCR-noise tolerant)."""
+    q = (q or "").strip()
+    if not q:
+        return queryset, False
+
+    from django.db import connection
+    from django.db.models import Q
+
+    fallback = _search_token_filter(q)
+
+    if connection.vendor == "postgresql":
+        from django.contrib.postgres.search import SearchQuery
+        from django.contrib.postgres.search import SearchRank
+        from django.contrib.postgres.search import SearchVector
+
+        vector = (
+            SearchVector("title", weight="A")
+            + SearchVector("issuer", weight="A")
+            + SearchVector("reference_number", weight="B")
+            + SearchVector("canonical_filename", weight="B")
+            + SearchVector("original_filename", weight="C")
+            + SearchVector("ocr_text", weight="C")
+        )
+        query = SearchQuery(q, config="english", search_type="websearch")
+        ranked = (
+            queryset.annotate(search=vector, rank=SearchRank(vector, query))
+            .filter(Q(search=query) | fallback)
+            .order_by("-rank", "-created_at")
+        )
+        return ranked, True
+
+    return queryset.filter(fallback), False
+
+
+def query_business_documents(
+    landlord,
+    *,
+    q: str = "",
+    holding_id: str = "",
+    kind: str = "",
+    year: str | int | None = None,
+    status: str = "",
+    tag: str = "",
+    payment_state: str = "",
+    has_expense: str | bool | None = None,
+    page: int = 1,
+    page_size: int = 25,
+):
+    """Filter + full-text search the landlord's business document cabinet."""
+    from django.db.models import Prefetch
+
+    from .models import DocumentTag
+
+    page = max(1, int(page or 1))
+    page_size = min(100, max(1, int(page_size or 25)))
+
+    queryset = (
+        RamaDocument.objects.filter(landlord=landlord)
+        .select_related("holding", "property", "ledger_entry")
+        .prefetch_related(
+            Prefetch(
+                "tags",
+                queryset=DocumentTag.objects.filter(landlord=landlord).order_by("name"),
+            )
+        )
+    )
+
+    status_filter = str(status or "").strip().upper()
+    if status_filter:
+        queryset = queryset.filter(status=status_filter)
+
+    kind_filter = str(kind or "").strip().upper()
+    if kind_filter:
+        queryset = queryset.filter(kind=kind_filter)
+
+    payment = str(payment_state or "").strip().upper()
+    if payment:
+        queryset = queryset.filter(payment_state=payment)
+
+    holding = str(holding_id or "").strip()
+    if holding:
+        queryset = queryset.filter(holding_id=holding)
+
+    if year not in (None, ""):
+        try:
+            year_int = int(year)
+        except (TypeError, ValueError) as exc:
+            raise DocumentError("year must be a four-digit number.") from exc
+        queryset = queryset.filter(document_date__year=year_int)
+
+    tag_filter = str(tag or "").strip().lower()
+    if tag_filter:
+        queryset = queryset.filter(tags__slug=tag_filter).distinct()
+
+    if has_expense is not None and has_expense != "":
+        want = has_expense
+        if isinstance(want, str):
+            want = want.strip().lower() in {"1", "true", "yes", "y"}
+        if want:
+            queryset = queryset.filter(ledger_entry__isnull=False)
+        else:
+            queryset = queryset.filter(ledger_entry__isnull=True)
+
+    queryset, ranked = _apply_document_search(queryset, q)
+    if not ranked:
+        queryset = queryset.order_by("-created_at")
+
+    total = queryset.count()
+    start = (page - 1) * page_size
+    rows = list(queryset[start : start + page_size])
+    return {
+        "documents": rows,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "has_next": start + page_size < total,
+            "has_prev": page > 1,
+        },
+    }
+
+
+def search_business_documents_for_chat(
+    landlord,
+    *,
+    query: str = "",
+    holding_query: str = "",
+    kind: str = "",
+    year: str = "",
+    tag: str = "",
+    status: str = "",
+    payment_state: str = "",
+    has_expense: str = "",
+    limit: int = 20,
+) -> dict:
+    """RAMA read tool: find filed paperwork by text + filters."""
+    holding_id = ""
+    hq = (holding_query or "").strip()
+    if hq:
+        holdings = PropertyHolding.objects.filter(landlord=landlord)
+        exact = holdings.filter(address__iexact=hq).first()
+        if exact is None:
+            exact = holdings.filter(name__iexact=hq).first()
+        if exact is None:
+            matches = list(
+                holdings.filter(address__icontains=hq)[:5]
+            ) or list(holdings.filter(name__icontains=hq)[:5])
+            if len(matches) == 1:
+                exact = matches[0]
+            elif len(matches) > 1:
+                return {
+                    "ok": False,
+                    "error": "Several holdings match that address/name.",
+                    "candidates": [
+                        {
+                            "id": str(h.pk),
+                            "name": h.name,
+                            "address": h.address,
+                        }
+                        for h in matches
+                    ],
+                    "hint": "Pass a more specific holding_query.",
+                }
+            else:
+                return {
+                    "ok": False,
+                    "error": f"No holding matches {hq!r}.",
+                }
+        holding_id = str(exact.pk)
+
+    try:
+        result = query_business_documents(
+            landlord,
+            q=query,
+            holding_id=holding_id,
+            kind=kind,
+            year=year or None,
+            status=status,
+            tag=tag,
+            payment_state=payment_state,
+            has_expense=has_expense if has_expense else None,
+            page=1,
+            page_size=min(50, max(1, int(limit or 20))),
+        )
+    except DocumentError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    rows = []
+    for doc in result["documents"]:
+        rows.append(
+            {
+                "document_id": str(doc.pk),
+                "title": doc.get_display_title(),
+                "kind": doc.kind,
+                "status": doc.status,
+                "issuer": doc.issuer,
+                "reference_number": doc.reference_number,
+                "document_date": (
+                    str(doc.document_date) if doc.document_date else None
+                ),
+                "amount": str(doc.amount) if doc.amount is not None else None,
+                "currency": doc.currency,
+                "payment_state": doc.payment_state,
+                "holding": (
+                    {
+                        "id": str(doc.holding_id),
+                        "name": doc.holding.name if doc.holding_id else None,
+                        "address": doc.holding.address if doc.holding_id else None,
+                    }
+                    if doc.holding_id
+                    else None
+                ),
+                "tags": [t.slug for t in doc.tags.all()],
+                "ledger_entry_id": (
+                    str(doc.ledger_entry_id) if doc.ledger_entry_id else None
+                ),
+                "documents_page": url_for_path(
+                    f"/dashboard/documents?document={doc.pk}"
+                ),
+            }
+        )
+    return {
+        "ok": True,
+        "query": (query or "").strip(),
+        "count": result["pagination"]["total"],
+        "returned": len(rows),
+        "documents": rows,
+        "documents_page": url_for_path("/dashboard/documents"),
+    }
+
+
+def get_or_create_document_tag(landlord, name: str):
+    from .models import DocumentTag
+
+    raw = (name or "").strip()
+    if not raw:
+        raise DocumentError("Tag name is required.")
+    slug = slugify(raw)[:64] or "tag"
+    tag, _ = DocumentTag.objects.get_or_create(
+        landlord=landlord,
+        slug=slug,
+        defaults={"name": raw[:64]},
+    )
+    return tag
+
+
+def set_document_tags(document, tag_names: list[str], *, replace: bool = True):
+    """Attach labels to a document. Names are created if missing for that landlord."""
+    tags = [get_or_create_document_tag(document.landlord, n) for n in tag_names if n]
+    if replace:
+        document.tags.set(tags)
+    else:
+        document.tags.add(*tags)
+    return list(document.tags.order_by("name"))
+
+
+def list_document_tags(landlord):
+    from .models import DocumentTag
+    from django.db.models import Count
+
+    return list(
+        DocumentTag.objects.filter(landlord=landlord)
+        .annotate(document_count=Count("documents"))
+        .order_by("name")
+    )
+
+
+def delete_document(*, landlord, document) -> dict:
+    """Intentionally remove a business document that is not ledger-linked.
+
+    Events are append-only for normal edits; removing the parent document uses
+    bulk CASCADE so the custody trail of a discarded mis-upload does not block
+    cleanup. Ledger expenses are never deleted.
+    """
+    if document.landlord_id != landlord.pk:
+        raise DocumentError("Document not found.")
+    if document.ledger_entry_id:
+        raise DocumentError(
+            "This document is linked to a ledger expense. Unlink or void the "
+            "expense first if you truly need the file gone; the expense itself "
+            "stays as audit history."
+        )
+
+    for field in (document.original_file, document.archival_pdf):
+        if field:
+            try:
+                field.delete(save=False)
+            except Exception:  # noqa: BLE001 — storage best-effort
+                pass
+
+    pk = str(document.pk)
+    with transaction.atomic():
+        # Bulk queryset delete bypasses RamaDocumentEvent.delete() append-only guard.
+        document.events.all().delete()
+        document.tags.clear()
+        document.delete()
+    return {"deleted": True, "document_id": pk}

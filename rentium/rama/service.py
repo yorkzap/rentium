@@ -279,6 +279,19 @@ def _write_result_message(tool: str, result: dict, target: str = "") -> str:
     message = str(result.get("message") or result.get("note") or "").strip()
     if message:
         return message
+    if tool == "create_expense" and result.get("created"):
+        exp = result.get("expense") if isinstance(result.get("expense"), dict) else {}
+        amount = exp.get("amount") or result.get("amount") or ""
+        scope = exp.get("scope") or exp.get("property") or target or "portfolio"
+        desc = (exp.get("description") or "").strip()
+        paid = exp.get("paid_on")
+        bits = [f"Logged ${amount} expense"]
+        if desc:
+            bits.append(f"“{desc[:80]}”")
+        bits.append(f"at {scope}")
+        if paid:
+            bits.append(f"(paid {paid})")
+        return " ".join(bits) + "."
     if tool == "update_property":
         before = str(result.get("previous_name") or target or "").strip()
         prop = result.get("property") or {}
@@ -296,6 +309,9 @@ def _write_result_message(tool: str, result: dict, target: str = "") -> str:
             return f"Updated lease {lease_number} for {prop_name}{detail}."
         return f"Updated lease {lease_number}{detail}."
     label = _write_label(result) or target
+    # "Created 950 McKenzie Ave — whole property" is wrong for money writes.
+    if tool == "create_expense" and result.get("created"):
+        return f"Logged expense at {label or 'portfolio'}."
     if result.get("created") and label:
         return f"Created {label}."
     if result.get("updated") and label:
@@ -1369,6 +1385,31 @@ def _merge_house_layout_answer(arguments: dict, message: str) -> dict:
 
 def _preview_reply(tool: str, result: dict) -> str:
     preview = result.get("preview") or {}
+    if tool == "create_expense":
+        amount = preview.get("amount") or ""
+        desc = preview.get("description") or "expense"
+        where = preview.get("property") or "portfolio"
+        day = preview.get("effective_date") or "today"
+        bank = preview.get("bank_status") or (
+            f"paid {preview['paid_on']}"
+            if preview.get("paid_on")
+            else "not yet taken from bank"
+        )
+        cat = (preview.get("category") or "").replace("_", " ").title()
+        lines = [
+            "Expense to file (no receipt required):",
+            f"• Amount: ${amount}",
+            f"• Description: {desc}",
+            f"• Property: {where}",
+            f"• Date: {day}",
+        ]
+        if cat:
+            lines.append(f"• Category: {cat}")
+        lines.append(f"• Bank: {bank}")
+        if preview.get("duplicate_warning"):
+            lines.append(f"• Note: {preview['duplicate_warning']}")
+        lines.append("Reply yes to post this expense, or no to cancel.")
+        return "\n".join(lines)
     if tool == "create_house_layout":
         holding = preview.get("holding") or {}
         lines = [
@@ -2314,10 +2355,17 @@ _DENIES_BUSINESS_RECORD = re.compile(
 )
 
 # The positive form: the landlord saying where the photos should actually go.
+# Without an explicit claim, bare photo attachments default to the document/OCR
+# path — weak models otherwise invent "inspection photo" for clear receipts.
 _CLAIMS_LISTING_PHOTO = re.compile(
-    r"\b(gallery|listing photo|listing photos|listing image|listing images|"
+    r"\b("
+    r"gallery|listing photo|listing photos|listing image|listing images|"
     r"property photo|property photos|main photo|primary photo|cover photo|"
-    r"just (?:some )?(?:images|photos|pics|pictures))\b",
+    r"marketing photo|marketing photos|inspection photo|inspection photos|"
+    r"for the listing|to the listing|on the listing|"
+    r"add (?:this |these )?(?:to|on) (?:the )?(?:listing|room|suite|unit)|"
+    r"just (?:some )?(?:images|photos|pics|pictures)"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -2403,6 +2451,7 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         "letter",
         "receipt",
         "invoice",
+        "invoices",
         "notice",
         "statement",
         "paperwork",
@@ -2415,8 +2464,17 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         "expense",
         "maintenance expense",
         "bill",
+        "bills",
+        "payable",
+        "installing",
+        "installation",
+        "contractor",
+        "vendor",
+        "tax notice",
+        "property tax",
     )
     business_record = any(term in lowered for term in business_terms)
+
     # File shape also forces the document path — a PDF receipt is not gallery media.
     if attachment_batch is not None:
         for row in attachment_batch.attachments.filter(pk__in=attachment_ids):
@@ -2438,8 +2496,17 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
     # was being corrected for. Both overrides below are checked against the
     # LATEST message only — the landlord's most recent words win.
     latest = (texts[0] if texts else "").casefold()
-    if _DENIES_BUSINESS_RECORD.search(latest) or _CLAIMS_LISTING_PHOTO.search(latest):
+    claims_listing = bool(_CLAIMS_LISTING_PHOTO.search(latest))
+    denies_business = bool(_DENIES_BUSINESS_RECORD.search(latest))
+    if denies_business or claims_listing:
         business_record = False
+    elif not business_record:
+        # DEFAULT: bare photo/file with no listing intent → document/OCR path.
+        # Landlords drop clear receipts with no caption; models then invent
+        # "property/inspection photo". Listing media almost always comes with
+        # "gallery / listing / for Room X / main photo". OCR first is safe —
+        # it never posts money and never attaches to a listing.
+        business_record = True
     issuer = "Scotiabank" if "scotiabank" in lowered else ""
     document_date = ""
     for pattern, fmt in (
@@ -2454,6 +2521,7 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
             break
         except ValueError:
             continue
+    pending_count = len(upload_ids) + len(attachment_ids)
     return {
         "unresolved_upload_ids": sorted(upload_ids),
         "attachment_batch_id": (
@@ -2462,34 +2530,116 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         "attachment_ids": attachment_ids,
         "document_ids": sorted(document_ids),
         "landlord_described_as_business_record": business_record,
+        "landlord_claims_listing_photo": claims_listing,
         # Stated explicitly because the model was guessing at how many photos
         # it had and consistently guessing low.
-        "pending_photo_count": len(upload_ids) + len(attachment_ids),
+        "pending_photo_count": pending_count,
         "issuer": issuer or None,
         "document_date": document_date or None,
         "instruction": (
-            f"The landlord has {len(upload_ids) + len(attachment_ids)} attached "
-            "file(s) in this request not yet "
-            f"placed. "
+            f"The landlord has {pending_count} attached file(s) not yet placed "
+            f"(attachment_batch_id={attachment_batch.pk if attachment_batch else None}; "
+            f"attachment_ids={attachment_ids or sorted(upload_ids)}). "
             + (
-                "Treat them as business documents. Call catalog_business_document "
-                "with attachment_id/upload_id ONLY first (no scope_query) — that "
-                "hashes + OCRs and returns already_done if this exact file was "
-                "already catalogued. Do NOT ask for the address before that call. "
-                "Only if needs_input, ask the holding address, then catalog with "
-                "document_id + scope_query. NEVER invent amounts. NEVER re-file "
-                "duplicates. NEVER claim you lack OCR."
+                "DEFAULT = business document. Call catalog_business_document "
+                "with attachment_id/upload_id ONLY first (no scope_query) — "
+                "hash + OCR. Do NOT call attach_photo_to_listing. Do NOT say "
+                "this 'looks like a property/inspection photo'. Do NOT ask for "
+                "the address before that OCR call. Only if needs_input, ask the "
+                "holding address, then catalog with document_id + scope_query. "
+                "NEVER invent amounts. NEVER re-file duplicates. NEVER claim "
+                "you lack OCR."
                 if business_record
                 else (
-                    "To put them on a listing call attach_photo_to_listing "
-                    "ONCE with attachment_batch_id from this focus. That uses "
-                    "only this message's ordered batch. Never substitute an "
-                    "older batch or global pending uploads. If they meant a "
-                    "receipt/expense, use catalog_business_document (no address "
-                    "first) instead."
+                    "Landlord indicated LISTING/property media. Call "
+                    "attach_photo_to_listing ONCE with attachment_batch_id from "
+                    "this focus (or upload_id for legacy). Never substitute an "
+                    "older batch. If they meant a receipt after all, use "
+                    "catalog_business_document (no address first) instead."
                 )
             )
         ),
+    }
+
+
+# Verbal expenses without a receipt photo this turn.
+_VERBAL_EXPENSE_RE = re.compile(
+    r"\b(bought|purchased|spent|i paid|paid \$?\d|cost me|expense for)\b",
+    re.IGNORECASE,
+)
+_NO_RECEIPT_RE = re.compile(
+    r"(didn'?t send|no (receipt|picture|photo)|lost (it|the receipt)|"
+    r"without (a )?(receipt|photo|picture)|just (log|file|record|post) (the )?expense|"
+    r"don'?t (need to )?catalog|not a (receipt|document)|something new|"
+    r"already been recorded|already recorded)",
+    re.IGNORECASE,
+)
+
+
+def _message_has_new_file(message: str) -> bool:
+    text = message or ""
+    return bool(
+        re.search(r"upload_id=", text)
+        or re.search(r"RAMA attachment batch", text)
+        or re.search(r"Business document [0-9a-fA-F-]{32,36}", text)
+    )
+
+
+def _verbal_expense_intent(landlord, message: str, live_portfolio: dict) -> dict | None:
+    """Parse 'I bought X for $Y at McKenzie, paid' with no photo → create_expense.
+
+    Must not steal turns that still have a fresh attachment, and must not re-open
+    an earlier OCR receipt when the landlord is stating a new cash expense.
+    """
+    if _message_has_new_file(message):
+        return None
+    text = _landlord_words(message or "").strip()
+    if not text:
+        return None
+    # Explicit "no receipt / something new" is enough even without "bought".
+    looks_expense = bool(_VERBAL_EXPENSE_RE.search(text)) or bool(
+        re.search(r"\$\s*\d", text) and re.search(r"\b(for|at|on)\b", text)
+    )
+    if not looks_expense and not _NO_RECEIPT_RE.search(text):
+        return None
+    money = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)", text)
+    if not money:
+        money = re.search(r"\b(\d+\.\d{2})\b", text)
+    if not money:
+        return None
+    amount = money.group(1)
+    holding = _address_scope_from_message(text, live_portfolio)
+    desc = text
+    desc = re.sub(r"\$\s*\d+(?:\.\d{1,2})?", "", desc)
+    desc = re.sub(r"\b\d+\.\d{2}\b", "", desc)
+    desc = re.sub(
+        r"\b(i bought|bought|purchased|spent|i paid|paid today|already paid|"
+        r"its paid|it's paid|and it'?s paid|today)\b",
+        "",
+        desc,
+        flags=re.IGNORECASE,
+    )
+    desc = re.sub(r"\s+", " ", desc).strip(" .,;:")
+    if len(desc) < 2:
+        desc = f"Expense ${amount}"
+    paid = bool(
+        re.search(
+            r"\b(paid|already paid|its paid|it's paid|and it'?s paid)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    return {
+        "tool": "create_expense",
+        "arguments": {
+            "amount": amount,
+            "description": desc[:200],
+            "holding_name": holding or "",
+            "property_query": "",
+            "paid_on": "today" if paid else "",
+            "effective_date": "",
+            "category": "",
+        },
     }
 
 
@@ -3327,37 +3477,111 @@ def run_turn(
                     result.get("error") or result.get("message") or result,
                 )
 
+    # Verbal cash expense with no receipt this turn — before document OCR path,
+    # so an old pending receipt cannot steal "I bought Draino for $18".
+    if deterministic_reply is None and pending_plan is None:
+        intent = _verbal_expense_intent(landlord, message, safe_context)
+        if intent is not None:
+            result = execute(
+                intent["tool"], intent["arguments"], landlord=landlord,
+            )
+            safe_result = json.loads(json.dumps(result, default=str))
+            tools_used.append(intent["tool"])
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": intent["tool"],
+                    "arguments": intent["arguments"],
+                    "result": safe_result,
+                    "deterministic_routing": True,
+                },
+            )
+            if result.get("needs_confirm"):
+                save_single(
+                    landlord,
+                    conversation_id,
+                    intent["tool"],
+                    intent["arguments"],
+                )
+                deterministic_reply = _preview_reply(intent["tool"], result)
+            elif result.get("error"):
+                deterministic_reply = str(result["error"])
+            elif result.get("created"):
+                deterministic_reply = _write_result_message(
+                    intent["tool"], result,
+                )
+
     # Deterministic document routing: weak models repeatedly treated photographed
-    # bank mail as a listing photo, or denied OCR exists. Once intent=document
-    # (or the file is a PDF/receipt) and a known legal address is present, the
-    # backend itself creates the holding-level preview with OCR.
+    # invoices as listing photos, or claimed OCR does not exist. Once intent is
+    # a business record (or the file is a PDF/receipt), the backend itself
+    # prepares hash+OCR first — address is only required after that.
+    # Also parse the CURRENT message for upload_id= / attachment batch markers —
+    # Telegram photos are always upload_id, never attachment_id.
+    msg_upload_ids = re.findall(
+        r"upload_id=([0-9a-fA-F-]{32,36})", message or ""
+    )
+    msg_attachment_ids = re.findall(
+        r"(?:attachment_id=|items=\d+:)([0-9a-fA-F-]{32,36})", message or ""
+    )
+    # Do not re-open catalog for a prior upload when this turn is a verbal expense.
+    verbal_this_turn = _verbal_expense_intent(landlord, message, safe_context)
+    focus = attachment_focus or {}
+    focus_has_pending_file = bool(
+        focus.get("unresolved_upload_ids")
+        or focus.get("attachment_ids")
+        or focus.get("document_ids")
+    )
     if (
         deterministic_reply is None
         and pending_plan is None
+        and verbal_this_turn is None
         and (
-            attachment_focus.get("landlord_described_as_business_record")
+            bool(msg_upload_ids)
+            or bool(msg_attachment_ids)
+            or (
+                focus.get("landlord_described_as_business_record")
+                and focus_has_pending_file
+            )
             or supported_tool_for_request(message) == "catalog_business_document"
         )
-        and attachment_focus
-    ):
-        attachment_ids = (
-            (attachment_focus.get("attachment_ids") or [])
-            + (attachment_focus.get("unresolved_upload_ids") or [])
-            + (attachment_focus.get("document_ids") or [])
+        and (
+            attachment_focus
+            or msg_upload_ids
+            or msg_attachment_ids
         )
+    ):
+        focus = attachment_focus or {}
+        batch_ids = list(focus.get("attachment_ids") or [])
+        upload_ids = list(focus.get("unresolved_upload_ids") or [])
+        doc_ids = list(focus.get("document_ids") or [])
+        # Prefer live message markers (this turn's Telegram photo).
+        for mid in msg_upload_ids:
+            if mid not in upload_ids:
+                upload_ids.append(mid)
+        for mid in msg_attachment_ids:
+            if mid not in batch_ids:
+                batch_ids.append(mid)
         scope_query = _address_scope_from_message(message, safe_context)
-        if len(attachment_ids) == 1 and scope_query:
-            is_batch_attachment = bool(attachment_focus.get("attachment_ids"))
-            is_upload = bool(attachment_focus.get("unresolved_upload_ids"))
+        # Exactly one file handle this turn — pick the right tool arg name.
+        if len(batch_ids) == 1 and not upload_ids and not doc_ids:
+            file_arg = {"attachment_id": batch_ids[0]}
+        elif len(upload_ids) == 1 and not batch_ids and not doc_ids:
+            file_arg = {"upload_id": upload_ids[0]}
+        elif len(doc_ids) == 1 and not batch_ids and not upload_ids:
+            file_arg = {"document_id": doc_ids[0]}
+        elif len(upload_ids) == 1:
+            # Mixed history: this turn's photo wins as upload.
+            file_arg = {"upload_id": upload_ids[0]}
+        elif len(batch_ids) == 1:
+            file_arg = {"attachment_id": batch_ids[0]}
+        else:
+            file_arg = {}
+        if file_arg:
             arguments = {
-                "scope_query": scope_query,
-                "issuer": attachment_focus.get("issuer") or "",
-                "document_date": attachment_focus.get("document_date") or "",
-                (
-                    "attachment_id"
-                    if is_batch_attachment
-                    else ("upload_id" if is_upload else "document_id")
-                ): attachment_ids[0],
+                "scope_query": scope_query or "",
+                "issuer": focus.get("issuer") or "",
+                "document_date": focus.get("document_date") or "",
+                **file_arg,
             }
             result = execute(
                 "catalog_business_document", arguments, landlord=landlord,
@@ -3381,14 +3605,50 @@ def run_turn(
                     arguments,
                 )
                 deterministic_reply = _document_preview_reply(result)
+            elif result.get("needs_input"):
+                # Prepared + OCR done; ask for holding only now.
+                intel = result.get("intelligence") or {}
+                bits = []
+                if intel.get("kind_display") or intel.get("kind"):
+                    bits.append(str(intel.get("kind_display") or intel.get("kind")))
+                if intel.get("title"):
+                    bits.append(str(intel["title"]))
+                if intel.get("amount"):
+                    bits.append(f"${intel['amount']}")
+                summary = (
+                    ("I read this as " + " · ".join(bits) + ". ") if bits else ""
+                )
+                if result.get("status") == "FAILED" or (
+                    intel.get("status") == "FAILED"
+                ):
+                    deterministic_reply = (
+                        summary
+                        + "OCR hit a processing error on the server (not a blurry "
+                        "photo). I will retry OCR; if it still fails, use Retry on "
+                        "the Documents page. "
+                        + str(result.get("question_for_user") or "")
+                    ).strip()
+                else:
+                    deterministic_reply = (
+                        summary
+                        + str(
+                            result.get("question_for_user")
+                            or (
+                                "Which physical property address does this belong "
+                                "to? (Or whole portfolio.)"
+                            )
+                        )
+                    ).strip()
+            elif result.get("already_done") or result.get("is_duplicate"):
+                deterministic_reply = str(
+                    result.get("message")
+                    or result.get("relay_instruction")
+                    or "This file is already in your document library."
+                )
             elif result.get("error"):
                 deterministic_reply = str(result["error"])
-        elif len(attachment_ids) == 1 and not scope_query:
-            deterministic_reply = (
-                "Which physical property address does this business document "
-                "belong to? You can also say it applies to the whole portfolio. "
-                "I will file it at the holding level—not against a room or unit."
-            )
+            elif result.get("prepared") or result.get("catalogued"):
+                deterministic_reply = _document_preview_reply(result)
 
     if (
         deterministic_reply is None
