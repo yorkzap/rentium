@@ -2752,6 +2752,244 @@ def update_lease(
     }
 
 
+def adjust_lease(
+    landlord,
+    *,
+    lease_number: str = "",
+    property_query: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    furnishing: str = "",
+    inventory_items: str = "",
+    special_terms: str = "",
+    confirm: str = "",
+) -> dict:
+    """Edit a DRAFT or PENDING (not yet ACTIVE) lease in one confirmed step.
+
+    Use this when the landlord wants to change start/end dates and/or
+    furnished status. Furnishing is NOT a lease checkbox — it is derived from
+    the listing's private inventory (a bed makes a room furnished). This tool
+    updates dates on the lease and, when asked, ensures inventory so the lease
+    PDF shows furnished correctly.
+
+    furnishing: furnished | semi_furnished | unfurnished (optional).
+    inventory_items: optional explicit list (e.g. 'Queen bed, Mattress, Desk').
+    """
+    from rentium.properties.models import InventoryItem
+
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number,
+    )
+    if err:
+        return _prop_err(err)
+    if lease.is_locked():
+        return {
+            "error": (
+                f"Lease {lease.lease_number} is {lease.status} and locked. "
+                "ACTIVE/EXPIRED/TERMINATED/RENEWED leases cannot have start "
+                "date or terms rewritten. Create a new lease instead."
+            ),
+        }
+    if not lease.property_id:
+        return {"error": "This lease has no listing attached."}
+
+    prop = lease.property
+    changes: dict = {}
+    inventory_to_add: list[str] = []
+    furnishing_note = ""
+
+    try:
+        if start_date.strip():
+            changes["start_date"] = _parse_date(start_date, "start_date")
+        if end_date.strip():
+            changes["end_date"] = _parse_date(end_date, "end_date")
+        if special_terms != "":
+            changes["special_terms"] = special_terms[:5000]
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if (
+        changes.get("start_date")
+        and changes.get("end_date")
+        and changes["end_date"] < changes["start_date"]
+    ):
+        return {"error": "end_date must be on or after start_date."}
+    if (
+        changes.get("start_date")
+        and not changes.get("end_date")
+        and lease.end_date
+        and lease.end_date < changes["start_date"]
+    ):
+        return {
+            "error": (
+                f"New start date {changes['start_date']} is after the current "
+                f"end date {lease.end_date}. Pass end_date too."
+            ),
+        }
+
+    mode = (
+        (furnishing or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if mode in ("furnished", "fully_furnished", "full"):
+        mode = "furnished"
+    elif mode in ("semi", "semi_furnished", "semifurnished", "partially_furnished"):
+        mode = "semi_furnished"
+    elif mode in ("unfurnished", "un_furnished", "none", "empty"):
+        mode = "unfurnished"
+    elif mode:
+        return {
+            "error": (
+                "furnishing must be furnished, semi_furnished, or unfurnished "
+                f"(got {furnishing!r})."
+            ),
+        }
+
+    explicit_items = []
+    raw_items = (inventory_items or "").strip()
+    if raw_items:
+        if raw_items.startswith("["):
+            import json
+
+            try:
+                explicit_items = [
+                    str(x).strip() for x in json.loads(raw_items) if str(x).strip()
+                ]
+            except Exception:  # noqa: BLE001
+                return {"error": "inventory_items JSON list is invalid."}
+        else:
+            explicit_items = [
+                p.strip() for p in raw_items.replace(";", ",").split(",") if p.strip()
+            ]
+
+    existing_names = {
+        n.casefold()
+        for n in prop.inventory_items.values_list("name", flat=True)
+    }
+
+    def _need(name: str) -> None:
+        if name.casefold() not in existing_names and name not in inventory_to_add:
+            inventory_to_add.append(name)
+
+    if explicit_items:
+        for name in explicit_items:
+            _need(name)
+    elif mode == "furnished":
+        _need("Queen bed")
+        _need("Mattress")
+        _need("Dresser")
+        _need("Nightstand")
+        furnishing_note = "Room is furnished."
+    elif mode == "semi_furnished":
+        _need("Queen bed")
+        _need("Mattress")
+        furnishing_note = "Room is semi-furnished (bed included; other items limited)."
+    elif mode == "unfurnished":
+        furnishing_note = (
+            "Landlord asked for unfurnished. Existing inventory is left as-is "
+            "(removing beds would change the listing for all future leases — "
+            "say remove inventory items if you want that)."
+        )
+
+    # Surface furnishing note in special_terms when not already present.
+    if furnishing_note and mode in ("furnished", "semi_furnished"):
+        current_terms = changes.get("special_terms", lease.special_terms or "")
+        if "semi-furnished" not in current_terms.casefold() and mode == "semi_furnished":
+            changes["special_terms"] = (
+                (current_terms + "\n\n" if current_terms else "")
+                + furnishing_note
+            ).strip()[:5000]
+        elif "furnished" not in current_terms.casefold() and mode == "furnished":
+            changes["special_terms"] = (
+                (current_terms + "\n\n" if current_terms else "")
+                + furnishing_note
+            ).strip()[:5000]
+
+    if not changes and not inventory_to_add and not (mode == "unfurnished"):
+        return {
+            "error": (
+                "Nothing to change. Pass start_date and/or end_date and/or "
+                "furnishing=furnished|semi_furnished|unfurnished."
+            ),
+        }
+
+    will_be_furnished = bool(prop.is_furnished) or bool(inventory_to_add)
+    preview = {
+        "lease_number": lease.lease_number,
+        "property": prop.name,
+        "status": lease.status,
+        "editable": True,
+        "note": (
+            "PENDING/DRAFT leases can be field-edited. Furnishing is derived "
+            "from inventory on the listing (a bed → furnished on the PDF)."
+        ),
+        "lease_changes": {
+            k: (str(v) if not isinstance(v, (list, dict)) else v)
+            for k, v in changes.items()
+        },
+        "inventory_to_add": inventory_to_add or None,
+        "furnishing": mode or None,
+        "property_is_furnished_now": bool(prop.is_furnished),
+        "property_will_read_as_furnished": will_be_furnished if mode else bool(prop.is_furnished),
+        "unfurnished_note": furnishing_note if mode == "unfurnished" else None,
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "adjust_lease",
+            preview,
+            "Updates the unlocked lease and listing inventory in one step.",
+        )
+
+    applied: list[str] = []
+    if changes:
+        for key, value in changes.items():
+            setattr(lease, key, value)
+        try:
+            lease.full_clean()
+            lease.save()
+        except ValidationError as exc:
+            return _validation_error_payload(exc)
+        applied.extend(changes.keys())
+
+    created_items = []
+    for name in inventory_to_add:
+        item = InventoryItem.objects.create(
+            property=prop,
+            name=name[:200],
+            quantity=1,
+            condition=InventoryItem.ItemCondition.GOOD,
+        )
+        created_items.append({"id": str(item.pk), "name": item.name})
+    if created_items:
+        applied.append("inventory")
+        prop.refresh_from_db()
+
+    return {
+        "updated": True,
+        "lease_number": lease.lease_number,
+        "status": lease.status,
+        "start_date": str(lease.start_date),
+        "end_date": str(lease.end_date) if lease.end_date else None,
+        "property": prop.name,
+        "property_is_furnished": bool(prop.is_furnished),
+        "inventory_added": created_items,
+        "applied": applied,
+        "message": (
+            f"Updated {lease.lease_number}: "
+            + ", ".join(applied)
+            + (
+                f". Listing now reads "
+                f"{'furnished' if prop.is_furnished else 'unfurnished'}."
+                if "inventory" in applied or mode
+                else "."
+            )
+        ),
+    }
+
+
 def delete_draft_lease(
     landlord, *, property_query: str = "", lease_number: str = "", confirm: str = "",
 ) -> dict:

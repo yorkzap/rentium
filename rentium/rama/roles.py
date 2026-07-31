@@ -265,8 +265,12 @@ security_deposit: if landlord said a deposit amount, pass it; if they only set \
 pet/cleaning to 0, KEEP security deposit from earlier in the chat OR omit so \
 it defaults to half of total_rent ($800 rent → $400). Pass security_deposit="0" \
 ONLY when they explicitly want zero security deposit. \
-update_lease only if not locked (ACTIVE/PENDING_SIGNATURES may lock fields — \
-never rewrite signed ACTIVE leases). \
+update_lease / adjust_lease on DRAFT and PENDING (awaiting signatures) leases — \
+start_date, end_date, rent, terms are editable until ACTIVE. NEVER refuse a \
+PENDING start-date change or invent "terminate + recreate". For furnished / \
+semi-furnished / unfurnished use adjust_lease (furnishing is inventory on the \
+listing: a bed → furnished on the PDF), not a fake lease flag. Only ACTIVE / \
+EXPIRED / TERMINATED / RENEWED are locked. \
 delete_draft_lease = DRAFT only; else terminate_lease (voids open charges). \
 landlord_sign_lease requires fully allocated rent. \
 Roster: list_lease_roster first. ADD roommate → add_roommate_to_lease (never replace). \
@@ -500,6 +504,7 @@ GENERAL_TOOLS = READ_TOOLS + (
     "invite_tenant_to_lease",
     "resend_lease_invite",
     "create_lease",
+    "adjust_lease",
     "schedule_viewing",
     "reschedule_viewing",
     "record_payment",

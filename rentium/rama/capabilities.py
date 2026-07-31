@@ -56,6 +56,21 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "room lease",
         "rental agreement",
     ),
+    "adjust_lease": (
+        "change start date",
+        "move lease start",
+        "make furnished",
+        "semi furnished",
+        "unfurnished lease",
+        "edit pending lease",
+        "change lease dates",
+    ),
+    "update_lease": (
+        "edit lease terms",
+        "change rent",
+        "update pending lease",
+        "change end date",
+    ),
     "invite_tenant_to_lease": (
         "send lease",
         "invite renter",
@@ -284,6 +299,16 @@ def supported_tool_for_request(request: str) -> str | None:
         text,
     ):
         return "catalog_business_document"
+    # Edit existing unlocked lease (before create — "change start date" is not create).
+    if re.search(
+        r"\b(change|update|edit|move|set)\b.+\b(start date|end date|lease start|lease end)\b"
+        r"|\b(start date|end date)\b.+\b(from|to)\b.+\b\d{4}-\d{2}-\d{2}\b"
+        r"|\b(make|mark|set)\b.+\b(furnished|semi[- ]?furnished|unfurnished)\b"
+        r"|\b(furnished|semi[- ]?furnished|unfurnished)\b.+\b(lease|room|listing)\b"
+        r"|\badjust_lease\b|\bchange the lease\b",
+        text,
+    ):
+        return "adjust_lease"
     # Leases — the most common false "I can't create a lease" gap.
     # Deliberately exclude co-landlord / co-host / invite-only phrasings.
     if not re.search(

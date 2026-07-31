@@ -1971,15 +1971,11 @@ def update_lease(
     is_month_to_month: str = "",
     confirm: str = "",
 ) -> dict:
-    """Update draft/pending lease fields. Blocked if ACTIVE/locked (LeaseNotLocked).
-    special_terms = extra clauses/terms; house_rules = roommate house rules (both
-    are how you 'customise the lease' / add clauses). shared_with = who else uses
-    the shared common areas on a ROOMMATE lease — comma list of landlord /
-    roommates / relatives. bills = utilities on the lease, a comma list like
-    'water included, hydro tenant pays, internet included' (utilities: hydro/
-    electricity, water, gas, heat, internet, cable, garbage, sewer; each is either
-    'included' in rent or 'tenant pays'); merges onto existing bills. Changing
-    total_rent rebalances unsigned shares. Preview; confirm=yes."""
+    """Update DRAFT or PENDING lease fields (including start_date and end_date).
+    Only ACTIVE/EXPIRED/TERMINATED/RENEWED are locked — PENDING signature leases
+    ARE editable (same as the UI). For furnished/semi-furnished changes use
+    adjust_lease (inventory-driven). special_terms / house_rules / shared_with /
+    bills as documented. Preview; confirm=yes."""
     from .domain_crud import update_lease as _fn
     return _fn(
         landlord, property_query=property_query, lease_number=lease_number,
@@ -1988,6 +1984,38 @@ def update_lease(
         smoking_allowed=smoking_allowed, special_terms=special_terms,
         house_rules=house_rules, shared_with=shared_with, bills=bills,
         etransfer_email=etransfer_email, is_month_to_month=is_month_to_month,
+        confirm=confirm,
+    )
+
+
+def adjust_lease(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    furnishing: str = "",
+    inventory_items: str = "",
+    special_terms: str = "",
+    confirm: str = "",
+) -> dict:
+    """One-step edit for an unlocked lease: change start/end dates and/or
+    furnishing. Prefer this over inventing a new lease. furnishing =
+    furnished | semi_furnished | unfurnished (sets listing inventory so the
+    PDF shows furnished correctly — a bed makes a room furnished). Optional
+    inventory_items e.g. 'Queen bed, Mattress, Desk'. lease_number preferred
+    (e.g. RMT415536-0617). Preview; confirm=yes."""
+    from .domain_crud import adjust_lease as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        start_date=start_date,
+        end_date=end_date,
+        furnishing=furnishing,
+        inventory_items=inventory_items,
+        special_terms=special_terms,
         confirm=confirm,
     )
 

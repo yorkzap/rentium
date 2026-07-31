@@ -296,6 +296,7 @@ TOOL_META: dict[str, ToolMeta] = {
     # ----------------------------------------------------------- leases
     "create_lease": ToolMeta(risk="medium"),
     "update_lease": ToolMeta(risk="medium"),
+    "adjust_lease": ToolMeta(risk="medium", own_confirm=True),
     "delete_draft_lease": ToolMeta(
         risk="medium", blockers=delete_draft_lease_blockers
     ),
