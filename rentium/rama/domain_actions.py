@@ -9,6 +9,7 @@ Every mutating tool:
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -817,6 +818,7 @@ def schedule_viewing(
     contact_name: str = "",
     contact_email: str = "",
     notes: str = "",
+    duration_minutes: str = "30",
     confirm: str = "",
 ) -> dict:
     """Schedule a viewing. when = ISO datetime or 'YYYY-MM-DD HH:MM' (local Vancouver-ish)."""
@@ -832,25 +834,42 @@ def schedule_viewing(
     tz = ZoneInfo("America/Vancouver")
     starts = None
     for fmt in (
+        "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H:%M",
         "%Y-%m-%d %H:%M",
         "%Y-%m-%d",
     ):
         try:
-            naive = datetime.strptime(when_s.replace("Z", "")[:19], fmt)
+            raw = when_s.replace("Z", "+00:00")
+            if fmt.endswith("%z") and re.search(r"[+-]\d{2}:\d{2}$", raw):
+                # strip colon in offset for strptime
+                raw = re.sub(r"([+-]\d{2}):(\d{2})$", r"\1\2", raw)
+            naive = datetime.strptime(raw[:22] if fmt.endswith("%z") else raw[:19], fmt)
             if fmt == "%Y-%m-%d":
                 naive = datetime.combine(naive.date(), time(14, 0))
-            starts = naive.replace(tzinfo=tz)
+            if naive.tzinfo is None:
+                starts = naive.replace(tzinfo=tz)
+            else:
+                starts = naive.astimezone(tz)
             break
         except ValueError:
             continue
     if starts is None:
         return {"error": f"Could not parse when={when!r}. Use YYYY-MM-DD HH:MM."}
 
+    try:
+        dur = int(str(duration_minutes or "30").strip() or "30")
+    except ValueError:
+        dur = 30
+    dur = max(5, min(240, dur))
+    ends = starts + timedelta(minutes=dur)
+
     preview = {
         "property": prop.name,
         "starts_at": starts.isoformat(),
+        "ends_at": ends.isoformat(),
+        "duration_minutes": dur,
         "kind": "VIEWING",
         "contact_name": contact_name or "",
         "contact_email": contact_email or "",
@@ -867,6 +886,7 @@ def schedule_viewing(
             landlord=landlord,
             property_obj=prop,
             starts_at=starts,
+            ends_at=ends,
             contact_name=(contact_name or "")[:200],
             contact_email=(contact_email or "")[:150],
             notes=(notes or "")[:2000],
@@ -883,10 +903,22 @@ def schedule_viewing(
     status_link = url_for_path(f"/viewing/status/{appt.public_token}")
     return {
         "created": True,
+        "message": (
+            f"Scheduled viewing of {prop.name} on "
+            f"{starts.strftime('%A, %B')} {starts.day} "
+            f"at {starts.strftime('%I:%M %p').lstrip('0')}–"
+            f"{ends.strftime('%I:%M %p').lstrip('0')}."
+            + (
+                f" Email invite queued to {appt.contact_email}."
+                if appt.contact_email
+                else ""
+            )
+        ),
         "appointment": {
             "id": str(appt.pk),
             "property": prop.name,
             "starts_at": starts.isoformat(),
+            "ends_at": ends.isoformat() if ends else None,
             "status": appt.status,
             "kind": appt.kind,
             "time_class": appt.time_class,

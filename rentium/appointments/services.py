@@ -33,6 +33,7 @@ def schedule_viewing(
     landlord,
     property_obj,
     starts_at: datetime,
+    ends_at: datetime | None = None,
     contact_name: str = "",
     contact_email: str = "",
     contact_phone: str = "",
@@ -45,6 +46,10 @@ def schedule_viewing(
         raise ValidationError({"property": "That property is outside this portfolio."})
     if starts_at.tzinfo is None:
         starts_at = starts_at.replace(tzinfo=landlord_tz(landlord))
+    if ends_at is not None and ends_at.tzinfo is None:
+        ends_at = ends_at.replace(tzinfo=landlord_tz(landlord))
+    if ends_at is None:
+        ends_at = starts_at + timedelta(minutes=30)
     active_lease = current_active_lease(property_obj)
     appointment = Appointment.objects.create(
         landlord=landlord,
@@ -53,6 +58,7 @@ def schedule_viewing(
         kind=Appointment.Kind.VIEWING,
         status=Appointment.Status.SCHEDULED,
         starts_at=starts_at,
+        ends_at=ends_at,
         contact_name=(contact_name or "")[:200],
         contact_email=(contact_email or "")[:150],
         contact_phone=(contact_phone or "")[:30],

@@ -1057,11 +1057,14 @@ def schedule_viewing(
     contact_name: str = "",
     contact_email: str = "",
     notes: str = "",
+    duration_minutes: str = "30",
     confirm: str = "",
 ) -> dict:
     """Schedule a property SHOWING/viewing for prospective tenants only.
-    when like '2026-08-05 14:00'.
-    Do NOT use for move-in condition inspections — use create_condition_inspection.
+    when like '2026-08-05 14:00' or relative dates resolved by the router.
+    duration_minutes default 30 (e.g. 15:00-15:30 → 30).
+    Always pass contact_email when the landlord gave one — that queues the
+    prospect invite. Do NOT use for move-in inspections.
     Preview first; confirm=yes to create."""
     from .domain_actions import schedule_viewing as _fn
 
@@ -1072,6 +1075,7 @@ def schedule_viewing(
         contact_name=contact_name,
         contact_email=contact_email,
         notes=notes,
+        duration_minutes=duration_minutes,
         confirm=confirm,
     )
 

@@ -477,8 +477,48 @@ def _dashboard_collection_intent(message: str) -> str | None:
     return None
 
 
+_MONTHS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+
+def _parse_clock_fragment(hour_s: str, minute_s: str | None, ampm: str | None) -> tuple[int, int]:
+    hour = int(hour_s)
+    minute = int(minute_s or 0)
+    ap = (ampm or "").lower()
+    if ap == "pm" and hour < 12:
+        hour += 12
+    elif ap == "am" and hour == 12:
+        hour = 0
+    return hour, minute
+
+
 def _relative_when_from_text(text: str) -> str:
-    """Parse 'tomorrow at 3 pm' → 'YYYY-MM-DD HH:MM' in America/Vancouver."""
+    """Parse 'tomorrow at 3 pm' / 'july 31st 15:00' → 'YYYY-MM-DD HH:MM' (Vancouver)."""
+    from datetime import date
     from datetime import datetime
     from datetime import timedelta
     from zoneinfo import ZoneInfo
@@ -487,33 +527,132 @@ def _relative_when_from_text(text: str) -> str:
     now = datetime.now(tz)
     day = now.date()
     low = (text or "").casefold()
-    if re.search(r"\btomorrow\b", low):
+    mdate = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text or "")
+    mdy = re.search(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
+        r"dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(20\d{2}))?\b",
+        low,
+    )
+    if mdate:
+        day = datetime.strptime(mdate.group(1), "%Y-%m-%d").date()
+    elif mdy:
+        key = mdy.group(1)
+        month = _MONTHS.get(key) or _MONTHS.get(key[:3])
+        year = int(mdy.group(3) or now.year)
+        day = date(year, int(month), int(mdy.group(2)))
+    elif re.search(r"\btomorrow\b", low):
         day = day + timedelta(days=1)
     elif re.search(r"\btoday\b", low):
         day = day
-    else:
-        # Absolute date already handled elsewhere.
-        mdate = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text or "")
-        if mdate:
-            day = datetime.strptime(mdate.group(1), "%Y-%m-%d").date()
+
     hour, minute = 15, 0
-    tm = re.search(
-        r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+    # Range "15:00 - 15:30" or "3-3:30pm" → use start clock.
+    range_m = re.search(
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*[-–—to]+\s*"
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
         text or "",
         re.IGNORECASE,
     )
-    if not tm:
-        tm = re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\b", text or "", re.IGNORECASE)
-    if tm:
-        hour = int(tm.group(1))
-        minute = int(tm.group(2) or 0)
-        ap = (tm.group(3) if tm.lastindex and tm.lastindex >= 3 else "") or ""
-        ap = ap.lower()
-        if ap == "pm" and hour < 12:
-            hour += 12
-        elif ap == "am" and hour == 12:
-            hour = 0
+    if range_m:
+        ap = range_m.group(3) or range_m.group(6)
+        hour, minute = _parse_clock_fragment(
+            range_m.group(1), range_m.group(2), ap
+        )
+    else:
+        tm = re.search(
+            r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+            text or "",
+            re.IGNORECASE,
+        )
+        if not tm:
+            tm = re.search(
+                r"\bat\s+(\d{1,2})(?::(\d{2}))?\b",
+                text or "",
+                re.IGNORECASE,
+            )
+        if not tm:
+            tm = re.search(r"\b(\d{1,2}):(\d{2})\b", text or "")
+        if tm:
+            ap = tm.group(3) if tm.lastindex and tm.lastindex >= 3 else None
+            hour, minute = _parse_clock_fragment(tm.group(1), tm.group(2), ap)
     return f"{day.isoformat()} {hour:02d}:{minute:02d}"
+
+
+def _duration_minutes_from_text(text: str, default: int = 30) -> int:
+    """Parse '15:00 - 15:30' or 'for 30 minutes' → duration minutes."""
+    range_m = re.search(
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*[-–—to]+\s*"
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+        text or "",
+        re.IGNORECASE,
+    )
+    if range_m:
+        ap_end = range_m.group(6) or range_m.group(3)
+        ap_start = range_m.group(3) or range_m.group(6)
+        sh, sm = _parse_clock_fragment(range_m.group(1), range_m.group(2), ap_start)
+        eh, em = _parse_clock_fragment(range_m.group(4), range_m.group(5), ap_end)
+        start_m = sh * 60 + sm
+        end_m = eh * 60 + em
+        if end_m > start_m:
+            return end_m - start_m
+    dm = re.search(r"\b(\d{1,3})\s*(min|mins|minutes)\b", text or "", re.I)
+    if dm:
+        return max(5, min(240, int(dm.group(1))))
+    return default
+
+
+def _amend_pending_schedule_from_message(
+    landlord, conversation_id, pending_plan, message: str
+) -> str | None:
+    """When a schedule_viewing plan is open, date/time corrections replace it.
+
+    Bare Yes must never re-run an outdated Aug-1 preview after the landlord
+    said "july 31 15:00-15:30".
+    """
+    if pending_plan is None:
+        return None
+    steps = list(pending_plan.steps.order_by("order"))
+    if not steps or steps[0].tool != "schedule_viewing":
+        return None
+    text = (message or "").strip()
+    if not text or _is_affirmative(text) and len(text) < 12:
+        return None
+    # Must look like a time/date correction, not an unrelated message.
+    low = text.casefold()
+    if not re.search(
+        r"\b(today|tomorrow|january|february|march|april|may|june|july|august|"
+        r"september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|"
+        r"oct|nov|dec|\d{1,2}:\d{2}|\d{1,2}\s*(am|pm)|should be|change|"
+        r"instead|move|reschedule)\b",
+        low,
+    ):
+        return None
+
+    args = dict(steps[0].arguments or {})
+    args["when"] = _relative_when_from_text(text)
+    args["duration_minutes"] = str(_duration_minutes_from_text(text))
+    # Preserve prospect contact from the original preview unless re-supplied.
+    email_m = re.search(
+        r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+        text,
+    )
+    if email_m:
+        args["contact_email"] = email_m.group(1)
+    name_m = re.search(
+        r"\bfor\s+([A-Z][a-zA-Z'’-]+(?:\s+[A-Z][a-zA-Z'’-]+)+)",
+        text,
+    )
+    if name_m and "@" not in name_m.group(1):
+        args["contact_name"] = name_m.group(1).strip()
+
+    result = execute("schedule_viewing", args, landlord=landlord)
+    if result.get("error"):
+        return str(result["error"])
+    if result.get("needs_confirm"):
+        save_single(landlord, conversation_id, "schedule_viewing", args)
+        return _preview_reply("schedule_viewing", result)
+    return _write_result_message("schedule_viewing", result)
 
 
 def _schedule_viewing_intent(message: str) -> dict | None:
@@ -565,6 +704,7 @@ def _schedule_viewing_intent(message: str) -> dict | None:
         prop_q = "950 McKenzie"
 
     when = _relative_when_from_text(text)
+    duration = _duration_minutes_from_text(text)
     if not prop_q:
         return None
     return {
@@ -572,6 +712,7 @@ def _schedule_viewing_intent(message: str) -> dict | None:
         "arguments": {
             "property_query": prop_q,
             "when": when,
+            "duration_minutes": str(duration),
             "contact_name": name,
             "contact_email": contact_email,
             "notes": "",
@@ -1563,10 +1704,13 @@ def _preview_reply(tool: str, result: dict) -> str:
         lines.append("Reply yes to void, or no to cancel.")
         return "\n".join(lines)
     if tool == "schedule_viewing":
+        when_line = preview.get("starts_at") or preview.get("when") or "—"
+        if preview.get("ends_at"):
+            when_line = f"{when_line} → {preview['ends_at']}"
         lines = [
             "Schedule viewing:",
             f"• Property: {preview.get('property') or '—'}",
-            f"• When: {preview.get('starts_at') or preview.get('when') or '—'}",
+            f"• When: {when_line}",
         ]
         if preview.get("contact_name"):
             lines.append(f"• Prospect: {preview['contact_name']}")
@@ -3330,6 +3474,15 @@ def run_turn(
     plan_progress: dict | None = None
     deterministic_reply: str | None = None
     pending_plan = load_fresh_plan(landlord, conversation_id)
+    # Date/time corrections while a viewing is awaiting Yes replace the plan
+    # before affirmation can run the stale preview ("tomorrow" → "july 31").
+    if pending_plan is not None and not _is_affirmative(message):
+        amended = _amend_pending_schedule_from_message(
+            landlord, conversation_id, pending_plan, message,
+        )
+        if amended is not None:
+            deterministic_reply = amended
+            pending_plan = load_fresh_plan(landlord, conversation_id)
     replacement_rows = (
         _explicit_room_creation_rows(
             landlord,
@@ -3356,7 +3509,7 @@ def run_turn(
             "as addresses while preparing the landlord's corrected request)\n"
             + json.dumps(rejected, default=str)
         )
-    elif pending_plan is not None and _is_affirmative(message):
+    elif pending_plan is not None and _is_affirmative(message) and deterministic_reply is None:
 
         def _plan_audit(content):
             tools_used.append(content.get("tool", ""))
