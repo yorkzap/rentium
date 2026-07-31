@@ -144,9 +144,18 @@ def telegram_webhook(request):
     # landlord can "send RAMA a photo" from Telegram, mirroring the web paperclip.
     photos = message.get("photo") or []
     photo_file_id = str(photos[-1].get("file_id")) if photos else ""
+    # PDFs and other files arrive as `document` (not photo). Without this branch
+    # the bot acks the webhook, stages nothing, and the model falsely claims it
+    # cannot see files.
+    document = message.get("document") or {}
+    document_file_id = str(document.get("file_id") or "").strip()
+    document_name = str(document.get("file_name") or "").strip()
+    document_mime = str(document.get("mime_type") or "").strip()
     if not text and message.get("caption"):
         text = str(message.get("caption") or "").strip()
-    if not chat_id or (not text and not photo_file_id):
+    if not chat_id or (
+        not text and not photo_file_id and not document_file_id
+    ):
         return Response({"ok": True})  # nothing actionable; ack anyway
 
     from .. import telegram as transport
@@ -196,7 +205,13 @@ def telegram_webhook(request):
     from ..tasks import handle_telegram_message
 
     handle_telegram_message.delay(
-        str(account.landlord_id), chat_id, text, photo_file_id=photo_file_id
+        str(account.landlord_id),
+        chat_id,
+        text,
+        photo_file_id=photo_file_id,
+        document_file_id=document_file_id,
+        document_name=document_name,
+        document_mime=document_mime,
     )
     return Response({"ok": True})
 

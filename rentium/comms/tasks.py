@@ -87,9 +87,87 @@ def _stage_telegram_photo(landlord, file_id: str) -> str:
     )
 
 
+def _stage_telegram_document(
+    landlord,
+    conversation_id,
+    file_id: str,
+    *,
+    preferred_name: str = "",
+    mime_type: str = "",
+) -> str:
+    """Download a Telegram document (PDF etc.) into a sealed attachment batch.
+
+    PDFs cannot use RamaUpload (ImageField). They use the same conversation-owned
+    RamaAttachment batch path as the web paperclip so catalog_business_document
+    can OCR them via attachment_id.
+    """
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from rentium.rama.attachment_services import AttachmentError
+    from rentium.rama.attachment_services import batch_chat_note
+    from rentium.rama.attachment_services import seal_batch
+    from rentium.rama.attachment_services import stage_files
+
+    from . import telegram as transport
+
+    got = transport.get_file_bytes(file_id)
+    if not got:
+        return ""
+    data, path_name = got
+    name = (preferred_name or path_name or "telegram-document").strip()
+    mime = (mime_type or "").strip().casefold()
+    # Telegram file paths are often extensionless hashes; recover PDF from magic.
+    if data[:4] == b"%PDF" and not name.casefold().endswith(".pdf"):
+        name = f"{name}.pdf" if "." not in name else name.rsplit(".", 1)[0] + ".pdf"
+        mime = mime or "application/pdf"
+    if not mime:
+        if name.casefold().endswith(".pdf"):
+            mime = "application/pdf"
+        elif name.casefold().endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif name.casefold().endswith(".png"):
+            mime = "image/png"
+        else:
+            mime = "application/octet-stream"
+    try:
+        upload = SimpleUploadedFile(name[:255], data, content_type=mime[:160])
+        batch = stage_files(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            uploads=[upload],
+        )
+        seal_batch(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            batch_id=str(batch.pk),
+        )
+        batch.refresh_from_db()
+        return batch_chat_note(batch)
+    except AttachmentError:
+        logger.exception(
+            "telegram document rejected for landlord %s (name=%s mime=%s)",
+            landlord.pk,
+            name,
+            mime,
+        )
+        return ""
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "failed staging telegram document for landlord %s", landlord.pk
+        )
+        return ""
+
+
 @app.task(bind=True, max_retries=2)
 def handle_telegram_message(
-    self, landlord_id: str, chat_id: str, text: str, photo_file_id: str = ""
+    self,
+    landlord_id: str,
+    chat_id: str,
+    text: str,
+    photo_file_id: str = "",
+    document_file_id: str = "",
+    document_name: str = "",
+    document_mime: str = "",
 ) -> None:
     from rentium.rama.service import run_turn
     from rentium.users.models import LandlordProfile
@@ -109,6 +187,7 @@ def handle_telegram_message(
     from rentium.users.access import acting_landlord
 
     landlord = acting_landlord(landlord.user) or landlord
+    conversation_id = telegram_conversation_id(chat_id)
 
     # A Telegram photo can be either property media OR photographed paperwork.
     # Stage it once; the shared turn engine deterministically routes business
@@ -125,10 +204,35 @@ def handle_telegram_message(
             )
             return
 
+    # PDF / file document (Telegram "document" message). Uses attachment batches
+    # so OCR via catalog_business_document works the same as web chat.
+    if document_file_id:
+        note = _stage_telegram_document(
+            landlord,
+            conversation_id,
+            document_file_id,
+            preferred_name=document_name,
+            mime_type=document_mime,
+        )
+        if note:
+            default = "The landlord sent a file."
+            if (document_name or "").casefold().endswith(".pdf") or (
+                document_mime or ""
+            ).casefold() == "application/pdf":
+                default = "The landlord sent a PDF document."
+            text = f"{text}{note}" if text else (default + note)
+        else:
+            transport.send_message(
+                chat_id,
+                "I couldn't download that file — try sending the PDF again "
+                "(as a document, not a compressed photo if possible).",
+            )
+            return
+
     result = run_turn(
         landlord,
         text,
-        telegram_conversation_id(chat_id),
+        conversation_id,
         role="general",
         channel="telegram",
     )

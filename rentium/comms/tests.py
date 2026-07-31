@@ -121,7 +121,15 @@ def test_webhook_linked_chat_enqueues_turn(landlord, settings):
     with mock.patch("rentium.comms.tasks.handle_telegram_message.delay") as delay:
         res = _webhook(client, {"message": {"chat": {"id": 777}, "text": "how's rent?"}})
     assert res.status_code == 200
-    delay.assert_called_once_with(str(landlord.pk), "777", "how's rent?", photo_file_id="")
+    delay.assert_called_once_with(
+        str(landlord.pk),
+        "777",
+        "how's rent?",
+        photo_file_id="",
+        document_file_id="",
+        document_name="",
+        document_mime="",
+    )
 
 
 def test_webhook_photo_message_passes_biggest_file_id(landlord, settings):
@@ -144,7 +152,48 @@ def test_webhook_photo_message_passes_biggest_file_id(landlord, settings):
         res = _webhook(client, msg)
     assert res.status_code == 200
     delay.assert_called_once_with(
-        str(landlord.pk), "777", "add this to Room C", photo_file_id="BIG"
+        str(landlord.pk),
+        "777",
+        "add this to Room C",
+        photo_file_id="BIG",
+        document_file_id="",
+        document_name="",
+        document_mime="",
+    )
+
+
+def test_webhook_pdf_document_message_passes_file_id(landlord, settings):
+    """Telegram PDFs arrive as message.document, not photo — must not be dropped."""
+    settings.TELEGRAM_WEBHOOK_SECRET = "test-secret"
+    ChannelAccount.objects.create(
+        landlord=landlord,
+        channel_type=ChannelAccount.ChannelType.TELEGRAM,
+        address="777",
+        verified=True,
+    )
+    client = APIClient()
+    msg = {
+        "message": {
+            "chat": {"id": 777},
+            "caption": "receipt for McKenzie",
+            "document": {
+                "file_id": "PDFDOC",
+                "file_name": "hydro-bill.pdf",
+                "mime_type": "application/pdf",
+            },
+        }
+    }
+    with mock.patch("rentium.comms.tasks.handle_telegram_message.delay") as delay:
+        res = _webhook(client, msg)
+    assert res.status_code == 200
+    delay.assert_called_once_with(
+        str(landlord.pk),
+        "777",
+        "receipt for McKenzie",
+        photo_file_id="",
+        document_file_id="PDFDOC",
+        document_name="hydro-bill.pdf",
+        document_mime="application/pdf",
     )
 
 
@@ -175,6 +224,65 @@ def test_handle_telegram_photo_stages_upload(landlord, settings):
                     str(landlord.pk), "42", "add to Room C", photo_file_id="BIG"
                 )
     assert RamaUpload.objects.filter(landlord=landlord).count() == 1
+
+
+def test_handle_telegram_pdf_document_stages_attachment_batch(landlord, settings):
+    """PDF document messages must stage a sealed attachment batch, not be ignored."""
+    from rentium.rama.models import RamaAttachment, RamaAttachmentBatch, RamaPreferences
+    from rentium.rama.providers import Turn
+    from rentium.rama.tests import ScriptedProvider
+
+    prefs = RamaPreferences.for_landlord(landlord)
+    prefs.enabled = True
+    prefs.provider = "xai"
+    prefs.api_key = "xai-test"
+    prefs.save()
+
+    from rentium.comms.tasks import handle_telegram_message, telegram_conversation_id
+
+    pdf_bytes = b"%PDF-1.4 fake receipt content"
+    seen_texts: list[str] = []
+    provider = ScriptedProvider(
+        [Turn(text="Got the PDF — which property should I file it against?")]
+    )
+
+    from rentium.rama import service as rama_service
+
+    original_run = rama_service.run_turn
+
+    def _capture_run(landlord_arg, text, conversation_id, **kwargs):
+        seen_texts.append(text)
+        return original_run(landlord_arg, text, conversation_id, **kwargs)
+
+    with mock.patch(
+        "rentium.comms.telegram.get_file_bytes",
+        return_value=(pdf_bytes, "telegram-hash"),
+    ):
+        with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+            with mock.patch("rentium.comms.telegram.send_message"):
+                with mock.patch(
+                    "rentium.rama.service.run_turn",
+                    side_effect=_capture_run,
+                ):
+                    handle_telegram_message(
+                        str(landlord.pk),
+                        "42",
+                        "receipt for McKenzie",
+                        document_file_id="PDFDOC",
+                        document_name="hydro-bill.pdf",
+                        document_mime="application/pdf",
+                    )
+
+    batch = RamaAttachmentBatch.objects.filter(landlord=landlord).first()
+    assert batch is not None
+    assert batch.status == RamaAttachmentBatch.Status.SEALED
+    assert batch.conversation_id == telegram_conversation_id("42")
+    att = RamaAttachment.objects.get(batch=batch)
+    assert att.original_filename == "hydro-bill.pdf"
+    assert att.content_type == "application/pdf"
+    assert seen_texts
+    assert f"RAMA attachment batch {batch.pk}" in seen_texts[0]
+    assert "catalog_business_document" in seen_texts[0].casefold()
 
 
 def test_telegram_bank_document_routes_to_physical_holding_not_listing(
