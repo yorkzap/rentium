@@ -810,31 +810,63 @@ class Lease(AgreementTerms):
             ).count()
         return 0
 
+    # Display order / labels for bills_included keys (UI + PDF + summary).
+    BILL_CATEGORY_LABELS = {
+        "electricity": "Electricity",
+        "water": "Water",
+        "heat": "Heat",
+        "gas": "Gas",
+        "internet": "Internet",
+        "cable": "Cable / TV",
+        "waste": "Garbage / Recycling",
+        "sewer": "Sewer",
+    }
+
     def get_bills_summary(self):
-        """Returns a human-readable summary of bills and tenant responsibilities."""
+        """Returns a human-readable summary of bills and tenant responsibilities.
+
+        Always names the utility (Electricity, Water, …). Provider is optional
+        context in parentheses — never the only label (empty provider used to
+        render as \" - Included in rent\").
+        """
         if not self.bills_included:
             return "No bills information available"
         summaries = []
-        for bill_type, details in self.bills_included.items():
+        # Stable order: known categories first, then any custom keys.
+        keys = list(self.BILL_CATEGORY_LABELS.keys())
+        for key in self.bills_included:
+            if key not in keys:
+                keys.append(key)
+        for bill_type in keys:
+            details = self.bills_included.get(bill_type)
             if not isinstance(details, dict):
                 continue
-            provider = details.get("provider", "")
-            display = f"{provider}"
+            label = self.BILL_CATEGORY_LABELS.get(
+                bill_type, str(bill_type).replace("_", " ").title()
+            )
+            provider = (details.get("provider") or "").strip()
+            name = f"{label} ({provider})" if provider else label
             if details.get("included", False):
-                summaries.append(f"{display} - Included in rent")
+                summaries.append(f"{name} — included in rent")
             else:
-                resp = details.get("tenant_responsibility", {})
+                resp = details.get("tenant_responsibility") or {}
+                if not isinstance(resp, dict):
+                    resp = {}
                 resp_type = resp.get("type")
                 if resp_type == "full":
-                    summaries.append(f"{display} - Tenant pays 100%")
+                    summaries.append(f"{name} — tenant pays 100%")
                 elif resp_type == "percentage":
                     value = resp.get("value", 0)
-                    summaries.append(f"{display} - Tenant pays {value}%")
+                    summaries.append(f"{name} — tenant pays {value}%")
                 elif resp_type == "fixed":
                     value = resp.get("value", 0)
-                    summaries.append(f"{display} - Tenant pays ${value}/month")
+                    summaries.append(f"{name} — tenant pays ${value}/month")
                 else:
-                    summaries.append(f"{display} - {details.get('notes', '')}")
+                    note = (details.get("notes") or "").strip()
+                    if note:
+                        summaries.append(f"{name} — {note}")
+                    else:
+                        summaries.append(f"{name} — tenant-paid")
         if not summaries:
             return "No bills information available"
         return "; ".join(summaries)
