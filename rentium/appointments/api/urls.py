@@ -2,6 +2,7 @@ from django.urls import include
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 
+from .public_views import public_email_events
 from .public_views import public_property
 from .public_views import public_viewing_request
 from .public_views import public_viewing_respond
@@ -46,4 +47,5 @@ public_urlpatterns = [
         public_viewing_respond,
         name="public-viewing-respond",
     ),
+    path("email-events/", public_email_events, name="public-email-events"),
 ]

@@ -36,16 +36,93 @@ def _notify(user, *, category, title, body="", url="", event=None):
     )
 
 
-def _send_email(to, subject, body):
+def _send_email(to, subject, body, *, appointment=None):
+    """Send email; when appointment is set, stamp invite_email_* delivery fields.
+
+    Provider message ids (SendGrid) are stored when Anymail returns them so
+    webhooks can mark delivered/bounced.
+    """
     if not to:
-        return
-    send_mail(
+        return None
+    from django.core.mail import EmailMessage
+    from django.utils import timezone
+
+    msg = EmailMessage(
         subject,
         body,
         getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@rentium.ca"),
         [to],
-        fail_silently=True,
     )
+    # Correlate SendGrid events → appointment (header + Anymail custom_args).
+    if appointment is not None:
+        msg.extra_headers = {
+            **(getattr(msg, "extra_headers", None) or {}),
+            "X-Rentium-Appointment-Id": str(appointment.pk),
+        }
+        try:
+            # Anymail/SendGrid: unique args echo on event webhooks.
+            msg.esp_extra = {
+                **(getattr(msg, "esp_extra", None) or {}),
+                "custom_args": {
+                    "appointment_id": str(appointment.pk),
+                },
+            }
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        sent = msg.send(fail_silently=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("email send failed to %s", to)
+        sent = 0
+        if appointment is not None:
+            appointment.invite_email_status = (
+                appointment.InviteEmailStatus.FAILED
+            )
+            appointment.invite_email_updated_at = timezone.now()
+            appointment.invite_email_detail = "send raised"
+            appointment.save(
+                update_fields=[
+                    "invite_email_status",
+                    "invite_email_updated_at",
+                    "invite_email_detail",
+                    "updated_at",
+                ]
+            )
+        return None
+
+    provider_id = ""
+    # Anymail attaches anymail_status after send.
+    status = getattr(msg, "anymail_status", None)
+    if status is not None:
+        try:
+            provider_id = (
+                getattr(status, "message_id", None)
+                or (status.message_ids or [None])[0]
+                or ""
+            )
+            provider_id = str(provider_id or "")[:128]
+        except Exception:  # noqa: BLE001
+            provider_id = ""
+
+    if appointment is not None:
+        appointment.invite_email_status = (
+            appointment.InviteEmailStatus.QUEUED
+            if sent
+            else appointment.InviteEmailStatus.FAILED
+        )
+        appointment.invite_email_provider_id = provider_id
+        appointment.invite_email_updated_at = timezone.now()
+        appointment.invite_email_detail = "sent" if sent else "send returned 0"
+        appointment.save(
+            update_fields=[
+                "invite_email_status",
+                "invite_email_provider_id",
+                "invite_email_updated_at",
+                "invite_email_detail",
+                "updated_at",
+            ]
+        )
+    return provider_id or None
 
 
 def _frontend_url(path: str) -> str:
@@ -197,6 +274,7 @@ def on_appointment_scheduled(event):
                 f"{chat_line}"
                 "— Rentium"
             ),
+            appointment=appt,
         )
 
     if appt.lease_id:

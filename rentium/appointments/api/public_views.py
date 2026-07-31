@@ -302,3 +302,19 @@ def public_viewing_status(request, token):
             },
         }
     )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def public_email_events(request):
+    """
+    POST /api/public/email-events/
+
+    SendGrid Event Webhook (and compatible batches). Matches events to
+    appointments via invite_email_provider_id / appointment_id custom args.
+    No auth — provider POSTs here; only updates known provider ids.
+    """
+    from rentium.appointments.email_tracking import process_sendgrid_events
+
+    result = process_sendgrid_events(request.data)
+    return Response({"ok": True, **result})

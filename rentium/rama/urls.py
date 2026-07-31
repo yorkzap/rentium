@@ -18,6 +18,7 @@ urlpatterns = [
         name="attachment-detail",
     ),
     path("documents/", views.documents_view, name="documents"),
+    path("documents/bulk/", views.documents_bulk_view, name="documents-bulk"),
     path("document-tags/", views.document_tags_view, name="document-tags"),
     path(
         "documents/<uuid:document_id>/",
@@ -33,6 +34,21 @@ urlpatterns = [
         "documents/<uuid:document_id>/reocr/",
         views.document_reocr_view,
         name="document-reocr",
+    ),
+    path(
+        "documents/<uuid:document_id>/restore/",
+        views.document_restore_view,
+        name="document-restore",
+    ),
+    path(
+        "documents/<uuid:document_id>/mark-paid/",
+        views.document_mark_paid_view,
+        name="document-mark-paid",
+    ),
+    path(
+        "documents/<uuid:document_id>/move/",
+        views.document_move_view,
+        name="document-move",
     ),
     path("general/chat/", views.general_chat_view, name="general-chat"),
     path("treasurer/chat/", views.treasurer_chat_view, name="treasurer-chat"),

@@ -1017,6 +1017,8 @@ def viewing_invite_status(
     appt = rows[0]
     opened = bool(appt.prospect_link_open_count)
     status_link = url_for_path(f"/viewing/status/{appt.public_token}")
+    email_status = getattr(appt, "invite_email_status", None) or "NONE"
+    email_detail = getattr(appt, "invite_email_detail", "") or ""
     if opened:
         msg = (
             f"{appt.contact_name or 'The prospect'} has opened the viewing link "
@@ -1029,6 +1031,13 @@ def viewing_invite_status(
             f"{appt.contact_name or 'The prospect'} has not opened the viewing "
             f"status link yet (invite may still be unread, in spam, or not clicked)."
         )
+    if email_status and email_status != "NONE":
+        msg += f" Invite email: {email_status}"
+        if email_detail:
+            msg += f" ({email_detail})"
+        msg += "."
+    elif appt.contact_email:
+        msg += " Invite email delivery not recorded yet (or no send)."
     return {
         "ok": True,
         "appointment_id": str(appt.pk),
@@ -1050,10 +1059,17 @@ def viewing_invite_status(
             if appt.prospect_link_last_opened_at
             else None
         ),
+        "invite_email_status": email_status,
+        "invite_email_detail": email_detail,
+        "invite_email_updated_at": (
+            appt.invite_email_updated_at.isoformat()
+            if getattr(appt, "invite_email_updated_at", None)
+            else None
+        ),
         "message": msg,
         "note": (
-            "Open tracking is page loads of the status link, not email pixels. "
-            "Email may be delivered without them clicking the link."
+            "link_opened is status-page loads (not email pixels). "
+            "invite_email_status is provider delivery (queued/delivered/bounced)."
         ),
     }
 

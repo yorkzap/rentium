@@ -639,6 +639,12 @@ def _document_payload(document, request=None):
         "tags": [{"id": str(t.pk), "name": t.name, "slug": t.slug} for t in tag_rows],
         "created_at": document.created_at.isoformat(),
         "filed_at": document.filed_at.isoformat() if document.filed_at else None,
+        "deleted_at": (
+            document.deleted_at.isoformat()
+            if getattr(document, "deleted_at", None)
+            else None
+        ),
+        "in_trash": bool(getattr(document, "deleted_at", None)),
     }
 
 
@@ -783,8 +789,15 @@ def document_detail_view(request, document_id):
             {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
         )
     if request.method == "DELETE":
+        hard = str(request.query_params.get("hard") or "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         try:
-            result = delete_document(landlord=landlord, document=document)
+            result = delete_document(
+                landlord=landlord, document=document, hard=hard,
+            )
         except DocumentError as exc:
             return Response(
                 {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
@@ -904,15 +917,24 @@ def document_detail_view(request, document_id):
     return Response(_document_payload(document, request))
 
 
+def _get_landlord_document(landlord, document_id, *, include_trashed: bool = True):
+    from .models import RamaDocument
+
+    qs = (
+        RamaDocument.objects.filter(pk=document_id, landlord=landlord)
+        .select_related("holding", "property", "ledger_entry")
+        .prefetch_related("tags")
+    )
+    if not include_trashed:
+        qs = qs.filter(deleted_at__isnull=True)
+    return qs.first()
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def document_download_view(request, document_id):
     """Authenticated download; private records are never exposed by a public URL."""
-    from .models import RamaDocument
-
-    document = RamaDocument.objects.filter(
-        pk=document_id, landlord=_landlord(request),
-    ).first()
+    document = _get_landlord_document(_landlord(request), document_id)
     if document is None:
         return Response(
             {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
@@ -936,12 +958,7 @@ def document_reocr_view(request, document_id):
     from .models import RamaDocument
 
     landlord = _landlord(request)
-    document = (
-        RamaDocument.objects.filter(pk=document_id, landlord=landlord)
-        .select_related("holding", "property", "ledger_entry")
-        .prefetch_related("tags")
-        .first()
-    )
+    document = _get_landlord_document(landlord, document_id, include_trashed=False)
     if document is None:
         return Response(
             {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
@@ -961,6 +978,120 @@ def document_reocr_view(request, document_id):
     payload = _document_payload(document, request)
     payload["ocr_text"] = (document.ocr_text or "")[:2000]
     return Response(payload)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def document_restore_view(request, document_id):
+    """Restore a soft-deleted document from trash."""
+    from .document_services import DocumentError
+    from .document_services import restore_document
+
+    landlord = _landlord(request)
+    document = _get_landlord_document(landlord, document_id)
+    if document is None:
+        return Response(
+            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
+        )
+    try:
+        result = restore_document(landlord=landlord, document=document)
+    except DocumentError as exc:
+        return Response(
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    document.refresh_from_db()
+    return Response({**result, **_document_payload(document, request)})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def document_mark_paid_view(request, document_id):
+    """Mark the linked ledger expense paid (and sync document payment_state)."""
+    from .document_services import DocumentError
+    from .document_services import mark_document_expense_paid
+
+    landlord = _landlord(request)
+    document = _get_landlord_document(landlord, document_id, include_trashed=False)
+    if document is None:
+        return Response(
+            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
+        )
+    data = request.data or {}
+    try:
+        result = mark_document_expense_paid(
+            landlord=landlord,
+            document=document,
+            paid_on=data.get("paid_on"),
+        )
+    except DocumentError as exc:
+        return Response(
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    except Exception as exc:  # noqa: BLE001 — ledger validation
+        return Response(
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    document.refresh_from_db()
+    return Response({**result, **_document_payload(document, request)})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def document_move_view(request, document_id):
+    """Re-file a document (and reallocate its expense) to another holding."""
+    from .document_services import DocumentError
+    from .document_services import move_document_holding
+
+    landlord = _landlord(request)
+    document = _get_landlord_document(landlord, document_id, include_trashed=False)
+    if document is None:
+        return Response(
+            {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
+        )
+    data = request.data or {}
+    portfolio_wide = bool(data.get("portfolio_wide"))
+    holding_id = data.get("holding_id") or data.get("holding") or ""
+    try:
+        result = move_document_holding(
+            landlord=landlord,
+            document=document,
+            holding=holding_id or None,
+            portfolio_wide=portfolio_wide,
+        )
+    except DocumentError as exc:
+        return Response(
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    document.refresh_from_db()
+    return Response({**result, **_document_payload(document, request)})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def documents_bulk_view(request):
+    """Bulk trash / restore / tag / move / hard_delete for the document library.
+
+    Body: {document_ids: [...], action, tag_names?, holding_id?, portfolio_wide?}
+    """
+    from .document_services import DocumentError
+    from .document_services import bulk_document_action
+
+    landlord = _landlord(request)
+    data = request.data or {}
+    try:
+        result = bulk_document_action(
+            landlord=landlord,
+            document_ids=data.get("document_ids") or data.get("ids") or [],
+            action=str(data.get("action") or ""),
+            tag_names=data.get("tag_names") or data.get("tags") or None,
+            holding_id=str(data.get("holding_id") or data.get("holding") or ""),
+            portfolio_wide=bool(data.get("portfolio_wide")),
+        )
+    except DocumentError as exc:
+        return Response(
+            {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(result)
 
 
 @api_view(["GET", "POST"])

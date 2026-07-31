@@ -585,16 +585,41 @@ def test_pdf_and_text_uses_force_ocr_not_skip_text(landlord, monkeypatch):
     assert "--skip-text" not in calls[0]
 
 
-def test_delete_document_cascades_events(landlord):
-    """DELETE must not 500 on RamaDocumentEvent PROTECT; events go with the doc."""
+def test_soft_delete_trashes_and_restore_works(landlord):
+    """Default delete soft-trashes; restore clears deleted_at."""
     from rentium.rama.document_services import delete_document
-    from rentium.rama.models import RamaDocumentEvent
+    from rentium.rama.document_services import query_business_documents
+    from rentium.rama.document_services import restore_document
 
     upload = SimpleUploadedFile(
         "junk.pdf", b"%PDF-delete-me-unique", content_type="application/pdf"
     )
     document, _ = ingest_document(landlord=landlord, upload=upload)
-    # ingest already records UPLOADED; add more custody rows so PROTECT would fire.
+    result = delete_document(landlord=landlord, document=document)
+    assert result["trashed"] is True
+    document.refresh_from_db()
+    assert document.deleted_at is not None
+
+    live = query_business_documents(landlord)
+    assert all(row.pk != document.pk for row in live["documents"])
+    trash = query_business_documents(landlord, status="TRASH")
+    assert any(row.pk == document.pk for row in trash["documents"])
+
+    restored = restore_document(landlord=landlord, document=document)
+    assert restored["restored"] is True
+    document.refresh_from_db()
+    assert document.deleted_at is None
+
+
+def test_hard_delete_cascades_events(landlord):
+    """Hard DELETE must not 500 on RamaDocumentEvent PROTECT; events go with the doc."""
+    from rentium.rama.document_services import delete_document
+    from rentium.rama.models import RamaDocumentEvent
+
+    upload = SimpleUploadedFile(
+        "junk2.pdf", b"%PDF-hard-delete-unique", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
     RamaDocumentEvent.objects.create(
         document=document, kind=RamaDocumentEvent.Kind.OCR_COMPLETED, detail={}
     )
@@ -603,15 +628,16 @@ def test_delete_document_cascades_events(landlord):
     )
     assert document.events.count() >= 2
 
-    result = delete_document(landlord=landlord, document=document)
+    result = delete_document(landlord=landlord, document=document, hard=True)
     assert result["deleted"] is True
+    assert result.get("hard") is True
     assert not RamaDocument.objects.filter(pk=document.pk).exists()
     assert not RamaDocumentEvent.objects.filter(
         document_id=result["document_id"]
     ).exists()
 
 
-def test_delete_document_refuses_ledger_link(landlord):
+def test_hard_delete_refuses_ledger_link_soft_allows(landlord):
     from datetime import date
 
     from rentium.rama.document_services import DocumentError
@@ -633,9 +659,107 @@ def test_delete_document_refuses_ledger_link(landlord):
     )
     document.ledger_entry = entry
     document.save(update_fields=["ledger_entry", "updated_at"])
+    # Soft trash is allowed (ledger stays).
+    soft = delete_document(landlord=landlord, document=document)
+    assert soft["trashed"] is True
+    document.refresh_from_db()
+    assert document.deleted_at is not None
+    assert document.ledger_entry_id == entry.pk
     with pytest.raises(DocumentError, match="ledger expense"):
-        delete_document(landlord=landlord, document=document)
+        delete_document(landlord=landlord, document=document, hard=True)
     assert RamaDocument.objects.filter(pk=document.pk).exists()
+
+
+def test_mark_paid_and_move_holding(landlord):
+    from datetime import date
+    from decimal import Decimal
+
+    from rentium.rama.document_services import mark_document_expense_paid
+    from rentium.rama.document_services import move_document_holding
+
+    holding_a = _holding(landlord)
+    holding_b = PropertyHolding.objects.create(
+        landlord=landlord,
+        name="Draino House",
+        address="123 Draino St",
+        city="Victoria",
+    )
+    upload = SimpleUploadedFile(
+        "bill.pdf", b"%PDF-mark-move-unique", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    entry = LedgerEntry.objects.create(
+        landlord=landlord,
+        holding=holding_a,
+        entry_type=EntryType.EXPENSE,
+        amount=Decimal("42.00"),
+        description="window screens",
+        category=ExpenseCategory.MAINTENANCE,
+        effective_date=date(2026, 7, 1),
+        paid_on=None,
+    )
+    document.holding = holding_a
+    document.ledger_entry = entry
+    document.payment_state = RamaDocument.PaymentState.UNPAID
+    document.status = RamaDocument.Status.FILED
+    document.save()
+
+    paid = mark_document_expense_paid(landlord=landlord, document=document)
+    assert paid["payment_state"] == RamaDocument.PaymentState.PAID
+    entry.refresh_from_db()
+    assert entry.paid_on is not None
+
+    # Unpaid-style move: reallocate to other holding.
+    entry2 = LedgerEntry.objects.create(
+        landlord=landlord,
+        holding=holding_a,
+        entry_type=EntryType.EXPENSE,
+        amount=Decimal("19.78"),
+        description="shower knob",
+        category=ExpenseCategory.MAINTENANCE,
+        effective_date=date(2026, 7, 2),
+    )
+    document.ledger_entry = entry2
+    document.payment_state = RamaDocument.PaymentState.UNPAID
+    document.save(update_fields=["ledger_entry", "payment_state", "updated_at"])
+    moved = move_document_holding(
+        landlord=landlord, document=document, holding=holding_b
+    )
+    assert moved["holding_id"] == str(holding_b.pk)
+    document.refresh_from_db()
+    assert document.holding_id == holding_b.pk
+    entry2.refresh_from_db()
+    assert entry2.voided is True or document.ledger_entry_id != entry2.pk
+
+
+def test_bulk_document_action_tag_and_trash(landlord):
+    from rentium.rama.document_services import bulk_document_action
+    from rentium.rama.document_services import query_business_documents
+
+    docs = []
+    for i in range(2):
+        upload = SimpleUploadedFile(
+            f"bulk{i}.pdf", f"%PDF-bulk-{i}-unique".encode(), content_type="application/pdf"
+        )
+        document, _ = ingest_document(landlord=landlord, upload=upload)
+        docs.append(document)
+
+    tagged = bulk_document_action(
+        landlord=landlord,
+        document_ids=[str(d.pk) for d in docs],
+        action="tag",
+        tag_names=["bulk-test"],
+    )
+    assert tagged["count"] == 2
+    trashed = bulk_document_action(
+        landlord=landlord,
+        document_ids=[str(d.pk) for d in docs],
+        action="trash",
+    )
+    assert trashed["count"] == 2
+    trash = query_business_documents(landlord, status="TRASH")
+    ids = {str(d.pk) for d in docs}
+    assert sum(1 for row in trash["documents"] if str(row.pk) in ids) == 2
 
 
 def test_query_and_tag_business_documents(landlord):

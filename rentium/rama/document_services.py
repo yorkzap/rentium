@@ -2111,6 +2111,7 @@ def query_business_documents(
     page = max(1, int(page or 1))
     page_size = min(100, max(1, int(page_size or 25)))
 
+    include_trash = str(status or "").strip().upper() == "TRASH"
     queryset = (
         RamaDocument.objects.filter(landlord=landlord)
         .select_related("holding", "property", "ledger_entry")
@@ -2121,9 +2122,13 @@ def query_business_documents(
             )
         )
     )
+    if include_trash:
+        queryset = queryset.exclude(deleted_at__isnull=True)
+    else:
+        queryset = queryset.filter(deleted_at__isnull=True)
 
     status_filter = str(status or "").strip().upper()
-    if status_filter:
+    if status_filter and status_filter != "TRASH":
         queryset = queryset.filter(status=status_filter)
 
     kind_filter = str(kind or "").strip().upper()
@@ -2322,21 +2327,35 @@ def list_document_tags(landlord):
     )
 
 
-def delete_document(*, landlord, document) -> dict:
-    """Intentionally remove a business document that is not ledger-linked.
+def delete_document(*, landlord, document, hard: bool = False) -> dict:
+    """Move a document to trash (soft) or permanently remove (hard).
 
-    Events are append-only for normal edits; removing the parent document uses
-    bulk CASCADE so the custody trail of a discarded mis-upload does not block
-    cleanup. Ledger expenses are never deleted.
+    Soft-delete is the default — hides from the library; restore anytime.
+    Linked ledger expenses are never deleted (append-only audit). Hard delete
+    is refused while a ledger link exists.
     """
     if document.landlord_id != landlord.pk:
         raise DocumentError("Document not found.")
-    if document.ledger_entry_id:
+    if document.ledger_entry_id and hard:
         raise DocumentError(
-            "This document is linked to a ledger expense. Unlink or void the "
-            "expense first if you truly need the file gone; the expense itself "
-            "stays as audit history."
+            "Cannot hard-delete a document linked to a ledger expense. "
+            "The expense stays as audit history — void it separately if needed."
         )
+
+    pk = str(document.pk)
+    if not hard:
+        if document.deleted_at:
+            return {"deleted": True, "trashed": True, "document_id": pk, "already": True}
+        document.deleted_at = timezone.now()
+        document.save(update_fields=["deleted_at", "updated_at"])
+        return {
+            "deleted": True,
+            "trashed": True,
+            "document_id": pk,
+            "ledger_entry_id": (
+                str(document.ledger_entry_id) if document.ledger_entry_id else None
+            ),
+        }
 
     for field in (document.original_file, document.archival_pdf):
         if field:
@@ -2345,10 +2364,174 @@ def delete_document(*, landlord, document) -> dict:
             except Exception:  # noqa: BLE001 — storage best-effort
                 pass
 
-    pk = str(document.pk)
     with transaction.atomic():
-        # Bulk queryset delete bypasses RamaDocumentEvent.delete() append-only guard.
         document.events.all().delete()
         document.tags.clear()
         document.delete()
-    return {"deleted": True, "document_id": pk}
+    return {"deleted": True, "hard": True, "document_id": pk}
+
+
+def restore_document(*, landlord, document) -> dict:
+    if document.landlord_id != landlord.pk:
+        raise DocumentError("Document not found.")
+    if not document.deleted_at:
+        return {"restored": True, "document_id": str(document.pk), "already": True}
+    # Unique sha256 among live docs — refuse if a live twin exists.
+    twin = (
+        RamaDocument.objects.filter(
+            landlord=landlord, sha256=document.sha256, deleted_at__isnull=True
+        )
+        .exclude(pk=document.pk)
+        .first()
+    )
+    if twin is not None:
+        raise DocumentError(
+            f"A live document with the same file already exists ({twin.pk})."
+        )
+    document.deleted_at = None
+    document.save(update_fields=["deleted_at", "updated_at"])
+    return {"restored": True, "document_id": str(document.pk)}
+
+
+def mark_document_expense_paid(*, landlord, document, paid_on=None) -> dict:
+    """Mark the linked ledger expense paid (and sync document.payment_state)."""
+    from datetime import date as date_cls
+
+    from rentium.ledger import services as ledger_services
+
+    if document.landlord_id != landlord.pk:
+        raise DocumentError("Document not found.")
+    if not document.ledger_entry_id:
+        raise DocumentError("This document has no linked ledger expense yet.")
+    entry = document.ledger_entry
+    when = paid_on or date_cls.today()
+    if isinstance(when, str):
+        when = date_cls.fromisoformat(when[:10])
+    entry = ledger_services.mark_expense_paid(entry, paid_on=when)
+    document.payment_state = RamaDocument.PaymentState.PAID
+    document.save(update_fields=["payment_state", "updated_at"])
+    return {
+        "updated": True,
+        "document_id": str(document.pk),
+        "ledger_entry_id": str(entry.pk),
+        "paid_on": str(entry.paid_on) if entry.paid_on else None,
+        "payment_state": document.payment_state,
+    }
+
+
+def move_document_holding(
+    *, landlord, document, holding=None, portfolio_wide: bool = False
+) -> dict:
+    """Re-file a document (and reallocate its expense) to another holding."""
+    from rentium.ledger import services as ledger_services
+    from rentium.properties.models import PropertyHolding
+
+    if document.landlord_id != landlord.pk:
+        raise DocumentError("Document not found.")
+    if portfolio_wide:
+        document.holding = None
+        document.property = None
+        document.portfolio_wide = True
+    else:
+        if holding is None:
+            raise DocumentError("holding is required (or portfolio_wide=true).")
+        if isinstance(holding, str):
+            holding = PropertyHolding.objects.filter(
+                pk=holding, landlord=landlord
+            ).first()
+        if holding is None or holding.landlord_id != landlord.pk:
+            raise DocumentError("No such holding.")
+        document.holding = holding
+        document.property = None
+        document.portfolio_wide = False
+
+    document.canonical_filename = _canonical_name(document)
+    try:
+        _relocate_archive(document)
+    except Exception:  # noqa: BLE001
+        pass
+    document.full_clean()
+    document.save()
+
+    if document.ledger_entry_id and not portfolio_wide and document.holding_id:
+        entry = document.ledger_entry
+        if entry and not entry.voided and entry.holding_id != document.holding_id:
+            try:
+                replacement = ledger_services.reallocate_entry(
+                    entry,
+                    property=None,
+                    holding=document.holding,
+                    reason="Document re-filed to correct physical property.",
+                    created_by=getattr(landlord, "user", None),
+                )
+                document.ledger_entry = replacement
+                document.save(update_fields=["ledger_entry", "updated_at"])
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "updated": True,
+                    "document_id": str(document.pk),
+                    "holding_id": str(document.holding_id) if document.holding_id else None,
+                    "warning": f"Document moved; expense reallocate failed: {exc}",
+                }
+
+    return {
+        "updated": True,
+        "document_id": str(document.pk),
+        "holding_id": str(document.holding_id) if document.holding_id else None,
+        "holding_name": document.holding.name if document.holding_id else None,
+        "portfolio_wide": document.portfolio_wide,
+        "canonical_filename": document.canonical_filename,
+    }
+
+
+def bulk_document_action(
+    *,
+    landlord,
+    document_ids: list,
+    action: str,
+    tag_names: list | None = None,
+    holding_id: str = "",
+    portfolio_wide: bool = False,
+) -> dict:
+    """Bulk tag / trash / restore / move for the document library."""
+    action = (action or "").strip().lower()
+    ids = [str(i) for i in (document_ids or []) if i]
+    if not ids:
+        raise DocumentError("document_ids required.")
+    if action not in {"trash", "restore", "tag", "move", "hard_delete"}:
+        raise DocumentError(
+            "action must be trash, restore, tag, move, or hard_delete."
+        )
+
+    qs = RamaDocument.objects.filter(landlord=landlord, pk__in=ids)
+    if action == "restore":
+        qs = qs.exclude(deleted_at__isnull=True)
+    elif action != "hard_delete":
+        qs = qs.filter(deleted_at__isnull=True)
+
+    results = []
+    for doc in qs:
+        try:
+            if action == "trash":
+                results.append(delete_document(landlord=landlord, document=doc))
+            elif action == "hard_delete":
+                results.append(
+                    delete_document(landlord=landlord, document=doc, hard=True)
+                )
+            elif action == "restore":
+                results.append(restore_document(landlord=landlord, document=doc))
+            elif action == "tag":
+                set_document_tags(doc, tag_names or [], replace=False)
+                results.append({"document_id": str(doc.pk), "tagged": True})
+            elif action == "move":
+                results.append(
+                    move_document_holding(
+                        landlord=landlord,
+                        document=doc,
+                        holding=holding_id or None,
+                        portfolio_wide=portfolio_wide,
+                    )
+                )
+        except DocumentError as exc:
+            results.append({"document_id": str(doc.pk), "error": str(exc)})
+    return {"action": action, "count": len(results), "results": results}

@@ -32,6 +32,25 @@ def _holding(landlord, name="950 McKenzie Ave"):
     )
 
 
+def test_reallocate_phrases_map_to_tool():
+    from rentium.rama.capabilities import supported_tool_for_request
+
+    assert (
+        supported_tool_for_request(
+            "that expense should be on the address not the room"
+        )
+        == "reallocate_expense"
+    )
+    assert (
+        supported_tool_for_request("reallocate the expense to the house")
+        == "reallocate_expense"
+    )
+    assert (
+        supported_tool_for_request("move the cost off the room")
+        == "reallocate_expense"
+    )
+
+
 def _room(landlord, holding, name="Room C"):
     from rentium.properties.models import Property
 

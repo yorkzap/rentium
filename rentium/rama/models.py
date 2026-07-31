@@ -854,12 +854,15 @@ class RamaDocument(models.Model):
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
     filed_at = models.DateTimeField(null=True, blank=True)
+    # Soft-delete / trash (30-day recycle before optional hard purge).
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     class Meta:
         ordering = ["-created_at"]
         constraints = [
             models.UniqueConstraint(
                 fields=["landlord", "sha256"],
+                condition=models.Q(deleted_at__isnull=True),
                 name="rama_document_landlord_sha256_unique",
             )
         ]
@@ -875,6 +878,10 @@ class RamaDocument(models.Model):
             models.Index(
                 fields=["landlord", "kind", "-document_date"],
                 name="rama_doc_kind_idx",
+            ),
+            models.Index(
+                fields=["landlord", "deleted_at", "-created_at"],
+                name="rama_doc_trash_idx",
             ),
         ]
 

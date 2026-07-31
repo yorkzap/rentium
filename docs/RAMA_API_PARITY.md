@@ -62,18 +62,26 @@ When you add a composite, update `COVERAGE_MAP` in the same PR.
 
 Not email-pixel tracking (unreliable); **status page loads only**.
 
-## Other known product gaps (prioritise)
+## Document library + invite delivery (gap-close, July 2026)
+
+| Gap | Implementation |
+|---|---|
+| Mark document expense paid | `POST /api/rama/documents/<id>/mark-paid/` + Documents UI |
+| Move document holding (+ reallocate expense) | `POST /api/rama/documents/<id>/move/` + Documents UI |
+| Soft-delete / trash / restore | `deleted_at`; `DELETE` soft; `POST …/restore/`; list `?status=TRASH` |
+| Bulk tag / trash / restore / move | `POST /api/rama/documents/bulk/` |
+| Email delivery/bounce | `Appointment.invite_email_*` + send stamp + `POST /api/public/email-events/` |
+| Reallocate chat phrases | Expanded `supported_tool_for_request` → `reallocate_expense` |
+| Parity map reocr/tags/actions | `COVERAGE_MAP` entries for document_* views |
+
+## Remaining product gaps (prioritise)
 
 | Gap | Notes |
 |---|---|
-| Email delivery confirmation | SES/SendGrid webhooks → “delivered/bounced” on appointment |
 | Reschedule emails when only ends_at changes | Mostly works via `appointment.rescheduled` |
-| Document reallocate/paid from Documents UI | Finance/RAMA only today |
-| Soft-delete / trash for documents | Phase C in document library plan |
 | Saved document views | Phase C |
-| `rama:document_reocr` / tags in COVERAGE_MAP | Unmapped in parity script — wire map |
-| Bulk document actions | Multi-select tag/move/delete |
 | Prospect email open (pixel) | Explicitly deferred; page-load tracking is enough for v1 |
+| Auto-purge trash after N days | Soft-delete exists; purge job optional |
 
 ## Learning as we go
 

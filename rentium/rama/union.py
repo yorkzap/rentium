@@ -1732,6 +1732,13 @@ def list_appointments(
                 if appt.prospect_link_last_opened_at
                 else None
             ),
+            "invite_email_status": getattr(appt, "invite_email_status", None) or "NONE",
+            "invite_email_detail": getattr(appt, "invite_email_detail", "") or "",
+            "invite_email_updated_at": (
+                appt.invite_email_updated_at.isoformat()
+                if getattr(appt, "invite_email_updated_at", None)
+                else None
+            ),
         }
         rows.append(row)
         counts["total_returned"] += 1
@@ -1756,7 +1763,8 @@ def list_appointments(
                 "Use date + weekday + time_local when the user says 'Thursday' "
                 "or a calendar date. "
                 "prospect_link_opened / first/last_opened_at answer "
-                "'have they seen the invite link?' (status page loads only)."
+                "'have they seen the invite link?' (status page loads only). "
+                "invite_email_status is provider delivery (QUEUED/DELIVERED/BOUNCED)."
             ),
         },
     }

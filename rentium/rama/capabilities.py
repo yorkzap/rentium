@@ -412,14 +412,27 @@ def supported_tool_for_request(request: str) -> str | None:
         return "create_work_order"
     if re.search(
         r"\b(expense|cost|bill|charge|repair|invoice)\b.*"
-        r"\b(wrong|mis-?scoped|misfiled|shouldn'?t be|should not be|belongs?)\b"
-        r"|\b(move|reallocate|re-?assign|rebook|re-?book|shift|transfer)\b.*"
-        r"\b(expense|cost|bill|repair|invoice)\b"
-        r"|\b(expense|cost|bill|repair)\b.*\b(to the (address|house|building|property)|"
-        r"off (of )?(the )?room)\b",
+        r"\b(wrong|mis-?scoped|misfiled|shouldn'?t be|should not be|belongs?|"
+        r"should (be|go)|put (it |that )?(on|against)|against (the )?(wrong|other))\b"
+        r"|\b(move|reallocate|re-?assign|rebook|re-?book|shift|transfer|relocate|"
+        r"re-?file|refile)\b.*"
+        r"\b(expense|cost|bill|repair|invoice|ledger)\b"
+        r"|\b(expense|cost|bill|repair)\b.*\b(to the (address|house|building|property|holding)|"
+        r"off (of )?(the )?room|to (room|suite|unit)|from (room|suite|unit))\b"
+        r"|\b(that|the) (expense|cost|bill|\$[\d.]+).*\b(should be|belongs) (on|at|to)\b"
+        r"|\breallocate_expense\b",
         text,
     ):
         return "reallocate_expense"
+    # Email / invite delivery — map to viewing_invite_status (has email + open fields).
+    if re.search(
+        r"\b(did|has).*\b(email|invite|invitation)\b.*(deliver|bounce|bounced|arrive|sent)"
+        r"|\b(email|invite).*\b(deliver|bounce|bounced|opened|open)"
+        r"|\b(have they|did they).*\b(get|receive|see).*\b(email|invite|link)\b"
+        r"|\b(bounce|bounced|undeliverable)\b.*\b(email|invite)\b",
+        text,
+    ):
+        return "viewing_invite_status"
     # Receipts / PDFs / OCR — never allow a false "I can't scan" gap.
     if re.search(
         r"\b(ocr|scan|scanned|scanner)\b"

@@ -87,3 +87,67 @@ def test_have_they_seen_maps_to_tool():
         supported_tool_for_request("have they seen the viewing link?")
         == "viewing_invite_status"
     )
+    assert (
+        supported_tool_for_request("did the invite email bounce?")
+        == "viewing_invite_status"
+    )
+
+
+def test_invite_email_webhook_updates_status(landlord, client):
+    from rentium.appointments.email_tracking import apply_invite_email_event
+
+    prop = _listing(landlord)
+    appt = _viewing(landlord, prop)
+    appt.invite_email_status = Appointment.InviteEmailStatus.QUEUED
+    appt.invite_email_provider_id = "sg-msg-abc123.filter0001"
+    appt.save(
+        update_fields=[
+            "invite_email_status",
+            "invite_email_provider_id",
+            "updated_at",
+        ]
+    )
+
+    result = apply_invite_email_event(
+        event_type="delivered",
+        provider_id="sg-msg-abc123.filter0001",
+    )
+    assert result["matched"] is True
+    appt.refresh_from_db()
+    assert appt.invite_email_status == Appointment.InviteEmailStatus.DELIVERED
+
+    res = client.post(
+        "/api/public/email-events/",
+        data=[
+            {
+                "event": "bounce",
+                "sg_message_id": "sg-msg-abc123.filter0001",
+                "email": "ishu@example.com",
+                "reason": "550 mailbox unavailable",
+            }
+        ],
+        content_type="application/json",
+    )
+    assert res.status_code == 200
+    assert res.json()["matched"] >= 1
+    appt.refresh_from_db()
+    assert appt.invite_email_status == Appointment.InviteEmailStatus.BOUNCED
+
+
+def test_viewing_invite_status_includes_email_fields(landlord):
+    from rentium.rama import registry
+
+    prop = _listing(landlord)
+    appt = _viewing(landlord, prop)
+    appt.invite_email_status = Appointment.InviteEmailStatus.DELIVERED
+    appt.invite_email_detail = "delivered"
+    appt.save(
+        update_fields=["invite_email_status", "invite_email_detail", "updated_at"]
+    )
+    out = registry.execute(
+        "viewing_invite_status",
+        {"contact": "Ishupreet"},
+        landlord=landlord,
+    )
+    assert out.get("invite_email_status") == "DELIVERED"
+    assert "DELIVERED" in (out.get("message") or "")

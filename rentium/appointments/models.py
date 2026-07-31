@@ -164,6 +164,31 @@ class Appointment(models.Model):
         default=0,
         help_text=_("How many times the status/invite page was loaded."),
     )
+    # Invite email delivery (SendGrid/Anymail webhook + send path).
+    class InviteEmailStatus(models.TextChoices):
+        NONE = "NONE", _("No email")
+        QUEUED = "QUEUED", _("Queued / sent to provider")
+        DELIVERED = "DELIVERED", _("Delivered to inbox")
+        OPENED = "OPENED", _("Email opened (pixel, optional)")
+        BOUNCED = "BOUNCED", _("Bounced")
+        DROPPED = "DROPPED", _("Dropped / blocked")
+        DEFERRED = "DEFERRED", _("Deferred")
+        FAILED = "FAILED", _("Send failed")
+
+    invite_email_status = models.CharField(
+        max_length=12,
+        choices=InviteEmailStatus.choices,
+        default=InviteEmailStatus.NONE,
+        db_index=True,
+    )
+    invite_email_provider_id = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text=_("Provider message id (e.g. SendGrid x-message-id)."),
+    )
+    invite_email_updated_at = models.DateTimeField(null=True, blank=True)
+    invite_email_detail = models.CharField(max_length=255, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
