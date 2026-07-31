@@ -659,6 +659,8 @@ def _unit_phrase_from_message(message: str) -> str:
 
 def _score_unit_for_message(unit, message: str) -> int:
     """Address-aware unit ranking for deterministic suite routing."""
+    from .unit_structure import _HOLDING_NOISE
+    from .unit_structure import _tokenise
     from .unit_structure import _unit_match_score
 
     phrase = _unit_phrase_from_message(message)
@@ -673,6 +675,19 @@ def _score_unit_for_message(unit, message: str) -> int:
         name = (offering.name or "").casefold()
         if name and name in lowered:
             score = max(score, 90 + min(len(name), 30))
+    # Strong boost when street tokens + unit name both appear (breaks twin
+    # "Garden Suite" rows without another round of yes-loops).
+    msg_tokens = _tokenise(message) - _HOLDING_NOISE
+    holding = unit.holding
+    if holding is not None:
+        addr_hits = (
+            (_tokenise(holding.address) | _tokenise(holding.name)) - _HOLDING_NOISE
+        ) & msg_tokens
+        unit_hits = (_tokenise(unit.name) - _HOLDING_NOISE) & msg_tokens
+        if addr_hits and unit_hits:
+            score += 40 + min(len(addr_hits) * 8, 32)
+        elif addr_hits:
+            score += 12 + min(len(addr_hits) * 5, 20)
     return score
 
 

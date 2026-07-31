@@ -564,21 +564,47 @@ def promote_chat_file_to_document(
         )
         if staged_attachment is None:
             return {"error": f"No attachment {aid!r}."}
-        # Already promoted earlier in this chat.
-        if (
-            staged_attachment.status == RamaAttachment.Status.APPLIED
-            and staged_attachment.target_id
-        ):
+        # Already linked to a document from a prior prepare/catalog step.
+        if staged_attachment.target_id:
             existing = RamaDocument.objects.filter(
                 pk=staged_attachment.target_id, landlord=landlord
             ).first()
-            if existing:
+            if existing is not None:
+                if (
+                    existing.holding_id
+                    or existing.status == RamaDocument.Status.FILED
+                ):
+                    return {
+                        **_duplicate_catalog_payload(
+                            existing, source="attachment_already_linked"
+                        ),
+                        "attachment_id": str(staged_attachment.pk),
+                        "attachment_batch_id": str(staged_attachment.batch_id),
+                    }
+                # Unscoped prepare — return same document_id for the address step.
+                document = _ensure_ocr(existing)
+                intelligence = document_intelligence_payload(document)
                 return {
-                    **_duplicate_catalog_payload(
-                        existing, source="attachment_already_applied"
-                    ),
+                    "prepared": True,
+                    "is_new_document": False,
+                    "is_duplicate": False,
+                    "document_id": str(document.pk),
+                    "status": document.status,
+                    "holding": None,
+                    "needs_scope": True,
+                    "intelligence": intelligence,
                     "attachment_id": str(staged_attachment.pk),
                     "attachment_batch_id": str(staged_attachment.batch_id),
+                    "next_steps": [
+                        f"catalog_business_document document_id={document.pk} "
+                        "scope_query=<address> (attachment_id optional)."
+                    ],
+                    "relay_instruction": (
+                        f"Document already prepared (document_id={document.pk}). "
+                        "Relay OCR intelligence, ask for holding address if needed, "
+                        "then catalog with document_id + scope_query — do NOT "
+                        "require the old attachment_id."
+                    ),
                 }
         staged_attachment.original.open("rb")
         try:
@@ -590,7 +616,12 @@ def promote_chat_file_to_document(
     else:
         staged_upload = RamaUpload.objects.filter(pk=uid, landlord=landlord).first()
         if staged_upload is None:
-            return {"error": f"No upload {uid!r}."}
+            return {
+                "error": (
+                    f"No upload {uid!r}. If this file was already prepared, pass "
+                    "document_id from the previous tool result (not upload_id)."
+                ),
+            }
         staged_upload.image.open("rb")
         try:
             data = staged_upload.image.read()
@@ -659,14 +690,18 @@ def promote_chat_file_to_document(
         )
     document = _ensure_ocr(document)
 
+    # Link staged row → document but keep CLASSIFIED until holding is set so
+    # a follow-up catalog with the same attachment_id (or document_id alone)
+    # still works. APPLIED only after successful scope.
     if staged_attachment is not None:
         staged_attachment.classification = RamaAttachment.Classification.DOCUMENT
-        staged_attachment.status = RamaAttachment.Status.APPLIED
+        staged_attachment.status = RamaAttachment.Status.CLASSIFIED
         staged_attachment.target_type = "rama_document"
         staged_attachment.target_id = str(document.pk)
         staged_attachment.result = {
             "document_id": str(document.pk),
             "created": created,
+            "prepared": True,
         }
         staged_attachment.save(
             update_fields=[
@@ -678,25 +713,8 @@ def promote_chat_file_to_document(
                 "updated_at",
             ]
         )
-    if staged_upload is not None and staged_upload.used_at is None:
-        # Not fully "used" until scoped, but hash is now a document — leave
-        # used_at null until scope confirms, so retries can re-find it.
-        pass
 
     intelligence = document_intelligence_payload(document)
-    proposed = None
-    if document.holding_id:
-        proposed = {
-            "holding_id": str(document.holding_id),
-            "name": document.holding.name,
-            "address": document.holding.address,
-            "source": "already_on_document",
-        }
-    elif document.holding_id is None:
-        # OCR may have matched a holding into match fields without save path
-        # when user_scope_locked — process_document sets holding when confident.
-        pass
-
     needs_scope = document.holding_id is None
     next_steps = []
     if needs_scope:
@@ -727,7 +745,6 @@ def promote_chat_file_to_document(
             if document.holding_id
             else None
         ),
-        "proposed_scope": proposed,
         "needs_scope": needs_scope,
         "intelligence": intelligence,
         "attachment_id": str(staged_attachment.pk) if staged_attachment else None,
@@ -739,10 +756,9 @@ def promote_chat_file_to_document(
         "relay_instruction": (
             "FIRST relay OCR intelligence (kind, title, amount — never invent). "
             + (
-                "This is a NEW document that needs a physical property address "
-                "before filing. Ask once for the holding address, then call "
-                f"catalog_business_document with document_id={document.pk} "
-                "and scope_query."
+                "Document is prepared. Ask once for the holding address, then "
+                f"call catalog_business_document with document_id={document.pk} "
+                "and scope_query (attachment_id optional)."
                 if needs_scope
                 else "Holding is known. Proceed to file_business_document if "
                 "they want a ledger expense."
@@ -993,6 +1009,26 @@ def catalog_batch_attachment_as_document(
     )
     if result.get("error"):
         return result
+    # Scope complete — mark attachment APPLIED if we still have a handle.
+    from .models import RamaAttachment
+
+    att = RamaAttachment.objects.filter(
+        pk=attachment_id, batch__landlord=landlord
+    ).first()
+    if att is not None:
+        att.status = RamaAttachment.Status.APPLIED
+        att.target_type = "rama_document"
+        att.target_id = str(document.pk)
+        att.classification = RamaAttachment.Classification.DOCUMENT
+        att.save(
+            update_fields=[
+                "status",
+                "target_type",
+                "target_id",
+                "classification",
+                "updated_at",
+            ]
+        )
     intelligence = result.get("intelligence") or {}
     return {
         **result,

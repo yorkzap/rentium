@@ -756,24 +756,45 @@ def catalog_business_document(
             upload_id=upload_id.strip(),
             **common,
         )
-    if not document_id.strip():
-        # No id at all — still try prepare if nothing? error.
-        return {
-            "error": (
-                "Pass attachment_id, upload_id, or document_id. "
-                "For a new chat file, pass attachment_id alone first (no address) "
-                "to OCR and check duplicates."
-            ),
-        }
-    # document_id path: if no scope yet, return status / need scope after OCR.
-    if not (scope_query or "").strip():
-        from .document_services import business_document_status as status_fn
+    if document_id.strip():
+        # document_id path (preferred after prepare): status or scope+confirm.
+        if not (scope_query or "").strip():
+            from .document_services import business_document_status as status_fn
 
-        return status_fn(landlord, document_id=document_id.strip())
-    return catalog_document_scope(
-        document_id=document_id.strip(),
-        **common,
-    )
+            return status_fn(landlord, document_id=document_id.strip())
+        return catalog_document_scope(
+            document_id=document_id.strip(),
+            **common,
+        )
+    # Bare address after prepare: pick the newest unscoped document for this
+    # landlord so the model can say "yes" / "950 McKenzie" without re-passing ids.
+    if (scope_query or "").strip():
+        from .models import RamaDocument
+
+        pending = (
+            RamaDocument.objects.filter(landlord=landlord, holding__isnull=True)
+            .exclude(status=RamaDocument.Status.FILED)
+            .order_by("-created_at")
+            .first()
+        )
+        if pending is None:
+            return {
+                "error": (
+                    "No pending unscoped business document to attach that address to. "
+                    "Pass attachment_id/upload_id first so the file is OCR'd."
+                ),
+            }
+        return catalog_document_scope(
+            document_id=str(pending.pk),
+            **common,
+        )
+    return {
+        "error": (
+            "Pass attachment_id, upload_id, or document_id. "
+            "For a new chat file, pass attachment_id alone first (no address) "
+            "to OCR and check duplicates."
+        ),
+    }
 
 
 def business_document_location(landlord, document_id: str) -> dict:

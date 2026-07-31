@@ -633,7 +633,10 @@ def _document_payload(document, request=None):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def documents_view(request):
-    """Upload or list the acting landlord's OCR-backed business records."""
+    """Upload or list the acting landlord's OCR-backed business records.
+
+    GET supports pagination: ?page=1&page_size=25 (max 100) and optional status=.
+    """
     from .document_services import DocumentError
     from .document_services import ingest_document
     from .models import RamaDocument
@@ -641,19 +644,37 @@ def documents_view(request):
 
     landlord = _landlord(request)
     if request.method == "GET":
+        try:
+            page = max(1, int(request.query_params.get("page") or "1"))
+        except ValueError:
+            page = 1
+        try:
+            page_size = min(100, max(1, int(request.query_params.get("page_size") or "25")))
+        except ValueError:
+            page_size = 25
         queryset = (
             RamaDocument.objects.filter(landlord=landlord)
-            .select_related("holding", "property", "ledger_entry")[:200]
+            .select_related("holding", "property", "ledger_entry")
+            .order_by("-created_at")
         )
         status_filter = str(request.query_params.get("status") or "").upper()
         if status_filter:
-            queryset = (
-                RamaDocument.objects.filter(
-                    landlord=landlord, status=status_filter,
-                )
-                .select_related("holding", "property", "ledger_entry")[:200]
-            )
-        return Response({"documents": [_document_payload(row, request) for row in queryset]})
+            queryset = queryset.filter(status=status_filter)
+        total = queryset.count()
+        start = (page - 1) * page_size
+        rows = list(queryset[start : start + page_size])
+        return Response(
+            {
+                "documents": [_document_payload(row, request) for row in rows],
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "has_next": start + page_size < total,
+                    "has_prev": page > 1,
+                },
+            }
+        )
 
     upload = request.FILES.get("file") or request.FILES.get("document")
     if not upload:
@@ -677,10 +698,10 @@ def documents_view(request):
     )
 
 
-@api_view(["GET", "POST"])
+@api_view(["GET", "POST", "DELETE"])
 @permission_classes([IsAuthenticated])
 def document_detail_view(request, document_id):
-    """Inspect OCR results or confirm/correct the proposed filing."""
+    """Inspect OCR results, confirm/correct filing, or delete a business document."""
     from rentium.properties.models import Property
     from rentium.properties.models import PropertyHolding
 
@@ -699,6 +720,30 @@ def document_detail_view(request, document_id):
         return Response(
             {"detail": "Document not found."}, status=http_status.HTTP_404_NOT_FOUND,
         )
+    if request.method == "DELETE":
+        # Soft-safe delete: refuse only if you need to keep legal evidence?
+        # Landlords may remove mis-uploads; ledger rows are not deleted.
+        if document.ledger_entry_id:
+            return Response(
+                {
+                    "detail": (
+                        "This document is linked to a ledger expense. Unlink or "
+                        "void the expense first if you truly need the file gone; "
+                        "the expense itself stays as audit history."
+                    ),
+                },
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        # Remove storage files best-effort, then the row.
+        for field in (document.original_file, document.archival_pdf):
+            if field:
+                try:
+                    field.delete(save=False)
+                except Exception:  # noqa: BLE001
+                    pass
+        pk = str(document.pk)
+        document.delete()
+        return Response({"deleted": True, "document_id": pk})
     if request.method == "GET":
         payload = _document_payload(document, request)
         payload["ocr_text"] = document.ocr_text

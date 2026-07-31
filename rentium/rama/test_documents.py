@@ -90,6 +90,46 @@ def test_invoice_ocr_prefers_total_not_first_money_and_maintenance_kind(landlord
     assert document.payment_state == RamaDocument.PaymentState.UNKNOWN
 
 
+def test_address_only_followup_scopes_pending_document(landlord):
+    """After prepare, landlord can reply with just the street — no attachment_id."""
+    from rentium.rama import registry
+
+    holding = _holding(landlord)
+    pdf = b"%PDF-1.4 address-followup-unique-bytes"
+    conversation_id = __import__("uuid").uuid4()
+    from rentium.rama.attachment_services import seal_batch, stage_files
+
+    batch = stage_files(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        uploads=[SimpleUploadedFile("bill.pdf", pdf, content_type="application/pdf")],
+    )
+    seal_batch(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        batch_id=str(batch.pk),
+    )
+    att = batch.attachments.get()
+    prep = registry.execute(
+        "catalog_business_document",
+        {"attachment_id": str(att.pk)},
+        landlord=landlord,
+    )
+    assert prep.get("document_id"), prep
+    assert prep.get("needs_scope") or prep.get("needs_input") or prep.get("prepared")
+    doc_id = prep["document_id"]
+
+    # Follow-up: address only (what the landlord types after "which property?").
+    scoped = registry.execute(
+        "catalog_business_document",
+        {"scope_query": "950 McKenzie Ave", "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert scoped.get("catalogued") or scoped.get("already_done"), scoped
+    document = RamaDocument.objects.get(pk=doc_id)
+    assert document.holding_id == holding.pk
+
+
 def test_same_file_hash_is_duplicate_before_asking_address(landlord):
     """Re-sending the same PDF must not open a new 'file for McKenzie' preview."""
     from rentium.rama.attachment_services import seal_batch, stage_files
