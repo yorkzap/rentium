@@ -2027,6 +2027,231 @@ def adjust_lease(
 
 
 @_params(
+    lease_number="Existing lease to renew (preferred), e.g. RMT415536-0617.",
+    start_date="New term start YYYY-MM-DD (default: day after old end_date).",
+    end_date="New fixed-term end YYYY-MM-DD (required unless month-to-month).",
+    total_rent="Monthly rent for the new term (default: same as old lease).",
+    copy_tenants="yes (default) copies roster as unsigned invites; no skips.",
+)
+def renew_lease(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    total_rent: str = "",
+    security_deposit: str = "",
+    is_month_to_month: str = "",
+    copy_tenants: str = "1",
+    confirm: str = "",
+) -> dict:
+    """Renew an ACTIVE/EXPIRED lease: old→RENEWED, new DRAFT linked as
+    previous_lease (same as UI Renew). Prefer this over terminate+create.
+    Preview; confirm=yes."""
+    from .domain_composites import renew_lease as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        start_date=start_date,
+        end_date=end_date,
+        total_rent=total_rent,
+        security_deposit=security_deposit,
+        is_month_to_month=is_month_to_month,
+        copy_tenants=copy_tenants,
+        confirm=confirm,
+    )
+
+
+@_params(
+    requested_end_date="Tenancy end date YYYY-MM-DD when opening a move-out.",
+    kind="LANDLORD_NOTICE (auto-applies if notice period met) or MUTUAL_AGREEMENT.",
+    rent_handling="NONE | VOID_FINAL | PRORATE_FINAL for mutual agreements.",
+    deposit_settlement="PENDING | RETURNED | AGREED | RTB when settling deposit.",
+)
+def settle_moveout(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    requested_end_date: str = "",
+    kind: str = "MUTUAL_AGREEMENT",
+    reason: str = "",
+    rent_handling: str = "NONE",
+    moveout_id: str = "",
+    forwarding_address: str = "",
+    forwarding_address_received_on: str = "",
+    deposit_settlement: str = "",
+    tenant_agreement_signed_on: str = "",
+    rtb_file_number: str = "",
+    confirm: str = "",
+) -> dict:
+    """End a tenancy (landlord notice or mutual agreement) and/or record
+    deposit settlement with evidence — same as UI move-out flow. Preview;
+    confirm=yes."""
+    from .domain_composites import settle_moveout as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        requested_end_date=requested_end_date,
+        kind=kind,
+        reason=reason,
+        rent_handling=rent_handling,
+        moveout_id=moveout_id,
+        forwarding_address=forwarding_address,
+        forwarding_address_received_on=forwarding_address_received_on,
+        deposit_settlement=deposit_settlement,
+        tenant_agreement_signed_on=tenant_agreement_signed_on,
+        rtb_file_number=rtb_file_number,
+        confirm=confirm,
+    )
+
+
+@_params(
+    fill_move_in_good="yes (default) fills empty move-in condition codes as GOOD.",
+    landlord_signature_name="Typed name to sign the move-in pass as landlord.",
+    start_move_out="yes to open the move-out pass (only after move-in signed).",
+)
+def complete_inspection_package(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    tenant_email: str = "",
+    fill_move_in_good: str = "1",
+    landlord_signature_name: str = "",
+    start_move_out: str = "0",
+    move_out_date: str = "",
+    confirm: str = "",
+) -> dict:
+    """Create or complete a condition inspection package: ensure report
+    exists, fill empty move-in codes GOOD, optional landlord sign, optional
+    start move-out. Never forges tenant signatures. Preview; confirm=yes."""
+    from .domain_composites import complete_inspection_package as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        tenant_email=tenant_email,
+        fill_move_in_good=fill_move_in_good,
+        landlord_signature_name=landlord_signature_name,
+        start_move_out=start_move_out,
+        move_out_date=move_out_date,
+        confirm=confirm,
+    )
+
+
+@_params(
+    adjustment_type="DISCOUNT | INCREASE | PRORATION | OTHER.",
+    amount="Dollars for FLAT_AMOUNT, or percent for PERCENTAGE.",
+    calculation_method="FLAT_AMOUNT (default) | PERCENTAGE | EXACT_NIGHTLY.",
+    effective_date="When the adjustment starts (YYYY-MM-DD, default today).",
+)
+def apply_rent_adjustment(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    tenant_email: str = "",
+    adjustment_type: str = "DISCOUNT",
+    amount: str = "",
+    calculation_method: str = "FLAT_AMOUNT",
+    reason: str = "",
+    effective_date: str = "",
+    end_date: str = "",
+    is_recurring: str = "0",
+    confirm: str = "",
+) -> dict:
+    """Record a rent discount/increase on a lease tenant and reconcile open
+    rent charges (same as UI rent-adjustments). Preview; confirm=yes."""
+    from .domain_composites import apply_rent_adjustment as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        tenant_email=tenant_email,
+        adjustment_type=adjustment_type,
+        amount=amount,
+        calculation_method=calculation_method,
+        reason=reason,
+        effective_date=effective_date,
+        end_date=end_date,
+        is_recurring=is_recurring,
+        confirm=confirm,
+    )
+
+
+@_params(
+    total_amount="Full bill amount the utility company charged.",
+    period_start="Billing period start YYYY-MM-DD.",
+    period_end="Billing period end YYYY-MM-DD.",
+    bill_key="Optional key from lease bills_included (e.g. electricity).",
+    record_landlord_expense="yes to also book the full bill as landlord expense.",
+)
+def record_utility_bill(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    total_amount: str = "",
+    period_start: str = "",
+    period_end: str = "",
+    description: str = "Utility bill",
+    bill_key: str = "",
+    due_date: str = "",
+    record_landlord_expense: str = "0",
+    vendor: str = "",
+    confirm: str = "",
+) -> dict:
+    """Post a utility bill to a lease: tenant share per bills_included, optional
+    landlord expense for the full amount (POST /api/ledger/utility-bills/).
+    Preview; confirm=yes."""
+    from .domain_composites import record_utility_bill as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        total_amount=total_amount,
+        period_start=period_start,
+        period_end=period_end,
+        description=description,
+        bill_key=bill_key,
+        due_date=due_date,
+        record_landlord_expense=record_landlord_expense,
+        vendor=vendor,
+        confirm=confirm,
+    )
+
+
+@_params(
+    inquiry_id="Inquiry UUID from list_inquiries (preferred).",
+    name_query="Prospect name if you don't have the id.",
+    when="Viewing datetime YYYY-MM-DD HH:MM (America/Vancouver).",
+)
+def convert_inquiry_to_viewing(
+    landlord,
+    inquiry_id: str = "",
+    name_query: str = "",
+    when: str = "",
+    confirm: str = "",
+) -> dict:
+    """Turn a listing inquiry into a scheduled viewing, carrying name/email/
+    phone and marking the inquiry replied (UI to_appointment). Preview;
+    confirm=yes."""
+    from .domain_composites import convert_inquiry_to_viewing as _fn
+
+    return _fn(
+        landlord,
+        inquiry_id=inquiry_id,
+        name_query=name_query,
+        when=when,
+        confirm=confirm,
+    )
+
+
+@_params(
     name="The co-host / co-landlord's name (required).",
     email="Their email (optional, for the agreement + notice).",
     phone="Their phone (optional).",

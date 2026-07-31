@@ -65,6 +65,49 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "edit pending lease",
         "change lease dates",
     ),
+    "renew_lease": (
+        "renew tenancy",
+        "renew the lease",
+        "extend lease another year",
+        "new term same tenant",
+        "roll over lease",
+    ),
+    "settle_moveout": (
+        "end tenancy",
+        "move out notice",
+        "mutual agreement end",
+        "settle deposit",
+        "return security deposit",
+        "landlord notice to end",
+    ),
+    "complete_inspection_package": (
+        "condition inspection",
+        "move in inspection",
+        "move out inspection",
+        "rtb inspection",
+        "walkthrough report",
+    ),
+    "apply_rent_adjustment": (
+        "rent discount",
+        "rent increase",
+        "reduce rent",
+        "raise rent",
+        "prorate rent",
+    ),
+    "record_utility_bill": (
+        "utility bill",
+        "hydro bill",
+        "gas bill",
+        "electricity bill",
+        "split utility",
+        "water bill",
+    ),
+    "convert_inquiry_to_viewing": (
+        "inquiry to viewing",
+        "book showing from inquiry",
+        "turn lead into viewing",
+        "schedule from inquiry",
+    ),
     "update_lease": (
         "edit lease terms",
         "change rent",
@@ -309,6 +352,48 @@ def supported_tool_for_request(request: str) -> str | None:
         text,
     ):
         return "adjust_lease"
+    if re.search(
+        r"\b(renew|renewal|roll over|rollover|extend)\b.+\b(lease|tenancy|term)\b"
+        r"|\brenew (the |this )?lease\b|\banother (year|term) (on|for) (the )?lease\b",
+        text,
+    ):
+        return "renew_lease"
+    if re.search(
+        r"\b(end|ending|terminate)\b.+\b(tenancy|move[- ]?out)\b"
+        r"|\b(move[- ]?out|mutual agreement)\b.+\b(end|notice|deposit)\b"
+        r"|\b(settle|return)\b.+\b(deposit|security deposit)\b"
+        r"|\blandlord notice\b.+\b(end|vacate)\b",
+        text,
+    ):
+        return "settle_moveout"
+    if re.search(
+        r"\b(condition|move[- ]?in|move[- ]?out)\b.+\binspection\b"
+        r"|\binspection (package|report|walkthrough)\b"
+        r"|\brtb[- ]?27\b|\bcondition inspection\b",
+        text,
+    ):
+        return "complete_inspection_package"
+    if re.search(
+        r"\b(rent )?(discount|increase|proration|adjustment)\b"
+        r"|\b(reduce|raise|lower|increase)\b.+\brent\b"
+        r"|\bapply_rent_adjustment\b",
+        text,
+    ):
+        return "apply_rent_adjustment"
+    if re.search(
+        r"\b(utility|hydro|electricity|gas|water)\b.+\bbill\b"
+        r"|\bbill\b.+\b(utility|hydro|electricity|gas|water)\b"
+        r"|\bsplit (the )?utility\b|\brecord_utility_bill\b",
+        text,
+    ):
+        return "record_utility_bill"
+    if re.search(
+        r"\b(inquiry|lead|enquiry)\b.+\b(viewing|showing|appointment|tour)\b"
+        r"|\b(viewing|showing)\b.+\b(inquiry|lead|enquiry)\b"
+        r"|\bconvert_inquiry\b|\bto_appointment\b",
+        text,
+    ):
+        return "convert_inquiry_to_viewing"
     # Leases — the most common false "I can't create a lease" gap.
     # Deliberately exclude co-landlord / co-host / invite-only phrasings.
     if not re.search(

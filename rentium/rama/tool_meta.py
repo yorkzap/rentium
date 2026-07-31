@@ -297,6 +297,22 @@ TOOL_META: dict[str, ToolMeta] = {
     "create_lease": ToolMeta(risk="medium"),
     "update_lease": ToolMeta(risk="medium"),
     "adjust_lease": ToolMeta(risk="medium", own_confirm=True),
+    # Legal: renew marks old RENEWED and opens a new DRAFT — own confirm.
+    "renew_lease": ToolMeta(risk="legal", own_confirm=True),
+    # Ends a tenancy / settles deposit with legal evidence — own confirm.
+    "settle_moveout": ToolMeta(risk="legal", own_confirm=True),
+    "complete_inspection_package": ToolMeta(risk="medium", own_confirm=True),
+    # Money: rent adjustments reconcile ledger charges.
+    "apply_rent_adjustment": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
+    "record_utility_bill": ToolMeta(
+        risk="high", independent_writes=True, autonomy=Autonomy.NEVER
+    ),
+    # Creates a viewing + emails prospect; irreversible outbound.
+    "convert_inquiry_to_viewing": ToolMeta(
+        risk="high", autonomy=Autonomy.NEVER
+    ),
     "delete_draft_lease": ToolMeta(
         risk="medium", blockers=delete_draft_lease_blockers
     ),

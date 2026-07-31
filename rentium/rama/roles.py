@@ -273,6 +273,12 @@ shown on the roommate PDF, and can seed inventory). update_property also accepts
 furnishing_status + furnishing_details. Only ACTIVE / EXPIRED / TERMINATED / \
 RENEWED leases are locked. After a lease edit, report "Updated lease <number> \
 for <listing>" — never just "Updated Room D". \
+renew_lease for ACTIVE/EXPIRED → old becomes RENEWED, new DRAFT (not terminate). \
+settle_moveout for landlord notice / mutual end + deposit settlement evidence. \
+complete_inspection_package for move-in/out condition reports (not schedule_viewing). \
+apply_rent_adjustment for discounts/increases (reconciles rent charges). \
+record_utility_bill for hydro/gas/water bills on a lease. \
+convert_inquiry_to_viewing turns a lead into a Calendar viewing. \
 delete_draft_lease = DRAFT only; else terminate_lease (voids open charges). \
 landlord_sign_lease requires fully allocated rent. \
 Roster: list_lease_roster first. ADD roommate → add_roommate_to_lease (never replace). \
@@ -507,6 +513,12 @@ GENERAL_TOOLS = READ_TOOLS + (
     "resend_lease_invite",
     "create_lease",
     "adjust_lease",
+    "renew_lease",
+    "settle_moveout",
+    "complete_inspection_package",
+    "apply_rent_adjustment",
+    "record_utility_bill",
+    "convert_inquiry_to_viewing",
     "schedule_viewing",
     "reschedule_viewing",
     "record_payment",
