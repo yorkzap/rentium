@@ -181,6 +181,10 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "created account",
         "signed up",
         "signed lease",
+        "last seen lease",
+        "when did tenant open",
+        "has tenant seen",
+        "seen the lease",
     ),
     "create_property_structure": (
         "create unit",
@@ -530,8 +534,10 @@ def supported_tool_for_request(request: str) -> str | None:
     ):
         return "invite_tenant_to_lease"
     if re.search(
-        r"\b(has|did|have)\b.+\b(signed|viewed|opened|clicked)\b.+\b(lease|invite)\b"
-        r"|\b(signed|viewed|opened)\b.+\b(lease|invite)\b"
+        r"\b(has|did|have)\b.+\b(signed|viewed|opened|clicked|seen)\b.+\b(lease|invite)\b"
+        r"|\b(signed|viewed|opened|seen)\b.+\b(lease|invite)\b"
+        r"|\blast (seen|opened|viewed)\b.+\b(lease|invite|tenant)\b"
+        r"|\bwhen did .+\b(open|see|view)\b.+\b(lease|invite)\b"
         r"|\bcreated an? account\b|\bsigned up\b",
         text,
     ):

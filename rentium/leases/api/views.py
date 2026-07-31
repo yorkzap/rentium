@@ -1187,6 +1187,8 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
             metadata={
                 "user_agent": str(request.headers.get("User-Agent") or "")[:300],
             },
+            # Invite pages re-fetch on load; don't flood the audit trail.
+            debounce_seconds=120,
         )
 
         return Response(

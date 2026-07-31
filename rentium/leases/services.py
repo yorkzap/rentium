@@ -53,9 +53,30 @@ def create_lease_record(*, landlord, values: dict):
     return lease
 
 
-def record_invite_event(lease_tenant, kind: str, *, actor=None, metadata=None):
+def record_invite_event(
+    lease_tenant,
+    kind: str,
+    *,
+    actor=None,
+    metadata=None,
+    debounce_seconds: int = 0,
+):
+    """Append an invite/view event. Optional debounce avoids spam on reloads."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
     from rentium.leases.models import LeaseInviteEvent
 
+    if debounce_seconds > 0:
+        since = timezone.now() - timedelta(seconds=debounce_seconds)
+        recent = (
+            lease_tenant.invite_events.filter(kind=kind, created_at__gte=since)
+            .order_by("-created_at")
+            .first()
+        )
+        if recent is not None:
+            return recent
     return LeaseInviteEvent.objects.create(
         lease_tenant=lease_tenant,
         kind=kind,
@@ -64,20 +85,49 @@ def record_invite_event(lease_tenant, kind: str, *, actor=None, metadata=None):
     )
 
 
+# Events that mean the tenant (or invitee) actually looked at the agreement.
+_SEEN_KINDS = frozenset(
+    {
+        "LINK_OPENED",
+        "LEASE_VIEWED",
+    }
+)
+
+
 def invite_lifecycle(lease_tenant) -> dict:
-    """Facts RAMA/UI may state without conflating opened, linked, and signed."""
+    """Facts RAMA/UI may state without conflating opened, linked, and signed.
+
+    last_seen_at is the most recent invite-link open or authenticated
+    agreement/PDF view. It is evidence of access, not proof of reading.
+    """
     from rentium.leases.models import LeaseInviteEvent
 
     events = list(lease_tenant.invite_events.order_by("created_at"))
     latest: dict[str, object] = {}
     for event in events:
         latest[event.kind] = event.created_at
+    seen_events = [e for e in events if e.kind in _SEEN_KINDS]
+    first_seen = seen_events[0].created_at if seen_events else None
+    last_seen_event = seen_events[-1] if seen_events else None
+    last_seen = last_seen_event.created_at if last_seen_event else None
     opened_at = latest.get(LeaseInviteEvent.Kind.LINK_OPENED)
     linked_at = (
         latest.get(LeaseInviteEvent.Kind.ACCOUNT_LINKED)
         or lease_tenant.invite_accepted_at
     )
     signed_at = latest.get(LeaseInviteEvent.Kind.SIGNED) or lease_tenant.signed_date
+    last_source = None
+    if last_seen_event is not None:
+        last_source = (
+            "invite_link"
+            if last_seen_event.kind == LeaseInviteEvent.Kind.LINK_OPENED
+            else "agreement"
+        )
+        meta = last_seen_event.metadata or {}
+        if meta.get("via") == "pdf":
+            last_source = "pdf"
+        elif meta.get("via") == "document":
+            last_source = "agreement"
     return {
         "invite_sent": bool(lease_tenant.invite_sent_at),
         "invite_sent_at": (
@@ -89,16 +139,56 @@ def invite_lifecycle(lease_tenant) -> dict:
         # prove the named person read or understood the agreement.
         "invite_link_opened": bool(opened_at),
         "invite_link_opened_at": opened_at.isoformat() if opened_at else None,
+        # Aggregate "has the tenant seen the lease?" (invite link and/or agreement).
+        "has_seen_lease": bool(last_seen),
+        "first_seen_at": first_seen.isoformat() if first_seen else None,
+        "last_seen_at": last_seen.isoformat() if last_seen else None,
+        "seen_count": len(seen_events),
+        "last_seen_source": last_source,
         "account_linked": bool(lease_tenant.tenant_id),
         "account_linked_at": linked_at.isoformat() if linked_at else None,
         "signed": bool(lease_tenant.has_signed),
         "signed_at": signed_at.isoformat() if signed_at else None,
         "declined": bool(lease_tenant.declined),
         "evidence_note": (
-            "LINK_OPENED means the token-gated invite URL was opened; it is not "
-            "proof that the recipient read the agreement."
+            "last_seen_at is the latest invite-link open or authenticated "
+            "agreement/PDF view. LINK_OPENED / LEASE_VIEWED prove access to the "
+            "lease page; they are not proof that the recipient read or "
+            "understood every clause."
         ),
     }
+
+
+def record_lease_view_for_user(lease, user, *, via: str = "document") -> int:
+    """Record that an authenticated tenant party viewed this lease.
+
+    Returns how many tenant slots were updated (0 if viewer is not a tenant).
+    """
+    from django.db.models import Q
+
+    from rentium.leases.models import LeaseInviteEvent
+
+    if user is None or not getattr(user, "is_authenticated", False):
+        return 0
+    qs = lease.lease_tenants.filter(declined=False)
+    email = (getattr(user, "email", None) or "").strip()
+    match = Q()
+    if hasattr(user, "tenant_profile"):
+        match |= Q(tenant=user.tenant_profile)
+    if email:
+        match |= Q(invited_email__iexact=email)
+    if not match:
+        return 0
+    slots = list(qs.filter(match).distinct())
+    for lt in slots:
+        record_invite_event(
+            lt,
+            LeaseInviteEvent.Kind.LEASE_VIEWED,
+            actor=user,
+            metadata={"via": via},
+            debounce_seconds=120,
+        )
+    return len(slots)
 
 
 def co_landlord_grants_for_lease(lease):

@@ -60,6 +60,10 @@ def _lease_for(request, lease_id) -> Lease:
 @permission_classes([IsAuthenticated])
 def lease_document(request, lease_id):
     lease = _lease_for(request, lease_id)
+    # Evidence for landlords: tenant opened the live agreement in the app.
+    from rentium.leases.services import record_lease_view_for_user
+
+    record_lease_view_for_user(lease, request.user, via="document")
     return Response(render_lease(lease).as_dict())
 
 
@@ -73,6 +77,9 @@ def lease_pdf(request, lease_id):
     # limping along and 501-ing at the one moment a tenant tries to download
     # the thing they're being asked to sign — which is what used to happen.
     from rentium.leases.pdf import build_lease_pdf
+    from rentium.leases.services import record_lease_view_for_user
+
+    record_lease_view_for_user(lease, request.user, via="pdf")
 
     response = HttpResponse(build_lease_pdf(lease), content_type="application/pdf")
     response["Content-Disposition"] = (

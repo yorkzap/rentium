@@ -1195,6 +1195,8 @@ class LeaseInviteEvent(models.Model):
     class Kind(models.TextChoices):
         SENT = "SENT", _("Invite sent")
         LINK_OPENED = "LINK_OPENED", _("Invite link opened")
+        # Authenticated tenant opened the agreement JSON or PDF (after linking).
+        LEASE_VIEWED = "LEASE_VIEWED", _("Lease agreement viewed")
         ACCOUNT_LINKED = "ACCOUNT_LINKED", _("Account linked")
         SIGNED = "SIGNED", _("Lease signed")
         DECLINED = "DECLINED", _("Lease declined")

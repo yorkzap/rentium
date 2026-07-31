@@ -1341,8 +1341,10 @@ def replace_lease_invite(
 def list_lease_roster(
     landlord, property_query: str = "", lease_number: str = "",
 ) -> dict:
-    """Who is on a lease: pending invites, signed tenants, rent shares, primary.
-    Use for 'who should sign?', 'any invitations sent?', rent split questions."""
+    """Who is on a lease: pending invites, signed tenants, rent shares, primary,
+    and when each person last saw the lease (invite link open or agreement/PDF
+    view — seen_summary / invite_lifecycle.last_seen_at). Use for 'who should
+    sign?', 'has X opened/seen the lease?', 'when did they view it?', rent split."""
     from .domain_actions import list_lease_roster as _fn
     return _fn(
         landlord, property_query=property_query, lease_number=lease_number,

@@ -2733,7 +2733,11 @@ def resend_lease_invite(
 def list_lease_roster(
     landlord, *, property_query: str = "", lease_number: str = ""
 ) -> dict:
-    """Who is on a lease: signed, pending invites, declined, rent shares, primary."""
+    """Who is on a lease: signed, pending invites, declined, rent shares, primary.
+
+    Each active tenant includes invite_lifecycle with last_seen_at (when they
+    last opened the invite link or viewed the agreement/PDF). Use this for
+    'has the tenant seen the lease?' / 'when did they open it?'."""
     lease, err = _resolve_lease(
         landlord, property_query=property_query, lease_number=lease_number
     )
@@ -2745,6 +2749,7 @@ def list_lease_roster(
     declined = list(lease.lease_tenants.filter(declined=True)[:20])
     total = lease.total_rent
     allocated = sum((Decimal(a.rent_amount) for a in active), Decimal("0"))
+    active_rows = [_slot_label(a) for a in active]
     return {
         "lease_number": lease.lease_number,
         "lease_status": lease.status,
@@ -2752,8 +2757,26 @@ def list_lease_roster(
         "lease_total_rent": str(total),
         "allocated_rent": str(allocated),
         "unallocated_rent": str(Decimal(total or 0) - allocated),
-        "active_tenants": [_slot_label(a) for a in active],
+        "active_tenants": active_rows,
         "declined_or_cancelled": [_slot_label(d) for d in declined],
+        "seen_summary": [
+            {
+                "name": row["name"],
+                "email": row["email"],
+                "has_seen_lease": (row.get("invite_lifecycle") or {}).get(
+                    "has_seen_lease"
+                ),
+                "last_seen_at": (row.get("invite_lifecycle") or {}).get(
+                    "last_seen_at"
+                ),
+                "seen_count": (row.get("invite_lifecycle") or {}).get("seen_count"),
+                "last_seen_source": (row.get("invite_lifecycle") or {}).get(
+                    "last_seen_source"
+                ),
+                "signed": row.get("has_signed"),
+            }
+            for row in active_rows
+        ],
         "rules": {
             "rent": (
                 "Shares should sum to lease_total_rent. One person alone gets full "
@@ -2763,6 +2786,10 @@ def list_lease_roster(
             "replace": (
                 "To swap invitees use replace_lease_invite or "
                 "invite_tenant_to_lease mode=replace — do not resend the old one."
+            ),
+            "last_seen": (
+                "last_seen_at is the latest invite-link open or authenticated "
+                "agreement/PDF view. It proves access, not that they read every clause."
             ),
         },
     }

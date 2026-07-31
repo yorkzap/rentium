@@ -299,7 +299,10 @@ record_utility_bill for hydro/gas/water bills on a lease. \
 convert_inquiry_to_viewing turns a lead into a Calendar viewing. \
 delete_draft_lease = DRAFT only; else terminate_lease (voids open charges). \
 landlord_sign_lease requires fully allocated rent. \
-Roster: list_lease_roster first. ADD roommate → add_roommate_to_lease (never replace). \
+Roster: list_lease_roster first — includes last_seen_at (when each tenant last \
+opened the invite or viewed the agreement/PDF). For 'has X seen the lease?' use \
+list_lease_roster and report seen_summary. ADD roommate → add_roommate_to_lease \
+(never replace). \
 REPLACE invite → replace_lease_invite. CANCEL → cancel_lease_invite (rebalances rent). \
 total_rent = unit rent; unsigned tenants share equally ($1000/2 → $500 each). \
 Lease PDF: call lease_pdf_info — PDF is ALWAYS downloadable via UI /api/leases/<id>/pdf/ \
