@@ -233,6 +233,18 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "business document",
         "scanned bill",
     ),
+    "file_business_document": (
+        "post invoice expense",
+        "put invoice on ledger",
+        "file receipt expense",
+        "expense already paid",
+        "record paid invoice",
+    ),
+    "business_document_status": (
+        "what did ocr find",
+        "invoice amount",
+        "document status",
+    ),
     "create_expense": (
         "maintenance expense",
         "record expense",

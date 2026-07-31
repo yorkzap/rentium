@@ -718,7 +718,12 @@ def catalog_business_document(
     building—not a rental listing. If no holding exists but listings share the
     exact legal address, this proposes creating it and linking those child
     rooms/units. Distinct apartment addresses stay separate. Never force a
-    child listing choice."""
+    child listing choice.
+
+    On confirm, OCR runs and the result includes intelligence: kind, title,
+    amount (from the document — NEVER invent), payment_state, next_steps.
+    Relay those facts. For invoices/receipts continue with
+    file_business_document (ask PAID vs UNPAID if unknown)."""
     from .document_services import catalog_batch_attachment_as_document
     from .document_services import catalog_document_scope
     from .document_services import catalog_staged_photo_as_document
@@ -764,6 +769,57 @@ def business_document_location(landlord, document_id: str) -> dict:
     from .document_services import document_location
 
     return document_location(landlord, document_id)
+
+
+def business_document_status(landlord, document_id: str) -> dict:
+    """Read OCR results for a catalogued business document: kind, title, amount,
+    payment_state, next steps. ALWAYS call this (or use catalog's intelligence
+    payload) before inventing an expense amount. Never guess totals."""
+    from .document_services import business_document_status as _fn
+
+    return _fn(landlord, document_id=document_id)
+
+
+@_params(
+    document_id="UUID of the catalogued business document.",
+    payment_state="PAID if the money has left the bank; UNPAID if still owing. "
+    "Required when OCR payment_state is UNKNOWN.",
+    amount="Override only if OCR amount is wrong; default uses OCR amount. "
+    "NEVER invent a figure — use intelligence.amount from catalog/status.",
+    confirm="Leave empty to preview; yes to file document + post expense.",
+)
+def file_business_document(
+    landlord,
+    document_id: str,
+    payment_state: str = "",
+    amount: str = "",
+    title: str = "",
+    expense_category: str = "",
+    issuer: str = "",
+    document_date: str = "",
+    duplicate_resolution: str = "",
+    confirm: str = "",
+) -> dict:
+    """File a catalogued invoice/receipt and post the ledger expense.
+
+    Use after catalog_business_document (or business_document_status) when the
+    document is expense-like. PAID sets paid_on (already cleared the bank).
+    UNPAID leaves paid_on empty. NEVER void because something was paid — void
+    means reverse a wrong entry. Preview; confirm=yes."""
+    from .document_services import file_business_document_for_chat as _fn
+
+    return _fn(
+        landlord,
+        document_id=document_id,
+        payment_state=payment_state,
+        amount=amount,
+        title=title,
+        expense_category=expense_category,
+        issuer=issuer,
+        document_date=document_date,
+        duplicate_resolution=duplicate_resolution,
+        confirm=confirm,
+    )
 
 
 # ---------------------------------------------------------------------------

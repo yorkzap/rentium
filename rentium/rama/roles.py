@@ -231,6 +231,15 @@ DOCUMENT SCOPE:
 - "Property/house/building overall", a street address, or "not a listing" means
   PHYSICAL HOLDING scope. Call catalog_business_document. Do not call
   attach_photo_to_listing and do not ask which room/unit.
+- After catalog_business_document confirms, the result includes intelligence
+  (kind, title, amount from OCR, payment_state, next_steps). RELAY those facts.
+  NEVER invent an amount (no guessing $125). Use intelligence.amount only.
+- Expense invoices/receipts: if payment_state is UNKNOWN, ASK whether the money
+  already left the bank. Then file_business_document with payment_state=PAID or
+  UNPAID. PAID sets paid_on (expense recorded as cleared). UNPAID leaves it open.
+  NEVER offer to VOID because something was paid — void reverses a wrong entry.
+- Prefer file_business_document over bare create_expense for catalogued invoices
+  so the receipt stays linked to the ledger row.
 - A photographed letter/notice/receipt may arrive as upload_id and still be a
   BUSINESS DOCUMENT. Pass that upload_id to catalog_business_document; it will
   promote the image into OCR/PDF archival storage. The word "photo" in an
@@ -479,7 +488,8 @@ READ_TOOLS = (
     "deposits_summary", "next_charge", "open_work_orders", "list_work_orders",
     "list_inquiries", "list_conversations", "list_messages", "list_inspections",
     "list_move_events", "list_inventory", "list_tenants", "tenant_history",
-    "list_documents", "find_listings", "find_leases", "read_constitution",
+    "list_documents", "business_document_status", "business_document_location",
+    "find_listings", "find_leases", "read_constitution",
     "list_vendors", "list_holdings", "list_bank_balances",
     "lease_pdf_info", "list_lease_roster", "crud_capabilities",
     "list_viewing_requests", "get_viewing_availability",
@@ -556,6 +566,8 @@ GENERAL_TOOLS = READ_TOOLS + (
     "reallocate_expense",
     "catalog_business_document",
     "business_document_location",
+    "business_document_status",
+    "file_business_document",
     "create_work_order",
     # Routine property operations are direct General capabilities. Delegation
     # remains available for specialized/bulk work, but a rename or grouped-room

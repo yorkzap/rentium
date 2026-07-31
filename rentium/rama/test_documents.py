@@ -66,6 +66,86 @@ def test_ocr_classifies_and_matches_holding(landlord):
     assert document.status == RamaDocument.Status.READY, document.failure_reason
 
 
+def test_invoice_ocr_prefers_total_not_first_money_and_maintenance_kind(landlord):
+    """Window-screen invoices must not pick $125 subtotal or generic EXPENSE."""
+    holding = _holding(landlord)
+    upload = SimpleUploadedFile("inv.pdf", b"%PDF-test", content_type="application/pdf")
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    text = (
+        "INVOICE\n950 McKenzie Ave\nWindow screens installation\n"
+        "Subtotal $125.00\nTax $16.80\nTotal $331.80\n"
+    )
+    with patch(
+        "rentium.rama.document_services._pdf_and_text",
+        return_value=(b"%PDF-archival", text),
+    ):
+        process_document(document.pk)
+    document.refresh_from_db()
+    from decimal import Decimal
+
+    assert document.holding == holding
+    assert document.kind == RamaDocument.Kind.MAINTENANCE
+    assert document.expense_category == ExpenseCategory.MAINTENANCE
+    assert document.amount == Decimal("331.80")
+    assert document.payment_state == RamaDocument.PaymentState.UNKNOWN
+
+
+def test_file_business_document_posts_paid_expense_from_chat(landlord):
+    from decimal import Decimal
+
+    from rentium.rama import registry
+    from rentium.rama.document_services import file_business_document_for_chat
+
+    holding = _holding(landlord)
+    upload = SimpleUploadedFile("inv.pdf", b"%PDF-test", content_type="application/pdf")
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.holding = holding
+    document.kind = RamaDocument.Kind.MAINTENANCE
+    document.title = "Maintenance — Window Screens"
+    document.amount = Decimal("331.80")
+    document.expense_category = ExpenseCategory.MAINTENANCE
+    document.payment_state = RamaDocument.PaymentState.UNKNOWN
+    document.status = RamaDocument.Status.NEEDS_REVIEW
+    document.archival_pdf.save(
+        "pending.pdf", SimpleUploadedFile("pending.pdf", b"%PDF")
+    )
+    document.save()
+
+    needs = file_business_document_for_chat(
+        landlord, document_id=str(document.pk)
+    )
+    assert needs.get("needs_input"), needs
+    assert "left your bank" in needs["question_for_user"].casefold()
+
+    preview = file_business_document_for_chat(
+        landlord,
+        document_id=str(document.pk),
+        payment_state="PAID",
+    )
+    assert preview.get("needs_confirm"), preview
+    assert preview["preview"]["amount"] == "331.80"
+    assert "void" in preview["preview"]["never"].casefold()
+
+    done = file_business_document_for_chat(
+        landlord,
+        document_id=str(document.pk),
+        payment_state="PAID",
+        confirm="yes",
+    )
+    assert done.get("filed"), done
+    assert done.get("paid_on")
+    expense = LedgerEntry.objects.get(entry_type=EntryType.EXPENSE)
+    assert expense.amount == Decimal("331.80")
+    assert expense.holding == holding
+    assert expense.paid_on is not None
+    document.refresh_from_db()
+    assert document.status == RamaDocument.Status.FILED
+    assert document.ledger_entry_id == expense.pk
+
+    assert "file_business_document" in registry.REGISTRY
+    assert "business_document_status" in registry.REGISTRY
+
+
 def test_review_posts_holding_expense_without_marking_invoice_paid(landlord):
     holding = _holding(landlord)
     upload = SimpleUploadedFile("tax.pdf", b"%PDF-test", content_type="application/pdf")
@@ -239,7 +319,7 @@ def test_photographed_mail_is_promoted_and_scoped_to_holding(landlord):
         confirm=True,
     )
     assert done["catalogued"] is True
-    assert done["ocr_enqueued"] is True
+    assert "intelligence" in done
     document = RamaDocument.objects.get(pk=done["document_id"])
     assert document.holding.address == "950 McKenzie Ave"
     assert document.property is None

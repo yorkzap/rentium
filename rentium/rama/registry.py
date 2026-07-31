@@ -59,6 +59,8 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.list_documents,
     tool_functions.catalog_business_document,
     tool_functions.business_document_location,
+    tool_functions.business_document_status,
+    tool_functions.file_business_document,
     tool_functions.find_listings,
     tool_functions.find_leases,
     tool_functions.read_constitution,

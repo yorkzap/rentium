@@ -430,6 +430,8 @@ def catalog_document_scope(
         address=holding.address,
         scope="physical_property_holding",
     )
+    document = _ensure_ocr(document)
+    intelligence = document_intelligence_payload(document)
     return {
         "updated": True,
         "catalogued": True,
@@ -449,6 +451,14 @@ def catalog_document_scope(
         "note": (
             "Stored at the physical-property level. No individual room or unit "
             "was selected."
+        ),
+        # Chat must use these OCR facts — never invent amount/kind.
+        "intelligence": intelligence,
+        "relay_instruction": (
+            "Relay the OCR intelligence to the landlord: kind, title, amount "
+            "(verbatim), payment_state, and next_steps. If expense_like and "
+            "payment_state is UNKNOWN, ASK whether it already left the bank. "
+            "Then preview file_business_document — do not invent amounts."
         ),
     }
 
@@ -540,14 +550,11 @@ def catalog_staged_photo_as_document(
         return result
     staged.used_at = timezone.now()
     staged.save(update_fields=["used_at"])
-    if created:
-        from .tasks import process_rama_document
-
-        transaction.on_commit(lambda: process_rama_document.delay(str(document.pk)))
+    # catalog_document_scope already runs _ensure_ocr and returns intelligence.
     return {
         **result,
         "promoted_from_upload_id": str(staged.pk),
-        "ocr_enqueued": created,
+        "ocr_complete": bool((result.get("intelligence") or {}).get("ocr_excerpt")),
     }
 
 
@@ -661,15 +668,13 @@ def catalog_batch_attachment_as_document(
             "updated_at",
         ]
     )
-    if created:
-        from .tasks import process_rama_document
-
-        transaction.on_commit(lambda: process_rama_document.delay(str(document.pk)))
+    # catalog_document_scope already ran OCR + returned intelligence.
+    intelligence = result.get("intelligence") or {}
     return {
         **result,
         "promoted_from_attachment_id": str(staged.pk),
         "attachment_batch_id": str(staged.batch_id),
-        "ocr_enqueued": created,
+        "ocr_complete": bool(intelligence.get("ocr_excerpt") or intelligence.get("amount")),
     }
 
 
@@ -732,16 +737,51 @@ def document_location(landlord, document_id: str) -> dict:
     }
 
 
-def _first_money(text: str) -> Decimal | None:
-    candidates = re.findall(r"(?:CAD\s*)?\$\s*([\d,]+(?:\.\d{2})?)", text, re.I)
-    for raw in candidates:
-        try:
-            value = Decimal(raw.replace(",", ""))
-            if value > 0:
-                return value
-        except InvalidOperation:
-            continue
+def _parse_money(raw: str) -> Decimal | None:
+    try:
+        value = Decimal(str(raw).replace(",", "").strip())
+        if value > 0:
+            return value
+    except (InvalidOperation, ValueError, TypeError):
+        return None
     return None
+
+
+def _all_money_values(text: str) -> list[Decimal]:
+    values: list[Decimal] = []
+    for raw in re.findall(r"(?:CAD\s*)?\$\s*([\d,]+(?:\.\d{2})?)", text or "", re.I):
+        value = _parse_money(raw)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _first_money(text: str) -> Decimal | None:
+    """Legacy helper: first positive money figure in reading order."""
+    values = _all_money_values(text)
+    return values[0] if values else None
+
+
+def _extract_amount(text: str) -> Decimal | None:
+    """Best-effort invoice/receipt total — not the first random $ figure.
+
+    Prefer labeled totals (Total / Amount Due / Balance Due / Grand Total).
+    When several match, use the last (usually grand total). Otherwise the
+    largest money figure on the page (subtotals are usually smaller).
+    """
+    labeled = re.findall(
+        r"(?:grand\s*total|invoice\s*total|amount\s*due|balance\s*due|"
+        r"total\s*due|total\s*amount|amount\s*paid|total)\b"
+        r"[^\n\d$]{0,40}\$?\s*([\d,]+(?:\.\d{2})?)",
+        text or "",
+        re.I,
+    )
+    for raw in reversed(labeled):
+        value = _parse_money(raw)
+        if value is not None:
+            return value
+    values = _all_money_values(text)
+    return max(values) if values else None
 
 
 def _classify(text: str, filename: str) -> dict:
@@ -773,15 +813,31 @@ def _classify(text: str, filename: str) -> dict:
             RamaDocument.Kind.INSURANCE,
             ExpenseCategory.INSURANCE,
         ),
+        # Maintenance BEFORE generic invoice — "Invoice for window screens"
+        # is a maintenance expense, not a vague "Expense Document".
+        (
+            (
+                "repair",
+                "work order",
+                "plumbing",
+                "electrical",
+                "maintenance",
+                "window screen",
+                "window screens",
+                "screens",
+                "hvac",
+                "furnace",
+                "appliance",
+                "handyman",
+                "contractor",
+            ),
+            RamaDocument.Kind.MAINTENANCE,
+            ExpenseCategory.MAINTENANCE,
+        ),
         (
             ("invoice", "receipt", "amount due", "subtotal"),
             RamaDocument.Kind.EXPENSE,
             ExpenseCategory.OTHER,
-        ),
-        (
-            ("repair", "work order", "plumbing", "electrical"),
-            RamaDocument.Kind.MAINTENANCE,
-            ExpenseCategory.MAINTENANCE,
         ),
         (("lease", "tenancy agreement"), RamaDocument.Kind.LEASE, ""),
     ]
@@ -801,30 +857,59 @@ def _classify(text: str, filename: str) -> dict:
         RamaDocument.Kind.MAINTENANCE,
     }
     if expense_like:
+        # Paid signals win over "invoice" alone — many paid invoices still
+        # say "invoice" at the top.
         if any(
             term in value
-            for term in ("paid", "payment received", "receipt", "balance $0")
+            for term in (
+                "paid in full",
+                "payment received",
+                "amount paid",
+                "balance $0",
+                "balance 0.00",
+                "thank you for your payment",
+                "payment processed",
+            )
         ):
             payment_state = RamaDocument.PaymentState.PAID
         elif any(
             term in value
-            for term in ("invoice", "amount due", "due date", "balance due")
+            for term in ("amount due", "due date", "balance due", "please pay")
         ):
             payment_state = RamaDocument.PaymentState.UNPAID
+        elif "invoice" in value and "receipt" not in value:
+            payment_state = RamaDocument.PaymentState.UNKNOWN
+        elif "receipt" in value:
+            # Receipt alone is weak evidence of paid — still ask if unclear.
+            payment_state = RamaDocument.PaymentState.UNKNOWN
         else:
             payment_state = RamaDocument.PaymentState.UNKNOWN
     else:
         payment_state = RamaDocument.PaymentState.NOT_APPLICABLE
 
+    # Prefer a short title from maintenance content when we can.
     title = {
         RamaDocument.Kind.TAX: "Property Tax Notice",
         RamaDocument.Kind.MORTGAGE: "Mortgage Document",
         RamaDocument.Kind.INSURANCE: "Insurance Document",
-        RamaDocument.Kind.EXPENSE: "Expense Document",
-        RamaDocument.Kind.MAINTENANCE: "Maintenance Document",
+        RamaDocument.Kind.EXPENSE: "Expense Invoice",
+        RamaDocument.Kind.MAINTENANCE: "Maintenance Invoice",
         RamaDocument.Kind.LEASE: "Lease Document",
         RamaDocument.Kind.BANK_STATEMENT: "Bank Statement",
     }.get(kind, "Business Document")
+    if kind == RamaDocument.Kind.MAINTENANCE:
+        for phrase in (
+            "window screens",
+            "window screen",
+            "plumbing",
+            "electrical",
+            "hvac",
+            "furnace",
+        ):
+            if phrase in value:
+                title = f"Maintenance — {phrase.title()}"
+                break
+
     return {
         "kind": kind,
         "category": category,
@@ -836,7 +921,7 @@ def _classify(text: str, filename: str) -> dict:
         "amount": (
             None
             if kind == RamaDocument.Kind.BANK_STATEMENT
-            else _first_money(text)
+            else _extract_amount(text)
         ),
     }
 
@@ -877,9 +962,104 @@ def _relocate_archive(document: RamaDocument) -> None:
     document.archival_pdf.storage.delete(old_name)
 
 
+def document_intelligence_payload(document: RamaDocument) -> dict:
+    """What chat/UI must relay after OCR — never invent these numbers."""
+    expense_like = document.kind in {
+        RamaDocument.Kind.EXPENSE,
+        RamaDocument.Kind.TAX,
+        RamaDocument.Kind.MORTGAGE,
+        RamaDocument.Kind.INSURANCE,
+        RamaDocument.Kind.MAINTENANCE,
+    }
+    ocr_excerpt = (document.ocr_text or "").strip()
+    if len(ocr_excerpt) > 400:
+        ocr_excerpt = ocr_excerpt[:400] + "…"
+    next_steps: list[str] = []
+    if expense_like and document.amount:
+        if document.payment_state == RamaDocument.PaymentState.UNKNOWN:
+            next_steps.append(
+                "ASK the landlord: has this amount already left the bank "
+                "(paid) or is it still unpaid? Paid ≠ void — paid means "
+                "post the expense with paid_on set."
+            )
+        next_steps.append(
+            "Call file_business_document with this document_id, "
+            f"amount={document.amount} (do NOT invent a different amount), "
+            "payment_state=PAID or UNPAID from their answer, and confirm=yes "
+            "only after they approve the preview."
+        )
+    elif expense_like and not document.amount:
+        next_steps.append(
+            "OCR did not extract an amount — ask the landlord for the total "
+            "before filing, then pass it as amount= on file_business_document."
+        )
+    elif document.status == RamaDocument.Status.FAILED:
+        next_steps.append(
+            f"OCR failed: {document.failure_reason or 'unknown'}. "
+            "Ask the landlord to re-send a clearer photo/PDF."
+        )
+    return {
+        "document_id": str(document.pk),
+        "status": document.status,
+        "kind": document.kind,
+        "kind_display": document.get_kind_display(),
+        "title": document.title or document.original_filename,
+        "amount": str(document.amount) if document.amount is not None else None,
+        "currency": getattr(document, "currency", None) or "CAD",
+        "expense_category": document.expense_category or None,
+        "payment_state": document.payment_state,
+        "issuer": document.issuer or None,
+        "document_date": (
+            str(document.document_date) if document.document_date else None
+        ),
+        "holding": (
+            {
+                "id": str(document.holding_id),
+                "name": document.holding.name,
+                "address": document.holding.address,
+            }
+            if document.holding_id
+            else None
+        ),
+        "clarification_question": document.clarification_question or None,
+        "ocr_excerpt": ocr_excerpt or None,
+        "expense_like": expense_like,
+        "ledger_entry_id": (
+            str(document.ledger_entry_id) if document.ledger_entry_id else None
+        ),
+        "documents_page": url_for_path(
+            f"/dashboard/documents?document={document.pk}"
+        ),
+        "next_steps": next_steps,
+        "rules_for_model": (
+            "NEVER invent or guess the amount — use amount from this payload "
+            "only. NEVER offer to void an expense because it was paid. "
+            "Paid means post with payment_state=PAID (sets paid_on). "
+            "Unpaid means post with payment_state=UNPAID (paid_on null)."
+        ),
+    }
+
+
+def _ensure_ocr(document: RamaDocument) -> RamaDocument:
+    """Run OCR now if still pending (chat path needs facts before the reply)."""
+    document.refresh_from_db()
+    if document.status == RamaDocument.Status.FILED:
+        return document
+    if document.status == RamaDocument.Status.FAILED and (document.ocr_text or ""):
+        return document
+    if document.status in {
+        RamaDocument.Status.READY,
+        RamaDocument.Status.NEEDS_REVIEW,
+    } and (document.ocr_text or "").strip():
+        return document
+    return process_document(document.pk)
+
+
 def process_document(document_id) -> RamaDocument:
     """OCR and propose filing metadata. Never posts money without review."""
-    document = RamaDocument.objects.select_related("landlord").get(pk=document_id)
+    document = RamaDocument.objects.select_related("landlord", "holding").get(
+        pk=document_id
+    )
     document.status = RamaDocument.Status.PROCESSING
     document.failure_reason = ""
     document.save(update_fields=["status", "failure_reason", "updated_at"])
@@ -897,13 +1077,14 @@ def process_document(document_id) -> RamaDocument:
         document.payment_state = result["payment_state"]
         document.title = result["title"]
         document.amount = result["amount"]
-        document.holding = holding
+        if holding is not None:
+            document.holding = holding
         document.classification_confidence = result["confidence"]
         document.match_confidence = match_confidence
         reasons = []
         if not text.strip():
             reasons.append("I could not read enough text from the file.")
-        if not holding:
+        if not document.holding_id:
             reasons.append("I could not confidently identify the property address.")
         if result["confidence"] < Decimal("0.70"):
             reasons.append("I could not confidently identify the document type.")
@@ -911,7 +1092,10 @@ def process_document(document_id) -> RamaDocument:
             result["payment_state"] == RamaDocument.PaymentState.UNKNOWN
             and result["amount"]
         ):
-            reasons.append("I cannot tell whether this amount has left the bank.")
+            reasons.append(
+                "I cannot tell whether this amount has left the bank — "
+                "ask if it is already paid."
+            )
         document.clarification_question = " ".join(reasons)
         document.status = (
             RamaDocument.Status.NEEDS_REVIEW if reasons else RamaDocument.Status.READY
@@ -921,8 +1105,10 @@ def process_document(document_id) -> RamaDocument:
             _archive_path(document), ContentFile(pdf), save=False
         )
         document.extracted_data = {
-            "classifier": "rentium-rules-v1",
+            **(document.extracted_data or {}),
+            "classifier": "rentium-rules-v2",
             "ocr_characters": len(text),
+            "amount_extractor": "labeled_total_or_max",
         }
         document.full_clean()
         document.save()
@@ -937,6 +1123,7 @@ def process_document(document_id) -> RamaDocument:
             document_kind=document.kind,
             holding_id=str(document.holding_id) if document.holding_id else None,
             confidence=str(document.classification_confidence),
+            amount=str(document.amount) if document.amount is not None else None,
         )
     except Exception as exc:
         document.status = RamaDocument.Status.FAILED
@@ -1093,3 +1280,223 @@ def file_document(
         )
     _event(document, RamaDocumentEvent.Kind.FILED, actor=actor)
     return document
+
+
+def file_business_document_for_chat(
+    landlord,
+    *,
+    document_id: str,
+    payment_state: str = "",
+    amount: str = "",
+    title: str = "",
+    expense_category: str = "",
+    issuer: str = "",
+    document_date: str = "",
+    duplicate_resolution: str = "",
+    confirm: str = "",
+) -> dict:
+    """Chat wrapper around file_document: post expense from OCR with paid/unpaid."""
+
+    def _confirmed(value: str) -> bool:
+        return str(value or "").strip().lower() in ("yes", "true", "1", "y", "confirm")
+
+    def _preview(action: str, preview: dict, how: str) -> dict:
+        return {
+            "needs_confirm": True,
+            "action": action,
+            "preview": preview,
+            "instruction": (
+                f"Show this preview to the landlord. If they approve, call {action} "
+                f"again with the same arguments AND confirm=yes. {how}"
+            ),
+            "ui_rules": True,
+        }
+
+    document = (
+        RamaDocument.objects.select_related("holding", "ledger_entry")
+        .filter(pk=document_id, landlord=landlord)
+        .first()
+    )
+    if document is None:
+        return {"error": f"No business document {document_id!r}."}
+    if document.status == RamaDocument.Status.FILED:
+        return {
+            "already_done": True,
+            "document_id": str(document.pk),
+            "ledger_entry_id": (
+                str(document.ledger_entry_id) if document.ledger_entry_id else None
+            ),
+            "message": "This document is already filed.",
+            "intelligence": document_intelligence_payload(document),
+        }
+
+    document = _ensure_ocr(document)
+    pay = (payment_state or "").strip().upper()
+    if pay in ("PAID", "YES", "Y", "TRUE", "1"):
+        pay = RamaDocument.PaymentState.PAID
+    elif pay in ("UNPAID", "NO", "N", "FALSE", "0"):
+        pay = RamaDocument.PaymentState.UNPAID
+    elif pay:
+        return {
+            "error": "payment_state must be PAID or UNPAID.",
+        }
+    else:
+        pay = document.payment_state
+        if pay == RamaDocument.PaymentState.UNKNOWN:
+            return {
+                "needs_input": True,
+                "question_for_user": (
+                    f"Has ${document.amount} for "
+                    f"{document.title or 'this invoice'} already left your bank "
+                    f"(paid), or is it still unpaid?"
+                ),
+                "relay_instruction": (
+                    "Ask question_for_user VERBATIM, then STOP. When they answer, "
+                    "call file_business_document again with payment_state=PAID or "
+                    "UNPAID. Paid means set paid_on — never void."
+                ),
+                "intelligence": document_intelligence_payload(document),
+            }
+
+    amt = amount.strip() if amount else ""
+    if not amt and document.amount is not None:
+        amt = str(document.amount)
+    if not amt:
+        return {
+            "needs_input": True,
+            "question_for_user": "What is the total amount on this invoice?",
+            "relay_instruction": (
+                "Ask for the amount, then call file_business_document with amount=."
+            ),
+            "intelligence": document_intelligence_payload(document),
+        }
+
+    category = (expense_category or document.expense_category or "").strip()
+    if not category:
+        if document.kind == RamaDocument.Kind.MAINTENANCE:
+            category = ExpenseCategory.MAINTENANCE
+        else:
+            category = ExpenseCategory.OTHER
+    kind = document.kind
+    if kind not in {
+        RamaDocument.Kind.EXPENSE,
+        RamaDocument.Kind.TAX,
+        RamaDocument.Kind.MORTGAGE,
+        RamaDocument.Kind.INSURANCE,
+        RamaDocument.Kind.MAINTENANCE,
+    }:
+        kind = (
+            RamaDocument.Kind.MAINTENANCE
+            if category == ExpenseCategory.MAINTENANCE
+            else RamaDocument.Kind.EXPENSE
+        )
+
+    desc = (title or document.title or "Business expense").strip()[:255]
+    vend = (issuer if issuer != "" else document.issuer) or ""
+    ddate = None
+    if (document_date or "").strip():
+        try:
+            ddate = date.fromisoformat(document_date.strip()[:10])
+        except ValueError:
+            return {"error": "document_date must be YYYY-MM-DD."}
+    else:
+        ddate = document.document_date
+
+    preview = {
+        "document_id": str(document.pk),
+        "amount": amt,
+        "title": desc,
+        "expense_category": category,
+        "kind": kind,
+        "payment_state": pay,
+        "paid_means": (
+            "Expense posts with paid_on set (already left the bank)."
+            if pay == RamaDocument.PaymentState.PAID
+            else "Expense posts unpaid (not yet taken from bank)."
+        ),
+        "holding": (
+            document.holding.address or document.holding.name
+            if document.holding_id
+            else None
+        ),
+        "issuer": vend or None,
+        "document_date": str(ddate) if ddate else None,
+        "side_effects": [
+            "File the document",
+            "Post one ledger EXPENSE via post_expense (append-only)",
+            "Link the document to that expense",
+        ],
+        "never": "Never void because the expense was paid.",
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "file_business_document",
+            preview,
+            "Files the document and posts the expense to the ledger.",
+        )
+
+    try:
+        filed = file_document(
+            document,
+            actor=getattr(landlord, "user", None),
+            holding=document.holding,
+            kind=kind,
+            title=desc,
+            amount=amt,
+            expense_category=category,
+            payment_state=pay,
+            document_date=ddate,
+            issuer=vend,
+            duplicate_resolution=(duplicate_resolution or "").strip(),
+        )
+    except DuplicateExpenseError as exc:
+        return {
+            "error": str(exc),
+            "code": "DUPLICATE_EXPENSE",
+            "candidates": exc.candidates,
+            "resolutions": {
+                "link": "duplicate_resolution=link:<entry_id>",
+                "separate": "duplicate_resolution=new",
+            },
+        }
+    except DocumentError as exc:
+        return {"error": str(exc)}
+
+    entry = filed.ledger_entry
+    return {
+        "filed": True,
+        "document_id": str(filed.pk),
+        "ledger_entry_id": str(entry.pk) if entry else None,
+        "amount": str(entry.amount) if entry else amt,
+        "paid_on": str(entry.paid_on) if entry and entry.paid_on else None,
+        "holding": (
+            filed.holding.address or filed.holding.name if filed.holding_id else None
+        ),
+        "documents_page": url_for_path(f"/dashboard/documents?document={filed.pk}"),
+        "message": (
+            f"Filed and posted expense ${amt}"
+            + (
+                f" (paid {entry.paid_on})."
+                if entry and entry.paid_on
+                else " (not yet taken from bank)."
+            )
+        ),
+        "intelligence": document_intelligence_payload(filed),
+    }
+
+
+def business_document_status(landlord, *, document_id: str = "") -> dict:
+    """Read OCR/classification state for a business document."""
+    document = (
+        RamaDocument.objects.select_related("holding", "ledger_entry")
+        .filter(pk=document_id, landlord=landlord)
+        .first()
+    )
+    if document is None:
+        return {"error": f"No business document {document_id!r}."}
+    if not (document.ocr_text or "").strip() and document.status not in {
+        RamaDocument.Status.FILED,
+        RamaDocument.Status.FAILED,
+    }:
+        document = _ensure_ocr(document)
+    return {"ok": True, **document_intelligence_payload(document)}

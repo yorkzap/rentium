@@ -228,6 +228,10 @@ TOOL_META: dict[str, ToolMeta] = {
     "reallocate_expense": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
     # Can post an immutable ledger expense.
     "catalog_business_document": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    # Posts an immutable ledger expense from a catalogued invoice/receipt.
+    "file_business_document": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
     # -------------------------------------------------------- inventory
     "bulk_add_inventory": ToolMeta(risk="low"),
     # Flips property.is_furnished, which shows on the public listing — a
