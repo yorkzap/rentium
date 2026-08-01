@@ -68,6 +68,19 @@ class InquiryThrottle(ScopedRateThrottle):
     scope = "inquiry"
 
 
+# Cloudflare was caching public JSON for up to 4h (default edge max-age) so
+# deleted listing photos kept appearing on /bc/... pages long after the DB
+# update. Short TTL + must-revalidate keeps SEO cache benefit without stale
+# galleries. Media *files* still use long S3 Cache-Control (immutable names).
+_PUBLIC_CACHE_CONTROL = "public, max-age=60, s-maxage=60, stale-while-revalidate=30"
+
+
+def _public_json(data, *, status_code=status.HTTP_200_OK) -> Response:
+    response = Response(data, status=status_code)
+    response["Cache-Control"] = _PUBLIC_CACHE_CONTROL
+    return response
+
+
 class AddressSearchThrottle(UserRateThrottle):
     scope = "address_search"
 
@@ -133,7 +146,7 @@ def public_city(request, province, city):
             except ValueError:
                 raise ValidationError({param: "Must be a number."})
 
-    return Response(
+    return _public_json(
         {
             **known,
             "facets": facets,
@@ -148,7 +161,7 @@ def public_city(request, province, city):
 @permission_classes([AllowAny])
 @throttle_classes([PublicReadThrottle])
 def public_cities_index(request):
-    return Response({"cities": services.all_public_cities()})
+    return _public_json({"cities": services.all_public_cities()})
 
 
 @api_view(["GET"])
@@ -199,7 +212,7 @@ def public_listings(request):
                 raise ValidationError({param: "Must be a number."})
 
     total = qs.count()
-    return Response(
+    return _public_json(
         {
             "total": total,
             "areas": services.all_public_cities(),
@@ -230,8 +243,8 @@ def public_showcase(request, slug):
     if not showcase:
         raise NotFound("No public page at that address.")
     if redirect_to:
-        return Response({"redirect_to": redirect_to}, status=status.HTTP_200_OK)
-    return Response(
+        return _public_json({"redirect_to": redirect_to})
+    return _public_json(
         PublicShowcaseSerializer(showcase, context={"request": request}).data
     )
 
@@ -250,7 +263,7 @@ def public_property_detail(request, slug):
     )
     if not prop:
         raise NotFound("This place isn't available.")
-    return Response(
+    return _public_json(
         PublicPropertyDetailSerializer(prop, context={"request": request}).data
     )
 
