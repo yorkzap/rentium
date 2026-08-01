@@ -169,10 +169,9 @@ def find_expense_to_attach_receipt(
 ) -> list:
     """Find open expenses this receipt likely documents (already logged in chat).
 
-    Prefer description tokens (e.g. draino) + any OCR amount candidate that
-    matches the logged amount — so a gift-card $1000 OCR total does not hide a
-    $13.41 Draino expense when the slip also has $11.97 / the landlord said
-    draino.
+    Match requires **amount agreement and/or description tokens**. Same holding
+    alone is never enough — that was wrongly linking a $39 nozzle receipt to a
+    $18 Draino expense just because both were at McKenzie.
     """
     from datetime import timedelta
 
@@ -207,32 +206,60 @@ def find_expense_to_attach_receipt(
             continue
 
     tokens = _hint_tokens(description_hint)
+    # Brand / product tokens that can stand alone without amount agreement.
+    strong_tokens = {
+        "drano",
+        "screens",
+        "mulch",
+        "nozzle",
+        "washer",
+        "pressure",
+    }
 
     rows = list(qs[:100])
     scored: list[tuple[int, object]] = []
     for entry in rows:
         score = 0
+        amount_hit = False
         if amounts and entry.amount in amounts:
             score += 50
-        # Near-amount (tax/rounding) within $2 of a candidate.
+            amount_hit = True
+        # Near-amount (tax/rounding / OCR line vs logged total) within $2.
         elif amounts:
             for a in amounts:
                 if abs(entry.amount - a) <= Decimal("2.00"):
-                    score += 25
+                    score += 30
+                    amount_hit = True
                     break
-        if holding is not None and entry.holding_id == holding.pk:
-            score += 20
+
         desc = (entry.description or "").casefold()
-        # Normalize draino/drano in expense description too.
         desc_norm = desc.replace("draino", "drano")
         token_hits = 0
+        strong_hits = 0
         for tok in tokens:
             if tok in desc_norm or tok in desc:
                 token_hits += 1
-                score += 20 if tok in {"drano", "screens", "mulch"} else 15
-        # Caption-only match (no amount) is enough when unique brand token hits.
-        if token_hits and not amounts:
-            score += 10
+                if tok in strong_tokens:
+                    strong_hits += 1
+                    score += 25
+                else:
+                    score += 12
+
+        # Gate: property alone is not a match.
+        if not amount_hit and token_hits == 0:
+            continue
+        # Landlord/OCR named a $ amount that disagrees: only keep if a strong
+        # product token still ties them (e.g. "draino receipt" with OCR $11.97
+        # vs logged $13.41 is near-amount; $39 vs $18 Draino with "nozzle" must
+        # NOT match Draino).
+        if amounts and not amount_hit and strong_hits == 0:
+            continue
+
+        if holding is not None and entry.holding_id == holding.pk:
+            score += 10  # boost only, never the sole signal
+        elif holding is None and entry.holding_id:
+            pass
+
         # Prefer rows that still lack a source document.
         has_doc = False
         try:
@@ -243,7 +270,7 @@ def find_expense_to_attach_receipt(
             has_doc = RamaDocument.objects.filter(ledger_entry_id=entry.pk).exists()
         if has_doc:
             score -= 40
-        if score > 0:
+        if score >= 25:
             scored.append((score, entry))
     scored.sort(key=lambda pair: (-pair[0], -pair[1].effective_date.toordinal()))
     return [e for _, e in scored[:8]]
@@ -291,6 +318,26 @@ def match_receipt_to_logged_expense(
             holding=None,
             description_hint=hint,
         )
+    # If the document has a clear amount far from the only candidate, drop it.
+    if document.amount is not None and matches:
+        kept = []
+        for e in matches:
+            if abs(e.amount - document.amount) <= Decimal("2.00"):
+                kept.append(e)
+                continue
+            # Allow only with strong shared product token in caption/OCR vs desc.
+            desc = (e.description or "").casefold().replace("draino", "drano")
+            toks = _hint_tokens(hint)
+            if any(
+                t in desc
+                for t in toks
+                if t in {"drano", "screens", "mulch", "nozzle", "washer"}
+            ):
+                # Still require near-amount when document amount is set —
+                # different products at same address are not the same expense.
+                continue
+            # No keep
+        matches = kept
     if len(matches) != 1:
         return None
     entry = matches[0]

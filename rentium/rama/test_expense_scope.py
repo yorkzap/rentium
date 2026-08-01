@@ -602,3 +602,54 @@ def test_already_logged_alone_links_pending_receipt(landlord):
     assert linked.get("linked_existing"), linked
     document.refresh_from_db()
     assert document.ledger_entry_id == entry.pk
+
+
+def test_nozzle_receipt_does_not_match_draino_expense(landlord):
+    """Same holding alone must not link a $39 nozzle receipt to $18 Draino."""
+    from datetime import date
+    from decimal import Decimal
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from rentium.ledger.models import EntryType, ExpenseCategory, LedgerEntry
+    from rentium.rama.document_services import ingest_document
+    from rentium.rama.document_services import match_receipt_to_logged_expense
+    from rentium.rama.models import RamaDocument
+
+    holding = _holding(landlord)
+    LedgerEntry.objects.create(
+        landlord=landlord,
+        holding=holding,
+        entry_type=EntryType.EXPENSE,
+        amount=Decimal("18.41"),
+        description="Draino for 950 McKenzie Ave house",
+        category=ExpenseCategory.SUPPLIES,
+        effective_date=date.today(),
+    )
+    upload = SimpleUploadedFile(
+        "nozzle.pdf", b"%PDF-nozzle-unique", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.holding = holding
+    document.amount = Decimal("39.36")
+    document.title = "Pressure washer nozzle"
+    document.ocr_text = "returns refunds footer pressure washer"
+    document.kind = RamaDocument.Kind.EXPENSE
+    document.save()
+
+    assert (
+        match_receipt_to_logged_expense(
+            landlord,
+            document,
+            caption="Bought pressure washer nozzle today $39.36 950 McKenzie Ave",
+        )
+        is None
+    )
+
+
+def test_new_expense_intent_phrases():
+    from rentium.rama.service import _wants_new_expense_not_link
+
+    assert _wants_new_expense_not_link("No it's a new expense")
+    assert _wants_new_expense_not_link("that's a separate expense")
+    assert not _wants_new_expense_not_link("expense is already logged")
