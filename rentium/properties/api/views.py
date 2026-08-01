@@ -376,14 +376,42 @@ class PropertyViewSet(viewsets.ModelViewSet):
 
     @action(
         detail=True,
-        methods=["get"],
+        methods=["get", "post"],
         url_path="media",
     )
     def media(self, request, pk=None):
-        """Stable handles shared by the dashboard and RAMA."""
+        """List media, or reorder gallery (POST {handles: [gallery:id, …]})."""
+        from ..media_services import PropertyMediaError
         from ..media_services import media_manifest
+        from ..media_services import reorder_gallery
 
-        return Response(media_manifest(self.get_object()))
+        property_obj = self.get_object()
+        if request.method == "GET":
+            return Response(media_manifest(property_obj))
+
+        # Reorder gallery only (primary stays primary). Body: handles=[…]
+        handles = request.data.get("handles") or request.data.get("order") or []
+        if not isinstance(handles, list) or not handles:
+            return Response(
+                {
+                    "detail": (
+                        "Pass handles as an ordered list of gallery:<id> values "
+                        "covering every gallery photo once."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            rows = reorder_gallery(
+                property_obj=property_obj,
+                handles=[str(h) for h in handles],
+            )
+        except PropertyMediaError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(rows)
 
     @action(
         detail=True,

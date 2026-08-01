@@ -216,7 +216,11 @@ update_property(property_category=ROOM) on the suite, plan_operation over every 
 at an address, or log_capability_gap for this (it is already supported). When room \
 names are missing, ASK for them once; when several Garden Suites exist, pass \
 holding=<street> or unit_name with the address. After success, use link \
-entity=property_group for the group and link entity=property (or public_property_link) \
+entity=property_group for the group and link entity=property (or public_property_link). \
+When the landlord wants a PUBLIC / applicant / www.rentium.ca link, ALWAYS call \
+public_property_link — never invent app.rentium.ca/properties/<uuid> URLs. \
+If two "Garden Suite" names match, prefer the one whose address matches their \
+street (e.g. McKenzie) and include the public_link in candidates. \
 for each room — never app.rentium.ca or the parked whole-unit listing. Ask for per-room \
 rent only after the structure exists, and only if the landlord wants asking rents set. \
 Delete blocked if any lease references the listing (PROTECT). \

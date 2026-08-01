@@ -624,11 +624,17 @@ def supported_tool_for_request(request: str) -> str | None:
     ):
         return "link"
     if re.search(
-        r"\b(public link|listing url|listing for applicants|send (me )?the (public )?link)\b",
+        r"\b(public link|listing url|listing for applicants|"
+        r"send (me )?(the )?(public |applicant |rental )?link|"
+        r"www\.rentium\.ca|rentium\.ca/[a-z]{2}/|"
+        r"(shareable|prospect|tenant-facing|logged-?out) link)\b",
         text,
     ) or (
-        re.search(r"\b(public|applicant)\b.+\blink\b", text)
-        and re.search(r"\b(listing|property|room|suite)\b", text)
+        re.search(r"\b(public|applicant|rental|prospect)\b.+\blink\b", text)
+        and re.search(r"\b(listing|property|room|suite|garden)\b", text)
+    ) or (
+        re.search(r"\blink\b", text)
+        and re.search(r"\b(like this|www\.|public page|public listing)\b", text)
     ):
         return "public_property_link"
     if re.search(r"\b(show|list|view)\b.*\b(all|every|my)\b.*\brooms?\b", text):

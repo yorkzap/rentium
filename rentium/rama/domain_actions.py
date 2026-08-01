@@ -1689,30 +1689,80 @@ def deliver_property_photos(landlord, *, property_query: str = "") -> dict:
 
 
 def open_property(landlord, *, property_query: str = "") -> dict:
-    """A clickable in-app link to a property's full listing (details + photos)."""
+    """Dashboard + public links for a listing (details + photos)."""
+    from .links import public_property_url
     from .links import url_for_path
 
     prop, err = _resolve_property(landlord, property_query)
     if err:
         return _prop_err(err)
     photos = prop.property_images.count() if hasattr(prop, "property_images") else 0
-    return {
+    public = public_property_url(prop)
+    payload = {
         "name": prop.name,
         "address": prop.address,
         "photos": photos,
-        "link": url_for_path(f"/dashboard/properties/{prop.id}"),
-        "note": f"Open this link to view {prop.name} — its photos and full details.",
+        "dashboard_link": url_for_path(f"/dashboard/properties/{prop.id}"),
+        # Prefer public when live — landlords almost always want the shareable URL.
+        "link": public.get("link")
+        if public.get("publicly_accessible") and public.get("link")
+        else url_for_path(f"/dashboard/properties/{prop.id}"),
+        "public_link": public.get("link"),
+        "publicly_accessible": public.get("publicly_accessible"),
+        "note": (
+            f"Public listing: {public.get('link')}"
+            if public.get("publicly_accessible") and public.get("link")
+            else f"Open the dashboard to view {prop.name}."
+        ),
     }
+    if public.get("error"):
+        payload["public_note"] = public["error"]
+    return payload
 
 
 def public_property_link(landlord, *, property_query: str = "") -> dict:
-    """The real logged-out listing route, never a guessed name-based URL."""
+    """The real logged-out listing route, never a guessed name-based URL.
+
+    Prefer this whenever the landlord wants a www.rentium.ca / applicant link.
+    Address words (McKenzie) disambiguate two 'Garden Suite' names.
+    """
     from .links import public_property_url
 
     prop, err = _resolve_property(landlord, property_query)
     if err:
+        # If ambiguous, surface candidates with public links when possible.
+        if isinstance(err, dict) and err.get("candidates"):
+            enriched = []
+            for c in err["candidates"][:8]:
+                row = dict(c)
+                pk = c.get("id") or c.get("property_id")
+                if pk:
+                    from rentium.properties.models import Property
+
+                    p = Property.objects.filter(pk=pk, landlord=landlord).first()
+                    if p is not None:
+                        pub = public_property_url(p)
+                        if pub.get("link"):
+                            row["public_link"] = pub["link"]
+                            row["address"] = p.address
+                enriched.append(row)
+            return {
+                **err,
+                "candidates": enriched,
+                "hint": (
+                    "Say the street (e.g. McKenzie) or the full name "
+                    "(Garden Suite at 950 McKenzie)."
+                ),
+            }
         return _prop_err(err)
-    return public_property_url(prop)
+    result = public_property_url(prop)
+    if result.get("link"):
+        result["note"] = (
+            f"Public listing for {prop.name}"
+            + (f" · {prop.address}" if prop.address else "")
+            + f": {result['link']}"
+        )
+    return result
 
 
 def _place(lease) -> str:

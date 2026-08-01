@@ -198,8 +198,8 @@ from rentium.rama.capabilities import supported_tool_for_request
             "start over, create a lease with these details Lease Term",
             "create_lease",
         ),
-        ("Has Siya signed the lease yet?", "list_lease_roster"),
-        ("Has she created an account", "list_lease_roster"),
+        ("Has Siya signed the lease yet?", "tenant_lease_status"),
+        ("Has she created an account", "tenant_lease_status"),
         (
             "schedule a viewing for Hitakshi tomorrow at 2pm",
             "schedule_viewing",
@@ -218,6 +218,10 @@ from rentium.rama.capabilities import supported_tool_for_request
         ),
         (
             "send me the public link for that listing",
+            "public_property_link",
+        ),
+        (
+            "no the public link like this www.rentium.ca for the mckenzie garden suite",
             "public_property_link",
         ),
         (
