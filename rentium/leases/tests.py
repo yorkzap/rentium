@@ -195,3 +195,106 @@ def test_activation_captures_the_signed_document(bc_property, landlord):
     assert lease.status == Lease.LeaseStatus.ACTIVE
     assert lease.signed_document, "activation must capture the signed document"
     assert len(lease.signed_document_sha256) == 64
+
+
+# ===================== fair use of what the landlord pays for
+# "Included in the rent" is not "unlimited", but an agreement that only says
+# the landlord supplies heat has said nothing about a tenant running it all
+# winter with the windows open — and a term never stated is one the landlord
+# cannot raise later.
+import pytest as _pytest  # noqa: E402  (module already imports pytest above)
+
+from rentium.leases.documents import included_utilities  # noqa: E402
+
+
+def _bills(**flags):
+    # `provider` is required by Lease._validate_bills_included, so include it
+    # even when empty — otherwise these only pass while nothing calls clean().
+    return {
+        key: {"included": value, "provider": "", "category": key}
+        for key, value in flags.items()
+    }
+
+
+@_pytest.mark.django_db
+def test_only_utilities_the_landlord_pays_for_get_a_fair_use_term(bc_lease):
+    bc_lease.bills_included = _bills(water=True, heat=True, internet=False)
+    bc_lease.signed_document = {}
+
+    text = _clause_text(render_lease(bc_lease))
+
+    assert "Water: taps, showers and hoses" in text
+    assert "Heat: the tenant should not run the heating" in text
+    # The tenant pays their own internet, so rules about it would be both
+    # wrong and unenforceable.
+    assert "Internet:" not in text
+
+
+@_pytest.mark.django_db
+def test_a_lease_with_nothing_included_carries_no_fair_use_terms(bc_lease):
+    bc_lease.bills_included = _bills(water=False, heat=False)
+    bc_lease.services_and_facilities = []
+    bc_lease.signed_document = {}
+
+    text = _clause_text(render_lease(bc_lease))
+
+    assert "normal household use" not in text
+
+
+@_pytest.mark.django_db
+def test_a_service_included_in_the_rent_counts_even_without_a_bill_row(bc_lease):
+    """RTB-1 §5 services and the billing config are different questions, but
+    either one means the landlord is holding the bill."""
+    bc_lease.bills_included = {}
+    bc_lease.services_and_facilities = ["HEAT", "GARBAGE"]
+    bc_lease.signed_document = {}
+
+    assert included_utilities(bc_lease) == ["heat", "waste"]
+    text = _clause_text(render_lease(bc_lease))
+    assert "Heat: the tenant should not run the heating" in text
+    assert "Garbage and recycling" in text
+
+
+@_pytest.mark.django_db
+def test_the_fair_use_term_does_not_let_the_landlord_help_themselves(bc_lease):
+    """Excess usage is money the tenant may owe — not money the landlord may
+    take. Same rule as every other charge against a deposit."""
+    bc_lease.bills_included = _bills(electricity=True)
+    bc_lease.signed_document = {}
+
+    text = _clause_text(render_lease(bc_lease))
+
+    assert "may not simply take it from a deposit" in text
+    assert "without the tenant's written agreement or an order" in text
+
+
+@_pytest.mark.django_db
+def test_fair_use_terms_reach_the_roommate_agreement_too(landlord):
+    """Shared living is where "the heat is included" turns into an argument
+    fastest."""
+    from datetime import date as _date
+
+    from rentium.leases.models import Lease as _Lease
+    from rentium.properties.models import Property as _Property
+
+    room = _Property.objects.create(
+        landlord=landlord,
+        name="Fair Use Room",
+        address="3 Fair Use Way",
+        city="Victoria",
+        province="bc",
+        property_category=_Property.PropertyCategory.ROOM,
+        room_type=_Property.RoomType.PRIVATE,
+    )
+    lease = _Lease.objects.create(
+        landlord=landlord,
+        property=room,
+        lease_type=_Lease.LeaseType.GENERIC_ROOMMATE,
+        status=_Lease.LeaseStatus.DRAFT,
+        start_date=_date(2026, 9, 1),
+        end_date=_date(2027, 8, 31),
+        total_rent="900.00",
+        bills_included=_bills(water=True),
+    )
+    text = _clause_text(render_lease(lease))
+    assert "Water: taps, showers and hoses" in text

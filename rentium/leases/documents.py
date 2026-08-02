@@ -34,6 +34,9 @@ from decimal import Decimal
 
 from .agreement import ServiceOrFacility
 from .clauses import OFFICIAL_TEXT_LOADED
+from .clauses import UTILITY_FAIR_USE
+from .clauses import UTILITY_FAIR_USE_CLOSING
+from .clauses import UTILITY_FAIR_USE_LEAD
 from .clauses import clauses_for
 
 
@@ -210,6 +213,62 @@ def services_row(lease) -> Row:
             block=True,
         )
     return Row("Included in the rent", ", ".join(included), block=True)
+
+
+# A utility can be "the landlord's" from either direction: named as a service
+# that comes with the place (RTB-1 §5, contractual) or marked included on the
+# billing configuration (who pays the invoice). Either way the landlord is the
+# one holding the bill, so either way the fair-use term applies.
+_SERVICE_TO_UTILITY = {
+    "HEAT": "heat",
+    "ELECTRICITY": "electricity",
+    "WATER": "water",
+    "NATURAL_GAS": "gas",
+    "HOT_WATER": "hot_water",
+    "INTERNET": "internet",
+    "CABLE": "cable",
+    "GARBAGE": "waste",
+}
+
+
+def included_utilities(lease) -> list[str]:
+    """Utility keys the LANDLORD is paying for on this lease, in a stable order.
+
+    Only these get a fair-use term. Attaching rules about wasting water to a
+    tenancy where the tenant pays their own water bill would be both wrong and
+    unenforceable — it is the landlord's exposure that the term exists to
+    address.
+    """
+    found = set()
+    for service in lease.services_and_facilities or []:
+        key = _SERVICE_TO_UTILITY.get(str(service))
+        if key:
+            found.add(key)
+    bills = lease.bills_included or {}
+    if isinstance(bills, dict):
+        for key, details in bills.items():
+            if isinstance(details, dict) and details.get("included") and (
+                str(key) in UTILITY_FAIR_USE
+            ):
+                found.add(str(key))
+    # UTILITY_FAIR_USE's own order, so the agreement reads the same every time.
+    return [key for key in UTILITY_FAIR_USE if key in found]
+
+
+def utility_fair_use_clauses(lease) -> list[str]:
+    """Lead-in, one paragraph per included utility, and the limit on recovery.
+
+    Empty when the landlord pays for nothing — a document should not carry a
+    section about included utilities when none are included.
+    """
+    keys = included_utilities(lease)
+    if not keys:
+        return []
+    return [
+        UTILITY_FAIR_USE_LEAD,
+        *(UTILITY_FAIR_USE[key] for key in keys),
+        UTILITY_FAIR_USE_CLOSING,
+    ]
 
 
 def parking_rows(lease) -> list[Row]:
@@ -392,7 +451,13 @@ class BCResidentialFormat(LeaseFormat):
                     services_row(lease),
                     *parking_rows(lease),
                 ],
-                clauses=self.clauses(lease, "rent"),
+                # The fair-use terms sit with the services they qualify: the
+                # row above says heat is included, and the paragraph below
+                # says what "included" does and doesn't cover.
+                clauses=[
+                    *self.clauses(lease, "rent"),
+                    *utility_fair_use_clauses(lease),
+                ],
             )
         )
 
@@ -796,14 +861,20 @@ class RoommateFormat(LeaseFormat):
                 id="money",
                 title="5. Rent and Money",
                 rows=money_rows,
-                clauses=(
-                    self.clauses(lease, "deposit_terms")
-                    if (
-                        Decimal(str(lease.security_deposit or 0)) > 0
-                        or cleaning_deposit > 0
-                    )
-                    else []
-                ),
+                clauses=[
+                    *(
+                        self.clauses(lease, "deposit_terms")
+                        if (
+                            Decimal(str(lease.security_deposit or 0)) > 0
+                            or cleaning_deposit > 0
+                        )
+                        else []
+                    ),
+                    # Shared living is where "the heat is included" turns into
+                    # an argument fastest, so the roommate agreement gets the
+                    # same fair-use terms as the whole-unit one.
+                    *utility_fair_use_clauses(lease),
+                ],
             )
         )
 

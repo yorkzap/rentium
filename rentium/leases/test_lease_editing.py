@@ -221,3 +221,98 @@ def test_rama_and_the_dashboard_share_one_edit_path(landlord, pending_lease):
     assert result["amended_signers"] == ["Early Signer"]
     assert "not been notified" in result["message"]
     assert _amendments(pending_lease).count() == 1
+
+
+# ============ "any field, before all parties have signed"
+def test_co_hosts_are_editable_on_an_unsigned_lease(landlord, pending_lease):
+    """They were create-only, so a typo in a co-host's email meant recreating
+    the lease. They carry no signature — a co-landlord who must sign is a
+    LeaseLandlordSignatory, invited through its own endpoint."""
+    response = _client(landlord).patch(
+        f"/api/leases/{pending_lease.pk}/",
+        {"co_hosts": [{"name": "Ana Ruiz", "email": "ana@example.com"}]},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.data
+    pending_lease.refresh_from_db()
+    assert pending_lease.co_hosts == [
+        {"name": "Ana Ruiz", "email": "ana@example.com", "phone": ""}
+    ]
+
+
+def test_a_co_host_without_a_name_is_refused(landlord, pending_lease):
+    response = _client(landlord).patch(
+        f"/api/leases/{pending_lease.pk}/",
+        {"co_hosts": [{"email": "nameless@example.com"}]},
+        format="json",
+    )
+    assert response.status_code == 400
+
+
+def test_a_signed_tenants_name_can_still_be_corrected(landlord, pending_lease):
+    """It used to freeze at signature. That name prints in the parties and
+    signature blocks, so a typo was unfixable without deleting the invite."""
+    slot = pending_lease.lease_tenants.get(invited_email="early@example.com")
+    response = _client(landlord).patch(
+        f"/api/leases/tenants/{slot.pk}/",
+        {"invited_name": "Early Signer-Jones"},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.data
+    slot.refresh_from_db()
+    assert slot.invited_name == "Early Signer-Jones"
+
+
+def test_a_linked_tenants_name_still_cannot_be_overwritten(landlord, pending_lease):
+    """Once they have an account, their own name is authoritative — writing
+    over it would put a name on the agreement they never chose."""
+    from rentium.users.models import TenantProfile
+    from rentium.users.tests.factories import UserFactory
+
+    slot = pending_lease.lease_tenants.get(invited_email="late@example.com")
+    slot.tenant = TenantProfile.objects.create(user=UserFactory())
+    slot.save(update_fields=["tenant"])
+
+    response = _client(landlord).patch(
+        f"/api/leases/tenants/{slot.pk}/",
+        {"invited_name": "Something Else"},
+        format="json",
+    )
+    assert response.status_code == 400
+    assert "linked their account" in str(response.data)
+
+
+def test_the_editor_is_told_which_services_exist(landlord, pending_lease):
+    """The list drives which fair-use terms print, so it ships from the server
+    rather than being hardcoded in the frontend."""
+    response = _client(landlord).get(f"/api/leases/{pending_lease.pk}/")
+
+    choices = response.data["service_choices"]
+    values = [c["value"] for c in choices]
+    assert "HEAT" in values and "ELECTRICITY" in values
+    assert all(set(c) == {"value", "label"} for c in choices)
+
+
+def test_services_included_are_editable_and_change_the_agreement(
+    landlord, pending_lease
+):
+    from rentium.leases.documents import render_lease
+
+    response = _client(landlord).patch(
+        f"/api/leases/{pending_lease.pk}/",
+        {"services_and_facilities": ["HEAT", "WATER"], "occupants": ["A child"]},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.data
+    pending_lease.refresh_from_db()
+    assert pending_lease.services_and_facilities == ["HEAT", "WATER"]
+    assert pending_lease.occupants == ["A child"]
+
+    text = "\n".join(
+        c for s in render_lease(pending_lease).sections for c in s.clauses
+    )
+    assert "Heat: the tenant should not run the heating" in text
+    assert "Water: taps, showers and hoses" in text

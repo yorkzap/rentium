@@ -390,6 +390,93 @@ CLAUSES: dict[tuple[str, str], list[str]] = {
 # banner saying so. This is not a nag; it's the guard that makes it impossible
 # to accidentally hand someone a document that looks official and isn't.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# FAIR USE OF WHAT THE LANDLORD PAYS FOR
+#
+# "Included in the rent" is not "unlimited", but an agreement that only says
+# the landlord supplies heat has said nothing about a tenant who runs it all
+# winter with the windows open — and a term the agreement never stated is one
+# the landlord cannot raise later. These paragraphs are attached ONLY for the
+# utilities actually included on this lease (see utility_fair_use_clauses in
+# documents.py); listing rules for a utility the tenant pays for themselves
+# would be both wrong and unenforceable.
+#
+# Deliberately framed as waste and negligence, not as a consumption cap. A
+# fixed limit ("200 kWh") is a rent increase in disguise and a term a tenant
+# cannot plan around; "don't leave it running needlessly" is the standard a
+# hearing can actually apply.
+# ---------------------------------------------------------------------------
+UTILITY_FAIR_USE_LEAD = (
+    "Utilities and services included in the rent are included for normal "
+    "household use. The tenant must not waste them or use them negligently, "
+    "and must take ordinary care to avoid loss the landlord is paying for."
+)
+
+UTILITY_FAIR_USE: dict[str, str] = {
+    "electricity": (
+        "Electricity: lights, heating, cooling and appliances should not be "
+        "left running in empty rooms or while the rental is unoccupied for "
+        "long periods. High-draw equipment beyond ordinary household use — "
+        "additional space heaters, server or cryptocurrency mining hardware, "
+        "grow lights, a second fridge or freezer — needs the landlord's "
+        "written consent before it is installed or run."
+    ),
+    "water": (
+        "Water: taps, showers and hoses should not be left running "
+        "needlessly. Dripping taps, running toilets and any leak must be "
+        "reported to the landlord promptly — a leak left unreported is the "
+        "clearest case of avoidable waste, and it damages the property as "
+        "well as the bill."
+    ),
+    "heat": (
+        "Heat: the tenant should not run the heating with windows or exterior "
+        "doors open, or turn the thermostat up to compensate for an open "
+        "window. Where the rental is left empty for more than a few days, the "
+        "heat should be turned down — but never off, and never below the "
+        "level needed to stop the pipes freezing."
+    ),
+    "gas": (
+        "Gas: gas heating and appliances should not be left burning in empty "
+        "rooms or run with windows or exterior doors open. Any smell of gas "
+        "must be reported immediately."
+    ),
+    "internet": (
+        "Internet: the connection is for the household's own use. It must not "
+        "be resold, shared beyond the rental, or used for anything unlawful."
+    ),
+    "cable": (
+        "Cable / TV: the service is for the household's own use and must not "
+        "be resold or shared beyond the rental."
+    ),
+    "waste": (
+        "Garbage and recycling: the tenant must use the bins provided, sort "
+        "waste as the collection service requires, and not overfill bins or "
+        "leave waste beside them. Bulky items, renovation debris and anything "
+        "the service will not take are the tenant's own to dispose of; extra "
+        "collection or dump charges caused this way are the tenant's."
+    ),
+    "sewer": (
+        "Sewer and drains: only water, waste and toilet paper may go down the "
+        "drains. Wipes (including those sold as flushable), fats, oils, "
+        "grease, coffee grounds and food scraps must not be. A blockage "
+        "caused this way is damage, not wear."
+    ),
+    "hot_water": (
+        "Hot water: hot water should not be left running needlessly, and any "
+        "leak or continuously running hot tap must be reported promptly."
+    ),
+}
+
+UTILITY_FAIR_USE_CLOSING = (
+    "If use of an included utility goes plainly beyond normal household use, "
+    "or a bill rises sharply because of waste or neglect, the landlord may "
+    "ask the tenant to pay the excess. The landlord must show the amount and "
+    "how it was worked out, and — as with any other money the tenant is said "
+    "to owe — may not simply take it from a deposit without the tenant's "
+    "written agreement or an order."
+)
+
+
 OFFICIAL_TEXT_LOADED: dict[str, bool] = {
     "BC_RESIDENTIAL": True,  # official RTB-1 (2023/06) §§1-17 transcribed above
     "SK_RESIDENTIAL": False,

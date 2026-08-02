@@ -274,6 +274,7 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
         rent_before = (
             Decimal(self.instance.rent_amount) if self.instance else None
         )
+        name_before = self.instance.invited_name if self.instance else None
         tenant = data.get("tenant")
         invited_email = data.get("invited_email")
         if not self.instance:
@@ -327,18 +328,27 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
                     "before": str(rent_before),
                     "after": str(data["rent_amount"]),
                 }
-        # --- Invited name is frozen once the slot signs or links ---
-        # A linked account's own name is authoritative (invited_name is just
-        # a fallback then), and a signed slot's identity shouldn't shift.
+        # --- Invited name is frozen once the slot LINKS an account ---
+        # Not once it signs. A landlord who typed "Siya Gulati" as "Sia Gulati"
+        # has to be able to correct it before the lease is executed — that is
+        # the name that prints in the parties and signature blocks, and being
+        # unable to fix a typo was pushing people to delete and re-invite.
+        # A linked account is different: from that point the tenant's own
+        # account name is authoritative and invited_name is only a fallback,
+        # so overwriting it would put a name on the agreement that the person
+        # it names never chose.
         if self.instance and "invited_name" in data:
-            changed = (data["invited_name"] or "") != (self.instance.invited_name or "")
-            if changed and (self.instance.has_signed or self.instance.tenant_id):
+            # name_before, not self.instance.invited_name — the model-clean
+            # block above has already written the incoming value onto the
+            # instance, so comparing here compares the new value with itself.
+            changed = (data["invited_name"] or "") != (name_before or "")
+            if changed and self.instance.tenant_id:
                 raise serializers.ValidationError(
                     {
                         "invited_name": (
-                            "The name can't be edited after the tenant has signed or "
-                            "linked their account — their account name is used from "
-                            "that point."
+                            "This tenant has linked their account, so their own "
+                            "account name is used on the agreement from that point "
+                            "and can't be overwritten here."
                         )
                     }
                 )
@@ -702,6 +712,11 @@ class LeaseSerializer(serializers.ModelSerializer):
         source="property.furnishing_details", read_only=True, allow_null=True
     )
     property_furnishing_label = serializers.SerializerMethodField()
+    # Shipped so the editor never hardcodes the enum — same reason the
+    # inspection serializer ships its condition/cleanliness legends. These
+    # drive which fair-use terms print on the agreement, so a frontend list
+    # that drifted from the model would silently change the document.
+    service_choices = serializers.SerializerMethodField()
     group_name = serializers.CharField(
         source="group.name", read_only=True, allow_null=True
     )
@@ -760,6 +775,7 @@ class LeaseSerializer(serializers.ModelSerializer):
             "property_furnishing_status",
             "property_furnishing_details",
             "property_furnishing_label",
+            "service_choices",
             "group_id",
             "group",
             "group_name",
@@ -844,7 +860,6 @@ class LeaseSerializer(serializers.ModelSerializer):
             "property_address",
             "group_name",
             "bills_summary",
-            "co_hosts",
             "common_space_clause_text",
             "effective_landlord_contact",
             "effective_etransfer_email",
@@ -879,6 +894,14 @@ class LeaseSerializer(serializers.ModelSerializer):
 
     def get_is_locked(self, obj):
         return obj.is_locked()
+
+    def get_service_choices(self, obj):
+        from rentium.leases.agreement import ServiceOrFacility
+
+        return [
+            {"value": value, "label": str(label)}
+            for value, label in ServiceOrFacility.choices
+        ]
 
     def get_property_furnishing_label(self, obj):
         if not obj.property_id:
@@ -972,6 +995,38 @@ class LeaseSerializer(serializers.ModelSerializer):
                             f"Custom splits for {bill_key} must add up to 100%, got {splits_total}%"
                         )
         return bills_included
+
+    def validate_co_hosts(self, value):
+        """[{name, email?, phone?}] — a lease term like any other while the
+        lease is unlocked, so it is editable rather than create-only.
+
+        Note this is the LEGACY co-host list, which carries no signature. A
+        co-landlord who must actually sign is a LeaseLandlordSignatory, invited
+        through its own endpoint; nothing here grants that.
+        """
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError(
+                "Expected a list of {name, email, phone} objects."
+            )
+        cleaned = []
+        for index, row in enumerate(value, start=1):
+            if not isinstance(row, dict):
+                raise serializers.ValidationError(
+                    f"Entry {index} must be an object with at least a name."
+                )
+            name = str(row.get("name") or "").strip()
+            if not name:
+                raise serializers.ValidationError(f"Entry {index} needs a name.")
+            cleaned.append(
+                {
+                    "name": name[:150],
+                    "email": str(row.get("email") or "").strip()[:254],
+                    "phone": str(row.get("phone") or "").strip()[:30],
+                }
+            )
+        return cleaned
 
     def validate_common_space_shared_with(self, value):
         if not value:
