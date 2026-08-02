@@ -874,8 +874,8 @@ class LeaseViewSet(viewsets.ModelViewSet):
                         rent_amount=old_lt.rent_amount,
                         room=old_lt.room,
                         is_primary_tenant=old_lt.is_primary_tenant,
-                        cleaning_fee=old_lt.cleaning_fee,
-                        cleaning_fee_paid=False,
+                        cleaning_deposit=old_lt.cleaning_deposit,
+                        cleaning_deposit_paid=False,
                         has_signed=False,
                     )
 
@@ -1037,7 +1037,13 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
     serializer_class = LeaseTenantSerializer
     permission_classes = [IsLandlordOrTenantMember, LeaseNotLocked]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ["lease", "tenant", "room", "has_signed", "cleaning_fee_paid"]
+    filterset_fields = [
+        "lease",
+        "tenant",
+        "room",
+        "has_signed",
+        "cleaning_deposit_paid",
+    ]
     ordering_fields = ["rent_amount", "signed_date", "created_at"]
     ordering = ["lease", "invited_email"]
 
@@ -1584,16 +1590,16 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=["post"], permission_classes=[IsLandlordOwner])
-    def mark_cleaning_fee_paid(self, request, pk=None):
-        """Mark the cleaning fee as paid for a tenant."""
+    def mark_cleaning_deposit_paid(self, request, pk=None):
+        """Mark the refundable cleaning deposit as paid for a tenant."""
         lease_tenant = self.get_object()
 
-        if lease_tenant.cleaning_fee_paid:
-            raise ValidationError("Cleaning fee is already marked as paid.")
-        if lease_tenant.cleaning_fee <= 0:
-            raise ValidationError("No cleaning fee was set for this tenant.")
+        if lease_tenant.cleaning_deposit_paid:
+            raise ValidationError("Cleaning deposit is already marked as paid.")
+        if lease_tenant.cleaning_deposit <= 0:
+            raise ValidationError("No cleaning deposit was set for this tenant.")
 
-        lease_tenant.cleaning_fee_paid = True
+        lease_tenant.cleaning_deposit_paid = True
         lease_tenant.save()
 
         return Response(self.get_serializer(lease_tenant).data)

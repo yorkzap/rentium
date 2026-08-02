@@ -73,7 +73,8 @@ _AFFIRM_EXACT = {
     "yes", "y", "ye", "yea", "yeah", "yep", "yup", "ya", "sure", "ok", "okay",
     "k", "kk", "confirm", "confirmed", "proceed", "correct", "aye", "affirmative",
     "right", "do it", "go", "go ahead", "go for it", "sounds good", "please do",
-    "do that", "yes do it", "do", "make it so", "yes please",
+    "do that", "then do it", "then do that", "yes do it", "do", "make it so",
+    "yes please",
 }
 _AFFIRM_LEAD = (
     "yes please", "go ahead", "please do", "do it", "confirm", "confirmed",
@@ -372,6 +373,85 @@ def _plan_fallback_reply(progress: dict) -> str:
     return "\n".join(parts) or "Done."
 
 
+def _document_rename_intent(message: str) -> dict | None:
+    """Parse a high-confidence existing-document rename instruction.
+
+    The selectors are still resolved by the landlord-scoped document service;
+    this only keeps document corrections out of the property-rename router.
+    """
+    text = str(message or "")
+    if not re.search(
+        r"\b(receipts?|invoices?|documents?|notices?|pdfs?)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return None
+    action = re.search(
+        r"\b(?:rename|retitle|(?:change|fix)\s+(?:the\s+)?(?:name|title)\s+of)\b"
+        r"\s+(.+?)\s+\b(?:to|as)\b\s+(.+?)\s*[.!]?\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if action is None:
+        action = re.search(
+            r"\b(?:change|fix)\s+(?:the\s+)?(.+?)(?:'s|\s+)"
+            r"(?:name|title)\s+\b(?:to|as)\b\s+(.+?)\s*[.!]?\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if action is None:
+        return None
+    selector = action.group(1).strip()
+    new_title = re.sub(
+        r"\s+instead\s*$", "", action.group(2).strip(), flags=re.IGNORECASE
+    ).strip(" \t\r\n.!?")
+    if not selector or not new_title:
+        return None
+
+    money = re.findall(r"\$?\s*(\d[\d,]*(?:\.\d{1,2})?)\b", selector)
+    amount = money[-1].replace(",", "") if money else ""
+    selector_query = re.sub(
+        r"\$?\s*\d[\d,]*(?:\.\d{1,2})?\b", " ", selector
+    )
+    selector_query = re.sub(
+        r"\b(?:the|one|other|for|from|by|with|amount|amounting|receipt|receipts|"
+        r"invoice|invoices|document|documents|notice|notices|pdf|pdfs|titled|named)\b",
+        " ",
+        selector_query,
+        flags=re.IGNORECASE,
+    )
+    selector_query = " ".join(selector_query.split()).strip(" -–—,;:")
+
+    document_query = selector_query
+    if not document_query:
+        prefix = text[: action.start()]
+        vendor_matches = re.findall(
+            r"\b(?:receipts?|invoices?|documents?|notices?|pdfs?)\s+"
+            r"(?:from|for|by)\s+([^.;!?]+)",
+            prefix,
+            flags=re.IGNORECASE,
+        )
+        if vendor_matches:
+            document_query = vendor_matches[-1].strip(" \t\r\n,;:-")
+            document_query = re.sub(
+                r"\s+(?:and|with)\s+(?:amounts?|totals?).*$",
+                "",
+                document_query,
+                flags=re.IGNORECASE,
+            ).strip()
+
+    if not document_query and not amount:
+        return None
+    return {
+        "tool": "rename_business_document",
+        "arguments": {
+            "document_query": document_query,
+            "amount": amount,
+            "new_title": new_title,
+        },
+    }
+
+
 def _rename_intent(landlord, message: str) -> dict | None:
     match = re.match(
         r"^\s*(?:please\s+)?rename\s+(?:the\s+)?(.+?)\s+to\s+(.+?)\s*[.!]?\s*$",
@@ -653,6 +733,198 @@ def _amend_pending_schedule_from_message(
         save_single(landlord, conversation_id, "schedule_viewing", args)
         return _preview_reply("schedule_viewing", result)
     return _write_result_message("schedule_viewing", result)
+
+
+def _expense_bank_correction(message: str) -> str | None:
+    """Return ``paid``/``unpaid`` for an explicit bank-status correction.
+
+    This is intentionally narrower than general payment language. It runs
+    while a create-expense preview is pending, where phrases such as "yes,
+    except it came out of the bank already" must amend the saved tool
+    arguments instead of confirming the stale unpaid preview.
+    """
+    low = (message or "").casefold().replace("’", "'")
+    unpaid = re.search(
+        r"\b(?:hasn'?t|has not|wasn'?t|was not|isn'?t|is not)\s+"
+        r"(?:been\s+)?(?:paid|taken|come|came|cleared)\b"
+        r"|\bnot\s+(?:yet\s+)?(?:paid|taken from|out of|cleared)\b"
+        r"|\b(?:leave|keep|mark)\s+(?:it\s+)?unpaid\b",
+        low,
+    )
+    if unpaid:
+        return "unpaid"
+    paid = re.search(
+        r"\b(?:already\s+)?paid\b"
+        r"|\b(?:taken|came|come)\s+(?:out\s+of|from)\s+(?:the\s+)?bank\b"
+        r"|\bbank\s+(?:has\s+|already\s+)?(?:cleared|charged|processed)\b"
+        r"|\bcleared\s+(?:the\s+)?bank\b",
+        low,
+    )
+    return "paid" if paid else None
+
+
+def _amend_pending_expense_from_message(
+    landlord, conversation_id, pending_plan, message: str,
+) -> str | None:
+    """Replace a pending expense preview when its bank status is corrected."""
+    if _is_expense_paid_status_question(message):
+        return None
+    correction = _expense_bank_correction(message)
+    if pending_plan is None or correction is None:
+        return None
+    steps = list(pending_plan.steps.order_by("order"))
+    if len(steps) != 1 or steps[0].tool != "create_expense":
+        return None
+
+    args = dict(steps[0].arguments or {})
+    old_paid = bool((args.get("paid_on") or "").strip())
+    new_paid = correction == "paid"
+    if old_paid == new_paid:
+        # The message still referred to the pending preview. Re-render it
+        # deterministically rather than letting a model invent a second write.
+        result = execute("create_expense", args, landlord=landlord)
+        return _preview_reply("create_expense", result)
+
+    explicit_day = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", message or "")
+    args["paid_on"] = (
+        explicit_day.group(1)
+        if new_paid and explicit_day
+        else ("paid" if new_paid else "")
+    )
+    result = execute("create_expense", args, landlord=landlord)
+    if result.get("error"):
+        return str(result["error"])
+    if result.get("needs_confirm"):
+        save_single(landlord, conversation_id, "create_expense", args)
+        return _preview_reply("create_expense", result)
+    return _write_result_message("create_expense", result)
+
+
+def _is_expense_paid_status_question(message: str) -> bool:
+    """True for a question about whether RAMA marked the current expense paid."""
+    low = re.sub(r"\s+", " ", (message or "").casefold()).strip()
+    return bool(
+        re.match(
+            r"^(?:"
+            r"did (?:you|u) mark (?:it|that|the expense) (?:as )?paid"
+            r"|(?:is|was) (?:it|that|the expense) (?:marked )?paid"
+            r"|(?:was it|is it) taken (?:from|out of) the bank"
+            r"|marked paid"
+            r")\s*[?.!]*$",
+            low,
+        )
+    )
+
+
+def _recent_conversation_expense(landlord, conversation_id):
+    """Return the newest expense actually written in this conversation."""
+    from rentium.ledger.models import EntryType
+    from rentium.ledger.models import LedgerEntry
+
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+    ).order_by("-created_at")[:40]
+    for row in rows:
+        content = row.content or {}
+        if content.get("tool") not in {"create_expense", "mark_ledger_paid"}:
+            continue
+        result = content.get("result") or {}
+        expense = (
+            result.get("expense")
+            if isinstance(result.get("expense"), dict)
+            else {}
+        )
+        entry_id = expense.get("id") or result.get("entry_id")
+        if not entry_id:
+            continue
+        entry = LedgerEntry.objects.filter(
+            landlord=landlord,
+            pk=entry_id,
+            entry_type=EntryType.EXPENSE,
+        ).first()
+        if entry is not None:
+            return entry
+    return None
+
+
+def _expense_paid_status_reply(landlord, conversation_id, pending_plan=None) -> str:
+    """Answer a paid-status follow-up without treating it as a new mutation."""
+    if pending_plan is not None:
+        steps = list(pending_plan.steps.order_by("order"))
+        if len(steps) == 1 and steps[0].tool == "create_expense":
+            args = steps[0].arguments or {}
+            planned_paid = bool((args.get("paid_on") or "").strip())
+            bank = "marked paid" if planned_paid else "not yet taken from bank"
+            return (
+                f"Not yet — the expense has not been posted. The pending preview is "
+                f"{bank}; reply yes to post it, or correct the preview first."
+            )
+
+    entry = _recent_conversation_expense(landlord, conversation_id)
+    if entry is None:
+        return (
+            "I can't verify which expense 'it' refers to from this conversation. "
+            "Name the expense or amount and I'll check it."
+        )
+    if entry.paid_on:
+        return (
+            f"Yes — the ${entry.amount} expense “{entry.description}” is marked "
+            f"paid on {entry.paid_on}. You can attach the receipt later."
+        )
+    return (
+        f"No — the ${entry.amount} expense “{entry.description}” is still marked "
+        "not yet taken from bank."
+    )
+
+
+def _mark_paid_followup_expense(landlord, conversation_id, message: str):
+    """Resolve pronoun/context follow-ups to the expense they refer to.
+
+    Explicit commands such as "then mark it paid" always qualify. Bare
+    continuations such as "then do it" qualify only when RAMA's immediately
+    preceding reply reported that the recent expense was not yet bank-cleared.
+    """
+    low = re.sub(r"\s+", " ", (message or "").casefold()).strip(" .!?")
+    explicit = bool(
+        re.match(
+            r"^(?:(?:okay|ok|so)\s+)?(?:then\s+)?(?:please\s+)?"
+            r"(?:go ahead and\s+)?mark\s+"
+            r"(?:it|that|this|the expense)\s+(?:as\s+)?paid$",
+            low,
+        )
+    )
+    contextual = low in {
+        "then do it",
+        "then do that",
+        "do it then",
+        "do that then",
+        "okay then do it",
+        "ok then do it",
+    }
+    if not explicit and not contextual:
+        return None
+
+    entry = _recent_conversation_expense(landlord, conversation_id)
+    if entry is None:
+        return None
+    if explicit:
+        return entry
+
+    previous = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.ASSISTANT_MESSAGE,
+    ).order_by("-created_at").first()
+    previous_text = (
+        str((previous.content or {}).get("text") or "").casefold()
+        if previous
+        else ""
+    )
+    if entry.paid_on is None and "not yet taken from bank" in previous_text:
+        return entry
+    return None
 
 
 def _schedule_viewing_intent(message: str) -> dict | None:
@@ -1664,6 +1936,27 @@ def _merge_house_layout_answer(arguments: dict, message: str) -> dict:
 
 def _preview_reply(tool: str, result: dict) -> str:
     preview = result.get("preview") or {}
+    if tool == "rename_business_document":
+        amount = preview.get("amount")
+        currency = preview.get("currency") or "CAD"
+        lines = [
+            "Rename document:",
+            f"• Current name: {preview.get('current_title') or preview.get('title')}",
+            f"• New name: {preview.get('new_title')}",
+        ]
+        if amount is not None:
+            lines.append(f"• Amount: {currency} {amount}")
+        if preview.get("issuer"):
+            lines.append(f"• Issuer: {preview['issuer']}")
+        if preview.get("document_date"):
+            lines.append(f"• Date: {preview['document_date']}")
+        if preview.get("holding"):
+            lines.append(f"• Property: {preview['holding']}")
+        lines.append(
+            "• Original file, archive, ledger link, and filing status stay unchanged"
+        )
+        lines.append("Reply yes to rename this document, or no to cancel.")
+        return "\n".join(lines)
     if tool == "create_expense":
         amount = preview.get("amount") or ""
         desc = preview.get("description") or "expense"
@@ -2414,6 +2707,62 @@ def _refuse_if_already_done(tool_name, arguments, result, landlord):
     }
 
 
+# Every flag a tool sets on its result to mean "this landed". Kept as one list
+# because the claimed-write guard reads it: a verb missing here makes a real
+# write invisible, and the guard then tells the landlord their change didn't
+# happen when it did — see test_claimed_writes for the enumeration that keeps
+# this in step with what the tools actually return.
+WRITE_RESULT_MARKERS = (
+    "created",
+    "updated",
+    "deleted",
+    "removed",
+    "terminated",
+    "cancelled",
+    "done",
+    "ok",
+    "recorded",
+    "returned",
+    "charged",
+    "credited",
+    "voided",
+    "paid",
+    "sent",
+    "signed",
+    "applied",
+    "filed",
+    "posted",
+    "linked",
+    "invited",
+    "renewed",
+    "approved",
+    "dismissed",
+    "archived",
+    "restored",
+    "committed",
+    "discarded",
+    "reallocated",
+    "attributed",
+    "scheduled",
+    "rescheduled",
+    "resent",
+    "settled",
+    "completed",
+    "corrected",
+    "converted",
+    "catalogued",
+    "delivered",
+    "rebalanced",
+    "tagged",
+    "trashed",
+    "logged",
+    "remembered",
+    "forgotten",
+    # An OCR'd document row exists that didn't before.
+    "prepared",
+)
+
+
 def _is_write_result(result) -> bool:
     """Whether a tool result represents a change that actually landed.
 
@@ -2423,19 +2772,79 @@ def _is_write_result(result) -> bool:
     writes nothing. That made "did this turn write?" answer yes for a turn that
     had only proposed, which is exactly the case the claimed-write guard exists
     to catch: preview `record_payment`, then say "Recorded the payment."
+
+    `already_done` and `question_for_user` are refusals with a friendly face —
+    a duplicate that was skipped and a missing fact that was asked about both
+    wrote nothing.
     """
     if not isinstance(result, dict):
         return False
-    if result.get("needs_confirm") or result.get("error"):
+    if (
+        result.get("needs_confirm")
+        or result.get("error")
+        or result.get("already_done")
+        or result.get("question_for_user")
+    ):
         return False
-    return bool(
-        result.get("created")
-        or result.get("updated")
-        or result.get("deleted")
-        or result.get("terminated")
-        or result.get("done")
-        or result.get("ok")
-        or result.get("recorded"),
+    return any(result.get(marker) for marker in WRITE_RESULT_MARKERS)
+
+
+def _conversation_writes(landlord, conversation_id) -> list[dict]:
+    """Writes this conversation actually landed, read back from the audit trail.
+
+    The claimed-write guard below is turn-local, which is right for catching a
+    fabrication and wrong for a follow-up question. A landlord confirmed a
+    lease edit, it was written, and then asked "u sure its added?" — the model
+    truthfully said yes, nothing was written on THAT turn, and the guard
+    replaced a true answer with "Nothing was written, so please don't rely on
+    that." The deposit was on the lease the whole time.
+
+    Both directions of that are the same failure: the landlord is told
+    something about their data that isn't so. The turn is the wrong unit; the
+    record is what settles it.
+    """
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+    ).order_by("created_at")
+    writes = []
+    for row in rows:
+        content = row.content or {}
+        result = content.get("result")
+        if not _is_write_result(result):
+            continue
+        writes.append(
+            {
+                "tool": content.get("tool") or "",
+                "message": str((result or {}).get("message") or "").strip(),
+            }
+        )
+    return writes
+
+
+def _writes_from_record_reply(writes: list[dict]) -> str:
+    """Answer a write question from the audit trail instead of from prose.
+
+    Used when the model claims a completed write on a turn that wrote nothing
+    but the conversation HAS written. The claim may be true, so it must not be
+    contradicted — but it is still the model's own voice asserting a change,
+    which is never allowed to stand on its own. So the model's sentence is
+    replaced by what the record says. Nothing invented survives, and nothing
+    real gets denied.
+    """
+    lines = []
+    for write in writes:
+        text = write["message"] or f"{write['tool']} completed."
+        if text not in lines:
+            lines.append(text)
+    body = "\n".join(f"• {line}" for line in lines)
+    return (
+        "Checking the record rather than my own memory — this conversation has "
+        "written:\n\n"
+        f"{body}\n\n"
+        "Nothing else has been written since. If you expected something that "
+        "isn't in that list, it did not happen — tell me and I'll do it."
     )
 
 
@@ -3206,16 +3615,42 @@ def _verbal_expense_intent(landlord, message: str, live_portfolio: dict) -> dict
     # correction — require explicit buy language or no-receipt language.
     if not _VERBAL_EXPENSE_RE.search(text) and not _NO_RECEIPT_RE.search(text):
         return None
-    money = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)", text)
-    if not money:
-        money = re.search(r"\b(\d+\.\d{2})\b", text)
-    if not money:
+    money_values = re.findall(r"\$\s*(\d+(?:\.\d{1,2})?)", text)
+    if not money_values:
+        bare_money = re.search(r"\b(\d+\.\d{2})\b", text)
+        money_values = [bare_money.group(1)] if bare_money else []
+    if not money_values:
         return None
-    amount = money.group(1)
+    from decimal import Decimal
+    from decimal import InvalidOperation
+
+    explicit_total = re.search(
+        r"\b(?:grand\s+)?total(?:\s+(?:was|is|came to))?\s*"
+        r"\$\s*(\d+(?:\.\d{1,2})?)",
+        text,
+        re.IGNORECASE,
+    )
+    try:
+        if explicit_total:
+            amount_value = Decimal(explicit_total.group(1))
+        else:
+            # Multiple dollar-prefixed line items in a purchase statement are
+            # one expense total: "$250 … and $30 dumping" means $280, not a
+            # silently truncated $250 entry.
+            amount_value = sum(
+                (Decimal(value) for value in money_values),
+                Decimal("0"),
+            )
+    except (InvalidOperation, ValueError):
+        return None
+    amount = f"{amount_value:.2f}"
     holding = _address_scope_from_message(text, live_portfolio)
     desc = text
-    desc = re.sub(r"\$\s*\d+(?:\.\d{1,2})?", "", desc)
-    desc = re.sub(r"\b\d+\.\d{2}\b", "", desc)
+    # Preserve component amounts when several costs make up the total; those
+    # allocations are useful audit detail (stove $250 + disposal $30).
+    if len(money_values) == 1:
+        desc = re.sub(r"\$\s*\d+(?:\.\d{1,2})?", "", desc)
+        desc = re.sub(r"\b\d+\.\d{2}\b", "", desc)
     desc = re.sub(
         r"\b(i bought|bought|purchased|spent|i paid|paid today|already paid|"
         r"its paid|it's paid|and it'?s paid|today)\b",
@@ -3228,11 +3663,26 @@ def _verbal_expense_intent(landlord, message: str, live_portfolio: dict) -> dict
         desc = f"Expense ${amount}"
     paid = bool(
         re.search(
-            r"\b(paid|already paid|its paid|it's paid|and it'?s paid)\b",
+            r"\b(paid|already paid|its paid|it's paid|and it'?s paid|"
+            r"gave (?:him|her|them|the vendor)|"
+            r"handed (?:him|her|them|the vendor))\b",
             text,
             re.IGNORECASE,
         )
     )
+    vendor = ""
+    vendor_match = re.search(
+        r"\b(?:from|used)\s+([^.;!?]+?)\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if vendor_match:
+        vendor = re.sub(
+            r"\s+(?:and\s+)?(?:it'?s\s+)?(?:already\s+)?paid\s*$",
+            "",
+            vendor_match.group(1),
+            flags=re.IGNORECASE,
+        ).strip(" ,-")[:150]
     return {
         "tool": "create_expense",
         "arguments": {
@@ -3243,8 +3693,47 @@ def _verbal_expense_intent(landlord, message: str, live_portfolio: dict) -> dict
             "paid_on": "today" if paid else "",
             "effective_date": "",
             "category": "",
+            "vendor": vendor,
         },
     }
+
+
+_DOCUMENT_FILING_TOOLS = {
+    "catalog_business_document",
+    "file_business_document",
+    "link_receipt_to_expense",
+}
+
+
+def _pending_document_filing_plan(plan) -> bool:
+    """True when every pending step belongs to the receipt/document pipeline."""
+    if plan is None:
+        return False
+    tools = set(plan.steps.values_list("tool", flat=True))
+    return bool(tools) and tools.issubset(_DOCUMENT_FILING_TOOLS)
+
+
+def _recent_verbal_expense_intent(
+    landlord,
+    conversation_id,
+    live_portfolio: dict,
+) -> dict | None:
+    """Recover a recent purchase after RAMA wrongly entered document mode."""
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.USER_MESSAGE,
+        created_at__gte=timezone.now() - timedelta(minutes=30),
+    ).order_by("-created_at")[:8]
+    for row in rows:
+        intent = _verbal_expense_intent(
+            landlord,
+            str((row.content or {}).get("text") or ""),
+            live_portfolio,
+        )
+        if intent is not None:
+            return intent
+    return None
 
 
 def _address_scope_from_message(message: str, live_portfolio: dict) -> str:
@@ -3701,16 +4190,108 @@ def run_turn(
     # for their own explicit "yes" (tiered confirm).
     plan_progress: dict | None = None
     deterministic_reply: str | None = None
+    forced_expense_intent: dict | None = None
     pending_plan = load_fresh_plan(landlord, conversation_id)
+    rejects_document = bool(_NO_RECEIPT_RE.search(message or "")) and bool(
+        re.search(r"\b(expense|ledger|log|record|post)\b", message or "", re.I)
+    )
+    # A new explicit purchase replaces an old receipt/document filing plan.
+    # Previously the model could SAY it had prepared an expense while the
+    # persisted plan still pointed at catalog_business_document; the next Yes
+    # therefore filed a document. The executable plan, not prose, now follows
+    # the landlord's latest explicit instruction.
+    if pending_plan is not None and _pending_document_filing_plan(pending_plan):
+        current_expense = _verbal_expense_intent(
+            landlord,
+            message,
+            safe_context,
+        )
+        if current_expense is not None or rejects_document:
+            old_plan = plan_to_payload(pending_plan)
+            forced_expense_intent = current_expense or _recent_verbal_expense_intent(
+                landlord,
+                conversation_id,
+                safe_context,
+            )
+            if forced_expense_intent is not None and _expense_bank_correction(
+                message,
+            ) == "paid":
+                forced_expense_intent["arguments"]["paid_on"] = "today"
+            clear_plan(landlord, conversation_id)
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": "_pending_document_plan_replaced",
+                    "arguments": {},
+                    "result": {
+                        "replaced": old_plan,
+                        "replacement": forced_expense_intent,
+                    },
+                    "deterministic_routing": True,
+                },
+            )
+            pending_plan = None
+            if forced_expense_intent is None:
+                deterministic_reply = (
+                    "Cancelled the document filing — nothing was filed. Tell me "
+                    "the expense amount and property, and I will prepare the "
+                    "ledger expense instead."
+                )
+    # The wrong document plan may already have executed. An explicit "there is
+    # no receipt; this is a paid ledger expense" still recovers the preceding
+    # purchase instead of re-opening the same document workflow yet again.
+    if (
+        pending_plan is None
+        and deterministic_reply is None
+        and forced_expense_intent is None
+        and rejects_document
+    ):
+        forced_expense_intent = _recent_verbal_expense_intent(
+            landlord,
+            conversation_id,
+            safe_context,
+        )
+        if forced_expense_intent is not None and _expense_bank_correction(
+            message,
+        ) == "paid":
+            forced_expense_intent["arguments"]["paid_on"] = "today"
+        if forced_expense_intent is None:
+            deterministic_reply = (
+                "I will not create or file a document for this. Tell me the "
+                "expense amount and property, and I will prepare only the "
+                "ledger expense."
+            )
+    # Corrections replace the saved plan before any affirmation can run stale
+    # arguments. Expense corrections deliberately include "Yes, except…".
+    if pending_plan is not None:
+        amended = _amend_pending_expense_from_message(
+            landlord, conversation_id, pending_plan, message,
+        )
+        if amended is not None:
+            deterministic_reply = amended
+            pending_plan = load_fresh_plan(landlord, conversation_id)
     # Date/time corrections while a viewing is awaiting Yes replace the plan
     # before affirmation can run the stale preview ("tomorrow" → "july 31").
-    if pending_plan is not None and not _is_affirmative(message):
+    if (
+        pending_plan is not None
+        and deterministic_reply is None
+        and not _is_affirmative(message)
+    ):
         amended = _amend_pending_schedule_from_message(
             landlord, conversation_id, pending_plan, message,
         )
         if amended is not None:
             deterministic_reply = amended
             pending_plan = load_fresh_plan(landlord, conversation_id)
+    if (
+        pending_plan is not None
+        and deterministic_reply is None
+        and _is_expense_paid_status_question(message)
+    ):
+        deterministic_reply = _expense_paid_status_reply(
+            landlord, conversation_id, pending_plan,
+        )
+
     replacement_rows = (
         _explicit_room_creation_rows(
             landlord,
@@ -3988,6 +4569,35 @@ def run_turn(
         if creation_rows is not None:
             deterministic_reply = _prepare_explicit_creation_batch(creation_rows)
 
+    # Existing document renames must run before the general property-rename
+    # router. Otherwise "rename the $39.36 receipt" is treated as a listing
+    # called "39.36" and never reaches the document library.
+    if deterministic_reply is None and pending_plan is None:
+        intent = _document_rename_intent(message)
+        if intent is not None:
+            result = _run_deterministic_tool(
+                intent["tool"], intent["arguments"],
+            )
+            if result.get("needs_input"):
+                deterministic_reply = str(result.get("question_for_user") or "")
+            elif result.get("needs_confirm"):
+                stable_arguments = dict(
+                    result.get("resolved_arguments") or intent["arguments"]
+                )
+                save_single(
+                    landlord,
+                    conversation_id,
+                    intent["tool"],
+                    stable_arguments,
+                )
+                deterministic_reply = _preview_reply(intent["tool"], result)
+            else:
+                deterministic_reply = str(
+                    result.get("error")
+                    or result.get("message")
+                    or result,
+                )
+
     # High-confidence property operations bypass model intent selection. A
     # rename can therefore never drift into an availability/status plan.
     if deterministic_reply is None and pending_plan is None:
@@ -4064,16 +4674,30 @@ def run_turn(
             )
 
     if deterministic_reply is None and pending_plan is None:
+        if _is_expense_paid_status_question(message):
+            deterministic_reply = _expense_paid_status_reply(
+                landlord, conversation_id,
+            )
+
+    if deterministic_reply is None and pending_plan is None:
         low_msg = (message or "").casefold()
+        followup_expense = _mark_paid_followup_expense(
+            landlord, conversation_id, message,
+        )
         # Mark expense paid / "not yet taken" follow-ups
-        if re.search(
-            r"\b(mark|marked).+\bpaid\b"
-            r"|\bneeds? to be (marked )?paid\b"
-            r"|\bnot yet taken\b"
-            r"|\bwhy does it say not yet\b"
-            r"|\b(expense|draino|invoice).+\bpaid\b",
-            low_msg,
-        ) and not re.search(r"\b(cleaning fee)\b", low_msg):
+        paid_intent = bool(followup_expense) or bool(
+            re.search(
+                r"\b(mark|marked).+\bpaid\b"
+                r"|\bneeds? to be (marked )?paid\b"
+                r"|\bnot yet taken\b"
+                r"|\bwhy does it say not yet\b"
+                r"|\b(expense|draino|invoice).+\bpaid\b",
+                low_msg,
+            )
+        )
+        if paid_intent and not re.search(
+            r"\bcleaning (?:deposit|fee)\b", low_msg,
+        ):
             amt_m = re.search(r"\$?\s*(\d+\.\d{2})\b", message or "")
             desc = re.sub(
                 r"\b(mark|marked|needs?|to be|as paid|paid|the|expense|"
@@ -4087,8 +4711,21 @@ def run_turn(
             args = {
                 "description_query": desc[:80] if desc else "expense",
                 "amount": amt_m.group(1) if amt_m else "",
-                "paid_on": "today",
+                "paid_on": timezone.localdate().isoformat(),
             }
+            if followup_expense is not None:
+                args["entry_id"] = str(followup_expense.pk)
+                args["description_query"] = ""
+            # Pronouns refer to the most recent expense actually written in
+            # this conversation. Never turn "mark it paid" into a search for
+            # descriptions containing the word "it".
+            if desc.casefold() in {"", "it", "that", "this", "?"}:
+                recent_expense = _recent_conversation_expense(
+                    landlord, conversation_id,
+                )
+                if recent_expense is not None:
+                    args["entry_id"] = str(recent_expense.pk)
+                    args["description_query"] = ""
             # Prefer mark_ledger_paid — if multi-match, tool returns candidates
             result = execute("mark_ledger_paid", args, landlord=landlord)
             tools_used.append("mark_ledger_paid")
@@ -4503,25 +5140,22 @@ def run_turn(
                     intent["arguments"]["void_all"] = "yes"
             deterministic_reply = _run_money_intent(intent)
 
-    # Verbal cash expense with no receipt this turn. Pending receipt photos /
-    # unscoped docs win unless the landlord explicitly says "no receipt".
+    # A clearly new verbal purchase wins over an OLD unresolved document. A
+    # file attached on this turn still wins because _verbal_expense_intent
+    # rejects messages carrying fresh attachment markers. Bare "$13 for
+    # McKenzie" receipt corrections remain documents because the verbal parser
+    # requires purchase language or an explicit "no receipt" instruction.
     pending_doc_id = _pending_unscoped_document_id(landlord, conversation_id)
     focus_has_pending_file = _focus_has_pending_file(attachment_focus)
     receipt_followup = _looks_like_receipt_followup(message)
+    verbal_this_turn = forced_expense_intent or (
+        None
+        if receipt_followup
+        else _verbal_expense_intent(landlord, message, safe_context)
+    )
     if deterministic_reply is None and pending_plan is None:
-        allow_verbal = True
-        if (focus_has_pending_file or pending_doc_id) and not _NO_RECEIPT_RE.search(
-            message or ""
-        ):
-            # Old pending receipt must not be abandoned by "$13 for McKenzie"
-            # correction language — only explicit no-receipt / new cash log.
-            allow_verbal = False
-        if receipt_followup:
-            allow_verbal = False
-        if allow_verbal:
-            intent = _verbal_expense_intent(landlord, message, safe_context)
-            if intent is not None:
-                deterministic_reply = _run_money_intent(intent)
+        if verbal_this_turn is not None:
+            deterministic_reply = _run_money_intent(verbal_this_turn)
 
     # Deterministic document routing: weak models repeatedly treated photographed
     # invoices as listing photos, or claimed OCR does not exist. Once intent is
@@ -4536,13 +5170,7 @@ def run_turn(
         r"(?:attachment_id=|items=\d+:)([0-9a-fA-F-]{32,36})", message or ""
     )
     # Do not re-open catalog for a prior upload when this turn is a verbal expense.
-    verbal_this_turn = None
-    if not receipt_followup and not (
-        (focus_has_pending_file or pending_doc_id)
-        and not _NO_RECEIPT_RE.search(message or "")
-    ):
-        verbal_this_turn = _verbal_expense_intent(landlord, message, safe_context)
-    focus = attachment_focus or {}
+    document_focus = attachment_focus or {}
     scope_query = _address_scope_from_message(message, safe_context)
     amount_correction = _amount_from_message(message)
     link_existing = _wants_link_existing_expense(message)
@@ -4553,7 +5181,7 @@ def run_turn(
         bool(msg_upload_ids)
         or bool(msg_attachment_ids)
         or (
-            focus.get("landlord_described_as_business_record")
+            document_focus.get("landlord_described_as_business_record")
             and focus_has_pending_file
         )
         or supported_tool_for_request(message) == "catalog_business_document"
@@ -4589,10 +5217,10 @@ def run_turn(
             or pending_doc_id
         )
     ):
-        focus = attachment_focus or {}
-        batch_ids = list(focus.get("attachment_ids") or [])
-        upload_ids = list(focus.get("unresolved_upload_ids") or [])
-        doc_ids = list(focus.get("document_ids") or [])
+        document_focus = attachment_focus or {}
+        batch_ids = list(document_focus.get("attachment_ids") or [])
+        upload_ids = list(document_focus.get("unresolved_upload_ids") or [])
+        doc_ids = list(document_focus.get("document_ids") or [])
         # Prefer live message markers (this turn's Telegram photo).
         for mid in msg_upload_ids:
             if mid not in upload_ids:
@@ -4695,26 +5323,10 @@ def run_turn(
 
             arguments = {
                 "scope_query": effective_scope,
-                "issuer": focus.get("issuer") or "",
-                "document_date": focus.get("document_date") or "",
+                "issuer": document_focus.get("issuer") or "",
+                "document_date": document_focus.get("document_date") or "",
                 **file_arg,
             }
-            # Auto-catalog when we know the holding.
-            auto_scope = bool(effective_scope) and (
-                receipt_followup
-                or link_existing
-                or force_new
-                or bool(amount_correction)
-                or bool(matched_expense)
-                or bool(scope_query)
-            )
-            auto_link_now = bool(link_existing) and bool(
-                effective_scope or matched_expense
-            )
-            if auto_scope or auto_link_now:
-                arguments["confirm"] = "yes"
-                if not arguments.get("scope_query") and effective_scope:
-                    arguments["scope_query"] = effective_scope
             result = execute(
                 "catalog_business_document", arguments, landlord=landlord,
             )
@@ -4765,12 +5377,10 @@ def run_turn(
 
             # Link when landlord confirmed expense already logged, OR when we
             # matched uniquely and they accepted / auto path.
-            should_link = (not force_new) and (
-                bool(link_existing)
-                or (auto_link_now and matched_expense is not None)
-            )
+            should_link = (not force_new) and bool(link_existing)
             if (
                 should_link
+                and not result.get("needs_confirm")
                 and doc_id
                 and (
                     result.get("catalogued")
@@ -4780,23 +5390,6 @@ def run_turn(
                     or (matched_expense and effective_scope)
                 )
             ):
-                # Ensure holding is set before link.
-                if (
-                    matched_expense
-                    and matched_expense.get("holding_address")
-                    and not result.get("catalogued")
-                ):
-                    scoped = execute(
-                        "catalog_business_document",
-                        {
-                            "document_id": doc_id,
-                            "scope_query": matched_expense["holding_address"],
-                            "confirm": "yes",
-                        },
-                        landlord=landlord,
-                    )
-                    if isinstance(scoped, dict) and not scoped.get("error"):
-                        result = {**result, **scoped}
                 link_args = {
                     "document_id": doc_id,
                     "amount": amount_correction
@@ -4808,19 +5401,37 @@ def run_turn(
                         if matched_expense and matched_expense.get("expense_id")
                         else "auto_link"
                     ),
-                    "confirm": "yes",
                 }
                 link_result = execute(
                     "file_business_document", link_args, landlord=landlord,
                 )
-                if isinstance(link_result, dict) and not link_result.get("error"):
-                    result = {**result, **link_result, "linked_existing": True}
+                if isinstance(link_result, dict) and link_result.get("needs_confirm"):
+                    save_single(
+                        landlord,
+                        conversation_id,
+                        "file_business_document",
+                        link_args,
+                    )
+                    preview_link = link_result.get("preview") or {}
+                    deterministic_reply = (
+                        "Ready to attach this receipt to the existing expense:\n"
+                        f"• ${preview_link.get('amount') or link_args['amount']} — "
+                        f"{preview_link.get('expense_description') or 'existing expense'}\n"
+                        "• No second expense will be posted\n"
+                        "Reply yes to link it, or no to cancel."
+                    )
+                    result = {
+                        **result,
+                        **link_result,
+                        "needs_confirm_link": True,
+                    }
                 elif isinstance(link_result, dict):
                     result = {**result, "link_attempt": link_result}
 
             # Unique existing-expense match → confirm-link plan (not "which property?").
             if (
                 not result.get("linked_existing")
+                and not result.get("needs_confirm")
                 and not link_existing
                 and not force_new
                 and matched_expense
@@ -4832,16 +5443,6 @@ def run_turn(
                     or result.get("catalogued")
                 )
             ):
-                if matched_expense.get("holding_address"):
-                    execute(
-                        "catalog_business_document",
-                        {
-                            "document_id": doc_id,
-                            "scope_query": matched_expense["holding_address"],
-                            "confirm": "yes",
-                        },
-                        landlord=landlord,
-                    )
                 save_single(
                     landlord,
                     conversation_id,
@@ -4877,6 +5478,7 @@ def run_turn(
             if (
                 deterministic_reply is None
                 and not result.get("linked_existing")
+                and not result.get("needs_confirm")
                 and not matched_expense
                 and doc_id
                 and effective_scope
@@ -4889,17 +5491,6 @@ def run_turn(
                 if not amt and doc_row and doc_row.amount is not None:
                     amt = str(doc_row.amount)
                 if amt:
-                    # Ensure holding is set.
-                    if not (doc_row and doc_row.holding_id):
-                        execute(
-                            "catalog_business_document",
-                            {
-                                "document_id": doc_id,
-                                "scope_query": effective_scope,
-                                "confirm": "yes",
-                            },
-                            landlord=landlord,
-                        )
                     title = _receipt_title_from_caption(caption, amt)
                     # Category hint from caption.
                     cat = ""
@@ -5066,24 +5657,32 @@ def run_turn(
             elif result.get("already_done") or result.get("is_duplicate"):
                 # Already in library — still try link if they said already logged.
                 if link_existing and doc_id and not result.get("linked_existing"):
+                    link_args = {
+                        "document_id": doc_id,
+                        "amount": amount_correction
+                        or (matched_expense or {}).get("amount")
+                        or "",
+                        "duplicate_resolution": "auto_link",
+                    }
                     link_result = execute(
                         "file_business_document",
-                        {
-                            "document_id": doc_id,
-                            "amount": amount_correction
-                            or (matched_expense or {}).get("amount")
-                            or "",
-                            "duplicate_resolution": "auto_link",
-                            "confirm": "yes",
-                        },
+                        link_args,
                         landlord=landlord,
                     )
-                    if isinstance(link_result, dict) and (
-                        link_result.get("filed") or link_result.get("linked_existing")
+                    if isinstance(link_result, dict) and link_result.get(
+                        "needs_confirm"
                     ):
-                        deterministic_reply = str(
-                            link_result.get("message")
-                            or "Receipt linked to the existing expense."
+                        save_single(
+                            landlord,
+                            conversation_id,
+                            "file_business_document",
+                            link_args,
+                        )
+                        p = link_result.get("preview") or {}
+                        deterministic_reply = (
+                            "Ready to attach this receipt to the existing "
+                            f"${p.get('amount') or link_args['amount']} expense. "
+                            "No second expense will be posted. Reply yes to link it."
                         )
                     else:
                         deterministic_reply = str(
@@ -5167,18 +5766,26 @@ def run_turn(
                 # "expense is already logged" — try match + link.
                 if matched_expense and doc_id:
                     if matched_expense.get("holding_address"):
-                        execute(
+                        scope_args = {
+                            "document_id": doc_id,
+                            "scope_query": matched_expense["holding_address"],
+                        }
+                        scoped = execute(
                             "catalog_business_document",
-                            {
-                                "document_id": doc_id,
-                                "scope_query": matched_expense["holding_address"],
-                                "confirm": "yes",
-                            },
+                            scope_args,
                             landlord=landlord,
                         )
-                    link_result = execute(
-                        "file_business_document",
-                        {
+                        if isinstance(scoped, dict) and scoped.get("needs_confirm"):
+                            save_single(
+                                landlord,
+                                conversation_id,
+                                "catalog_business_document",
+                                scope_args,
+                            )
+                            deterministic_reply = _document_preview_reply(scoped)
+                            result = {**result, **scoped}
+                    if deterministic_reply is None:
+                        link_args = {
                             "document_id": doc_id,
                             "amount": amount_correction
                             or matched_expense.get("amount")
@@ -5186,22 +5793,32 @@ def run_turn(
                             "duplicate_resolution": (
                                 f"link:{matched_expense['expense_id']}"
                             ),
-                            "confirm": "yes",
-                        },
-                        landlord=landlord,
-                    )
-                    if isinstance(link_result, dict) and (
-                        link_result.get("filed") or link_result.get("linked_existing")
-                    ):
-                        deterministic_reply = str(
-                            link_result.get("message")
-                            or "Receipt linked to the existing expense."
+                        }
+                        link_result = execute(
+                            "file_business_document",
+                            link_args,
+                            landlord=landlord,
                         )
-                    else:
-                        deterministic_reply = str(
-                            (link_result or {}).get("error")
-                            or "Could not link the receipt to the logged expense."
-                        )
+                        if isinstance(link_result, dict) and link_result.get(
+                            "needs_confirm"
+                        ):
+                            save_single(
+                                landlord,
+                                conversation_id,
+                                "file_business_document",
+                                link_args,
+                            )
+                            p = link_result.get("preview") or {}
+                            deterministic_reply = (
+                                "Ready to attach this receipt to the existing "
+                                f"${p.get('amount') or link_args['amount']} expense. "
+                                "No second expense will be posted. Reply yes to link it."
+                            )
+                        else:
+                            deterministic_reply = str(
+                                (link_result or {}).get("error")
+                                or "Could not prepare the receipt link."
+                            )
                 else:
                     deterministic_reply = (
                         "I have the receipt but could not uniquely match a logged "
@@ -5394,6 +6011,13 @@ def run_turn(
                     else:
                         stable_arguments = dict(effective_arguments)
                         preview = result.get("preview") or {}
+                        if (
+                            call.name == "rename_business_document"
+                            and isinstance(result.get("resolved_arguments"), dict)
+                        ):
+                            # Confirmation must target the UUID selected during
+                            # preview, not rerun a fuzzy vendor/amount search.
+                            stable_arguments = dict(result["resolved_arguments"])
                         if call.name == "create_property":
                             for field in ("address", "city", "province"):
                                 if preview.get(field):
@@ -5401,9 +6025,6 @@ def run_turn(
                         if (
                             call.name == "update_property"
                             and preview.get("id")
-                            and str(
-                                effective_arguments.get("name") or "",
-                            ).strip()
                         ):
                             stable_arguments["property_query"] = str(
                                 preview["id"],
@@ -5413,6 +6034,7 @@ def run_turn(
                                 original_property_query
                                 if alias_id and original_property_query
                                 else preview.get("property")
+                                or preview.get("current_title")
                             )
                             or stable_arguments.get("property_query")
                             or stable_arguments.get("room_name")
@@ -5739,21 +6361,40 @@ def run_turn(
     # the payment; shall I also update the rent?" is precisely the shape where
     # a proposal and a fabrication travel in the same message. A truthful
     # preview says "I'll record", which is future tense and never matches.
+    #
+    # "Nothing was written" is itself a claim about the landlord's data, so it
+    # is only safe to make when the conversation genuinely has not written. A
+    # follow-up question one turn after a real write ("u sure its added?") is
+    # not a fabrication, and answering it with a retraction sends the landlord
+    # to re-do work that was already done. When the record shows writes, the
+    # model's sentence is replaced by the record rather than contradicted.
     if (
         not response_deterministic
         and claims_completed_write(reply)
         and not _turn_wrote_anything(turn_writes, delegated_auto)
     ):
         response_deterministic = True
-        audit(
-            RamaAudit.Kind.ERROR,
-            {"error": "claimed_write_without_writing", "claim": reply[:500]},
-        )
-        gap = _capability_gap_hint(landlord, message, conversation_id)
-        reply = (
-            "I said that as though it were done — it isn't. Nothing was "
-            "written, so please don't rely on that.\n\n" + gap
-        )
+        prior_writes = _conversation_writes(landlord, conversation_id)
+        if prior_writes:
+            audit(
+                RamaAudit.Kind.ERROR,
+                {
+                    "error": "write_claim_answered_from_record",
+                    "claim": reply[:500],
+                    "writes": [w["tool"] for w in prior_writes],
+                },
+            )
+            reply = _writes_from_record_reply(prior_writes)
+        else:
+            audit(
+                RamaAudit.Kind.ERROR,
+                {"error": "claimed_write_without_writing", "claim": reply[:500]},
+            )
+            gap = _capability_gap_hint(landlord, message, conversation_id)
+            reply = (
+                "I said that as though it were done — it isn't. Nothing was "
+                "written, so please don't rely on that.\n\n" + gap
+            )
 
     # A warning the tool computed is not advice the model may edit out. Only
     # appended when the reply does not already carry it, so a model that DID

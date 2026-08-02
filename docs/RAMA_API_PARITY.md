@@ -27,8 +27,13 @@ The script:
 2. Lists every tool in `rama.registry.REGISTRY`.
 3. Joins them via a curated `COVERAGE_MAP` in
    `scripts/rama_api_parity_report.py`.
-4. Reports **covered**, **missing_tool** (map points at a tool that does not
-   exist), **unmapped** (API action not yet reviewed), and **intentional**.
+4. Checks mappings against the General's fail-closed capability contract, not
+   merely registered internal tools.
+5. Reports **covered**, **missing_tool**, **unmapped**, and **intentional**.
+
+`--fail-on-gap` fails for a mapped capability unavailable to the General or an
+unreviewed non-GET endpoint. Read-only list/retrieve noise may remain unmapped;
+every scanned mutation must be covered or explicitly intentional.
 
 When you add a composite, update `COVERAGE_MAP` in the same PR.
 
@@ -66,6 +71,7 @@ Not email-pixel tracking (unreliable); **status page loads only**.
 
 | Gap | Implementation |
 |---|---|
+| Rename + preview business documents | Metadata-only `title` update, authenticated blob preview, and confirmed `rename_business_document` with strict amount/date/holding disambiguation |
 | Mark document expense paid | `POST /api/rama/documents/<id>/mark-paid/` + Documents UI |
 | Move document holding (+ reallocate expense) | `POST /api/rama/documents/<id>/move/` + Documents UI |
 | Soft-delete / trash / restore | `deleted_at`; `DELETE` soft; `POST …/restore/`; list `?status=TRASH` |
@@ -74,14 +80,23 @@ Not email-pixel tracking (unreliable); **status page loads only**.
 | Reallocate chat phrases | Expanded `supported_tool_for_request` → `reallocate_expense` |
 | Parity map reocr/tags/actions | `COVERAGE_MAP` entries for document_* views |
 
-## Remaining product gaps (prioritise)
+## Current landlord mutation coverage (August 2026)
 
-| Gap | Notes |
-|---|---|
-| Reschedule emails when only ends_at changes | Mostly works via `appointment.rescheduled` |
-| Saved document views | Phase C |
-| Prospect email open (pixel) | Explicitly deferred; page-load tracking is enough for v1 |
-| Auto-purge trash after N days | Soft-delete exists; purge job optional |
+The parity gate currently has no missing tools and no unmapped mutation
+endpoints. Recent composites cover:
+
+- document tags/trash/restore/re-OCR/move/mark-paid;
+- listing-media ordering, property groups/common areas/shared inventory;
+- full unlocked lease fields and exact lease-roster row edits;
+- all appointment kinds, viewing-window edit/removal, and reversible manual
+  calendar archive/restore;
+- condition-report headers/custom rows/keys;
+- import upload/mapping/row correction/reversible exclusion;
+- showcase, insight, notification-channel, and consented Treasurer settings;
+- explicitly saved, parameterised workflows that always re-preview.
+
+Read-only public/auth/tenant-self-service endpoints and irreversible account,
+credential, or permanent-record deletion remain intentional exclusions.
 
 ## Learning as we go
 
@@ -107,7 +122,7 @@ False “I can’t” should hit `supported_tool_for_request` and refuse to log 
 | Appointment destroy / cancel | `cancel_viewing` |
 | Appointment confirm/counter/decline | `respond_to_viewing_request` |
 | Payment reminders | `create_payment_reminder`, `mark_payment_reminder_sent`, `list_payment_reminders` |
-| Cleaning fee paid | `mark_cleaning_fee_paid` |
+| Cleaning deposit paid | `mark_cleaning_deposit_paid` |
 | Inquiry notes/archive | `update_inquiry` |
 | Import commit/discard | `commit_import_batch`, `discard_import_batch` |
 | Notifications | `list_notifications`, `mark_notifications_read` |
@@ -122,9 +137,8 @@ Implementation: `rentium/rama/domain_gap_tools.py` + extensions in
 - Webhooks (Telegram/WhatsApp)  
 - Tenant-only actions (tenant sign, claim, tenant_respond)  
 - RAMA HTTP meta (chat, settings, uploads) — already tools elsewhere  
-- Hard-delete of permanent records (work orders cancel via transition)  
-- Agenda CRUD — primary scheduling is appointments/calendar  
-- Showcase settings slug editor — rare; use dashboard  
+- Hard-delete of permanent records (work orders cancel via transition)
+- Provider/API-key/account controls and internal capability-gap triage
 
 ## Rules
 

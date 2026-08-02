@@ -159,8 +159,8 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
             "effective_rent",
             "room_id",
             "room_name",
-            "cleaning_fee",
-            "cleaning_fee_paid",
+            "cleaning_deposit",
+            "cleaning_deposit_paid",
             "is_primary_tenant",
             "has_signed",
             "signed_date",
@@ -191,7 +191,7 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
             "signed_date",
             "declined",
             "declined_at",
-            "cleaning_fee_paid",
+            "cleaning_deposit_paid",
             "invite_status",
             "invite_lifecycle",
             "invite_sent_at",
@@ -266,6 +266,14 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
         lease = self.context.get("lease") or data.get("lease")
         if not self.instance and not lease:
             raise serializers.ValidationError("Lease context is required.")
+        # Read the current rent BEFORE the model-clean block below, which
+        # setattr()s the incoming values straight onto self.instance. Comparing
+        # after that point compares the new value with itself — which is why
+        # the signed-rent rule that used to live further down never actually
+        # fired on a real request.
+        rent_before = (
+            Decimal(self.instance.rent_amount) if self.instance else None
+        )
         tenant = data.get("tenant")
         invited_email = data.get("invited_email")
         if not self.instance:
@@ -305,26 +313,20 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
             temp_instance.clean()
         except DjangoValidationError as e:
             raise serializers.ValidationError(serializers.as_serializer_error(e))
-        # --- Once a tenant has signed, their rent share is locked ---
-        # Applies on update only. A signature is agreement to a specific
-        # number — quietly changing it afterward (even while the lease is
-        # still PENDING_SIGNATURES and technically not "locked" yet) would
-        # mean they're bound to a figure they never actually agreed to.
-        # Anything else about their row (notes, dates, etc.) can still be
-        # edited; only rent_amount is frozen once signed.
+        # --- Changing a signed tenant's rent share is an AMENDMENT ---
+        # It used to be refused outright. It is allowed now, deliberately: the
+        # landlord owns the document until it is executed, and refusing left
+        # them with no route but Django admin. What it is not allowed to be is
+        # silent — a signature is agreement to a specific number, so the change
+        # writes an immutable TERMS_AMENDED event against that tenant. The
+        # landlord decides whether to tell them; the record exists either way.
+        # Once the lease is ACTIVE, LeaseNotLocked stops all of this anyway.
         if self.instance and self.instance.has_signed and "rent_amount" in data:
-            if Decimal(str(data["rent_amount"])) != Decimal(self.instance.rent_amount):
-                raise serializers.ValidationError(
-                    {
-                        "rent_amount": (
-                            "This tenant has already signed at their current rent amount "
-                            "and it can no longer be changed here. Adjust it via a "
-                            "RentAdjustment (for an ongoing discount/increase going "
-                            "forward) or through Django admin if the original figure "
-                            "was genuinely wrong."
-                        )
-                    }
-                )
+            if Decimal(str(data["rent_amount"])) != rent_before:
+                self._amends_signed_rent = {
+                    "before": str(rent_before),
+                    "after": str(data["rent_amount"]),
+                }
         # --- Invited name is frozen once the slot signs or links ---
         # A linked account's own name is authoritative (invited_name is just
         # a fallback then), and a signed slot's identity shouldn't shift.
@@ -410,6 +412,37 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
         if invited_email:
             validated_data["invite_sent_at"] = timezone.now()
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        """Records the amendment when a signed tenant's rent share changes.
+
+        Written after the save, and only if the save succeeded — an event
+        claiming a change that a validation error rolled back would be worse
+        than no event at all.
+        """
+        amendment = getattr(self, "_amends_signed_rent", None)
+        updated = super().update(instance, validated_data)
+        if amendment:
+            from rentium.leases.models import LeaseInviteEvent
+
+            request = self.context.get("request")
+            actor = getattr(request, "user", None)
+            LeaseInviteEvent.objects.create(
+                lease_tenant=updated,
+                kind=LeaseInviteEvent.Kind.TERMS_AMENDED,
+                actor=actor if getattr(actor, "pk", None) else None,
+                metadata={
+                    "fields": ["rent_amount"],
+                    "before": {"rent_amount": amendment["before"]},
+                    "after": {"rent_amount": amendment["after"]},
+                    "signed_on": (
+                        instance.signed_date.isoformat()
+                        if instance.signed_date
+                        else None
+                    ),
+                },
+            )
+        return updated
 
 
 class LeaseDocumentSerializer(serializers.ModelSerializer):
@@ -743,9 +776,23 @@ class LeaseSerializer(serializers.ModelSerializer):
             "move_out_date",
             "security_deposit",
             "pet_deposit",
-            "cleaning_fee",
+            "cleaning_deposit",
+            "security_deposit_received_date",
+            "pet_deposit_received_date",
+            "cleaning_deposit_received_date",
             "pets_allowed",
             "smoking_allowed",
+            # AgreementTerms: DB columns that print into the agreement and were
+            # previously reachable only from Django admin.
+            "rent_due_day",
+            "pets_terms",
+            "smoking_terms",
+            "parking_included",
+            "parking_description",
+            "parking_extra_charge",
+            "services_and_facilities",
+            "occupants",
+            "house_rules",
             "bills_included",
             "bills_summary",
             "special_terms",
@@ -785,6 +832,12 @@ class LeaseSerializer(serializers.ModelSerializer):
             "landlord_name",
             "lease_number",
             "lease_type_display",
+            # A lease reaches ACTIVE only through check_and_activate(), which
+            # freezes the signed document, posts the deposit and rent charges,
+            # and opens occupancy. PATCHing status straight to ACTIVE skipped
+            # all three and left an "active" lease with no charges behind it.
+            # Status changes belong to landlord_sign / terminate / renew.
+            "status",
             "status_display",
             "is_locked",
             "property_name",
@@ -797,6 +850,11 @@ class LeaseSerializer(serializers.ModelSerializer):
             "effective_etransfer_email",
             "landlord_signed",
             "landlord_signed_date",
+            # Stamped by the ledger when a deposit is actually settled — the
+            # date money arrived is a fact, not a field to type over.
+            "security_deposit_received_date",
+            "pet_deposit_received_date",
+            "cleaning_deposit_received_date",
             "created_at",
             "updated_at",
             "lease_tenants",
@@ -962,3 +1020,34 @@ class LeaseSerializer(serializers.ModelSerializer):
             return create_lease_record(landlord=landlord, values=validated_data)
         except DjangoValidationError as exc:
             raise serializers.ValidationError(serializers.as_serializer_error(exc)) from exc
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        """Delegates to the one lease-edit service RAMA also uses.
+
+        Both surfaces go through it so the amendment record written for tenants
+        who already signed cannot be bypassed by editing from the other door.
+        """
+        from rentium.leases.services import update_lease_record
+
+        request = self.context.get("request")
+        try:
+            result = update_lease_record(
+                landlord=instance.landlord,
+                lease=instance,
+                values=validated_data,
+                actor=getattr(request, "user", None),
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(serializers.as_serializer_error(exc)) from exc
+        # Surfaced on the response so the landlord's UI can say WHO signed under
+        # the old terms rather than silently succeeding.
+        self._amended_signers = result["amended_signers"]
+        return result["lease"]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        amended = getattr(self, "_amended_signers", None)
+        if amended is not None:
+            data["amended_signers"] = amended
+        return data

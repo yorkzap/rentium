@@ -362,10 +362,15 @@ CLAUSES: dict[tuple[str, str], list[str]] = {
         "tenant; replacing lost keys or changing locks the tenant compromised; "
         "extermination made necessary by the tenant; and any other repair or "
         "cleaning caused by the tenant or the tenant's guests.",
-        "The security deposit may not be used by the tenant as payment of rent. The "
-        "landlord will return the deposit, less any proper deductions, after the "
-        "tenancy ends and the tenant provides a forwarding address, within the time "
-        "and in the manner required by any applicable law.",
+        "The security deposit may not be used by the tenant as payment of rent. "
+        "Any cleaning deposit stated in this agreement is a refundable deposit, "
+        "not a cleaning fee. It is held separately from the security deposit and "
+        "may only be applied to reasonable cleaning costs beyond ordinary use.",
+        "After the tenancy ends and the tenant provides a forwarding address, the "
+        "landlord will account for and return the security deposit and any cleaning "
+        "deposit separately, less any proper deductions, within the time and in the "
+        "manner required by any applicable law. If this agreement states no cleaning "
+        "deposit, only the security deposit is due for return.",
     ],
     # Attached to the Ending section.
     ("GENERIC_ROOMMATE", "ending_terms"): [

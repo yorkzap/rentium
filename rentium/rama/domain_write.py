@@ -273,6 +273,38 @@ def update(landlord, *, entity: str = "", query: str = "", changes: str = "",
 
     from django.core.exceptions import ValidationError
 
+    # A lease edit goes through the lease service, not a generic setattr: it is
+    # the one place that records an amendment against tenants who already
+    # signed, and a second write path would silently skip that.
+    if spec.key == "lease":
+        from rentium.leases.services import update_lease_record
+
+        try:
+            result = update_lease_record(
+                landlord=landlord, lease=inst, values=parsed
+            )
+        except ValidationError as exc:
+            return {
+                "error": "; ".join(
+                    m
+                    for msgs in getattr(exc, "message_dict", {"": exc.messages}).values()
+                    for m in msgs
+                )
+            }
+        out = {
+            "updated": True,
+            "entity": spec.key,
+            "target": label,
+            "changes": {k: str(v) for k, v in parsed.items()},
+        }
+        if result["amended_signers"]:
+            out["amended_signers"] = result["amended_signers"]
+            out["note"] = (
+                f'{", ".join(result["amended_signers"])} had already signed — '
+                f"this amends the agreement they signed. Not notified."
+            )
+        return out
+
     for k, v in parsed.items():
         setattr(inst, k, v)
     try:

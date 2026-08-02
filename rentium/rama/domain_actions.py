@@ -3120,6 +3120,7 @@ def create_expense(
     effective_date: str = "",
     paid_on: str = "",
     category: str = "",
+    vendor: str = "",
     confirm: str = "",
 ) -> dict:
     from rentium.ledger import services as ledger_services
@@ -3206,6 +3207,7 @@ def create_expense(
         "property": where,
         "effective_date": day.isoformat(),
         "category": cat,
+        "vendor": (vendor or "").strip() or None,
         "paid_on": paid_day.isoformat() if paid_day else None,
         "bank_status": "paid" if paid_day else "not yet taken from bank",
     }
@@ -3245,7 +3247,7 @@ def create_expense(
                 if prop is not None
                 else (unit.holding if unit is not None else holding)
             ),
-            vendor="",
+            vendor=(vendor or "").strip()[:150],
             paid_on=paid_day,
             created_by=landlord.user,
         )
@@ -3259,12 +3261,14 @@ def create_expense(
         "created": True,
         "message": (
             f"Logged ${amt} {cat.replace('_', ' ').title().lower()} expense "
-            f"“{desc[:80]}” at {scope}{paid_bit}."
+            f"“{desc[:160]}” at {scope}{paid_bit}. "
+            "No receipt is attached; one can be added later."
         ),
         "expense": {
             "id": str(getattr(entry, "pk", "")),
             "amount": str(amt),
             "description": desc[:200],
+            "vendor": (vendor or "").strip() or None,
             "property": where,
             # `scope` is what the confirmation message reads back
             # (service._write_label), so a holding-wide cost is reported as the
@@ -3567,37 +3571,116 @@ _PAYMENT_METHODS = {
 
 
 def _open_charges(landlord, query: str = "", property_query: str = ""):
-    """Charges with something still owing, newest first."""
+    """Charges with something still owing, newest first.
+
+    Query words are OR-matched against description (and rent month tokens).
+    Empty query returns all open charges for the landlord (optionally scoped).
+    """
+    from django.db.models import Q
+
     from rentium.ledger.models import CHARGE_TYPES, ChargeStatus, LedgerEntry
 
     rows = (
         LedgerEntry.objects.not_voided()
         .filter(landlord=landlord, entry_type__in=CHARGE_TYPES)
-        .select_related("property", "tenant", "tenant__user")
+        .select_related("property", "tenant", "tenant__user", "lease")
         .order_by("-effective_date")
     )
-    for word in (query or "").split():
-        rows = rows.filter(description__icontains=word)
     if property_query:
-        rows = rows.filter(property__name__icontains=property_query)
+        rows = rows.filter(
+            Q(property__name__icontains=property_query)
+            | Q(property__address__icontains=property_query)
+            | Q(lease__property__name__icontains=property_query)
+            | Q(lease__property__address__icontains=property_query)
+        )
+    q = (query or "").strip()
+    if q:
+        # Expand month names so "August rent" hits "Rent for August 2026".
+        month_aliases = {
+            "jan": "january",
+            "feb": "february",
+            "mar": "march",
+            "apr": "april",
+            "jun": "june",
+            "jul": "july",
+            "aug": "august",
+            "sep": "september",
+            "sept": "september",
+            "oct": "october",
+            "nov": "november",
+            "dec": "december",
+        }
+        tokens = []
+        for word in re.findall(r"[A-Za-z0-9]+", q):
+            w = word.casefold()
+            tokens.append(w)
+            if w in month_aliases:
+                tokens.append(month_aliases[w])
+            # deposit aliases
+            if w in {"security", "sec", "damage"}:
+                tokens.append("security")
+            if w in {"cleaning", "clean"}:
+                tokens.append("cleaning")
+            if w in {"pet"}:
+                tokens.append("pet")
+            if w in {"rent", "rental"}:
+                tokens.append("rent")
+        tokens = list(dict.fromkeys(tokens))
+        q_filter = Q()
+        for t in tokens:
+            if len(t) < 3:
+                continue
+            q_filter |= Q(description__icontains=t)
+        if q_filter:
+            rows = rows.filter(q_filter)
     settled = (ChargeStatus.PAID, ChargeStatus.VOIDED)
     return [row for row in rows if row.charge_status() not in settled]
 
 
 def _outstanding_on(charge) -> Decimal:
-    from django.db.models import Sum
+    from rentium.ledger.services import outstanding_on
 
-    from rentium.ledger.models import SETTLEMENT_TYPES
-
-    paid = charge.settlements.filter(
-        entry_type__in=SETTLEMENT_TYPES, reversed_by__isnull=True
-    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-    return charge.amount - paid
+    return outstanding_on(charge)
 
 
 def _charge_label(charge) -> str:
     where = charge.property.name if charge.property_id else "portfolio"
     return f"{charge.description[:60]} ({where}, ${charge.amount})"
+
+
+def _parse_payment_method(payment_method: str, *, amount_label: str = "") -> dict:
+    """Return {method: CODE} or a question_for_user payload."""
+    raw_method = (payment_method or "").strip().lower()
+    if not raw_method:
+        return {
+            "question_for_user": (
+                f"How did the {amount_label or 'money'} come in — "
+                f"e-transfer, cash, or cheque?"
+            ),
+            "needs": "payment_method",
+        }
+    method = _PAYMENT_METHODS.get(raw_method)
+    if method is None:
+        # Tolerate free text like "e transfer" / "cash deposit"
+        for key, code in _PAYMENT_METHODS.items():
+            if key in raw_method:
+                return {"method": code}
+        return {
+            "question_for_user": (
+                f"I don't recognise {payment_method!r} as a payment method. "
+                f"Was it an e-transfer, cash, or a cheque?"
+            ),
+            "needs": "payment_method",
+        }
+    return {"method": method}
+
+
+def _suggest_deposit_split(candidates: list, amount: Decimal) -> list | None:
+    """If amount equals a clear combination of open deposit/cleaning charges,
+    return them. Shared with the dashboard — see ledger.services."""
+    from rentium.ledger.services import suggest_deposit_split
+
+    return suggest_deposit_split(candidates, amount)
 
 
 def record_payment(
@@ -3608,8 +3691,16 @@ def record_payment(
     property_query: str = "",
     payment_method: str = "",
     payment_date: str = "",
+    reference_number: str = "",
+    notes: str = "",
+    tenant_query: str = "",
     confirm: str = "",
 ) -> dict:
+    """Record money against one open charge (partials OK).
+
+    If the amount exactly matches several open deposit/cleaning charges, offers
+    a multi-charge split (or use record_payment_allocation explicitly).
+    """
     from rentium.ledger import services as ledger_services
 
     try:
@@ -3629,17 +3720,45 @@ def record_payment(
                 "charge this was for — or post the charge first."
             ),
         }
+
+    # Auto multi-charge when one transfer covers security + cleaning, etc.
     if len(candidates) > 1:
-        return {
-            "question_for_user": (
-                "Which charge was this payment for?\n"
-                + "\n".join(
-                    f"• {_charge_label(c)} — ${_outstanding_on(c)} still owing"
-                    for c in candidates[:6]
+        split = _suggest_deposit_split(candidates, amt)
+        if split is not None:
+            return record_payment_allocation(
+                landlord,
+                amount=str(amt),
+                charge_ids=",".join(str(c.pk) for c in split),
+                payment_method=payment_method,
+                payment_date=payment_date,
+                confirm=confirm,
+            )
+        # Prefer a unique high-signal match over asking every time.
+        q = (charge_query or "").casefold()
+        if q:
+            tight = [
+                c
+                for c in candidates
+                if any(
+                    tok in (c.description or "").casefold()
+                    for tok in re.findall(r"[a-z]{3,}", q)
                 )
-            ),
-            "candidates": [_charge_label(c) for c in candidates[:6]],
-        }
+            ]
+            if len(tight) == 1:
+                candidates = tight
+        if len(candidates) > 1:
+            return {
+                "question_for_user": (
+                    "Which charge was this payment for?\n"
+                    + "\n".join(
+                        f"• {_charge_label(c)} — ${_outstanding_on(c)} still owing"
+                        for c in candidates[:6]
+                    )
+                    + "\n\nIf one payment covers several (e.g. $500 for security "
+                    "+ cleaning deposits), say so and I will split it."
+                ),
+                "candidates": [_charge_label(c) for c in candidates[:6]],
+            }
 
     charge = candidates[0]
     outstanding = _outstanding_on(charge)
@@ -3653,37 +3772,33 @@ def record_payment(
                 "error": f"payment_date must be YYYY-MM-DD, got {payment_date!r}."
             }
 
-    # Never guessed silently. A default of "e-Transfer" quietly puts a fact on
-    # a financial record that nobody stated, and the landlord only finds out
-    # when they reconcile against a bank statement that shows cash. If the
-    # model could not pick it up from the conversation, ask once.
-    raw_method = (payment_method or "").strip().lower()
-    if not raw_method:
-        return {
-            "question_for_user": (
-                f"How did the ${amt} come in — e-transfer, cash, or cheque?"
-            ),
-            "needs": "payment_method",
-        }
-    method = _PAYMENT_METHODS.get(raw_method)
-    if method is None:
-        return {
-            "question_for_user": (
-                f"I don't recognise {payment_method!r} as a payment method. "
-                f"Was it an e-transfer, cash, or a cheque?"
-            ),
-            "needs": "payment_method",
-        }
+    method_out = _parse_payment_method(payment_method, amount_label=f"${amt}")
+    if "method" not in method_out:
+        return method_out
+    method = method_out["method"]
+    payer = None
+    if (tenant_query or "").strip():
+        from .domain_crud import _resolve_tenant_profile
+
+        payer, payer_error = _resolve_tenant_profile(landlord, tenant_query)
+        if payer_error:
+            return payer_error
+        if charge.lease_id and not charge.lease.lease_tenants.filter(tenant=payer).exists():
+            return {"error": "That payer is not on the selected charge's lease."}
 
     preview = {
         "charge": _charge_label(charge),
         "charge_amount": str(charge.amount),
         "already_paid": str(charge.amount - outstanding),
         "this_payment": str(amt),
-        # The number the landlord actually wants to see before saying yes.
         "still_owing_after": str(max(outstanding - amt, Decimal("0.00"))),
         "method": method,
         "payment_date": day.isoformat(),
+        "reference_number": (reference_number or "").strip() or None,
+        "notes": (notes or "").strip() or None,
+        "payer": payer.user.name if payer else (
+            charge.tenant.user.name if charge.tenant_id else None
+        ),
     }
     if amt > outstanding:
         preview["overpayment_warning"] = (
@@ -3705,9 +3820,17 @@ def record_payment(
             amount=amt,
             payment_method=method,
             payment_date=day,
-            # Same amount, same charge, same day is almost certainly a repeat of
-            # one confirmation rather than a second real payment.
-            idempotency_key=f"rama-payment:{charge.pk}:{day}:{amt}",
+            reference_number=(reference_number or "").strip()[:100],
+            notes=(notes or (
+                f"Recorded via RAMA ({method})"
+                + (f" · {charge_query}" if charge_query else "")
+            ))[:200],
+            paid_by=payer,
+            created_by=landlord.user,
+            idempotency_key=(
+                f"rama-payment:{charge.pk}:{day}:{amt}:"
+                f"{(reference_number or '').strip()[:40]}:{getattr(payer, 'pk', '')}"
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — surfaced to the landlord
         return {"error": str(exc)}
@@ -3722,11 +3845,190 @@ def record_payment(
         "still_owing": str(remaining),
         "charge_status": charge.charge_status(),
         "message": (
-            f"Recorded ${amt} against {charge.description[:60]}. "
+            f"Recorded ${amt} ({method}) against {charge.description[:60]}. "
             + (
                 f"${remaining} still owing."
                 if remaining > 0
                 else "That charge is now fully paid."
             )
+        ),
+    }
+
+
+def record_payment_allocation(
+    landlord,
+    *,
+    amount: str = "",
+    charge_ids: str = "",
+    allocations: str = "",
+    payment_method: str = "",
+    payment_date: str = "",
+    property_query: str = "",
+    confirm: str = "",
+) -> dict:
+    """Split one real-world payment across several open charges.
+
+    Example: e-transfer $500 covering $250 security + $250 cleaning deposit.
+    Posts one PAYMENT row per charge (append-only). Preview first; confirm=yes.
+
+    Provide either:
+    - charge_ids: comma-separated UUIDs (auto full outstanding each, sum must
+      match amount if amount is set)
+    - allocations: 'charge_id:amount,charge_id:amount' explicit split
+    """
+    from rentium.ledger import services as ledger_services
+    from rentium.ledger.models import LedgerEntry
+
+    day = date.today()
+    if payment_date:
+        try:
+            day = date.fromisoformat(payment_date.strip()[:10])
+        except ValueError:
+            return {
+                "error": f"payment_date must be YYYY-MM-DD, got {payment_date!r}."
+            }
+
+    # Build list of (charge, amount)
+    parts: list[tuple] = []
+    raw_alloc = (allocations or "").strip()
+    if raw_alloc:
+        for piece in raw_alloc.replace(";", ",").split(","):
+            piece = piece.strip()
+            if not piece or ":" not in piece:
+                continue
+            cid, araw = piece.split(":", 1)
+            try:
+                a = Decimal(str(araw).replace("$", "").replace(",", "").strip())
+            except (InvalidOperation, ValueError):
+                return {"error": f"Invalid allocation amount in {piece!r}."}
+            charge = (
+                LedgerEntry.objects.not_voided()
+                .filter(landlord=landlord, pk=cid.strip())
+                .first()
+            )
+            if charge is None:
+                return {"error": f"No open charge {cid.strip()!r}."}
+            parts.append((charge, a))
+    else:
+        ids = [
+            x.strip()
+            for x in (charge_ids or "").replace(";", ",").split(",")
+            if x.strip()
+        ]
+        if not ids:
+            # Fall back to auto-suggest from open deposit-like charges.
+            try:
+                target = Decimal(str(amount).replace("$", "").replace(",", "").strip())
+            except (InvalidOperation, ValueError):
+                return {
+                    "error": (
+                        "Pass charge_ids or allocations, or amount that matches "
+                        "open deposits (e.g. 500 for security+cleaning)."
+                    )
+                }
+            split = _suggest_deposit_split(
+                _open_charges(landlord, "", property_query), target
+            )
+            if not split:
+                return {
+                    "error": "no_allocation",
+                    "message": (
+                        "Could not auto-split that amount across open charges. "
+                        "Name the charges (security + cleaning) or pass charge_ids."
+                    ),
+                }
+            parts = [(c, _outstanding_on(c)) for c in split]
+        else:
+            for cid in ids:
+                charge = (
+                    LedgerEntry.objects.not_voided()
+                    .filter(landlord=landlord, pk=cid)
+                    .first()
+                )
+                if charge is None:
+                    return {"error": f"No charge {cid!r}."}
+                parts.append((charge, _outstanding_on(charge)))
+
+    if not parts:
+        return {"error": "No charges to allocate against."}
+
+    total = sum((a for _, a in parts), Decimal("0"))
+    if amount:
+        try:
+            stated = Decimal(str(amount).replace("$", "").replace(",", "").strip())
+        except (InvalidOperation, ValueError):
+            return {"error": f"Invalid amount {amount!r}."}
+        if stated != total:
+            return {
+                "error": (
+                    f"Amount ${stated} does not match the allocation total ${total}. "
+                    f"Adjust the split or the total."
+                )
+            }
+    else:
+        stated = total
+
+    method_out = _parse_payment_method(payment_method, amount_label=f"${stated}")
+    if "method" not in method_out:
+        return method_out
+    method = method_out["method"]
+
+    lines = []
+    for charge, pay_amt in parts:
+        out = _outstanding_on(charge)
+        lines.append(
+            {
+                "charge_id": str(charge.pk),
+                "charge": _charge_label(charge),
+                "payment": str(pay_amt),
+                "still_owing_after": str(max(out - pay_amt, Decimal("0"))),
+            }
+        )
+
+    preview = {
+        "total": str(stated),
+        "method": method,
+        "payment_date": day.isoformat(),
+        "allocations": lines,
+        "rule": "One payment row per charge (append-only). Same method and date.",
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "record_payment_allocation",
+            preview,
+            "Posts a separate payment against each charge. Use when one "
+            "e-transfer or cash amount covers security + cleaning (etc.).",
+        )
+
+    results = []
+    try:
+        posted = ledger_services.record_split_payment(
+            landlord=landlord,
+            allocations=parts,
+            payment_method=method,
+            payment_date=day,
+            idempotency_prefix="rama-alloc",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    for (entry, created), (charge, pay_amt) in zip(posted, parts, strict=True):
+        results.append(
+            {
+                "entry_id": str(entry.pk),
+                "charge": _charge_label(charge),
+                "amount": str(pay_amt),
+                "still_owing": str(_outstanding_on(charge)),
+                "duplicate": not created,
+            }
+        )
+
+    return {
+        "ok": True,
+        "total": str(stated),
+        "method": method,
+        "payments": results,
+        "message": (
+            f"Recorded ${stated} ({method}) split across {len(results)} charge(s): "
+            + "; ".join(f"${p['amount']} → {p['charge'][:40]}" for p in results)
         ),
     }

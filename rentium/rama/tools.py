@@ -906,6 +906,58 @@ def search_business_documents(
 
 
 @_params(
+    document_query="Vendor, current title, OCR words, filename, or reference used "
+    "to find the document, e.g. 'PNR Screens LTD'. Combined with amount when both "
+    "are supplied.",
+    amount="Exact document amount used to distinguish similar receipts, e.g. "
+    "'39.36'. Optional when document_id identifies the exact record.",
+    document_date="Optional exact YYYY-MM-DD date to distinguish documents with "
+    "the same vendor and amount.",
+    holding_query="Optional physical property name or street address to narrow "
+    "otherwise similar documents.",
+    new_title="The new human-facing document title. This never renames or rewrites "
+    "the preserved original file.",
+    document_id="Exact document UUID. Preferred after a search or clarification; "
+    "when supplied it is the authoritative target.",
+    expected_title="Confirmation safety value returned in resolved_arguments. Pass "
+    "it back unchanged; do not invent it.",
+    confirm="Leave empty to preview; pass yes only after landlord approval.",
+)
+def rename_business_document(
+    landlord,
+    new_title: str,
+    document_query: str = "",
+    amount: str = "",
+    document_id: str = "",
+    document_date: str = "",
+    holding_query: str = "",
+    expected_title: str = "",
+    confirm: str = "",
+) -> dict:
+    """Rename one existing receipt, invoice, notice, or business document.
+
+    Resolves by vendor/title/OCR text plus an exact amount, so requests such as
+    "two PNR Screens receipts; rename the $39.36 one" select the right record.
+    If zero or several records match, asks for a date/property/document ID and
+    changes nothing. Preview first; confirm=yes. Only the display title changes:
+    original file, archival PDF, hash, filing status, and ledger stay untouched.
+    """
+    from .document_services import rename_business_document_for_chat as _fn
+
+    return _fn(
+        landlord,
+        new_title=new_title,
+        document_query=document_query,
+        amount=amount,
+        document_id=document_id,
+        document_date=document_date,
+        holding_query=holding_query,
+        expected_title=expected_title,
+        confirm=confirm,
+    )
+
+
+@_params(
     document_id="UUID of the catalogued business document.",
     payment_state="PAID if the money has left the bank; UNPAID if still owing. "
     "Required when OCR payment_state is UNKNOWN.",
@@ -1287,6 +1339,7 @@ def bulk_add_inventory(
     paid_on="If already paid: 'paid', 'today', or YYYY-MM-DD. Leave blank if "
     "not yet taken from the bank.",
     category="Optional: SUPPLIES, MAINTENANCE, UTILITIES, OTHER, …",
+    vendor="Optional payee/vendor, e.g. Chris Klatt's Second Hand Appliances.",
 )
 def create_expense(
     landlord,
@@ -1297,13 +1350,15 @@ def create_expense(
     effective_date: str = "",
     paid_on: str = "",
     category: str = "",
+    vendor: str = "",
     confirm: str = "",
 ) -> dict:
     """Record a landlord expense with NO receipt photo. Use when they say they
     bought/spent/paid something and did NOT attach a receipt — do NOT call
     catalog_business_document. Four scopes: LISTING (property_query), unit
     shared space, WHOLE property (holding_name=address), or portfolio-wide.
-    Pass paid_on when they said it is already paid. Preview first; confirm=yes."""
+    Pass paid_on when they said it is already paid. A receipt can be attached
+    to the posted expense later. Preview first; confirm=yes."""
     from .domain_actions import create_expense as _fn
 
     return _fn(
@@ -1315,6 +1370,7 @@ def create_expense(
         effective_date=effective_date,
         paid_on=paid_on,
         category=category,
+        vendor=vendor,
         confirm=confirm,
     )
 
@@ -1327,6 +1383,9 @@ def create_expense(
     property_query="The listing, to narrow it down when several charges match.",
     payment_method="etransfer | cash | cheque. Take it from what the landlord said; leave BLANK if they did not say and the tool will ask. Never guess.",
     payment_date="The day the money ARRIVED, YYYY-MM-DD. Leave blank if they did not say — it then dates from today, which is when they are telling you.",
+    reference_number="Optional bank/e-transfer/cheque reference from the UI or landlord.",
+    notes="Optional factual payment note; never invent one.",
+    tenant_query="Optional exact payer name/email, especially for a joint household charge.",
 )
 def record_payment(
     landlord,
@@ -1335,6 +1394,9 @@ def record_payment(
     property_query: str = "",
     payment_method: str = "",
     payment_date: str = "",
+    reference_number: str = "",
+    notes: str = "",
+    tenant_query: str = "",
     confirm: str = "",
 ) -> dict:
     """Record money RECEIVED against a charge — rent arrived, deposit paid,
@@ -1350,6 +1412,9 @@ def record_payment(
         property_query=property_query,
         payment_method=payment_method,
         payment_date=payment_date,
+        reference_number=reference_number,
+        notes=notes,
+        tenant_query=tenant_query,
         confirm=confirm,
     )
 
@@ -1574,6 +1639,16 @@ def create_property(
     group_name: str = "",
     asking_rent: str = "",
     inventory_items: str = "",
+    postal_code: str = "",
+    neighbourhood: str = "",
+    max_occupancy: str = "",
+    square_footage: str = "",
+    available_from: str = "",
+    building_amenities: str = "",
+    default_bills_included: str = "",
+    is_publicly_visible: str = "",
+    furnishing_status: str = "",
+    furnishing_details: str = "",
     allow_duplicate_name: str = "0",
     confirm: str = "",
 ) -> dict:
@@ -1597,6 +1672,13 @@ def create_property(
         unit_type=unit_type, room_type=room_type, bedrooms=bedrooms,
         bathrooms=bathrooms, description=description, group_name=group_name,
         asking_rent=asking_rent, inventory_items=inventory_items,
+        postal_code=postal_code, neighbourhood=neighbourhood,
+        max_occupancy=max_occupancy, square_footage=square_footage,
+        available_from=available_from, building_amenities=building_amenities,
+        default_bills_included=default_bills_included,
+        is_publicly_visible=is_publicly_visible,
+        furnishing_status=furnishing_status,
+        furnishing_details=furnishing_details,
         allow_duplicate_name=allow_duplicate_name, confirm=confirm,
     )
 
@@ -1781,7 +1863,7 @@ def setup_room_tenancy(
     total_rent: str = "",
     security_deposit: str = "",
     pet_deposit: str = "0",
-    cleaning_fee: str = "0",
+    cleaning_deposit: str = "0",
     special_terms: str = "",
     tenant_name: str = "",
     tenant_email: str = "",
@@ -1810,7 +1892,7 @@ def setup_room_tenancy(
         total_rent=total_rent,
         security_deposit=security_deposit,
         pet_deposit=pet_deposit,
-        cleaning_fee=cleaning_fee,
+        cleaning_deposit=cleaning_deposit,
         special_terms=special_terms,
         tenant_name=tenant_name,
         tenant_email=tenant_email,
@@ -1985,6 +2067,11 @@ def update_property(
     is_publicly_visible: str = "",
     furnishing_status: str = "",
     furnishing_details: str = "",
+    postal_code: str = "",
+    neighbourhood: str = "",
+    available_from: str = "",
+    building_amenities: str = "",
+    default_bills_included: str = "",
     pick: str = "",
     confirm: str = "",
 ) -> dict:
@@ -2011,6 +2098,11 @@ def update_property(
         is_publicly_visible=is_publicly_visible,
         furnishing_status=furnishing_status,
         furnishing_details=furnishing_details,
+        postal_code=postal_code,
+        neighbourhood=neighbourhood,
+        available_from=available_from,
+        building_amenities=building_amenities,
+        default_bills_included=default_bills_included,
         pick=pick, confirm=confirm,
     )
 
@@ -2147,11 +2239,23 @@ def create_lease(
     total_rent: str = "",
     security_deposit: str = "",
     pet_deposit: str = "0",
-    cleaning_fee: str = "0",
+    cleaning_deposit: str = "0",
     is_month_to_month: str = "0",
     pets_allowed: str = "0",
     smoking_allowed: str = "0",
     special_terms: str = "",
+    house_rules: str = "",
+    shared_with: str = "",
+    move_in_date: str = "",
+    co_hosts: str = "",
+    landlord_service_address: str = "",
+    landlord_daytime_phone: str = "",
+    landlord_other_phone: str = "",
+    landlord_fax: str = "",
+    landlord_service_email: str = "",
+    custom_tenant_notice_months: str = "",
+    fixed_term_end_reason: str = "",
+    fixed_term_end_regulation_section: str = "",
     etransfer_email: str = "",
     bills_included: str = "",
     pick: str = "",
@@ -2160,7 +2264,7 @@ def create_lease(
     """Create a DRAFT lease (UI New Lease). Type auto: room→Standard Roommate,
     BC complete unit→RTB-1. Fixed-term needs end_date.
     property_query can be listing id or name; pick=first|with_group|… if duplicates.
-    Defaults for protection: no smoking/pets; pet_deposit & cleaning_fee 0 unless set.
+    Defaults for protection: no smoking/pets; pet and cleaning deposits are 0 unless set.
     RENT is essential: if the landlord didn't give it (and the listing has no
     asking rent), leave total_rent blank — the tool will ASK rather than make a
     $0 lease. Pass '0' only for a genuinely free room.
@@ -2171,9 +2275,19 @@ def create_lease(
     return _fn(
         landlord, property_query=property_query, start_date=start_date,
         end_date=end_date, total_rent=total_rent, security_deposit=security_deposit,
-        pet_deposit=pet_deposit, cleaning_fee=cleaning_fee,
+        pet_deposit=pet_deposit, cleaning_deposit=cleaning_deposit,
         is_month_to_month=is_month_to_month, pets_allowed=pets_allowed,
         smoking_allowed=smoking_allowed, special_terms=special_terms,
+        house_rules=house_rules, shared_with=shared_with,
+        move_in_date=move_in_date, co_hosts=co_hosts,
+        landlord_service_address=landlord_service_address,
+        landlord_daytime_phone=landlord_daytime_phone,
+        landlord_other_phone=landlord_other_phone,
+        landlord_fax=landlord_fax,
+        landlord_service_email=landlord_service_email,
+        custom_tenant_notice_months=custom_tenant_notice_months,
+        fixed_term_end_reason=fixed_term_end_reason,
+        fixed_term_end_regulation_section=fixed_term_end_regulation_section,
         etransfer_email=etransfer_email, bills_included=bills_included,
         pick=pick, confirm=confirm,
     )
@@ -2185,8 +2299,12 @@ def update_lease(
     lease_number: str = "",
     total_rent: str = "",
     security_deposit: str = "",
+    pet_deposit: str = "",
+    cleaning_deposit: str = "",
     start_date: str = "",
     end_date: str = "",
+    move_in_date: str = "",
+    move_out_date: str = "",
     pets_allowed: str = "",
     smoking_allowed: str = "",
     special_terms: str = "",
@@ -2194,22 +2312,60 @@ def update_lease(
     shared_with: str = "",
     bills: str = "",
     etransfer_email: str = "",
+    co_hosts: str = "",
+    landlord_service_address: str = "",
+    landlord_daytime_phone: str = "",
+    landlord_other_phone: str = "",
+    landlord_fax: str = "",
+    landlord_service_email: str = "",
+    custom_tenant_notice_months: str = "",
+    fixed_term_end_reason: str = "",
+    fixed_term_end_regulation_section: str = "",
     is_month_to_month: str = "",
+    rent_due_day: str = "",
+    parking_included: str = "",
+    parking_description: str = "",
+    parking_extra_charge: str = "",
+    pets_terms: str = "",
+    smoking_terms: str = "",
+    services_and_facilities: str = "",
+    occupants: str = "",
     confirm: str = "",
 ) -> dict:
     """Update DRAFT or PENDING lease fields (including start_date and end_date).
     Only ACTIVE/EXPIRED/TERMINATED/RENEWED are locked — PENDING signature leases
-    ARE editable (same as the UI). For furnished/semi-furnished changes use
-    adjust_lease (inventory-driven). special_terms / house_rules / shared_with /
-    bills as documented. Preview; confirm=yes."""
+    ARE editable (same as the UI), even if some tenants already signed; the
+    result names anyone whose signed terms this amends. For furnished/
+    semi-furnished changes use adjust_lease (inventory-driven). special_terms /
+    house_rules / shared_with / bills as documented. Preview; confirm=yes."""
     from .domain_crud import update_lease as _fn
     return _fn(
         landlord, property_query=property_query, lease_number=lease_number,
         total_rent=total_rent, security_deposit=security_deposit,
-        start_date=start_date, end_date=end_date, pets_allowed=pets_allowed,
+        pet_deposit=pet_deposit, cleaning_deposit=cleaning_deposit,
+        start_date=start_date, end_date=end_date,
+        move_in_date=move_in_date, move_out_date=move_out_date,
+        pets_allowed=pets_allowed,
         smoking_allowed=smoking_allowed, special_terms=special_terms,
         house_rules=house_rules, shared_with=shared_with, bills=bills,
-        etransfer_email=etransfer_email, is_month_to_month=is_month_to_month,
+        etransfer_email=etransfer_email, co_hosts=co_hosts,
+        landlord_service_address=landlord_service_address,
+        landlord_daytime_phone=landlord_daytime_phone,
+        landlord_other_phone=landlord_other_phone,
+        landlord_fax=landlord_fax,
+        landlord_service_email=landlord_service_email,
+        custom_tenant_notice_months=custom_tenant_notice_months,
+        rent_due_day=rent_due_day,
+        parking_included=parking_included,
+        parking_description=parking_description,
+        parking_extra_charge=parking_extra_charge,
+        pets_terms=pets_terms,
+        smoking_terms=smoking_terms,
+        services_and_facilities=services_and_facilities,
+        occupants=occupants,
+        fixed_term_end_reason=fixed_term_end_reason,
+        fixed_term_end_regulation_section=fixed_term_end_regulation_section,
+        is_month_to_month=is_month_to_month,
         confirm=confirm,
     )
 
@@ -2289,6 +2445,9 @@ def renew_lease(
     kind="LANDLORD_NOTICE (auto-applies if notice period met) or MUTUAL_AGREEMENT.",
     rent_handling="NONE | VOID_FINAL | PRORATE_FINAL for mutual agreements.",
     deposit_settlement="PENDING | RETURNED | AGREED | RTB when settling deposit.",
+    deposit_return_method=(
+        "Required for RETURNED when deposits are held: e-transfer, cash, or cheque."
+    ),
 )
 def settle_moveout(
     landlord,
@@ -2303,6 +2462,8 @@ def settle_moveout(
     forwarding_address: str = "",
     forwarding_address_received_on: str = "",
     deposit_settlement: str = "",
+    deposit_return_method: str = "",
+    deposit_return_date: str = "",
     tenant_agreement_signed_on: str = "",
     rtb_file_number: str = "",
     confirm: str = "",
@@ -2325,6 +2486,8 @@ def settle_moveout(
         forwarding_address=forwarding_address,
         forwarding_address_received_on=forwarding_address_received_on,
         deposit_settlement=deposit_settlement,
+        deposit_return_method=deposit_return_method,
+        deposit_return_date=deposit_return_date,
         tenant_agreement_signed_on=tenant_agreement_signed_on,
         rtb_file_number=rtb_file_number,
         confirm=confirm,
@@ -2544,6 +2707,9 @@ def correct_ledger_entry(
     description: str = "",
     category: str = "",
     vendor: str = "",
+    due_date: str = "",
+    effective_date: str = "",
+    reference_number: str = "",
     reason: str = "Correction",
     confirm: str = "",
 ) -> dict:
@@ -2558,6 +2724,9 @@ def correct_ledger_entry(
         description=description,
         category=category,
         vendor=vendor,
+        due_date=due_date,
+        effective_date=effective_date,
+        reference_number=reference_number,
         reason=reason,
         confirm=confirm,
     )
@@ -2720,21 +2889,102 @@ def tenant_lease_status(landlord, person_query: str = "") -> dict:
     return _fn(landlord, person_query=person_query)
 
 
-def mark_cleaning_fee_paid(
+def mark_cleaning_deposit_paid(
     landlord,
     lease_number: str = "",
     property_query: str = "",
     tenant_email: str = "",
     confirm: str = "",
 ) -> dict:
-    """Mark cleaning fee paid for a lease tenant. Preview; confirm=yes."""
-    from .domain_gap_tools import mark_cleaning_fee_paid as _fn
+    """Mark a refundable cleaning deposit paid for a lease tenant. Preview; confirm=yes."""
+    from .domain_gap_tools import mark_cleaning_deposit_paid as _fn
 
     return _fn(
         landlord,
         lease_number=lease_number,
         property_query=property_query,
         tenant_email=tenant_email,
+        confirm=confirm,
+    )
+
+
+@_params(
+    deposit=(
+        "Which deposit this comes out of: security, pet, or cleaning. They are "
+        "held and returned separately — never guess, ask."
+    ),
+    basis=(
+        "labour (your own time) | supplies | cleaner | garbage | other. "
+        "Take it from what the landlord said."
+    ),
+    hours="For basis=labour: hours spent, e.g. '3'. Needs hourly_rate too.",
+    hourly_rate="For basis=labour: rate per hour, e.g. '35'.",
+    amount="For every other basis: what it cost, e.g. '80.00'.",
+    note="What was cleaned, hauled or repaired. A bare amount loses a hearing.",
+    tenant_email="Roommate leases have one inspection each — whose is this?",
+)
+def record_deposit_deduction(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    tenant_email: str = "",
+    deposit: str = "cleaning",
+    basis: str = "",
+    hours: str = "",
+    hourly_rate: str = "",
+    amount: str = "",
+    note: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record ONE costed line of what the landlord wants to keep from a deposit
+    — own labour (hours x rate), supplies, professional cleaners, garbage
+    removal. Attaches to the move-out inspection as evidence. Recording it
+    KEEPS NOTHING: deposit money can only be kept with the tenant's written
+    agreement or an RTB order. Preview first; confirm=yes."""
+    from .domain_gap_tools import record_deposit_deduction as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        tenant_email=tenant_email,
+        deposit=deposit,
+        basis=basis,
+        hours=hours,
+        hourly_rate=hourly_rate,
+        amount=amount,
+        note=note,
+        confirm=confirm,
+    )
+
+
+@_params(
+    payment_method=(
+        "etransfer | cash | cheque. How the money is going back. Leave BLANK "
+        "if the landlord did not say and the tool will ask. Never guess."
+    ),
+    return_date="Date the money went back, YYYY-MM-DD. Defaults to today.",
+)
+def return_deposits(
+    landlord,
+    lease_number: str = "",
+    property_query: str = "",
+    payment_method: str = "",
+    return_date: str = "",
+    confirm: str = "",
+) -> dict:
+    """Return the deposits held on a lease at the end of a tenancy. Each
+    deposit (security, pet, cleaning) goes back as its OWN transfer, never as
+    one lump. Deductions the tenant already agreed to in writing are held back
+    automatically; nothing else is. Preview first; confirm=yes."""
+    from .domain_gap_tools import return_deposits as _fn
+
+    return _fn(
+        landlord,
+        lease_number=lease_number,
+        property_query=property_query,
+        payment_method=payment_method,
+        return_date=return_date,
         confirm=confirm,
     )
 

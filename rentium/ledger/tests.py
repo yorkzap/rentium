@@ -480,3 +480,288 @@ def test_the_owed_tile_equals_the_charge_rows_it_sits_above(
         if not r["voided"] and Decimal(r["outstanding"] or "0") > 0
     )
     assert Decimal(_summary(landlord)["owed_total"]) == owed_in_rows == Decimal("444.78")
+
+
+def test_security_and_cleaning_deposits_return_as_separate_liabilities(
+    landlord, bc_lease
+):
+    charges = []
+    for description, kind in (
+        ("Security deposit", "security_deposit"),
+        ("Cleaning deposit", "cleaning_deposit_lease"),
+    ):
+        charge, _ = services.post_charge(
+            landlord=landlord,
+            tenant=None,
+            lease=bc_lease,
+            property=bc_lease.property,
+            amount="200.00",
+            due_date=date.today(),
+            entry_type=EntryType.DEPOSIT_CHARGE,
+            description=description,
+            metadata={"kind": kind},
+        )
+        services.record_payment(
+            charge=charge,
+            amount="200.00",
+            payment_method="ETRANSFER",
+        )
+        charges.append(charge)
+
+    assert services.deposits_held(landlord) == Decimal("400.00")
+    returned = services.return_refundable_deposits(
+        landlord=landlord,
+        lease=bc_lease,
+        payment_method="ETRANSFER",
+    )
+
+    assert len(returned) == 2
+    assert {entry.description for entry in returned} == {
+        "Security deposit returned",
+        "Cleaning deposit returned",
+    }
+    assert {entry.amount for entry in returned} == {Decimal("200.00")}
+    assert all(entry.metadata["returned_separately"] for entry in returned)
+    assert {
+        entry.metadata["source_charge_id"] for entry in returned
+    } == {str(charge.pk) for charge in charges}
+    assert services.deposits_held(landlord) == Decimal("0.00")
+
+
+def test_lease_without_cleaning_deposit_returns_only_security(landlord, bc_lease):
+    charge, _ = services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=bc_lease,
+        property=bc_lease.property,
+        amount="200.00",
+        due_date=date.today(),
+        entry_type=EntryType.DEPOSIT_CHARGE,
+        description="Security deposit",
+        metadata={"kind": "security_deposit"},
+    )
+    services.record_payment(
+        charge=charge,
+        amount="200.00",
+        payment_method="ETRANSFER",
+    )
+
+    returned = services.return_refundable_deposits(
+        landlord=landlord,
+        lease=bc_lease,
+        payment_method="ETRANSFER",
+    )
+
+    assert [entry.description for entry in returned] == [
+        "Security deposit returned"
+    ]
+
+
+def test_a_paid_cleaning_deposit_stamps_its_receipt_date_on_the_lease(
+    landlord, bc_lease
+):
+    """The cleaning deposit is refundable, so its receipt starts the same
+    15-day clock the security deposit's does. Before this it had only a
+    boolean, and the agreement printed 'Not yet received' forever."""
+    from .billing import stamp_deposit_received
+
+    paid_on = date.today() - timedelta(days=3)
+    charge, _ = services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=bc_lease,
+        property=bc_lease.property,
+        amount="200.00",
+        due_date=date.today(),
+        entry_type=EntryType.DEPOSIT_CHARGE,
+        description="Cleaning deposit",
+        metadata={"kind": "cleaning_deposit_lease"},
+    )
+    services.record_payment(
+        charge=charge,
+        amount="200.00",
+        payment_method="ETRANSFER",
+        payment_date=paid_on,
+    )
+
+    assert stamp_deposit_received(charge) is True
+    bc_lease.refresh_from_db()
+    assert bc_lease.cleaning_deposit_received_date == paid_on
+    # The old behaviour — flipping the per-tenant paid flag — still happens.
+    assert all(
+        lt.cleaning_deposit_paid
+        for lt in bc_lease.lease_tenants.filter(declined=False)
+    )
+
+
+def test_a_per_tenant_cleaning_deposit_leaves_the_lease_date_alone(
+    landlord, bc_lease
+):
+    """One date can't describe three roommates paying separately, so an
+    individual cleaning deposit stays on that tenant's paid flag."""
+    from .billing import stamp_deposit_received
+
+    charge, _ = services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=bc_lease,
+        property=bc_lease.property,
+        amount="75.00",
+        due_date=date.today(),
+        entry_type=EntryType.DEPOSIT_CHARGE,
+        description="Cleaning deposit (individual)",
+        metadata={"kind": "cleaning_deposit_individual"},
+    )
+    services.record_payment(
+        charge=charge, amount="75.00", payment_method="ETRANSFER"
+    )
+
+    stamp_deposit_received(charge)
+    bc_lease.refresh_from_db()
+    assert bc_lease.cleaning_deposit_received_date is None
+
+
+# --------------------------------------------------------- split payments
+def _deposit_charge(landlord, lease, description, kind, amount="200.00"):
+    charge, _ = services.post_charge(
+        landlord=landlord,
+        tenant=None,
+        lease=lease,
+        property=lease.property,
+        amount=amount,
+        due_date=date.today(),
+        entry_type=EntryType.DEPOSIT_CHARGE,
+        description=description,
+        metadata={"kind": kind},
+    )
+    return charge
+
+
+def test_one_transfer_settles_both_deposits_as_separate_payments(landlord, bc_lease):
+    """Deposits arrive as one bank line but must stay two charges, because
+    they are returned separately at the end of the tenancy."""
+    security = _deposit_charge(
+        landlord, bc_lease, "Security deposit", "security_deposit"
+    )
+    cleaning = _deposit_charge(
+        landlord, bc_lease, "Cleaning deposit", "cleaning_deposit_lease"
+    )
+
+    posted = services.record_split_payment(
+        landlord=landlord,
+        allocations=[(security, Decimal("200.00")), (cleaning, Decimal("200.00"))],
+        payment_method="ETRANSFER",
+    )
+
+    assert [created for _, created in posted] == [True, True]
+    assert {entry.settles_id for entry, _ in posted} == {security.pk, cleaning.pk}
+    assert all("Allocated from $400.00" in entry.description for entry, _ in posted)
+    assert services.outstanding_on(security) == Decimal("0.00")
+    assert services.outstanding_on(cleaning) == Decimal("0.00")
+    assert services.deposits_held(landlord) == Decimal("400.00")
+
+
+def test_resubmitting_a_split_does_not_double_record(landlord, bc_lease):
+    security = _deposit_charge(
+        landlord, bc_lease, "Security deposit", "security_deposit"
+    )
+    cleaning = _deposit_charge(
+        landlord, bc_lease, "Cleaning deposit", "cleaning_deposit_lease"
+    )
+    allocations = [(security, Decimal("200.00")), (cleaning, Decimal("200.00"))]
+
+    services.record_split_payment(
+        landlord=landlord, allocations=allocations, payment_method="ETRANSFER"
+    )
+    again = services.record_split_payment(
+        landlord=landlord, allocations=allocations, payment_method="ETRANSFER"
+    )
+
+    assert [created for _, created in again] == [False, False]
+    assert services.deposits_held(landlord) == Decimal("400.00")
+
+
+def test_a_split_cannot_reach_another_landlords_charge(landlord, bc_lease):
+    from rentium.users.models import LandlordProfile
+    from rentium.users.tests.factories import UserFactory
+
+    other = LandlordProfile.objects.create(user=UserFactory())
+    mine = _deposit_charge(landlord, bc_lease, "Security deposit", "security_deposit")
+    with pytest.raises(services.LedgerError):
+        services.record_split_payment(
+            landlord=other,
+            allocations=[(mine, Decimal("200.00"))],
+            payment_method="ETRANSFER",
+        )
+
+
+def test_the_split_suggestion_finds_security_plus_cleaning(landlord, bc_lease):
+    security = _deposit_charge(
+        landlord, bc_lease, "Security deposit", "security_deposit"
+    )
+    cleaning = _deposit_charge(
+        landlord, bc_lease, "Cleaning deposit", "cleaning_deposit_lease"
+    )
+
+    chosen = services.suggest_deposit_split([security, cleaning], Decimal("400.00"))
+    assert {c.pk for c in chosen} == {security.pk, cleaning.pk}
+    # An amount that matches nothing cleanly gets no guess at all.
+    assert services.suggest_deposit_split([security, cleaning], Decimal("397.00")) is None
+
+
+def test_the_split_endpoint_posts_one_payment_per_charge(landlord, bc_lease):
+    security = _deposit_charge(
+        landlord, bc_lease, "Security deposit", "security_deposit"
+    )
+    cleaning = _deposit_charge(
+        landlord, bc_lease, "Cleaning deposit", "cleaning_deposit_lease"
+    )
+    client = APIClient()
+    client.force_authenticate(user=landlord.user)
+
+    suggested = client.get(
+        f"/api/ledger/entries/suggest_split/?amount=400&lease={bc_lease.pk}"
+    ).json()
+    assert suggested["matched"] is True
+    assert len(suggested["allocations"]) == 2
+
+    response = client.post(
+        "/api/ledger/entries/record_split_payment/",
+        {
+            "amount": "400.00",
+            "payment_method": "ETRANSFER",
+            "allocations": [
+                {"charge_id": row["charge_id"], "amount": row["amount"]}
+                for row in suggested["allocations"]
+            ],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 201, response.data
+    assert len(response.data["payments"]) == 2
+    assert services.outstanding_on(security) == Decimal("0.00")
+    assert services.outstanding_on(cleaning) == Decimal("0.00")
+
+
+def test_the_split_endpoint_refuses_a_total_that_does_not_add_up(landlord, bc_lease):
+    """The stated total is the landlord's own arithmetic against their bank
+    line — silently accepting a mismatch is how a deposit ends up half-paid."""
+    security = _deposit_charge(
+        landlord, bc_lease, "Security deposit", "security_deposit"
+    )
+    client = APIClient()
+    client.force_authenticate(user=landlord.user)
+
+    response = client.post(
+        "/api/ledger/entries/record_split_payment/",
+        {
+            "amount": "400.00",
+            "payment_method": "ETRANSFER",
+            "allocations": [{"charge_id": str(security.pk), "amount": "200.00"}],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert services.outstanding_on(security) == Decimal("200.00")

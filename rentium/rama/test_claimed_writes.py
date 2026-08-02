@@ -290,3 +290,210 @@ def test_an_offer_to_act_passes_through_untouched(landlord, settings):
         result = run_turn(landlord, "record the $100")
 
     assert result.reply == offer
+
+
+# --------------------------------------- the verb list, kept in step
+# A write flag missing from WRITE_RESULT_MARKERS makes a real change invisible
+# to the guard, which then tells the landlord it didn't happen. `return_deposits`
+# reports {"returned": True} and was invisible exactly this way. Rather than
+# trusting anyone to remember, this reads the flags the tools actually set.
+def test_every_write_flag_a_tool_sets_is_recognised():
+    import re
+    from pathlib import Path
+
+    from rentium.rama.service import WRITE_RESULT_MARKERS
+
+    # Keys that are data, a question, or a refusal on a result — never a
+    # "this landed" flag. Anything not here and not in WRITE_RESULT_MARKERS is
+    # a decision nobody has made yet, which is what this test forces.
+    NOT_WRITE_FLAGS = {
+        # Explicit non-writes.
+        "already",
+        "already_done",
+        "unchanged",
+        "refused",
+        "reused",  # "already exists — reusing it, nothing changed"
+        "exists",
+        "needs_confirm",
+        "needs_answer",
+        "needs_input",
+        "needs_scope",
+        "required",
+        # Descriptive data about the thing acted on.
+        "atomic",
+        "attached",
+        "collection",
+        "create",
+        "damage_claim",
+        "duplicate",
+        "is_duplicate",
+        "editable",
+        "excluded",
+        "hard",
+        "has_file",
+        "idempotent",
+        "included",
+        "landlord_signed",
+        "linked_existing",
+        "linked_existing_account",
+        "ocr_complete",
+        "raw_preserved",
+        "returned_separately",
+        "reuse_property",
+        "supported",
+        "user_scope_locked",
+        # Prompt/UI hints the tool ships to the model or the frontend.
+        "convert_to_ocr_document",
+        "never_say_no_pdf_if_lease_exists",
+        "pdf_always_available",
+        "pdf_download_available",
+        "reocr_requested",
+        "ui_rules",
+    }
+    root = Path(__file__).resolve().parent
+    sources = [
+        *root.glob("domain_*.py"),
+        root / "finance.py",
+        root / "document_services.py",
+        root / "landlord_capabilities.py",
+        root / "house_layout.py",
+        root / "unit_structure.py",
+    ]
+    # `"flag": True` inside a returned dict literal.
+    flag = re.compile(r'"([a-z_]+)":\s*True')
+    seen = set()
+    for path in sources:
+        if not path.exists():
+            continue
+        seen |= set(flag.findall(path.read_text()))
+
+    unknown = sorted(seen - set(WRITE_RESULT_MARKERS) - NOT_WRITE_FLAGS)
+    assert not unknown, (
+        f"These result flags are set by tools but are not in "
+        f"WRITE_RESULT_MARKERS (and are not listed as non-flags): {unknown}. "
+        f"A write the guard can't see gets reported to the landlord as not "
+        f"having happened."
+    )
+
+
+def test_returning_deposits_is_recognised_as_a_write():
+    """The shape return_deposits actually reports."""
+    from rentium.rama.service import _is_write_result
+
+    assert _is_write_result({"returned": True, "lease_number": "RMT1-A"}) is True
+
+
+def test_a_skipped_duplicate_is_not_a_write():
+    from rentium.rama.service import _is_write_result
+
+    assert (
+        _is_write_result({"already_done": True, "message": "Already marked paid."})
+        is False
+    )
+
+
+def test_an_unanswered_question_is_not_a_write():
+    from rentium.rama.service import _is_write_result
+
+    assert (
+        _is_write_result(
+            {"question_for_user": "Which deposit?", "needs": "deposit"}
+        )
+        is False
+    )
+
+
+# =========================== a follow-up about a write that DID happen
+# The other direction of the same failure. A landlord confirmed a $350 cleaning
+# deposit on lease RMT652523-C281, it was written, and one turn later they
+# asked "u sure its added?". The model said yes — truthfully — nothing was
+# written on THAT turn, and the guard replaced the true answer with "Nothing
+# was written, so please don't rely on that." The deposit was on the lease the
+# whole time, and the landlord was sent to re-do work that was already done.
+#
+# "Nothing was written" is a claim about their data too. It only gets made when
+# the record supports it.
+def _wrote_earlier(landlord, conversation_id, tool="update_lease", message="Updated lease RMT1-A: cleaning_deposit."):
+    from rentium.rama.models import RamaAudit
+
+    RamaAudit.objects.create(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+        content={
+            "tool": tool,
+            "arguments": {"confirm": "yes"},
+            "result": {"updated": True, "message": message},
+        },
+    )
+
+
+def test_a_follow_up_about_a_real_write_is_not_retracted(landlord, settings):
+    import uuid
+    from unittest import mock
+
+    from rentium.rama.service import run_turn
+    from rentium.rama.tests import _enable_rama
+
+    _enable_rama(landlord, settings=settings)
+    conversation_id = uuid.uuid4()
+    _wrote_earlier(landlord, conversation_id)
+
+    with mock.patch(
+        "rentium.rama.service.get_provider",
+        return_value=_scripted("Yes — I added the $350 cleaning deposit."),
+    ):
+        result = run_turn(landlord, "u sure its added?", conversation_id)
+
+    assert "Nothing was written" not in result.reply
+    # It answers from the record rather than from the model's own memory.
+    assert "cleaning_deposit" in result.reply
+    assert result.deterministic is True
+
+
+def test_the_record_answer_names_only_what_actually_landed(landlord, settings):
+    """A real write earlier must not launder a fresh fabrication: the reply is
+    built from the audit trail, so an invented second change simply isn't in
+    it."""
+    import uuid
+    from unittest import mock
+
+    from rentium.rama.service import run_turn
+    from rentium.rama.tests import _enable_rama
+
+    _enable_rama(landlord, settings=settings)
+    conversation_id = uuid.uuid4()
+    _wrote_earlier(landlord, conversation_id)
+
+    with mock.patch(
+        "rentium.rama.service.get_provider",
+        return_value=_scripted(
+            "I added the cleaning deposit and also recorded the $900 rent "
+            "payment against August."
+        ),
+    ):
+        result = run_turn(landlord, "did both go through?", conversation_id)
+
+    assert "$900" not in result.reply
+    assert "rent payment" not in result.reply.lower()
+    assert "cleaning_deposit" in result.reply
+
+
+def test_a_fabrication_in_a_conversation_that_never_wrote_still_retracts(
+    landlord, settings
+):
+    """The original protection, unchanged."""
+    import uuid
+    from unittest import mock
+
+    from rentium.rama.service import run_turn
+    from rentium.rama.tests import _enable_rama
+
+    _enable_rama(landlord, settings=settings)
+    with mock.patch(
+        "rentium.rama.service.get_provider",
+        return_value=_scripted("I recorded the payment."),
+    ):
+        result = run_turn(landlord, "record it", uuid.uuid4())
+
+    assert "Nothing was written" in result.reply

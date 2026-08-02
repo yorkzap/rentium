@@ -754,9 +754,14 @@ def test_followup_pronoun_resolves_to_conversation_property(landlord, settings):
         kind=RamaAudit.Kind.TOOL_CALL,
         content__tool="update_property",
     ).latest("created_at")
-    assert audit.content["arguments"]["property_query"] == "Garden Suite"
+    # Conversation focus resolves the pronoun, then the write path pins the
+    # selected row by UUID so confirmation cannot drift to a later duplicate.
+    assert audit.content["arguments"]["property_query"] in {
+        "Garden Suite",
+        str(prop.pk),
+    }, audit.content
     pending = RamaPendingPlan.objects.get(conversation_id=second["conversation_id"])
-    assert pending.steps.get().arguments["property_query"] == "Garden Suite"
+    assert pending.steps.get().arguments["property_query"] == str(prop.pk)
     prop.refresh_from_db()
     assert prop.property_category == Property.PropertyCategory.ROOM
 
@@ -805,7 +810,7 @@ def test_business_photo_attachment_focus_persists_across_followups(
         },
     ).json()
     assert followup.requests == []
-    assert "Address: 950 McKenzie Ave" in second["reply"]
+    assert "Address: 950 McKenzie Ave" in second["reply"], second
     assert "Individual listing: none" in second["reply"]
     assert second["pending_plan"] is not None
 
@@ -3483,6 +3488,7 @@ def test_tool_meta_covers_every_write_tool():
         "list_conversations", "list_messages", "list_inspections",
         "list_move_events", "list_inventory", "list_tenants",
             "tenant_history", "list_documents", "business_document_location",
+            "business_document_status",
             "find_listings", "find_leases",
         "read_constitution", "list_vendors", "list_holdings", "list_bank_balances",
         "lease_pdf_info", "list_lease_roster", "crud_capabilities",
@@ -3493,9 +3499,10 @@ def test_tool_meta_covers_every_write_tool():
         "list_capability_gaps", "list_co_landlords",
         # Durable landlord preferences. remember/forget mutate and ARE
         # classified; listing them does not.
-        "list_memories",
+        "list_memories", "list_payment_reminders", "list_notifications",
+        "list_saved_workflows",
         # Uploaded historical data. Reading a staged batch mutates nothing —
-        # commit_batch is what creates ledger rows, and it is not a tool.
+        # commit_import_batch is the separately classified guarded mutation.
         "list_import_batches", "read_staged_entries",
         # plan builders only compose previews; the runner executes real tools
         "plan_operation", "plan_move_tenant",
@@ -3611,7 +3618,6 @@ def test_run_plan_item_key_skip(landlord):
     from rentium.rama.plan_runner import run_plan, save_plan
 
     prop = _mk_prop(landlord, "Room F")
-    _mk_lease(landlord, prop, Lease.LeaseStatus.ACTIVE)
     plan = save_plan(
         landlord,
         _uuid.uuid4(),
@@ -3628,6 +3634,9 @@ def test_run_plan_item_key_skip(landlord):
             ],
         },
     )
+    # State drifts after preview: execution-time blockers must catch the new
+    # lease and skip the same-item follow-up.
+    _mk_lease(landlord, prop, Lease.LeaseStatus.ACTIVE)
     progress = run_plan(plan, landlord)
     assert progress["status"] == "partial"
     assert [it["target"] for it in progress["failed"]] == ["Room F"]
@@ -4155,6 +4164,7 @@ def test_supported_operations_cannot_be_logged_as_capability_gaps(landlord):
 
     for request, tool in (
         ("Rename room B to room A", "update_property"),
+        ("Rename the $39.36 receipt to PNV Screens", "rename_business_document"),
         ("Show all my rooms", "list_properties"),
         ("Open the dashboard properties link", "link"),
         ("Create a room in a property group", "create_group_room"),
@@ -4221,6 +4231,99 @@ def test_deterministic_rename_transcript_and_grouped_room_display(landlord, sett
     assert "McKenzie House" in shown.reply
     assert "Room A" in shown.reply
 
+
+def test_deterministic_document_rename_selects_receipt_by_vendor_and_amount(
+    landlord, settings
+):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from rentium.rama.document_services import ingest_document
+    from rentium.rama.models import RamaDocument
+    from rentium.rama.plan_runner import load_fresh_plan
+    from rentium.rama.service import _document_rename_intent
+    from rentium.rama.service import run_turn
+
+    message = (
+        "there's two receipts for PNR Screens LTD. One is for amount $250, "
+        "the other one $39.36. Rename the 39.36 to PNV SCreens ltd instead"
+    )
+    intent = _document_rename_intent(message)
+    assert intent == {
+        "tool": "rename_business_document",
+        "arguments": {
+            "document_query": "PNR Screens LTD",
+            "amount": "39.36",
+            "new_title": "PNV SCreens ltd",
+        },
+    }
+    for wording in (
+        "Rename the PNR Screens LTD receipt for $39.36 as PNV Screens Ltd",
+        "Change the title of the PNR Screens LTD receipt for $39.36 to PNV Screens Ltd",
+        "Fix the PNR Screens LTD receipt title to PNV Screens Ltd",
+    ):
+        parsed = _document_rename_intent(wording)
+        assert parsed is not None, wording
+        assert parsed["tool"] == "rename_business_document"
+        assert parsed["arguments"]["document_query"] == "PNR Screens LTD"
+        assert parsed["arguments"]["new_title"] == "PNV Screens Ltd"
+
+    documents = []
+    for index, amount in enumerate(("250.00", "39.36"), start=1):
+        document, _ = ingest_document(
+            landlord=landlord,
+            upload=SimpleUploadedFile(
+                f"pnr-transcript-{index}.pdf",
+                f"%PDF-pnr-transcript-{index}".encode(),
+                content_type="application/pdf",
+            ),
+        )
+        document.title = "PNR Screens LTD receipt"
+        document.issuer = "PNR Screens LTD"
+        document.amount = Decimal(amount)
+        document.status = RamaDocument.Status.FILED
+        document.save()
+        documents.append(document)
+
+    _enable_rama(landlord, settings=settings)
+    provider = ScriptedProvider([Turn(text="must not run")])
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(
+            landlord,
+            message,
+            role="general",
+            channel="telegram",
+        )
+
+    assert preview.deterministic is True
+    assert preview.tools_used == ["_live_context", "rename_business_document"]
+    assert "Current name: PNR Screens LTD receipt" in preview.reply
+    assert "New name: PNV SCreens ltd" in preview.reply
+    assert "Amount: CAD 39.36" in preview.reply
+    assert provider.requests == []
+    plan = load_fresh_plan(landlord, preview.conversation_id)
+    step = plan.steps.get()
+    assert step.tool == "rename_business_document"
+    assert step.arguments == {
+        "document_id": str(documents[1].pk),
+        "new_title": "PNV SCreens ltd",
+        "expected_title": "PNR Screens LTD receipt",
+    }
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        confirmed = run_turn(
+            landlord,
+            "Yes",
+            preview.conversation_id,
+            role="general",
+            channel="telegram",
+        )
+    documents[0].refresh_from_db()
+    documents[1].refresh_from_db()
+    assert documents[0].title == "PNR Screens LTD receipt"
+    assert documents[1].title == "PNV SCreens ltd"
+    assert "Renamed document 'PNR Screens LTD receipt' to 'PNV SCreens ltd'." in (
+        confirmed.reply
+    )
 
 def test_group_room_instruction_one_clarification_one_preview(landlord, settings):
     from rentium.properties.models import Property

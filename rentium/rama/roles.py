@@ -17,6 +17,7 @@ Sub-turns (delegation) run with depth >= 1: delegation tools are stripped
 from __future__ import annotations
 
 from .registry import tool_schemas
+from .capability_contract import general_tool_names
 
 ROLES = ("corporal", "general", "fsa", "treasurer")
 
@@ -142,6 +143,9 @@ property → charge_schedule; one lease month → charge_status
 - Documents/PDFs metadata → list_documents (titles only, no file contents)
 - Find invoices/receipts/notices by words, year, holding, tag, unpaid →
   search_business_documents (OCR + title full-text). Prefer this over guessing.
+- Rename an existing receipt/invoice/document → rename_business_document. Pass
+  vendor/title words plus the exact amount when several documents are similar;
+  if it returns candidates, ask for date/property/document ID and never guess.
 - Uploaded business record + address/property overall →
   catalog_business_document (physical holding, never a forced child listing)
 - Business document directory/path/manual location/download →
@@ -299,7 +303,7 @@ should sign up with that email. list_co_landlords shows who has access. \
 (add_co_host_to_lease still exists for a NAME-ONLY party who will never log in or \
 sign — only use it if the landlord explicitly wants just a name on the document.) \
 Defaults for landlord protection: smoking_allowed=false, pets_allowed=false, \
-pet_deposit=0, cleaning_fee=0 unless the landlord sets them. \
+pet_deposit=0, cleaning_deposit=0 unless the landlord sets them. \
 security_deposit: if landlord said a deposit amount, pass it; if they only set \
 pet/cleaning to 0, KEEP security deposit from earlier in the chat OR omit so \
 it defaults to half of total_rent ($800 rent → $400). Pass security_deposit="0" \
@@ -524,98 +528,15 @@ READ_TOOLS = (
     "get_notification_channels", "list_capability_gaps", "list_co_landlords",
     "list_memories",
     "list_payment_reminders", "list_notifications",
+    "list_saved_workflows",
+    "deposit_position", "tenant_statement", "list_import_batches",
+    "read_staged_entries",
 )
 
 # The General can directly run common landlord workflows. Every write still
 # goes through the same preview/confirmation runner and application services;
 # delegation is for specialist analysis, not a capability bottleneck.
-GENERAL_TOOLS = READ_TOOLS + (
-    "plan_operation",
-    "plan_move_tenant",
-    "amend_constitution",
-    "log_capability_gap",
-    # Standing preferences the landlord states in passing. The General is the
-    # role that hears them, so it is the role that records them.
-    "remember",
-    "forget",
-    # The WRITE side of the financial data layer. Deliberately here and not on
-    # the Treasurer: the agent that concludes "your equity looks strong" must
-    # not also be able to adjust the valuation that rests on.
-    "record_treasurer_fact",
-    "record_holding_financials",
-    "record_valuation",
-    "record_mortgage",
-    # Common landlord edits the General should do DIRECTLY (previews before any
-    # write), instead of a delegation round-trip that weak models fumble — this
-    # is what made Telegram RAMA fall back to hallucinated "not available" answers.
-    "attach_photo_to_listing",
-    "remove_photo_from_listing",
-    "remove_photos_from_listing",
-    "add_co_landlord",
-    "add_co_host_to_lease",
-    "update_lease",
-    "update",
-    "bulk_add_inventory",
-    "create_inventory_item",
-    "invite_tenant_to_lease",
-    "resend_lease_invite",
-    "create_lease",
-    "adjust_lease",
-    "renew_lease",
-    "settle_moveout",
-    "complete_inspection_package",
-    "apply_rent_adjustment",
-    "record_utility_bill",
-    "convert_inquiry_to_viewing",
-    "void_ledger_entry",
-    "mark_ledger_paid",
-    "correct_ledger_entry",
-    "post_ledger_credit",
-    "post_one_off_charge",
-    "update_inspection_items",
-    "approve_inspection_suggestion",
-    "dismiss_inspection_suggestion",
-    "mark_inspection_delivered",
-    "cancel_viewing",
-    "mark_cleaning_fee_paid",
-    "list_payment_reminders",
-    "create_payment_reminder",
-    "mark_payment_reminder_sent",
-    "update_inquiry",
-    "commit_import_batch",
-    "discard_import_batch",
-    "list_notifications",
-    "mark_notifications_read",
-    "schedule_viewing",
-    "reschedule_viewing",
-    "viewing_invite_status",
-    "tenant_lease_status",
-    "respond_to_viewing_request",
-    "record_payment",
-    "create_expense",
-    "reallocate_expense",
-    "catalog_business_document",
-    "business_document_location",
-    "business_document_status",
-    "search_business_documents",
-    "file_business_document",
-    "create_work_order",
-    # Routine property operations are direct General capabilities. Delegation
-    # remains available for specialized/bulk work, but a rename or grouped-room
-    # creation must not be lost in a second model round-trip.
-    "create_property",
-    "update_property",
-    "create_property_group",
-    "assign_property_to_group",
-    "create_house_layout",
-    "create_group_room",
-    "create_property_structure",
-    "update_unit_layout",
-    "set_unit_rental_mode",
-    "configure_unit_room_offerings",
-    "create_holding",
-    "assign_property_to_holding",
-)
+GENERAL_TOOLS = general_tool_names(READ_TOOLS)
 
 # The FSA reasons over facts; its proposal surface arrives in Phase 4.
 FSA_TOOLS = READ_TOOLS

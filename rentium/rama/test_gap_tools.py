@@ -1,4 +1,4 @@
-"""API gap-close tools: ledger control, cancel viewing, inquiry, cleaning fee."""
+"""API gap-close tools: ledger control, cancel viewing, inquiry, cleaning deposit."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def room_lease(landlord):
         invited_email="gap@example.com",
         invited_name="Gap Tenant",
         rent_amount=Decimal("900.00"),
-        cleaning_fee=Decimal("75.00"),
+        cleaning_deposit=Decimal("75.00"),
         is_primary_tenant=True,
         has_signed=True,
     )
@@ -61,7 +61,7 @@ def test_gap_tools_registered():
         "dismiss_inspection_suggestion",
         "mark_inspection_delivered",
         "cancel_viewing",
-        "mark_cleaning_fee_paid",
+        "mark_cleaning_deposit_paid",
         "list_payment_reminders",
         "create_payment_reminder",
         "mark_payment_reminder_sent",
@@ -78,7 +78,10 @@ def test_gap_close_phrases():
     assert supported_tool_for_request("void this expense") == "void_ledger_entry"
     assert supported_tool_for_request("cancel the viewing tomorrow") == "cancel_viewing"
     assert supported_tool_for_request("charge tenant for damage") == "post_one_off_charge"
-    assert supported_tool_for_request("cleaning fee paid") == "mark_cleaning_fee_paid"
+    assert (
+        supported_tool_for_request("cleaning deposit paid")
+        == "mark_cleaning_deposit_paid"
+    )
     assert supported_tool_for_request("archive this inquiry") == "update_inquiry"
 
 
@@ -187,9 +190,9 @@ def test_mark_expense_paid(room_lease, landlord):
     assert entry.paid_on == date(2026, 7, 20)
 
 
-def test_mark_cleaning_fee_paid(room_lease, landlord):
+def test_mark_cleaning_deposit_paid(room_lease, landlord):
     done = registry.execute(
-        "mark_cleaning_fee_paid",
+        "mark_cleaning_deposit_paid",
         {
             "lease_number": room_lease.lease_number,
             "confirm": "yes",
@@ -199,7 +202,7 @@ def test_mark_cleaning_fee_paid(room_lease, landlord):
     assert done.get("updated"), done
     lt = room_lease.lease_tenants.get()
     lt.refresh_from_db()
-    assert lt.cleaning_fee_paid is True
+    assert lt.cleaning_deposit_paid is True
 
 
 def test_cancel_viewing(landlord):
@@ -266,3 +269,249 @@ def test_update_inquiry(landlord):
     assert done.get("updated"), done
     inq.refresh_from_db()
     assert inq.status == Inquiry.Status.ARCHIVED
+
+
+# ------------------------------------------------- deposit deductions/returns
+@pytest.fixture
+def unit_lease_with_deposits(landlord):
+    """A whole-unit tenancy with $200 security + $200 cleaning, both paid."""
+    from rentium.ledger import services as ledger_services
+
+    prop = Property.objects.create(
+        landlord=landlord,
+        name="Deduction House",
+        address="7 Deduct Rd",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.COMPLETE_UNIT,
+    )
+    lease = Lease.objects.create(
+        landlord=landlord,
+        property=prop,
+        lease_type=Lease.LeaseType.GENERIC_RESIDENTIAL,
+        status=Lease.LeaseStatus.ACTIVE,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+        total_rent=Decimal("1800.00"),
+        security_deposit=Decimal("200.00"),
+        cleaning_deposit=Decimal("200.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=lease,
+        invited_email="ded@example.com",
+        invited_name="Ded Tenant",
+        rent_amount=Decimal("1800.00"),
+        is_primary_tenant=True,
+        has_signed=True,
+    )
+    for description, kind in (
+        ("Security deposit", "security_deposit"),
+        ("Cleaning deposit", "cleaning_deposit_lease"),
+    ):
+        charge, _ = ledger_services.post_charge(
+            landlord=landlord,
+            tenant=None,
+            lease=lease,
+            property=prop,
+            amount="200.00",
+            due_date=date(2026, 1, 1),
+            entry_type="DEPOSIT_CHARGE",
+            description=description,
+            metadata={"kind": kind},
+        )
+        ledger_services.record_payment(
+            charge=charge, amount="200.00", payment_method="ETRANSFER"
+        )
+    return lease
+
+
+@pytest.fixture
+def inspection_for(unit_lease_with_deposits):
+    from django.core.management import call_command
+
+    from rentium.leases.inspection_services import build_inspection
+
+    call_command("seed_inspection_templates", verbosity=0)
+    return build_inspection(lease=unit_lease_with_deposits)
+
+
+def test_deposit_tools_are_registered_and_confirm_gated():
+    for name in ("record_deposit_deduction", "return_deposits"):
+        assert name in REGISTRY
+        assert "confirm" in REGISTRY[name].parameters["properties"]
+
+
+def test_deposit_deduction_intents_route_to_the_right_tool():
+    assert supported_tool_for_request("deduct from deposit") == (
+        "record_deposit_deduction"
+    )
+    assert supported_tool_for_request("return the deposit") == "return_deposits"
+
+
+def _deduct(landlord, **kwargs):
+    return registry.execute("record_deposit_deduction", kwargs, landlord=landlord)
+
+
+def test_a_labour_deduction_prices_hours_times_rate(
+    landlord, unit_lease_with_deposits, inspection_for
+):
+    result = _deduct(
+        landlord,
+        lease_number=unit_lease_with_deposits.lease_number,
+        deposit="cleaning",
+        basis="labour",
+        hours="3",
+        hourly_rate="35",
+        note="Oven and bathroom",
+        confirm="yes",
+    )
+    assert result["recorded"] is True
+    assert result["amount"] == "105.00"
+    inspection_for.refresh_from_db()
+    assert inspection_for.deduction_cleaning_deposit == Decimal("105.00")
+    # It records a proposal — it must not have touched the money.
+    from rentium.ledger import services as ledger_services
+
+    assert ledger_services.deposits_held(landlord) == Decimal("400.00")
+
+
+def test_labour_without_a_rate_is_asked_about_not_guessed(
+    landlord, unit_lease_with_deposits, inspection_for
+):
+    result = _deduct(
+        landlord,
+        lease_number=unit_lease_with_deposits.lease_number,
+        deposit="cleaning",
+        basis="labour",
+        hours="3",
+        confirm="yes",
+    )
+    assert "question_for_user" in result
+    assert inspection_for.deposit_deductions.count() == 0
+
+
+def test_a_deduction_never_names_the_deposit_for_you(
+    landlord, unit_lease_with_deposits, inspection_for
+):
+    """Deposits are held separately, so which one this comes out of is a fact
+    to ask for, never one to assume."""
+    result = _deduct(
+        landlord,
+        lease_number=unit_lease_with_deposits.lease_number,
+        deposit="",
+        basis="garbage",
+        amount="80",
+        confirm="yes",
+    )
+    assert result["needs"] == "deposit"
+    assert inspection_for.deposit_deductions.count() == 0
+
+
+def test_returning_deposits_pays_each_one_separately(
+    landlord, unit_lease_with_deposits
+):
+    from rentium.ledger import services as ledger_services
+
+    result = registry.execute(
+        "return_deposits",
+        {
+            "lease_number": unit_lease_with_deposits.lease_number,
+            "payment_method": "etransfer",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert result["returned"] is True
+    assert len(result["deposits"]) == 2
+    assert {row["returning"] for row in result["deposits"]} == {"200.00"}
+    assert ledger_services.deposits_held(landlord) == Decimal("0.00")
+
+
+def test_agreed_deductions_are_held_back_and_the_rest_goes_home(
+    landlord, unit_lease_with_deposits, inspection_for
+):
+    """The whole point: 2h x $35 + $22 supplies + $80 dump run = $172 comes out
+    of the CLEANING deposit only, and the security deposit goes back whole."""
+    from django.utils import timezone
+
+    from rentium.ledger import services as ledger_services
+
+    for kwargs in (
+        {"basis": "labour", "hours": "2", "hourly_rate": "35"},
+        {"basis": "supplies", "amount": "22"},
+        {"basis": "garbage", "amount": "80"},
+    ):
+        _deduct(
+            landlord,
+            lease_number=unit_lease_with_deposits.lease_number,
+            deposit="cleaning",
+            note="move-out clean",
+            confirm="yes",
+            **kwargs,
+        )
+    inspection_for.refresh_from_db()
+    assert inspection_for.deduction_cleaning_deposit == Decimal("172.00")
+
+    # Nothing is kept until the tenant agrees in writing.
+    before = registry.execute(
+        "return_deposits",
+        {
+            "lease_number": unit_lease_with_deposits.lease_number,
+            "payment_method": "etransfer",
+        },
+        landlord=landlord,
+    )
+    assert {row["kept_by_agreement"] for row in before["preview"]["deposits"]} == {
+        "0.00"
+    }
+
+    inspection_for.deduction_agreed_at = timezone.now()
+    inspection_for.save(update_fields=["deduction_agreed_at"])
+
+    result = registry.execute(
+        "return_deposits",
+        {
+            "lease_number": unit_lease_with_deposits.lease_number,
+            "payment_method": "etransfer",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    by_deposit = {row["deposit"]: row for row in result["deposits"]}
+    assert by_deposit["Security deposit"]["returning"] == "200.00"
+    assert by_deposit["Security deposit"]["kept_by_agreement"] == "0.00"
+    assert by_deposit["Cleaning deposit"]["returning"] == "28.00"
+    assert by_deposit["Cleaning deposit"]["kept_by_agreement"] == "172.00"
+    # Every dollar left the deposit liability: 228 to the tenant, 172 kept.
+    assert ledger_services.deposits_held(landlord) == Decimal("0.00")
+
+
+def test_a_deduction_cannot_exceed_the_deposit_it_comes_from(
+    landlord, unit_lease_with_deposits, inspection_for
+):
+    from django.utils import timezone
+
+    _deduct(
+        landlord,
+        lease_number=unit_lease_with_deposits.lease_number,
+        deposit="cleaning",
+        basis="cleaner",
+        amount="500",
+        note="Deep clean",
+        confirm="yes",
+    )
+    inspection_for.refresh_from_db()
+    inspection_for.deduction_agreed_at = timezone.now()
+    inspection_for.save(update_fields=["deduction_agreed_at"])
+
+    result = registry.execute(
+        "return_deposits",
+        {
+            "lease_number": unit_lease_with_deposits.lease_number,
+            "payment_method": "etransfer",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert "error" in result
+    assert "more than" in result["error"] or "exceed" in result["error"]

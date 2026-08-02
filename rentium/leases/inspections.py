@@ -25,6 +25,7 @@ Wire-up required in leases/models.py (mirrors the existing occupancy line):
     from .inspections import (  # noqa: E402,F401
         AreaConditionState,
         ConditionInspection,
+        DepositDeduction,
         InspectionItem,
         InspectionKeyRow,
         InspectionTemplate,
@@ -279,7 +280,11 @@ class ConditionInspection(models.Model):
     tenant_signed_move_out_at = models.DateTimeField(null=True, blank=True)
     tenant_move_out_signature_name = models.CharField(max_length=150, blank=True)
 
-    # --- Box 2: tenant-consented deposit deductions (ledger wiring: ph. 2)
+    # --- Box 2: tenant-consented deposit deductions ------------------------
+    # These three are the AGREED TOTAL per deposit, rolled up from the
+    # DepositDeduction lines below (see refresh_deduction_totals). They are
+    # what the tenant signs off on; the lines are what makes the number
+    # defensible at a hearing.
     deduction_security_deposit = models.DecimalField(
         _("Agreed Deduction — Security Deposit"),
         max_digits=10,
@@ -289,6 +294,13 @@ class ConditionInspection(models.Model):
     )
     deduction_pet_deposit = models.DecimalField(
         _("Agreed Deduction — Pet Deposit"),
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    deduction_cleaning_deposit = models.DecimalField(
+        _("Agreed Deduction — Cleaning Deposit"),
         max_digits=10,
         decimal_places=2,
         null=True,
@@ -383,6 +395,49 @@ class ConditionInspection(models.Model):
         if pass_name == InspectionPass.MOVE_IN:
             return self.move_in_fully_signed
         return self.move_out_fully_signed
+
+    # ---------------------------------------------------- deposit deductions
+    DEDUCTION_TOTAL_FIELDS = {
+        "SECURITY": "deduction_security_deposit",
+        "PET": "deduction_pet_deposit",
+        "CLEANING": "deduction_cleaning_deposit",
+    }
+
+    def deduction_totals(self) -> dict:
+        """{deposit_kind: Decimal} summed from the lines. Always all three
+        keys, so a caller never has to distinguish "nothing claimed" from
+        "kind not present"."""
+        from decimal import Decimal
+
+        totals = {kind: Decimal("0.00") for kind in self.DEDUCTION_TOTAL_FIELDS}
+        for line in self.deposit_deductions.all():
+            totals[line.deposit_kind] += line.line_amount()
+        return totals
+
+    def refresh_deduction_totals(self):
+        """Roll the lines up into the three agreed-total columns.
+
+        The totals are stored rather than derived on read because they are what
+        the tenant agreed to in writing — if a line is edited afterwards, the
+        difference between the stored total and the recomputed one is the
+        evidence that the agreement no longer covers the claim.
+        """
+        totals = self.deduction_totals()
+        for kind, field in self.DEDUCTION_TOTAL_FIELDS.items():
+            setattr(self, field, totals[kind])
+        self.save(
+            update_fields=[*self.DEDUCTION_TOTAL_FIELDS.values(), "updated_at"]
+        )
+        return totals
+
+    def deductions_are_agreed(self) -> bool:
+        """Whether the landlord may actually keep any of it.
+
+        Under the BC RTA a landlord keeps deposit money ONLY with the tenant's
+        written agreement or an RTB order. Recording lines is bookkeeping;
+        this is the gate that turns them into a claim.
+        """
+        return bool(self.deduction_agreed_at)
 
 
 class InspectionItem(models.Model):
@@ -482,6 +537,159 @@ class InspectionItem(models.Model):
     def latest_code(self) -> str:
         """The most recent recorded repair-state code (end column wins)."""
         return self.move_out_condition_code or self.move_in_condition_code or ""
+
+
+class DepositDeduction(models.Model):
+    """One costed line of what the landlord proposes to keep, and why.
+
+    Hangs off the move-out inspection rather than living in its own system:
+    the RTB-27 is already the document that records what state the place was
+    left in, row by row, with both parties' signatures on it. A deduction is
+    the price of one of those rows, so it belongs next to the row — that is
+    what makes "$80 garbage removal" answerable at a hearing instead of being
+    a number in a different screen.
+
+    Nothing here keeps any money on its own. The deposit is only reduced once
+    ConditionInspection.deduction_agreed_at is set (the tenant's written
+    agreement) or an RTB file number exists on the move-out request — see
+    MoveOutRequest.deposit_status(): there are three lawful routes and this is
+    not a fourth one.
+    """
+
+    class DepositKind(models.TextChoices):
+        SECURITY = "SECURITY", _("Security deposit")
+        PET = "PET", _("Pet damage deposit")
+        CLEANING = "CLEANING", _("Cleaning deposit")
+
+    class Basis(models.TextChoices):
+        LABOUR = "LABOUR", _("Own labour (hours × rate)")
+        SUPPLIES = "SUPPLIES", _("Cleaning supplies / materials")
+        PROFESSIONAL_CLEANER = "CLEANER", _("Professional cleaners")
+        GARBAGE_REMOVAL = "GARBAGE", _("Garbage removal / dumping fees")
+        OTHER = "OTHER", _("Other")
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    inspection = models.ForeignKey(
+        ConditionInspection,
+        on_delete=models.CASCADE,
+        related_name="deposit_deductions",
+    )
+    # Which row of the report this came from. Optional because some costs
+    # (a dump run) are about the whole tenancy, not one item.
+    inspection_item = models.ForeignKey(
+        InspectionItem,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deposit_deductions",
+    )
+    # Damage that became a job has an invoice behind it; same link maintenance
+    # already uses for tenant-attributed work.
+    work_order = models.ForeignKey(
+        "maintenance.WorkOrder",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deposit_deductions",
+    )
+
+    deposit_kind = models.CharField(
+        _("Taken from"),
+        max_length=10,
+        choices=DepositKind.choices,
+        db_index=True,
+        help_text=_(
+            "Deposits are held and returned separately, so every deduction has "
+            "to name which one it comes out of."
+        ),
+    )
+    basis = models.CharField(_("Basis"), max_length=10, choices=Basis.choices)
+
+    # LABOUR is priced; everything else is a receipt.
+    hours = models.DecimalField(
+        _("Hours"), max_digits=6, decimal_places=2, null=True, blank=True
+    )
+    hourly_rate = models.DecimalField(
+        _("Hourly Rate"), max_digits=8, decimal_places=2, null=True, blank=True
+    )
+    amount = models.DecimalField(
+        _("Amount"), max_digits=10, decimal_places=2, null=True, blank=True
+    )
+
+    note = models.TextField(
+        _("What this covers"),
+        blank=True,
+        help_text=_(
+            "What was cleaned, hauled or repaired. A bare amount with no "
+            "description is the deduction that loses a hearing."
+        ),
+    )
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deposit_deductions_created",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = _("Deposit Deduction")
+        verbose_name_plural = _("Deposit Deductions")
+        ordering = ["inspection", "created_at"]
+        indexes = [
+            models.Index(
+                fields=["inspection", "deposit_kind"],
+                name="deposit_deduction_kind_idx",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.get_basis_display()} — ${self.line_amount()}"
+
+    def line_amount(self):
+        """What this line costs. Labour is computed so the arithmetic is on
+        the record; everything else is the figure on the receipt."""
+        from decimal import Decimal
+
+        if self.basis == self.Basis.LABOUR:
+            if self.hours is None or self.hourly_rate is None:
+                return Decimal("0.00")
+            return (self.hours * self.hourly_rate).quantize(Decimal("0.01"))
+        return Decimal(self.amount or 0)
+
+    def clean(self):
+        super().clean()
+        if self.inspection_item and self.inspection_item.inspection_id != (
+            self.inspection_id
+        ):
+            raise ValidationError(
+                {"inspection_item": _("That item belongs to another inspection.")}
+            )
+        if self.basis == self.Basis.LABOUR:
+            if self.hours is None or self.hourly_rate is None:
+                raise ValidationError(
+                    {
+                        "hours": _(
+                            "Own labour needs both the hours and the hourly rate — "
+                            "a lump sum for your own time is not defensible."
+                        )
+                    }
+                )
+            if self.hours <= 0 or self.hourly_rate <= 0:
+                raise ValidationError(
+                    {"hours": _("Hours and rate must both be positive.")}
+                )
+        elif not self.amount or self.amount <= 0:
+            raise ValidationError({"amount": _("Enter a positive amount.")})
+
+    def save(self, *args, **kwargs):
+        # Keep `amount` populated for labour lines too, so every report and
+        # export can read one field without knowing about the basis.
+        self.amount = self.line_amount()
+        return super().save(*args, **kwargs)
 
 
 class InspectionKeyRow(models.Model):

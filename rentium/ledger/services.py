@@ -23,6 +23,7 @@ from .models import CHARGE_TYPES
 from .models import SETTLEMENT_TYPES
 from .models import EntryType
 from .models import LedgerEntry
+from .models import PaymentMethod
 
 
 class LedgerError(Exception):
@@ -181,6 +182,137 @@ def record_payment(
             lease_id=entry.lease_id,
         )
     return entry, created
+
+
+def outstanding_on(charge: LedgerEntry) -> Decimal:
+    """What is still owing on one charge, net of live settlements."""
+    from django.db.models import Sum
+
+    paid = charge.settlements.filter(
+        entry_type__in=SETTLEMENT_TYPES, reversed_by__isnull=True
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+    return charge.amount - paid
+
+
+def suggest_deposit_split(candidates, amount) -> list | None:
+    """Which open charges add up to exactly `amount`, if any obviously do.
+
+    Deposits arrive together and land as one bank line: a tenant signs, sends a
+    single $400 e-transfer, and that is $200 security + $200 cleaning. The
+    charges stay separate all the way through (they are returned separately, and
+    a cleaning deduction must never reach the security deposit), so the split has
+    to happen at the moment the money is recorded.
+
+    Exact full-pay of each selected charge only — a guess that leaves a stray
+    $3 owing on a deposit is worse than no guess. Returns None when nothing
+    matches cleanly, and the caller asks.
+    """
+    amount = Decimal(amount)
+    if not candidates or amount <= 0:
+        return None
+    scored = []
+    for charge in candidates:
+        desc = (charge.description or "").casefold()
+        kind = 0
+        if "security" in desc or charge.entry_type == EntryType.DEPOSIT_CHARGE:
+            kind = 3
+        if "cleaning" in desc:
+            kind = max(kind, 2)
+        if "pet" in desc:
+            kind = max(kind, 2)
+        if "rent" in desc:
+            kind = max(kind, 1)
+        out = outstanding_on(charge)
+        if out <= 0:
+            continue
+        scored.append((kind, out, charge))
+
+    # Deposit-like charges first; fall back to everything open if there are none.
+    pool = [(out, c) for kind, out, c in scored if kind >= 2] or [
+        (out, c) for kind, out, c in scored
+    ]
+    pool = pool[:8]  # 2**8 subsets is the ceiling on an interactive path
+    n = len(pool)
+    best = None
+    for mask in range(1, 1 << n):
+        total = Decimal("0")
+        chosen = []
+        for i in range(n):
+            if mask & (1 << i):
+                total += pool[i][0]
+                chosen.append(pool[i][1])
+        if total == amount and 1 < len(chosen) <= 4:
+            # Fewer charges first, then the more deposit-like reading.
+            score = (
+                -len(chosen),
+                sum(1 for c in chosen if "deposit" in (c.description or "").casefold()),
+            )
+            if best is None or score > best[0]:
+                best = (score, chosen)
+    return best[1] if best else None
+
+
+@transaction.atomic
+def record_split_payment(
+    *,
+    landlord,
+    allocations,
+    payment_method,
+    payment_date=None,
+    reference_number="",
+    notes="",
+    paid_by=None,
+    created_by=None,
+    idempotency_prefix="split",
+) -> list[tuple[LedgerEntry, bool]]:
+    """One real-world payment, recorded against several charges.
+
+    `allocations` is [(charge, amount)]. Posts one PAYMENT row per charge —
+    append-only, one per charge, so each charge's own balance and its own
+    settlement history stay true. There is deliberately no "combined payment"
+    parent row: the ledger's unit is the settlement of a charge, and inventing a
+    parent would give two places to ask "is this deposit paid?".
+
+    All rows share a date, a method and a note naming the total, which is what
+    ties them back to the single line on the bank statement.
+
+    Returns [(entry, created)] in the order given, matching record_payment — a
+    re-submitted split comes back created=False rather than double-posting.
+    """
+    parts = [(charge, Decimal(amount)) for charge, amount in allocations]
+    if not parts:
+        raise LedgerError("No charges to allocate this payment against.")
+    if any(amount <= 0 for _, amount in parts):
+        raise LedgerError("Every allocation must be a positive amount.")
+    for charge, _ in parts:
+        if charge.landlord_id != landlord.pk:
+            raise LedgerError("That charge belongs to another landlord.")
+    if len({charge.pk for charge, _ in parts}) != len(parts):
+        raise LedgerError("The same charge appears twice in the allocation.")
+
+    total = sum((amount for _, amount in parts), Decimal("0"))
+    day = payment_date or date.today()
+
+    posted = []
+    for charge, amount in parts:
+        posted.append(
+            record_payment(
+                charge=charge,
+                amount=amount,
+                payment_method=payment_method,
+                payment_date=day,
+                reference_number=reference_number,
+                notes=(
+                    notes or f"Allocated from ${total} {payment_method} (multi-charge)"
+                ),
+                paid_by=paid_by,
+                created_by=created_by,
+                idempotency_key=(
+                    f"{idempotency_prefix}:{charge.pk}:{day}:{amount}:{total}"
+                ),
+            )
+        )
+    return posted
 
 
 def post_credit(
@@ -577,8 +709,10 @@ def post_deposit_return(
     property=None,
     description="Deposit returned",
     payment_method="ETRANSFER",
+    effective_date=None,
     created_by=None,
     idempotency_key=None,
+    metadata=None,
 ) -> tuple[LedgerEntry, bool]:
     return post_entry(
         landlord=landlord,
@@ -587,12 +721,297 @@ def post_deposit_return(
         tenant=tenant,
         entry_type=EntryType.DEPOSIT_RETURN,
         amount=Decimal(amount),
-        effective_date=date.today(),
+        effective_date=effective_date or date.today(),
         description=description,
         payment_method=payment_method,
         created_by=created_by,
         idempotency_key=idempotency_key,
+        metadata=metadata or {},
     )
+
+
+def refundable_deposit_balances(*, landlord, lease) -> list[dict]:
+    """Return the refundable balance of each deposit charge on a lease.
+
+    Incoming payments remain attached to their own deposit charge even when
+    they originated in one bank transfer. Returns are likewise linked through
+    immutable metadata, so security and cleaning deposits can be accounted for
+    and returned separately.
+    """
+    from django.db.models import Sum
+
+    labels = {
+        "security_deposit": "Security deposit",
+        "pet_deposit": "Pet damage deposit",
+        "cleaning_deposit_lease": "Cleaning deposit",
+        "cleaning_deposit_individual": "Cleaning deposit",
+        # Read historical rows during/after the data migration as a safeguard.
+        "cleaning_fee_lease": "Cleaning deposit",
+        "cleaning_fee_individual": "Cleaning deposit",
+    }
+    returns = list(
+        LedgerEntry.objects.not_voided().filter(
+            landlord=landlord,
+            lease=lease,
+            entry_type=EntryType.DEPOSIT_RETURN,
+        )
+    )
+    unallocated_returns = [
+        row for row in returns if not (row.metadata or {}).get("source_charge_id")
+    ]
+    if unallocated_returns:
+        raise LedgerError(
+            "This lease has a historical deposit return that is not allocated "
+            "to a deposit type. Allocate it before posting another automatic return."
+        )
+
+    sole_tenant = None
+    tenant_ids = list(
+        lease.lease_tenants.filter(tenant__isnull=False)
+        .values_list("tenant_id", flat=True)
+        .distinct()[:2]
+    )
+    if len(tenant_ids) == 1:
+        from rentium.users.models import TenantProfile
+
+        sole_tenant = TenantProfile.objects.filter(pk=tenant_ids[0]).first()
+
+    balances = []
+    charges = (
+        LedgerEntry.objects.not_voided()
+        .filter(
+            landlord=landlord,
+            lease=lease,
+            entry_type=EntryType.DEPOSIT_CHARGE,
+        )
+        .select_related("tenant")
+        .order_by("effective_date", "created_at")
+    )
+    for charge in charges:
+        received = (
+            charge.settlements.filter(
+                entry_type=EntryType.PAYMENT,
+                reversed_by__isnull=True,
+            ).aggregate(total=Sum("amount"))["total"]
+            or Decimal("0.00")
+        )
+        returned = sum(
+            (
+                row.amount
+                for row in returns
+                if str((row.metadata or {}).get("source_charge_id"))
+                == str(charge.pk)
+            ),
+            Decimal("0.00"),
+        )
+        balance = received - returned
+        if balance <= 0:
+            continue
+        kind = str((charge.metadata or {}).get("kind") or "deposit")
+        balances.append(
+            {
+                "charge": charge,
+                "charge_id": str(charge.pk),
+                "kind": kind,
+                "label": labels.get(kind, "Deposit"),
+                "received": received,
+                "returned": returned,
+                "balance": balance,
+                "tenant": charge.tenant or sole_tenant,
+            }
+        )
+    return balances
+
+
+# The inspection records deductions against a deposit KIND ("the cleaning
+# deposit"); the ledger holds them as charges. One kind can be several charges
+# — a lease-level cleaning deposit plus per-roommate ones.
+DEPOSIT_KIND_BY_LEDGER_KIND = {
+    "security_deposit": "SECURITY",
+    "pet_deposit": "PET",
+    "cleaning_deposit_lease": "CLEANING",
+    "cleaning_deposit_individual": "CLEANING",
+    # Historical rows, same as the label map above.
+    "cleaning_fee_lease": "CLEANING",
+    "cleaning_fee_individual": "CLEANING",
+}
+
+
+def allocate_deductions(balances, totals) -> dict:
+    """Spread an agreed per-deposit total across that deposit's charges.
+
+    `totals` is {SECURITY|PET|CLEANING: Decimal} — what the tenant agreed to in
+    writing. Returns {charge_id: Decimal}. Charges are filled in the order they
+    were posted and each is capped at its own balance, so a deduction can never
+    quietly reach into a different deposit: keeping cleaning money out of the
+    security deposit is the whole reason they are separate charges.
+    """
+    remaining = {
+        kind: Decimal(str(amount or 0))
+        for kind, amount in (totals or {}).items()
+        if Decimal(str(amount or 0)) > 0
+    }
+    allocated = {}
+    for item in balances:
+        deposit_kind = DEPOSIT_KIND_BY_LEDGER_KIND.get(item["kind"])
+        left = remaining.get(deposit_kind, Decimal("0.00"))
+        if left <= 0:
+            continue
+        take = min(left, item["balance"])
+        allocated[item["charge_id"]] = take
+        remaining[deposit_kind] = left - take
+
+    over = {kind: amount for kind, amount in remaining.items() if amount > 0}
+    if over:
+        detail = ", ".join(f"{kind} by ${amount}" for kind, amount in over.items())
+        raise LedgerError(
+            f"The agreed deductions exceed the deposit money actually held "
+            f"({detail}). A landlord can't keep more than they were given — "
+            f"the balance is a debt to claim, not a deduction."
+        )
+    return allocated
+
+
+@transaction.atomic
+def return_refundable_deposits(
+    *,
+    landlord,
+    lease,
+    payment_method,
+    effective_date=None,
+    created_by=None,
+    deductions=None,
+) -> list[LedgerEntry]:
+    """Return every held deposit as separate, idempotent ledger entries.
+
+    `deductions` is {charge_id: Decimal} — money the tenant agreed IN WRITING
+    that the landlord may keep (or that an RTB order awards). Callers must have
+    checked that consent; this function books it, it does not authorise it.
+
+    A deducted deposit posts THREE rows, not one netted row:
+
+      1. DEPOSIT_RETURN for what the tenant actually gets back.
+      2. DEPOSIT_RETURN for the deducted part, method OTHER — the money left
+         the deposit liability but never left the bank. Without this leg
+         `deposits_held` (payments in, minus DEPOSIT_RETURNs out) would show
+         the landlord holding a deposit they have already spent, forever.
+      3. An OTHER_CHARGE for the deduction plus a PAYMENT settling it from
+         that money, so what was kept shows up as income that was earned
+         rather than as a deposit that evaporated.
+
+    Three explicit legs rather than one quiet subtraction, for the same reason
+    damage claims are never netted against deposits: at a hearing, "we kept
+    $187" has to be answerable line by line.
+    """
+    if payment_method not in PaymentMethod.values:
+        raise LedgerError(f"Unknown deposit return method {payment_method!r}.")
+    deductions = {str(k): Decimal(str(v)) for k, v in (deductions or {}).items()}
+
+    posted = []
+    for item in refundable_deposit_balances(landlord=landlord, lease=lease):
+        charge_id = item["charge_id"]
+        deducted = deductions.get(charge_id, Decimal("0.00"))
+        if deducted < 0:
+            raise LedgerError("A deduction cannot be negative.")
+        if deducted > item["balance"]:
+            raise LedgerError(
+                f'The deduction on {item["label"]} (${deducted}) is more than '
+                f'the ${item["balance"]} held against it.'
+            )
+        to_tenant = item["balance"] - deducted
+
+        if to_tenant > 0:
+            entry, _created = post_deposit_return(
+                landlord=landlord,
+                tenant=item["tenant"],
+                amount=to_tenant,
+                lease=lease,
+                description=f'{item["label"]} returned',
+                payment_method=payment_method,
+                effective_date=effective_date,
+                created_by=created_by,
+                idempotency_key=f"deposit-return:{lease.pk}:{charge_id}:full",
+                metadata={
+                    "kind": item["kind"],
+                    "source_charge_id": charge_id,
+                    "returned_separately": True,
+                    "leg": "returned_to_tenant",
+                },
+            )
+            posted.append(entry)
+
+        if deducted > 0:
+            posted.extend(
+                _post_agreed_deduction(
+                    landlord=landlord,
+                    lease=lease,
+                    item=item,
+                    amount=deducted,
+                    effective_date=effective_date,
+                    created_by=created_by,
+                )
+            )
+    return posted
+
+
+def _post_agreed_deduction(
+    *, landlord, lease, item, amount, effective_date, created_by
+) -> list[LedgerEntry]:
+    """The two-and-a-half legs that turn held deposit money into kept money.
+
+    Called only from return_refundable_deposits, which has already established
+    that the tenant agreed to this in writing. See its docstring for why this
+    is three rows rather than a subtraction.
+    """
+    charge_id = item["charge_id"]
+    day = effective_date or date.today()
+    label = item["label"]
+
+    applied, _created = post_deposit_return(
+        landlord=landlord,
+        tenant=item["tenant"],
+        amount=amount,
+        lease=lease,
+        description=f"{label} applied to agreed deductions",
+        # Not the tenant's return method: this money never moved.
+        payment_method=PaymentMethod.OTHER,
+        effective_date=effective_date,
+        created_by=created_by,
+        idempotency_key=f"deposit-return:{lease.pk}:{charge_id}:applied",
+        metadata={
+            "kind": item["kind"],
+            "source_charge_id": charge_id,
+            "returned_separately": True,
+            "leg": "applied_to_deductions",
+        },
+    )
+
+    charge, _created = post_charge(
+        landlord=landlord,
+        tenant=item["tenant"],
+        lease=lease,
+        property=lease.property if lease.property_id else None,
+        amount=amount,
+        due_date=day,
+        entry_type=EntryType.OTHER_CHARGE,
+        description=f"Agreed deduction from the {label.lower()}",
+        idempotency_key=f"deposit-deduction:{lease.pk}:{charge_id}",
+        metadata={
+            "kind": "deposit_deduction",
+            "source_charge_id": charge_id,
+            "deposit_kind": DEPOSIT_KIND_BY_LEDGER_KIND.get(item["kind"]),
+        },
+    )
+    settlement, _created = record_payment(
+        charge=charge,
+        amount=amount,
+        payment_method=PaymentMethod.OTHER,
+        payment_date=day,
+        notes=f"Settled from the {label.lower()} held on this lease",
+        created_by=created_by,
+        idempotency_key=f"deposit-deduction-paid:{lease.pk}:{charge_id}",
+    )
+    return [applied, charge, settlement]
 
 
 def deposits_held(landlord) -> Decimal:

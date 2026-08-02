@@ -185,7 +185,7 @@ def renew_lease(
             "total_rent": rent,
             "security_deposit": deposit,
             "pet_deposit": old.pet_deposit,
-            "cleaning_fee": old.cleaning_fee,
+            "cleaning_deposit": old.cleaning_deposit,
             "pets_allowed": old.pets_allowed,
             "smoking_allowed": old.smoking_allowed,
             "special_terms": old.special_terms or "",
@@ -222,8 +222,8 @@ def renew_lease(
                     rent_amount=old_lt.rent_amount,
                     room=old_lt.room,
                     is_primary_tenant=old_lt.is_primary_tenant,
-                    cleaning_fee=old_lt.cleaning_fee,
-                    cleaning_fee_paid=False,
+                    cleaning_deposit=old_lt.cleaning_deposit,
+                    cleaning_deposit_paid=False,
                     has_signed=False,
                 )
                 copied += 1
@@ -273,6 +273,8 @@ def settle_moveout(
     forwarding_address: str = "",
     forwarding_address_received_on: str = "",
     deposit_settlement: str = "",
+    deposit_return_method: str = "",
+    deposit_return_date: str = "",
     tenant_agreement_signed_on: str = "",
     rtb_file_number: str = "",
     confirm: str = "",
@@ -373,6 +375,7 @@ def settle_moveout(
         or (forwarding_address_received_on or "").strip()
         or (deposit_settlement or "").strip()
         or (rtb_file_number or "").strip()
+        or (deposit_return_method or "").strip()
     )
 
     if not creating and not settling:
@@ -435,6 +438,9 @@ def settle_moveout(
                 }
 
     settlement_code = (deposit_settlement or "").strip().upper()
+    return_method = ""
+    return_day = None
+    deposit_returns = []
     if settlement_code:
         valid = {c for c, _ in MoveOutRequest.DepositSettlement.choices}
         if settlement_code not in valid:
@@ -455,6 +461,44 @@ def settle_moveout(
         if settlement_code == MoveOutRequest.DepositSettlement.RTB_APPLIED:
             if not (rtb_file_number or "").strip():
                 return {"error": "RTB settlement needs rtb_file_number."}
+        if settlement_code == MoveOutRequest.DepositSettlement.RETURNED_IN_FULL:
+            from rentium.ledger import services as ledger_services
+            from rentium.ledger.services import LedgerError
+
+            try:
+                deposit_returns = ledger_services.refundable_deposit_balances(
+                    landlord=landlord, lease=lease
+                )
+            except LedgerError as exc:
+                return {"error": str(exc)}
+            if deposit_returns:
+                method_map = {
+                    "etransfer": "ETRANSFER",
+                    "e-transfer": "ETRANSFER",
+                    "e transfer": "ETRANSFER",
+                    "cash": "CASH",
+                    "cheque": "CHEQUE",
+                    "check": "CHEQUE",
+                    "other": "OTHER",
+                }
+                return_method = method_map.get(
+                    (deposit_return_method or "").strip().lower(), ""
+                )
+                if not return_method:
+                    return {
+                        "question_for_user": (
+                            "How will the security and cleaning deposits be "
+                            "returned — e-transfer, cash, or cheque?"
+                        ),
+                        "needs": "deposit_return_method",
+                    }
+                if (deposit_return_date or "").strip():
+                    try:
+                        return_day = _parse_date(
+                            deposit_return_date, "deposit_return_date"
+                        )
+                    except ValueError as exc:
+                        return {"error": str(exc)}
 
     preview = {
         "lease_number": lease.lease_number,
@@ -467,6 +511,16 @@ def settle_moveout(
         "settling_deposit": settling,
         "forwarding_address": (forwarding_address or "")[:80] or None,
         "deposit_settlement": settlement_code or None,
+        "deposit_returns": [
+            {
+                "type": item["label"],
+                "amount": str(item["balance"]),
+                "returned_separately": True,
+            }
+            for item in deposit_returns
+        ] or None,
+        "deposit_return_method": return_method or None,
+        "deposit_return_date": str(return_day) if return_day else None,
         "existing_moveout_id": str(existing.pk) if existing else None,
     }
     if not _confirmed(confirm):
@@ -546,8 +600,32 @@ def settle_moveout(
         if (rtb_file_number or "").strip() and "rtb_file_number" not in fields:
             existing.rtb_file_number = (rtb_file_number or "")[:50]
             fields.append("rtb_file_number")
-        existing.save(update_fields=list(dict.fromkeys(fields)))
+        try:
+            with transaction.atomic():
+                existing.save(update_fields=list(dict.fromkeys(fields)))
+                if deposit_returns:
+                    from rentium.ledger import services as ledger_services
+
+                    posted_returns = ledger_services.return_refundable_deposits(
+                        landlord=landlord,
+                        lease=lease,
+                        payment_method=return_method,
+                        effective_date=return_day,
+                        created_by=getattr(landlord, "user", None),
+                    )
+                else:
+                    posted_returns = []
+        except Exception as exc:  # noqa: BLE001 — financial write must roll back
+            return {"error": str(exc)}
         result["deposit_settlement"] = existing.deposit_settlement
+        result["deposit_returns"] = [
+            {
+                "entry_id": str(entry.pk),
+                "description": entry.description,
+                "amount": str(entry.amount),
+            }
+            for entry in posted_returns
+        ]
         result["forwarding_address"] = existing.forwarding_address or None
         result["moveout_id"] = str(existing.pk)
 

@@ -94,6 +94,12 @@ def _lease_edit_guard(inst):
     return True, ""
 
 
+def _lease_tenant_edit_guard(inst):
+    """Same gate, reached through the parent lease — LeaseNotLocked resolves a
+    LeaseTenant to its lease for exactly this reason."""
+    return _lease_edit_guard(inst.lease)
+
+
 # --------------------------------------------------------------------------- #
 # The manifest. Phase 1 covers Property + Lease — the two entities most of the
 # historical read/write gaps came from.
@@ -152,11 +158,22 @@ LEASE = EntitySpec(
         FieldSpec("total_rent", "Total monthly rent", "money"),  # rebalances → bespoke
         FieldSpec("security_deposit", "Security deposit", "money", editable=True),
         FieldSpec("pet_deposit", "Pet deposit", "money", editable=True),
-        FieldSpec("cleaning_fee", "Cleaning fee", "money", editable=True),
+        FieldSpec("cleaning_deposit", "Cleaning deposit", "money", editable=True),
         FieldSpec("pets_allowed", "Pets allowed", "bool", editable=True),
         FieldSpec("smoking_allowed", "Smoking allowed", "bool", editable=True),
         FieldSpec("parking_included", "Parking included", "bool", editable=True),
+        FieldSpec("parking_description", "Parking details", editable=True),
+        FieldSpec("parking_extra_charge", "Parking charge", "money", editable=True),
         FieldSpec("rent_due_day", "Rent due day", "number", editable=True),
+        FieldSpec("pets_terms", "Pet terms", filterable=False, editable=True),
+        FieldSpec("smoking_terms", "Smoking terms", filterable=False, editable=True),
+        FieldSpec("special_terms", "Special terms", filterable=False, editable=True),
+        FieldSpec(
+            "services_and_facilities",
+            "Services and facilities",
+            filterable=False,
+            editable=True,
+        ),
         FieldSpec("landlord_signed", "Landlord signed", "bool"),
         FieldSpec("move_in_date", "Move-in date", "date", editable=True),
         FieldSpec("move_out_date", "Move-out date", "date", editable=True),
@@ -190,8 +207,11 @@ LEASE_TENANT = EntitySpec(
         FieldSpec("invited_name", "Name"),
         FieldSpec("invited_email", "Email"),
         FieldSpec("invited_phone", "Phone"),
-        FieldSpec("rent_amount", "Rent share", "money"),
-        FieldSpec("cleaning_fee", "Cleaning fee", "money"),
+        # Editable while the lease itself is: a roommate's share and their own
+        # cleaning deposit are lease terms, and refusing them here left the
+        # landlord with Django admin as the only route.
+        FieldSpec("rent_amount", "Rent share", "money", editable=True),
+        FieldSpec("cleaning_deposit", "Cleaning deposit", "money", editable=True),
         FieldSpec("is_primary_tenant", "Primary tenant", "bool"),
         FieldSpec("has_signed", "Signed", "bool"),
         FieldSpec("signed_date", "Signed on", "date"),
@@ -200,6 +220,11 @@ LEASE_TENANT = EntitySpec(
         FieldSpec("individual_end_date", "Their end date", "date"),
         FieldSpec("tenant_notes", "Notes", filterable=False),
     ],
+    # Mirrors LeaseNotLocked, which walks a LeaseTenant up to its lease: a
+    # roommate row on an executed lease is part of an executed lease.
+    edit_guard=_lease_tenant_edit_guard,
+    lookup=("invited_name", "invited_email", "tenant__user__email"),
+    label_field="display_name",
 )
 
 WORK_ORDER = EntitySpec(

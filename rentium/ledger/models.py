@@ -735,6 +735,10 @@ class StagedLedgerEntry(models.Model):
     )
     raw = models.JSONField(default=dict, blank=True)  # original spreadsheet row
     issues = models.JSONField(default=list, blank=True)
+    # A bad import row is excluded rather than destroyed when RAMA handles it.
+    # The landlord can restore it before commit and the raw source row remains.
+    excluded_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    exclusion_reason = models.CharField(max_length=255, blank=True, default="")
     committed_entry = models.ForeignKey(
         LedgerEntry, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )

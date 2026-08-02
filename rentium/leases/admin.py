@@ -169,7 +169,7 @@ class LeaseAdmin(admin.ModelAdmin):
                     "total_rent",
                     "security_deposit",
                     "pet_deposit",
-                    "cleaning_fee",
+                    "cleaning_deposit",
                     "bills_included",
                 ),
             },

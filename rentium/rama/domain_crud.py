@@ -15,6 +15,7 @@ Rules (same as the dashboard / API):
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import re
 from datetime import date
 from datetime import datetime
@@ -734,6 +735,16 @@ def create_property(
     group_name: str = "",
     asking_rent: str = "",
     inventory_items: str = "",
+    postal_code: str = "",
+    neighbourhood: str = "",
+    max_occupancy: str = "",
+    square_footage: str = "",
+    available_from: str = "",
+    building_amenities: str = "",
+    default_bills_included: str = "",
+    is_publicly_visible: str = "",
+    furnishing_status: str = "",
+    furnishing_details: str = "",
     allow_duplicate_name: str = "0",
     confirm: str = "",
 ) -> dict:
@@ -911,6 +922,34 @@ def create_property(
             return {"error": str(exc)}
 
     inv_names = _parse_item_names(inventory_items)
+    try:
+        occupancy = int(max_occupancy) if str(max_occupancy).strip() else None
+        sqft = int(square_footage) if str(square_footage).strip() else None
+        available = date.fromisoformat(available_from) if available_from else None
+    except ValueError as exc:
+        return {"error": f"Invalid occupancy, square footage, or available_from: {exc}"}
+    amenities: list[str] = []
+    if building_amenities:
+        try:
+            parsed_amenities = json.loads(building_amenities) if building_amenities.strip().startswith("[") else [part.strip().upper() for part in building_amenities.split(",") if part.strip()]
+        except json.JSONDecodeError:
+            return {"error": "building_amenities must be a JSON array or comma-separated values."}
+        if not isinstance(parsed_amenities, list):
+            return {"error": "building_amenities must be a list."}
+        amenities = [str(value).upper() for value in parsed_amenities]
+    bills = {}
+    if default_bills_included:
+        try:
+            bills = json.loads(default_bills_included)
+        except json.JSONDecodeError:
+            return {"error": "default_bills_included must be a JSON object."}
+        if not isinstance(bills, dict):
+            return {"error": "default_bills_included must be a JSON object."}
+    furnish = Property.FurnishingStatus.UNFURNISHED
+    if furnishing_status:
+        furnish = _choice_code(Property.FurnishingStatus.choices, furnishing_status)
+        if furnish is None:
+            return {"error": "furnishing_status must be furnished, semi-furnished, or unfurnished."}
 
     preview = {
         "name": name,
@@ -926,6 +965,16 @@ def create_property(
         "asking_rent": str(ask) if ask is not None else None,
         "description": (description or "")[:200],
         "inventory_items_to_create": inv_names,
+        "postal_code": postal_code or None,
+        "neighbourhood": neighbourhood or None,
+        "max_occupancy": occupancy,
+        "square_footage": sqft,
+        "available_from": str(available) if available else None,
+        "building_amenities": amenities,
+        "default_bills_included": bills,
+        "is_publicly_visible": _truthy(is_publicly_visible) if is_publicly_visible != "" else True,
+        "furnishing_status": furnish,
+        "furnishing_details": furnishing_details or None,
         "name_conflicts": name_conflicts,
         "duplicate_warning": (
             "A similarly named listing already exists. Confirm only if this is "
@@ -965,6 +1014,16 @@ def create_property(
         holding=holding,
         asking_rent=ask,
         country="Canada",
+        postal_code=postal_code,
+        neighbourhood=neighbourhood[:120],
+        max_occupancy=occupancy,
+        square_footage=sqft,
+        available_from=available,
+        building_amenities=amenities,
+        default_bills_included=bills,
+        is_publicly_visible=_truthy(is_publicly_visible) if is_publicly_visible != "" else True,
+        furnishing_status=furnish,
+        furnishing_details=furnishing_details[:2000],
     )
     try:
         prop.full_clean()
@@ -1555,6 +1614,11 @@ def update_property(
     is_publicly_visible: str = "",
     furnishing_status: str = "",
     furnishing_details: str = "",
+    postal_code: str = "",
+    neighbourhood: str = "",
+    available_from: str = "",
+    building_amenities: str = "",
+    default_bills_included: str = "",
     pick: str = "",
     confirm: str = "",
 ) -> dict:
@@ -1608,6 +1672,36 @@ def update_property(
         if prov not in Province.values:
             return {"error": f"Invalid province {province!r}."}
         changes["province"] = prov
+    if postal_code != "":
+        from rentium.properties.models import normalise_postal_code
+
+        changes["postal_code"] = normalise_postal_code(postal_code)
+    if neighbourhood != "":
+        changes["neighbourhood"] = neighbourhood.strip()[:120]
+    if available_from != "":
+        try:
+            changes["available_from"] = (
+                None if available_from.strip().lower() in {"clear", "none", "null"}
+                else date.fromisoformat(available_from)
+            )
+        except ValueError:
+            return {"error": "available_from must be YYYY-MM-DD or clear."}
+    if building_amenities != "":
+        try:
+            parsed = json.loads(building_amenities) if building_amenities.strip().startswith("[") else [part.strip().upper() for part in building_amenities.split(",") if part.strip()]
+        except json.JSONDecodeError:
+            return {"error": "building_amenities must be a JSON array or comma-separated values."}
+        if not isinstance(parsed, list):
+            return {"error": "building_amenities must be a list."}
+        changes["building_amenities"] = [str(value).upper() for value in parsed]
+    if default_bills_included != "":
+        try:
+            parsed_bills = json.loads(default_bills_included or "{}")
+        except json.JSONDecodeError:
+            return {"error": "default_bills_included must be a JSON object."}
+        if not isinstance(parsed_bills, dict):
+            return {"error": "default_bills_included must be a JSON object."}
+        changes["default_bills_included"] = parsed_bills
     target_category = prop.property_category
     if property_category.strip():
         category_input = property_category.strip().lower().replace("_", " ")
@@ -1767,6 +1861,11 @@ def update_property(
             is_publicly_visible,
             furnishing_status,
             furnishing_details,
+            postal_code,
+            neighbourhood,
+            available_from,
+            building_amenities,
+            default_bills_included,
         )
     )
     if not changes and requested_a_field:
@@ -2406,7 +2505,7 @@ def _resolve_security_deposit(
     - Explicit number (incl. 0) → use it.
     - Empty / omitted / 'default' / 'half' → half of monthly rent (capped
       common room practice; matches "$800 rent → $400 deposit").
-    Pet deposit and cleaning fee stay 0 unless the landlord mentions them.
+    Pet and cleaning deposits stay 0 unless the landlord mentions them.
     """
     raw = str(security_deposit if security_deposit is not None else "").strip().lower()
     if raw in ("", "default", "half", "half_month", "auto"):
@@ -2430,11 +2529,23 @@ def create_lease(
     total_rent: str = "",
     security_deposit: str = "",
     pet_deposit: str = "0",
-    cleaning_fee: str = "0",
+    cleaning_deposit: str = "0",
     is_month_to_month: str = "0",
     pets_allowed: str = "0",
     smoking_allowed: str = "0",
     special_terms: str = "",
+    house_rules: str = "",
+    shared_with: str = "",
+    move_in_date: str = "",
+    co_hosts: str = "",
+    landlord_service_address: str = "",
+    landlord_daytime_phone: str = "",
+    landlord_other_phone: str = "",
+    landlord_fax: str = "",
+    landlord_service_email: str = "",
+    custom_tenant_notice_months: str = "",
+    fixed_term_end_reason: str = "",
+    fixed_term_end_regulation_section: str = "",
     etransfer_email: str = "",
     bills_included: str = "",
     pick: str = "",
@@ -2442,7 +2553,7 @@ def create_lease(
 ) -> dict:
     """Create DRAFT lease. Defaults (landlord protection):
     - smoking_allowed / pets_allowed = false unless truthy
-    - pet_deposit / cleaning_fee = 0 unless set
+    - pet_deposit / cleaning_deposit = 0 unless set
     - security_deposit: if omitted → half of total_rent; pass "0" for zero
     - etransfer_email: landlord service email fallback if blank
     """
@@ -2472,6 +2583,13 @@ def create_lease(
         return {"error": "Month-to-month leases must not have end_date."}
 
     try:
+        move_in = _parse_date(move_in_date, "move_in_date") if move_in_date.strip() else start
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if move_in < start or (end and move_in > end):
+        return {"error": "move_in_date must fall within the lease term."}
+
+    try:
         rent = _money(total_rent or "0")
         if rent <= 0 and prop.asking_rent:
             rent = Decimal(prop.asking_rent)
@@ -2481,7 +2599,7 @@ def create_lease(
             asking_rent=Decimal(prop.asking_rent or 0) if prop.asking_rent else None,
         )
         pet_dep = _money(pet_deposit or "0")
-        clean_fee = _money(cleaning_fee or "0")
+        clean_deposit = _money(cleaning_deposit or "0")
     except ValueError as exc:
         return {"error": str(exc)}
 
@@ -2509,6 +2627,36 @@ def create_lease(
             or ""
         )[:254]
 
+    common_space = []
+    if shared_with.strip():
+        shared_map = {
+            "landlord": "LANDLORD", "the landlord": "LANDLORD",
+            "roommate": "ROOMMATES", "roommates": "ROOMMATES",
+            "other roommates": "ROOMMATES",
+            "relatives": "LANDLORD_RELATIVES",
+            "landlord relatives": "LANDLORD_RELATIVES",
+            "landlord_relatives": "LANDLORD_RELATIVES",
+            "landlord's relatives": "LANDLORD_RELATIVES",
+        }
+        for token in shared_with.replace(";", ",").split(","):
+            value = shared_map.get(token.strip().lower())
+            if value and value not in common_space:
+                common_space.append(value)
+    parsed_co_hosts = []
+    if co_hosts.strip():
+        try:
+            parsed_co_hosts = json.loads(co_hosts)
+        except json.JSONDecodeError:
+            return {"error": "co_hosts must be a JSON array of name/email/phone objects."}
+        if not isinstance(parsed_co_hosts, list) or any(not isinstance(row, dict) for row in parsed_co_hosts):
+            return {"error": "co_hosts must be a JSON array of name/email/phone objects."}
+    try:
+        notice_months = int(custom_tenant_notice_months or 1)
+    except ValueError:
+        return {"error": "custom_tenant_notice_months must be a positive whole number."}
+    if notice_months < 1:
+        return {"error": "custom_tenant_notice_months must be at least 1."}
+
     bills = {}
     raw_bills = (bills_included or "").strip()
     if raw_bills:
@@ -2535,18 +2683,25 @@ def create_lease(
         "lease_type_display": dict(Lease.LeaseType.choices).get(lease_type, lease_type),
         "status": Lease.LeaseStatus.DRAFT,
         "start_date": str(start),
+        "move_in_date": str(move_in),
         "end_date": str(end) if end else None,
         "is_month_to_month": mtm,
         "total_rent": str(rent),
         "security_deposit": str(deposit),
         "security_deposit_source": deposit_src,
         "pet_deposit": str(pet_dep),
-        "cleaning_fee": str(clean_fee),
+        "cleaning_deposit": str(clean_deposit),
         "pets_allowed": pets,
         "smoking_allowed": smoking,
         "etransfer_email": e_email or None,
         "bills_included": bills or None,
         "special_terms": (special_terms or "")[:200] or None,
+        "house_rules": (house_rules or "")[:200] or None,
+        "common_space_shared_with": common_space,
+        "co_hosts": parsed_co_hosts,
+        "custom_tenant_notice_months": notice_months,
+        "fixed_term_end_reason": fixed_term_end_reason or None,
+        "fixed_term_end_regulation_section": fixed_term_end_regulation_section or None,
         "inventory_on_property": prop.inventory_items.count(),
         "warnings": (
             []
@@ -2583,14 +2738,25 @@ def create_lease(
                 "start_date": start,
                 "end_date": end,
                 "is_month_to_month": mtm,
-                "move_in_date": start,
+                "move_in_date": move_in,
                 "total_rent": rent,
                 "security_deposit": deposit,
                 "pet_deposit": pet_dep,
-                "cleaning_fee": clean_fee,
+                "cleaning_deposit": clean_deposit,
                 "pets_allowed": pets,
                 "smoking_allowed": smoking,
                 "special_terms": (special_terms or "")[:5000],
+                "house_rules": (house_rules or "")[:5000],
+                "common_space_shared_with": common_space,
+                "co_hosts": parsed_co_hosts,
+                "landlord_service_address": landlord_service_address[:255],
+                "landlord_daytime_phone": landlord_daytime_phone,
+                "landlord_other_phone": landlord_other_phone,
+                "landlord_fax": landlord_fax[:20],
+                "landlord_service_email": landlord_service_email[:254],
+                "custom_tenant_notice_months": notice_months,
+                "fixed_term_end_reason": fixed_term_end_reason,
+                "fixed_term_end_regulation_section": fixed_term_end_regulation_section[:20],
                 "etransfer_email": e_email,
                 "bills_included": bills or {},
             },
@@ -2613,7 +2779,7 @@ def create_lease(
             "security_deposit": str(lease.security_deposit),
             "security_deposit_source": deposit_src,
             "pet_deposit": str(lease.pet_deposit),
-            "cleaning_fee": str(lease.cleaning_fee),
+            "cleaning_deposit": str(lease.cleaning_deposit),
             "pets_allowed": lease.pets_allowed,
             "smoking_allowed": lease.smoking_allowed,
             "etransfer_email": lease.etransfer_email or None,
@@ -2635,8 +2801,12 @@ def update_lease(
     lease_number: str = "",
     total_rent: str = "",
     security_deposit: str = "",
+    pet_deposit: str = "",
+    cleaning_deposit: str = "",
     start_date: str = "",
     end_date: str = "",
+    move_in_date: str = "",
+    move_out_date: str = "",
     pets_allowed: str = "",
     smoking_allowed: str = "",
     special_terms: str = "",
@@ -2644,7 +2814,24 @@ def update_lease(
     shared_with: str = "",
     bills: str = "",
     etransfer_email: str = "",
+    co_hosts: str = "",
+    landlord_service_address: str = "",
+    landlord_daytime_phone: str = "",
+    landlord_other_phone: str = "",
+    landlord_fax: str = "",
+    landlord_service_email: str = "",
+    custom_tenant_notice_months: str = "",
+    fixed_term_end_reason: str = "",
+    fixed_term_end_regulation_section: str = "",
     is_month_to_month: str = "",
+    rent_due_day: str = "",
+    parking_included: str = "",
+    parking_description: str = "",
+    parking_extra_charge: str = "",
+    pets_terms: str = "",
+    smoking_terms: str = "",
+    services_and_facilities: str = "",
+    occupants: str = "",
     confirm: str = "",
 ) -> dict:
 
@@ -2670,6 +2857,10 @@ def update_lease(
             changes["total_rent"] = _money(total_rent)
         if security_deposit != "":
             changes["security_deposit"] = _money(security_deposit)
+        if pet_deposit != "":
+            changes["pet_deposit"] = _money(pet_deposit)
+        if cleaning_deposit != "":
+            changes["cleaning_deposit"] = _money(cleaning_deposit)
         if start_date.strip():
             changes["start_date"] = _parse_date(start_date, "start_date")
         if is_month_to_month != "":
@@ -2682,6 +2873,15 @@ def update_lease(
                 changes["end_date"] = None
             elif end_date.strip():
                 changes["end_date"] = _parse_date(end_date, "end_date")
+        for field, raw in {
+            "move_in_date": move_in_date,
+            "move_out_date": move_out_date,
+        }.items():
+            if raw != "":
+                changes[field] = (
+                    None if raw.strip().lower() in {"clear", "none", "null"}
+                    else _parse_date(raw, field)
+                )
         if pets_allowed != "":
             changes["pets_allowed"] = _truthy(pets_allowed)
         if smoking_allowed != "":
@@ -2744,7 +2944,55 @@ def update_lease(
                 changes["bills_included"] = merged
         if etransfer_email != "":
             changes["etransfer_email"] = etransfer_email.strip()[:254]
-    except ValueError as exc:
+        if co_hosts != "":
+            parsed_co_hosts = json.loads(co_hosts or "[]")
+            if not isinstance(parsed_co_hosts, list) or any(
+                not isinstance(row, dict) for row in parsed_co_hosts
+            ):
+                return {"error": "co_hosts must be a JSON array of name/email/phone objects."}
+            changes["co_hosts"] = parsed_co_hosts
+        for field, value, limit in (
+            ("landlord_service_address", landlord_service_address, 255),
+            ("landlord_daytime_phone", landlord_daytime_phone, None),
+            ("landlord_other_phone", landlord_other_phone, None),
+            ("landlord_fax", landlord_fax, 20),
+            ("landlord_service_email", landlord_service_email, 254),
+            ("fixed_term_end_reason", fixed_term_end_reason, 5000),
+            ("fixed_term_end_regulation_section", fixed_term_end_regulation_section, 20),
+        ):
+            if value != "":
+                changes[field] = value[:limit] if limit else value
+        if custom_tenant_notice_months != "":
+            notice = int(custom_tenant_notice_months)
+            if notice < 1:
+                return {"error": "custom_tenant_notice_months must be at least 1."}
+            changes["custom_tenant_notice_months"] = notice
+        # AgreementTerms fields — they print into the agreement, so RAMA needs
+        # the same reach the dashboard now has.
+        if rent_due_day != "":
+            day = int(rent_due_day)
+            if not 1 <= day <= 31:
+                return {"error": "rent_due_day must be between 1 and 31."}
+            changes["rent_due_day"] = day
+        if parking_included != "":
+            changes["parking_included"] = _truthy(parking_included)
+        if parking_description != "":
+            changes["parking_description"] = parking_description[:255]
+        if parking_extra_charge != "":
+            changes["parking_extra_charge"] = _money(parking_extra_charge)
+        for field, value in (
+            ("pets_terms", pets_terms),
+            ("smoking_terms", smoking_terms),
+            ("services_and_facilities", services_and_facilities),
+        ):
+            if value != "":
+                changes[field] = value
+        if occupants != "":
+            parsed_occupants = json.loads(occupants or "[]")
+            if not isinstance(parsed_occupants, list):
+                return {"error": "occupants must be a JSON array of names."}
+            changes["occupants"] = parsed_occupants
+    except (ValueError, json.JSONDecodeError) as exc:
         return {"error": str(exc)}
 
     if not changes:
@@ -2755,7 +3003,11 @@ def update_lease(
         "property": lease.property.name if lease.property_id else "",
         "status": lease.status,
         "changes": {
-            k: (str(v) if isinstance(v, (Decimal, date)) else v)
+            k: (
+                f"{v:.2f}"
+                if isinstance(v, Decimal)
+                else (str(v) if isinstance(v, date) else v)
+            )
             for k, v in changes.items()
         },
     }
@@ -2766,11 +3018,14 @@ def update_lease(
             "Updates draft/pending lease fields only.",
         )
 
-    for k, v in changes.items():
-        setattr(lease, k, v)
+    # Same service the dashboard's PATCH goes through, so the amendment record
+    # written for tenants who already signed can't be bypassed by editing here.
+    from rentium.leases.services import update_lease_record
+
     try:
-        lease.full_clean()
-        lease.save()
+        result = update_lease_record(
+            landlord=landlord, lease=lease, values=changes
+        )
     except ValidationError as exc:
         return _validation_error_payload(exc)
 
@@ -2781,6 +3036,20 @@ def update_lease(
         rebalance_lease_rent_shares(lease, force_equal_unsigned=True)
 
     prop_name = lease.property.name if lease.property_id else ""
+    amended = result["amended_signers"]
+    message = (
+        f"Updated lease {lease.lease_number} for {prop_name}: "
+        f"{', '.join(changes.keys())}."
+        if prop_name
+        else f"Updated lease {lease.lease_number}: {', '.join(changes.keys())}."
+    )
+    if amended:
+        # Never report a silent success here — someone is now holding a copy
+        # of terms that no longer match the lease.
+        message += (
+            f" Note: {', '.join(amended)} had already signed, so this amends "
+            f"the agreement they signed. They have not been notified."
+        )
     return {
         "updated": True,
         "lease_number": lease.lease_number,
@@ -2788,12 +3057,8 @@ def update_lease(
         "total_rent": str(lease.total_rent),
         "property": prop_name,
         "applied": list(changes.keys()),
-        "message": (
-            f"Updated lease {lease.lease_number} for {prop_name}: "
-            f"{', '.join(changes.keys())}."
-            if prop_name
-            else f"Updated lease {lease.lease_number}: {', '.join(changes.keys())}."
-        ),
+        "amended_signers": amended,
+        "message": message,
     }
 
 
@@ -3785,7 +4050,7 @@ def setup_room_tenancy(
     total_rent: str = "",
     security_deposit: str = "",
     pet_deposit: str = "0",
-    cleaning_fee: str = "0",
+    cleaning_deposit: str = "0",
     special_terms: str = "",
     tenant_name: str = "",
     tenant_email: str = "",
@@ -3841,7 +4106,7 @@ def setup_room_tenancy(
             "total_rent": rent_s,
             "security_deposit": security_deposit or "half month if omitted",
             "pet_deposit": pet_deposit or "0",
-            "cleaning_fee": cleaning_fee or "0",
+            "cleaning_deposit": cleaning_deposit or "0",
             "smoking_allowed": _truthy(smoking_allowed),
             "pets_allowed": _truthy(pets_allowed),
             "special_terms": (special_terms or "")[:200] or None,
@@ -3964,7 +4229,7 @@ def setup_room_tenancy(
         total_rent=rent_s,
         security_deposit=security_deposit,
         pet_deposit=pet_deposit,
-        cleaning_fee=cleaning_fee,
+        cleaning_deposit=cleaning_deposit,
         smoking_allowed=smoking_allowed,
         pets_allowed=pets_allowed,
         special_terms=special_terms,

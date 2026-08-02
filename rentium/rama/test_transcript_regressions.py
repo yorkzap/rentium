@@ -58,6 +58,359 @@ def _image(name: str):
     return SimpleUploadedFile(name, TINY_GIF, content_type="image/gif")
 
 
+def test_expense_paid_correction_replaces_stale_preview_and_followups_are_grounded(
+    landlord,
+):
+    """Regression: "Yes, except it's taken" must not post the unpaid plan.
+
+    Paid-status questions are reads about the just-written entry, not fuzzy
+    searches for descriptions containing punctuation or pronouns.
+    """
+    import uuid
+    from datetime import date
+
+    from rentium.ledger.models import EntryType
+    from rentium.ledger.models import LedgerEntry
+    from rentium.rama.plan_runner import save_single
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    holding = PropertyHolding.objects.create(
+        landlord=landlord,
+        name="950 McKenzie Ave",
+        address="950 McKenzie Ave",
+        city="Victoria",
+    )
+    conversation_id = uuid.uuid4()
+    args = {
+        "amount": "280.00",
+        "description": (
+            "Stove for McKenzie Basement + disposal of old unit - "
+            "Chris Klatt's Second Hand Appliances"
+        ),
+        "holding_name": "950 McKenzie Ave",
+        "property_query": "",
+        "effective_date": "2026-08-02",
+        "paid_on": "",
+        "category": "OTHER",
+    }
+    save_single(landlord, conversation_id, "create_expense", args)
+    provider = mock.Mock()
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        pending_status = run_turn(
+            landlord,
+            "did u mark it paid",
+            conversation_id,
+        )
+
+    assert "Not yet — the expense has not been posted" in pending_status.reply
+    assert RamaPendingPlan.objects.get(
+        conversation_id=conversation_id,
+    ).steps.get().arguments["paid_on"] == ""
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        corrected = run_turn(
+            landlord,
+            "Yes, except for it's taken from the bank already",
+            conversation_id,
+        )
+
+    assert corrected.deterministic is True
+    assert provider.complete.call_count == 0
+    assert "Bank: paid" in corrected.reply
+    assert not LedgerEntry.objects.filter(
+        landlord=landlord,
+        entry_type=EntryType.EXPENSE,
+    ).exists()
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    step = plan.steps.get()
+    assert step.tool == "create_expense"
+    assert step.arguments["paid_on"] == "paid"
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        posted = run_turn(landlord, "yes", conversation_id)
+
+    entries = LedgerEntry.objects.filter(
+        landlord=landlord,
+        entry_type=EntryType.EXPENSE,
+    )
+    assert entries.count() == 1
+    entry = entries.get()
+    assert entry.holding_id == holding.pk
+    assert entry.paid_on == date(2026, 8, 2)
+    assert "paid 2026-08-02" in posted.reply
+    assert "receipt" in posted.reply.casefold()
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        terse_status = run_turn(landlord, "marked paid?", conversation_id)
+        natural_status = run_turn(landlord, "did u mark it paid", conversation_id)
+
+    assert provider.complete.call_count == 0
+    assert "Yes — the $280.00 expense" in terse_status.reply
+    assert "marked paid on 2026-08-02" in terse_status.reply
+    assert "Yes — the $280.00 expense" in natural_status.reply
+    assert entries.count() == 1
+
+
+@pytest.mark.parametrize("command", ["mark it paid", "then mark it paid"])
+def test_mark_it_paid_uses_recent_expense_id_not_pronoun_search(
+    landlord,
+    command,
+):
+    import uuid
+
+    from rentium.ledger.models import LedgerEntry
+    from rentium.rama.plan_runner import save_single
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    PropertyHolding.objects.create(
+        landlord=landlord,
+        name="950 McKenzie Ave",
+        address="950 McKenzie Ave",
+        city="Victoria",
+    )
+    conversation_id = uuid.uuid4()
+    save_single(
+        landlord,
+        conversation_id,
+        "create_expense",
+        {
+            "amount": "280.00",
+            "description": "Replacement stove",
+            "holding_name": "950 McKenzie Ave",
+            "paid_on": "",
+        },
+    )
+    provider = mock.Mock()
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        run_turn(landlord, "yes", conversation_id)
+        mark_preview = run_turn(landlord, command, conversation_id)
+
+    entry = LedgerEntry.objects.get(landlord=landlord)
+    assert entry.paid_on is None
+    assert "Mark expense paid:" in mark_preview.reply
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    step = plan.steps.get()
+    assert step.tool == "mark_ledger_paid"
+    assert step.arguments["entry_id"] == str(entry.pk)
+    assert step.arguments["description_query"] == ""
+    assert provider.complete.call_count == 0
+
+
+def test_then_do_it_after_unpaid_status_previews_and_confirms_mark_paid(landlord):
+    import uuid
+
+    from rentium.ledger.models import LedgerEntry
+    from rentium.rama.plan_runner import save_single
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    PropertyHolding.objects.create(
+        landlord=landlord,
+        name="950 McKenzie Ave",
+        address="950 McKenzie Ave",
+        city="Victoria",
+    )
+    conversation_id = uuid.uuid4()
+    save_single(
+        landlord,
+        conversation_id,
+        "create_expense",
+        {
+            "amount": "280.00",
+            "description": "Replacement stove",
+            "holding_name": "950 McKenzie Ave",
+            "paid_on": "",
+        },
+    )
+    provider = mock.Mock()
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        run_turn(landlord, "yes", conversation_id)
+        status = run_turn(landlord, "marked paid?", conversation_id)
+        mark_preview = run_turn(landlord, "then do it", conversation_id)
+
+    entry = LedgerEntry.objects.get(landlord=landlord)
+    assert "still marked not yet taken from bank" in status.reply
+    assert "Mark expense paid:" in mark_preview.reply
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    assert plan.steps.get().arguments["entry_id"] == str(entry.pk)
+    assert entry.paid_on is None
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        done = run_turn(landlord, "then do it", conversation_id)
+
+    entry.refresh_from_db()
+    assert entry.paid_on is not None
+    assert "marked paid" in done.reply
+    assert provider.complete.call_count == 0
+
+
+def test_new_multi_line_expense_beats_stale_document_focus_and_totals_costs(
+    landlord,
+):
+    import uuid
+
+    from rentium.rama.document_services import ingest_document
+    from rentium.rama.models import RamaAudit
+    from rentium.rama.plan_runner import save_single
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    holding = PropertyHolding.objects.create(
+        landlord=landlord,
+        name="950 McKenzie Ave",
+        address="950 McKenzie Ave",
+        city="Victoria",
+    )
+    Property.objects.create(
+        landlord=landlord,
+        holding=holding,
+        name="McKenzie Basement",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.COMPLETE_UNIT,
+    )
+    old_document, _ = ingest_document(
+        landlord=landlord,
+        upload=SimpleUploadedFile(
+            "older-document.pdf",
+            b"%PDF-old-unresolved-document",
+            content_type="application/pdf",
+        ),
+    )
+    conversation_id = uuid.uuid4()
+    RamaAudit.objects.create(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+        content={
+            "tool": "catalog_business_document",
+            "arguments": {"document_id": str(old_document.pk)},
+            "result": {
+                "prepared": True,
+                "document_id": str(old_document.pk),
+                "needs_scope": True,
+            },
+        },
+    )
+    save_single(
+        landlord,
+        conversation_id,
+        "catalog_business_document",
+        {
+            "document_id": str(old_document.pk),
+            "scope_query": "950 McKenzie Ave",
+        },
+    )
+    provider = mock.Mock()
+    message = (
+        "what did u make? i bought a stove for mckenzie basement for $250 and "
+        "$30 for dumping the old one. Used Chris Klatt's second hand appliances."
+    )
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(landlord, message, conversation_id)
+
+    assert preview.deterministic is True
+    assert provider.complete.call_count == 0
+    assert "Expense to file (no receipt required):" in preview.reply
+    assert "• Amount: $280.00" in preview.reply
+    assert "• Property: 950 McKenzie Ave — whole property" in preview.reply
+    assert "$250" in preview.reply and "$30" in preview.reply
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    step = plan.steps.get()
+    assert step.tool == "create_expense"
+    assert step.arguments["amount"] == "280.00"
+    assert step.arguments["holding_name"] == "950 McKenzie Ave"
+    assert step.arguments["paid_on"] == ""
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        done = run_turn(landlord, "yes", conversation_id)
+
+    assert "Logged $280.00" in done.reply
+    old_document.refresh_from_db()
+    assert old_document.holding_id is None
+    assert old_document.ledger_entry_id is None
+
+
+def test_no_receipt_correction_recovers_paid_purchase_and_replaces_document_plan(
+    landlord,
+):
+    import uuid
+
+    from rentium.ledger.models import EntryType
+    from rentium.ledger.models import LedgerEntry
+    from rentium.rama.document_services import ingest_document
+    from rentium.rama.models import RamaAudit
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    holding = PropertyHolding.objects.create(
+        landlord=landlord,
+        name="950 McKenzie Ave",
+        address="950 McKenzie Ave",
+        city="Victoria",
+    )
+    Property.objects.create(
+        landlord=landlord,
+        holding=holding,
+        name="McKenzie Basement",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.COMPLETE_UNIT,
+    )
+    old_document, _ = ingest_document(
+        landlord=landlord,
+        upload=SimpleUploadedFile(
+            "wrong-document.pdf",
+            b"%PDF-must-not-be-filed",
+            content_type="application/pdf",
+        ),
+    )
+    conversation_id = uuid.uuid4()
+    purchase = (
+        "what did u make? i bought a stove for mckenzie basement for $250 and "
+        "gave him another $30 to dump the old stove from Chris Klatt second "
+        "hand appliances"
+    )
+    RamaAudit.objects.create(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.USER_MESSAGE,
+        content={"text": purchase},
+    )
+    provider = mock.Mock()
+    correction = (
+        "There is no receipt. I just notified you. Documents are only when I "
+        "send photos or actual documents. You should have logged a paid expense "
+        "in the ledger."
+    )
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(landlord, correction, conversation_id)
+        done = run_turn(landlord, "yes", conversation_id)
+
+    assert "• Amount: $280.00" in preview.reply
+    assert "• Bank: paid" in preview.reply
+    assert "Logged $280.00" in done.reply
+    entries = LedgerEntry.objects.filter(
+        landlord=landlord,
+        entry_type=EntryType.EXPENSE,
+    )
+    assert entries.count() == 1
+    entry = entries.get()
+    assert entry.amount == Decimal("280.00")
+    assert entry.paid_on is not None
+    assert entry.holding_id == holding.pk
+    old_document.refresh_from_db()
+    assert old_document.holding_id is None
+    assert old_document.ledger_entry_id is None
+    assert provider.complete.call_count == 0
+
+
 def test_mckenzie_suite_layout_keeps_exact_names_and_all_areas(landlord):
     from rentium.rama.service import run_turn
 
@@ -383,7 +736,7 @@ def test_room_d_lease_is_drafted_before_siya_is_invited(landlord):
             "total_rent": "800",
             "security_deposit": "400",
             "pet_deposit": "0",
-            "cleaning_fee": "0",
+            "cleaning_deposit": "0",
             "special_terms": terms,
             "confirm": "yes",
         },
@@ -577,7 +930,7 @@ def test_rest_and_rama_lease_creation_share_legal_derivation(landlord):
             "total_rent": "800.00",
             "security_deposit": "400.00",
             "pet_deposit": "0.00",
-            "cleaning_fee": "0.00",
+            "cleaning_deposit": "0.00",
         },
         format="json",
     )
@@ -585,3 +938,98 @@ def test_rest_and_rama_lease_creation_share_legal_derivation(landlord):
     api_lease = Lease.objects.get(pk=response.data["id"])
     assert rama_lease.common_space_shared_with == ["LANDLORD"]
     assert api_lease.common_space_shared_with == ["LANDLORD"]
+
+
+# ===================== "can u add a $200 cleaning deposit to lease X"
+# 2026-08-02. Asked to add a cleaning deposit to lease RMT415536-0617, RAMA
+# said it had no tool for it, then that the lease was "already signed and
+# active, so its deposit fields are locked". The lease was PENDING with one
+# tenant signed and the landlord not — is_locked() was False the whole time.
+#
+# The refusal was honest about the menu it was given: retrieval offered
+# create_lease, adjust_lease and mark_cleaning_deposit_paid and never offered
+# update_lease. The invented lock rule was what the model reached for to
+# explain a gap it couldn't see the shape of. Pinning the tool removes both:
+# the tool's own guard answers the lock question from the record.
+def test_setting_a_deposit_on_an_existing_lease_reaches_update_lease():
+    from rentium.rama.capabilities import (
+        select_tool_schemas,
+        supported_tool_for_request,
+    )
+    from rentium.rama.registry import tool_schemas
+
+    asks = [
+        "can u add a $200 cleaning deposit to lease RMT415536-0617",
+        "yes, edit the lease deposit field",
+        "set the security deposit to 500 on lease RMT415536-0617",
+        "change the cleaning deposit to 350",
+    ]
+    for ask in asks:
+        assert supported_tool_for_request(ask) == "update_lease", ask
+        offered = [s["name"] for s in select_tool_schemas(ask, tool_schemas(), limit=12)]
+        assert "update_lease" in offered, ask
+
+
+@pytest.mark.parametrize(
+    "ask,expected",
+    [
+        # The more specific things to do with a deposit keep their routing.
+        ("cleaning deposit paid", "mark_cleaning_deposit_paid"),
+        ("return the deposit", "return_deposits"),
+        ("deduct 80 from the deposit for garbage removal", "record_deposit_deduction"),
+        # And creating a lease WITH a deposit is still creating a lease.
+        ("create a lease for Room C with a $500 deposit", "create_lease"),
+    ],
+)
+def test_the_deposit_edit_route_does_not_swallow_its_neighbours(ask, expected):
+    from rentium.rama.capabilities import supported_tool_for_request
+
+    assert supported_tool_for_request(ask) == expected
+
+
+def test_a_pending_lease_with_one_signature_is_editable(landlord):
+    """The fact RAMA got wrong. A lease is locked at ACTIVE, not at the first
+    signature — so 'already signed, therefore locked' is never a valid reason
+    to refuse on a PENDING lease."""
+    from datetime import date
+
+    prop = Property.objects.create(
+        landlord=landlord,
+        name="Signed-Once Suite",
+        address="9 Partial St",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    lease = Lease.objects.create(
+        landlord=landlord,
+        property=prop,
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.PENDING_SIGNATURES,
+        start_date=date(2026, 9, 1),
+        end_date=date(2027, 8, 31),
+        total_rent=Decimal("900.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=lease,
+        invited_email="one@example.com",
+        invited_name="One Signer",
+        rent_amount=Decimal("900.00"),
+        is_primary_tenant=True,
+        has_signed=True,
+    )
+    assert lease.is_locked() is False
+
+    result = registry.execute(
+        "update_lease",
+        {
+            "lease_number": lease.lease_number,
+            "cleaning_deposit": "200",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert result.get("updated") is True, result
+    lease.refresh_from_db()
+    assert lease.cleaning_deposit == Decimal("200.00")

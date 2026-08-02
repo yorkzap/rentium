@@ -302,3 +302,53 @@ def test_no_date_means_the_day_they_told_us(landlord, deposit):
     )
     payment = LedgerEntry.objects.get(entry_type=EntryType.PAYMENT)
     assert payment.effective_date == datetime.date.today()
+
+
+def test_one_etransfer_splits_security_and_cleaning_deposits(landlord, bc_lease):
+    from rentium.ledger import services as ledger_services
+
+    charges = []
+    for description, kind in (
+        ("Security deposit — due on signing", "security_deposit"),
+        ("Cleaning deposit — due on signing", "cleaning_deposit_lease"),
+    ):
+        charge, _ = ledger_services.post_charge(
+            landlord=landlord,
+            property=bc_lease.property,
+            lease=bc_lease,
+            tenant=None,
+            entry_type=EntryType.DEPOSIT_CHARGE,
+            amount=Decimal("200.00"),
+            due_date=TODAY,
+            description=description,
+            metadata={"kind": kind},
+        )
+        charges.append(charge)
+
+    preview = _call(
+        landlord,
+        amount="400",
+        charge_query="deposit",
+        payment_method="etransfer",
+    )
+    assert preview["action"] == "record_payment_allocation"
+    assert {row["payment"] for row in preview["preview"]["allocations"]} == {
+        "200.00"
+    }
+
+    done = _call(
+        landlord,
+        amount="400",
+        charge_query="deposit",
+        payment_method="etransfer",
+        confirm="yes",
+    )
+    assert done.get("ok"), done
+    payments = list(LedgerEntry.objects.filter(entry_type=EntryType.PAYMENT))
+    assert len(payments) == 2
+    assert {payment.settles_id for payment in payments} == {
+        charge.pk for charge in charges
+    }
+    assert sum((payment.amount for payment in payments), Decimal("0")) == Decimal(
+        "400.00"
+    )

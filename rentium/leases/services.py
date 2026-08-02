@@ -53,6 +53,124 @@ def create_lease_record(*, landlord, values: dict):
     return lease
 
 
+# Changing one of these is changing the deal, not fixing a typo — so it is what
+# triggers an amendment record against anyone who had already signed.
+MATERIAL_LEASE_FIELDS = frozenset(
+    {
+        "total_rent",
+        "security_deposit",
+        "pet_deposit",
+        "cleaning_deposit",
+        "start_date",
+        "end_date",
+        "move_in_date",
+        "move_out_date",
+        "is_month_to_month",
+        "rent_due_day",
+        "lease_type",
+        "pets_allowed",
+        "smoking_allowed",
+        "parking_included",
+        "parking_extra_charge",
+        "bills_included",
+        "custom_tenant_notice_months",
+    }
+)
+
+
+@transaction.atomic
+def update_lease_record(*, landlord, lease, values: dict, actor=None) -> dict:
+    """Edit one lease through the single boundary the API and RAMA both use.
+
+    A lease is editable until it is executed — `Lease.is_locked()` (ACTIVE and
+    beyond), which is also what the LeaseNotLocked permission enforces. Re-checked
+    here so no caller can reach a locked lease by picking a different door.
+
+    Before then a lease can already carry signatures: the landlord's, and any
+    tenant who signed early. Editing is still allowed — the landlord owns the
+    document — but every material change writes an immutable TERMS_AMENDED
+    event against each person who had already signed. Nothing is sent to them;
+    the record exists so the landlord can see, and later prove, who agreed to
+    what and when.
+
+    Returns {"lease", "changed", "amended_signers"} so callers can tell the
+    landlord what their edit actually did.
+    """
+    from rentium.leases.models import Lease
+    from rentium.leases.models import LeaseInviteEvent
+
+    if lease.landlord_id != landlord.pk:
+        raise ValidationError("That lease is outside this portfolio.")
+    if lease.is_locked():
+        raise ValidationError(
+            f"Lease {lease.lease_number} is {lease.get_status_display().lower()} "
+            f"and can no longer be edited."
+        )
+
+    data = dict(values)
+    # Never settable through an edit: identity, ownership, and the two fields
+    # that are the signed document's own tamper evidence.
+    for protected in (
+        "landlord",
+        "lease_number",
+        "status",
+        "signed_document",
+        "signed_document_sha256",
+        "landlord_signed",
+        "landlord_signed_date",
+    ):
+        data.pop(protected, None)
+
+    before = {}
+    changed = {}
+    for field, new in data.items():
+        old = getattr(lease, field, None)
+        if old == new:
+            continue
+        before[field] = old
+        changed[field] = new
+        setattr(lease, field, new)
+    if not changed:
+        return {"lease": lease, "changed": {}, "amended_signers": []}
+
+    lease.full_clean(
+        exclude=[f.name for f in Lease._meta.fields if f.name not in changed]
+    )
+    lease.save()
+
+    material = sorted(set(changed) & MATERIAL_LEASE_FIELDS)
+    amended_signers = []
+    if material:
+        signed_slots = lease.lease_tenants.filter(has_signed=True, declined=False)
+        for slot in signed_slots:
+            LeaseInviteEvent.objects.create(
+                lease_tenant=slot,
+                kind=LeaseInviteEvent.Kind.TERMS_AMENDED,
+                actor=actor if getattr(actor, "pk", None) else None,
+                metadata={
+                    "fields": material,
+                    "before": {f: _jsonable(before[f]) for f in material},
+                    "after": {f: _jsonable(changed[f]) for f in material},
+                    "signed_on": _jsonable(slot.signed_date),
+                },
+            )
+            amended_signers.append(slot.display_name)
+
+    return {"lease": lease, "changed": changed, "amended_signers": amended_signers}
+
+
+def _jsonable(value):
+    """Decimals, dates and models don't survive JSONField as-is."""
+    from datetime import date as _date
+    from datetime import datetime as _datetime
+
+    if value is None or isinstance(value, (bool, int, str, list, dict)):
+        return value
+    if isinstance(value, (_date, _datetime)):
+        return value.isoformat()
+    return str(value)
+
+
 def record_invite_event(
     lease_tenant,
     kind: str,

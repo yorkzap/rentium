@@ -26,11 +26,11 @@ def stamp_deposit_receipt_date(event):
     """
     A deposit has been fully paid -> record the DATE it was received on the lease.
 
-    Lease.security_deposit_received_date and pet_deposit_received_date have existed
-    on AgreementTerms since the agreement rewrite, they already print on every lease
-    document, and until now literally nothing ever set them — so every agreement this
-    app has produced says "Received on: Not yet received", forever, including for
-    deposits that were paid months ago.
+    Lease.security_deposit_received_date, pet_deposit_received_date and
+    cleaning_deposit_received_date have existed on AgreementTerms since the agreement
+    rewrite, they already print on every lease document, and until now literally
+    nothing ever set them — so every agreement this app has produced says "Received
+    on: Not yet received", forever, including for deposits that were paid months ago.
 
     They are not decoration. The date a landlord RECEIVES a deposit is what starts the
     statutory clock for returning it at the end of the tenancy (15 days from the later

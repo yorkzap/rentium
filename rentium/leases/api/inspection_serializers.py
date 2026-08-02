@@ -12,6 +12,7 @@ from rentium.leases.inspections import (
     CleanlinessCode,
     ConditionCode,
     ConditionInspection,
+    DepositDeduction,
     InspectionItem,
     InspectionKeyRow,
 )
@@ -36,6 +37,35 @@ class InspectionItemSerializer(serializers.ModelSerializer):
             "id", "section", "label", "sort_order", "is_custom",
             "area", "area_name", "inventory_item", "shared_inventory_item",
             "suggestion_status", "work_order_id",
+        ]
+
+
+class DepositDeductionSerializer(serializers.ModelSerializer):
+    """One costed line of what the landlord proposes to keep, and why.
+
+    `amount` is read-only for labour lines — the model computes hours × rate so
+    the arithmetic itself is on the record, which is what a hearing asks for.
+    """
+
+    deposit_kind_display = serializers.CharField(
+        source="get_deposit_kind_display", read_only=True
+    )
+    basis_display = serializers.CharField(source="get_basis_display", read_only=True)
+    item_label = serializers.CharField(
+        source="inspection_item.label", read_only=True, allow_null=True
+    )
+
+    class Meta:
+        model = DepositDeduction
+        fields = [
+            "id", "inspection", "inspection_item", "item_label", "work_order",
+            "deposit_kind", "deposit_kind_display", "basis", "basis_display",
+            "hours", "hourly_rate", "amount", "note",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "inspection", "item_label", "deposit_kind_display",
+            "basis_display", "created_at", "updated_at",
         ]
 
 
@@ -89,6 +119,8 @@ class InspectionListSerializer(serializers.ModelSerializer):
 class InspectionDetailSerializer(InspectionListSerializer):
     items = InspectionItemSerializer(many=True, read_only=True)
     key_rows = InspectionKeyRowSerializer(many=True, read_only=True)
+    deposit_deductions = DepositDeductionSerializer(many=True, read_only=True)
+    deduction_totals = serializers.SerializerMethodField()
     move_in_fully_signed = serializers.BooleanField(read_only=True)
     move_out_fully_signed = serializers.BooleanField(read_only=True)
     disputed_move_in = serializers.BooleanField(read_only=True)
@@ -107,12 +139,13 @@ class InspectionDetailSerializer(InspectionListSerializer):
             "tenant_signed_move_in_at", "tenant_move_in_signature_name",
             "landlord_signed_move_out_at", "landlord_move_out_signature_name",
             "tenant_signed_move_out_at", "tenant_move_out_signature_name",
-            "deduction_security_deposit", "deduction_pet_deposit", "deduction_agreed_at",
+            "deduction_security_deposit", "deduction_pet_deposit",
+            "deduction_cleaning_deposit", "deduction_agreed_at",
             "tenant_forwarding_address",
             "move_in_report_delivered_at", "move_out_report_delivered_at",
             "move_in_fully_signed", "move_out_fully_signed",
             "disputed_move_in", "disputed_move_out",
-            "items", "key_rows",
+            "items", "key_rows", "deposit_deductions", "deduction_totals",
             "condition_codes", "cleanliness_codes",
         ]
         # Header boxes the landlord may PATCH while the relevant pass is open
@@ -129,6 +162,14 @@ class InspectionDetailSerializer(InspectionListSerializer):
                 "tenant_forwarding_address",
             }
         ]
+
+    def get_deduction_totals(self, obj):
+        """Live sum of the lines, per deposit. Compare against the stored
+        deduction_* columns to see whether the tenant's written agreement
+        still covers what is being claimed."""
+        return {
+            kind: str(amount) for kind, amount in obj.deduction_totals().items()
+        }
 
     def get_condition_codes(self, obj):
         """Ship the legend so the frontend never hardcodes it."""

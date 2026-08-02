@@ -270,7 +270,7 @@ def commit_batch(batch: ImportBatch, *, created_by=None) -> dict:
         raise LedgerError("This batch was discarded.")
 
     rows = list(
-        StagedLedgerEntry.objects.filter(batch=batch)
+        StagedLedgerEntry.objects.filter(batch=batch, excluded_at__isnull=True)
         .select_related("settles_row", "batch")
         .order_by("row_number")
     )
@@ -354,7 +354,7 @@ def commit_batch(batch: ImportBatch, *, created_by=None) -> dict:
             errors.append({"row": row.row_number, "error": str(exc)})
 
     remaining = StagedLedgerEntry.objects.filter(
-        batch=batch, committed_entry__isnull=True
+        batch=batch, committed_entry__isnull=True, excluded_at__isnull=True
     ).exists()
     if not remaining:
         batch.status = ImportBatch.Status.COMMITTED

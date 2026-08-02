@@ -2925,6 +2925,338 @@ def set_document_tags(document, tag_names: list[str], *, replace: bool = True):
     return list(document.tags.order_by("name"))
 
 
+@transaction.atomic
+def rename_document(*, landlord, document, title: str, actor=None) -> RamaDocument:
+    """Change only the document's human-facing library title.
+
+    Originals and canonical archive names are evidence and remain immutable.
+    Recording the before/after value keeps this small metadata correction in
+    the document's append-only event trail.
+    """
+    if document.landlord_id != landlord.pk:
+        raise DocumentError("Document not found.")
+    clean_title = str(title or "").strip()
+    if not clean_title:
+        raise DocumentError("Document name is required.")
+    if len(clean_title) > RamaDocument._meta.get_field("title").max_length:
+        raise DocumentError("Document name must be 255 characters or fewer.")
+    if document.title == clean_title:
+        return document
+
+    previous_title = document.title
+    document.title = clean_title
+    document.save(update_fields=["title", "updated_at"])
+    _event(
+        document,
+        RamaDocumentEvent.Kind.CLARIFIED,
+        actor=actor,
+        field="title",
+        before=previous_title,
+        after=clean_title,
+        source="document_library_rename",
+    )
+    return document
+
+
+def _document_rename_candidate(document: RamaDocument) -> dict:
+    return {
+        "document_id": str(document.pk),
+        "title": document.get_display_title(),
+        "issuer": document.issuer,
+        "amount": str(document.amount) if document.amount is not None else None,
+        "currency": document.currency,
+        "document_date": (
+            str(document.document_date) if document.document_date else None
+        ),
+        "holding": (
+            document.holding.address or document.holding.name
+            if document.holding_id
+            else None
+        ),
+        "original_filename": document.original_filename,
+    }
+
+
+def _parse_document_amount_selector(amount: str) -> Decimal | None:
+    raw = str(amount or "").strip()
+    if not raw:
+        return None
+    cleaned = re.sub(r"\s*(?:cad|usd)\s*$", "", raw, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("$", "").replace(",", "").strip()
+    if not re.fullmatch(r"\d+(?:\.\d{1,2})?", cleaned):
+        raise DocumentError("amount must be a positive amount such as 39.36.")
+    parsed = Decimal(cleaned)
+    if parsed < 0:
+        raise DocumentError("amount must be positive.")
+    return parsed
+
+
+def _strict_document_rename_filter(query: str):
+    """Require every meaningful selector token for a metadata write.
+
+    Library search is deliberately fuzzy/OR-based for discovery. Reusing that
+    rule for a write could let "PNR Screens LTD" select "XYZ Screens LTD". A
+    rename should ask rather than act when OCR cannot support the full selector.
+    """
+    from django.db.models import Q
+
+    tokens = [
+        token
+        for token in re.findall(r"[a-zA-Z0-9]+", str(query or ""))
+        if len(token) >= 2
+    ]
+    combined = Q()
+    for token in dict.fromkeys(tokens):
+        token_filter = (
+            Q(title__icontains=token)
+            | Q(issuer__icontains=token)
+            | Q(reference_number__icontains=token)
+            | Q(ocr_text__icontains=token)
+            | Q(canonical_filename__icontains=token)
+            | Q(original_filename__icontains=token)
+        )
+        combined &= token_filter
+    return combined, bool(tokens)
+
+
+def rename_business_document_for_chat(
+    landlord,
+    *,
+    new_title: str,
+    document_query: str = "",
+    amount: str = "",
+    document_id: str = "",
+    document_date: str = "",
+    holding_query: str = "",
+    expected_title: str = "",
+    confirm: str = "",
+) -> dict:
+    """Resolve one landlord document, preview a title-only rename, then apply it.
+
+    Text and amount selectors are combined, never treated as alternatives. This
+    is what makes "the PNR receipt for $39.36" safe when another PNR receipt is
+    for $250. A persisted confirmation uses the resolved UUID and expected title
+    so a later upload or concurrent rename cannot silently change its target.
+    """
+    clean_title = str(new_title or "").strip()
+    if not clean_title:
+        return {"error": "new_title is required."}
+    if len(clean_title) > 255:
+        return {"error": "new_title must be 255 characters or fewer."}
+
+    query = str(document_query or "").strip()
+    did = str(document_id or "").strip()
+    date_selector = str(document_date or "").strip()
+    parsed_date = None
+    if date_selector:
+        try:
+            parsed_date = date.fromisoformat(date_selector)
+        except ValueError:
+            return {"error": "document_date must be YYYY-MM-DD."}
+    holding_selector = str(holding_query or "").strip()
+    try:
+        parsed_amount = _parse_document_amount_selector(amount)
+    except DocumentError as exc:
+        return {"error": str(exc)}
+    if not did and not query and parsed_amount is None and not parsed_date and not holding_selector:
+        return {
+            "needs_input": True,
+            "question_for_user": (
+                "Which document should I rename? Give me its vendor/title, amount, "
+                "date, property, or document ID."
+            ),
+        }
+
+    base = (
+        RamaDocument.objects.filter(landlord=landlord)
+        .select_related("holding", "property", "ledger_entry")
+        .order_by("-created_at")
+    )
+    if did:
+        document = base.filter(pk=did).first()
+        if document is None:
+            return {"error": "No business document with that ID was found."}
+        if document.deleted_at:
+            return {
+                "error": (
+                    "That document is in trash. Restore it before renaming it."
+                ),
+                "document_id": str(document.pk),
+            }
+        candidates = [document]
+    else:
+        candidates_qs = base.filter(deleted_at__isnull=True)
+        if query:
+            strict_filter, has_tokens = _strict_document_rename_filter(query)
+            if not has_tokens:
+                return {
+                    "needs_input": True,
+                    "question_for_user": (
+                        "Give me a more specific vendor, title, filename, or document ID."
+                    ),
+                }
+            candidates_qs = candidates_qs.filter(strict_filter)
+        if parsed_amount is not None:
+            candidates_qs = candidates_qs.filter(amount=parsed_amount)
+        if parsed_date is not None:
+            candidates_qs = candidates_qs.filter(document_date=parsed_date)
+        if holding_selector:
+            holding_matches = PropertyHolding.objects.filter(landlord=landlord)
+            exact_holding = holding_matches.filter(address__iexact=holding_selector).first()
+            if exact_holding is None:
+                exact_holding = holding_matches.filter(name__iexact=holding_selector).first()
+            if exact_holding is None:
+                partial = list(
+                    holding_matches.filter(address__icontains=holding_selector)[:5]
+                ) or list(holding_matches.filter(name__icontains=holding_selector)[:5])
+                if len(partial) == 1:
+                    exact_holding = partial[0]
+                elif len(partial) > 1:
+                    return {
+                        "needs_input": True,
+                        "question_for_user": (
+                            "Several properties match that name/address. Give me the "
+                            "full street address or the document ID."
+                        ),
+                        "holdings": [
+                            {
+                                "id": str(holding.pk),
+                                "name": holding.name,
+                                "address": holding.address,
+                            }
+                            for holding in partial
+                        ],
+                    }
+                else:
+                    return {
+                        "needs_input": True,
+                        "question_for_user": (
+                            f"No property matches {holding_selector!r}. Check the "
+                            "address or give me the document ID."
+                        ),
+                    }
+            candidates_qs = candidates_qs.filter(holding=exact_holding)
+        candidates = list(candidates_qs[:11])
+
+    selector_bits = []
+    if query:
+        selector_bits.append(f"vendor/title {query!r}")
+    if parsed_amount is not None:
+        selector_bits.append(f"amount ${parsed_amount:.2f}")
+    if parsed_date is not None:
+        selector_bits.append(f"date {parsed_date}")
+    if holding_selector:
+        selector_bits.append(f"property {holding_selector!r}")
+    selector = " and ".join(selector_bits) or f"ID {did}"
+    if not candidates:
+        return {
+            "needs_input": True,
+            "question_for_user": (
+                f"I couldn't find a live document matching {selector}. "
+                "Check the vendor/title or amount, or give me its document ID."
+            ),
+            "candidates": [],
+        }
+    if len(candidates) > 1:
+        shown = candidates[:10]
+        descriptions = []
+        for candidate in shown:
+            data = _document_rename_candidate(candidate)
+            parts = [f"{data['title']} — {data['currency']} {data['amount'] or 'no amount'}"]
+            if data["document_date"]:
+                parts.append(data["document_date"])
+            if data["holding"]:
+                parts.append(data["holding"])
+            descriptions.append("; ".join(parts))
+        return {
+            "needs_input": True,
+            "question_for_user": (
+                f"I found {len(candidates) if len(candidates) <= 10 else 'more than 10'} "
+                f"documents matching {selector}. Which one should I rename? "
+                + " | ".join(descriptions)
+            ),
+            "candidates": [
+                _document_rename_candidate(candidate) for candidate in shown
+            ],
+        }
+
+    document = candidates[0]
+    current_title = document.get_display_title()
+    if current_title == clean_title:
+        return {
+            "already_done": True,
+            "document_id": str(document.pk),
+            "title": current_title,
+            "message": f"That document is already named {clean_title!r}.",
+            "documents_page": url_for_path(
+                f"/dashboard/documents?document={document.pk}"
+            ),
+        }
+
+    is_confirmed = str(confirm or "").strip().casefold() in {
+        "yes",
+        "y",
+        "true",
+        "1",
+        "confirm",
+    }
+    if not is_confirmed:
+        return {
+            "needs_confirm": True,
+            "action": "rename_business_document",
+            "preview": {
+                **_document_rename_candidate(document),
+                "current_title": current_title,
+                "new_title": clean_title,
+                "preserves": (
+                    "Original file, archival PDF, hash, filing status, and linked "
+                    "ledger expense are unchanged."
+                ),
+            },
+            "resolved_arguments": {
+                "document_id": str(document.pk),
+                "new_title": clean_title,
+                "expected_title": current_title,
+            },
+            "instruction": (
+                "Show the exact document, amount, old title, and new title. "
+                "If the landlord approves, call rename_business_document again "
+                "with resolved_arguments and confirm=yes."
+            ),
+        }
+
+    expected = str(expected_title or "").strip()
+    if expected and current_title != expected:
+        return {
+            "error": (
+                "This document's title changed after the preview. Review the "
+                "current document and preview the rename again."
+            ),
+            "document_id": str(document.pk),
+            "expected_title": expected,
+            "current_title": current_title,
+        }
+
+    renamed = rename_document(
+        landlord=landlord,
+        document=document,
+        title=clean_title,
+        actor=getattr(landlord, "user", None),
+    )
+    return {
+        "updated": True,
+        "document_id": str(renamed.pk),
+        "previous_title": current_title,
+        "title": renamed.get_display_title(),
+        "amount": str(renamed.amount) if renamed.amount is not None else None,
+        "currency": renamed.currency,
+        "message": f"Renamed document {current_title!r} to {clean_title!r}.",
+        "documents_page": url_for_path(
+            f"/dashboard/documents?document={renamed.pk}"
+        ),
+    }
+
+
 def list_document_tags(landlord):
     from .models import DocumentTag
     from django.db.models import Count

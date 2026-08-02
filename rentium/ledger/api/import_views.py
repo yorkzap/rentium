@@ -48,6 +48,8 @@ def _row_payload(row: StagedLedgerEntry) -> dict:
         "payment_method": row.payment_method,
         "settles_row_id": str(row.settles_row_id) if row.settles_row_id else None,
         "issues": row.issues,
+        "excluded_at": row.excluded_at,
+        "exclusion_reason": row.exclusion_reason,
         "committed": row.committed_entry_id is not None,
         "raw": row.raw,
     }

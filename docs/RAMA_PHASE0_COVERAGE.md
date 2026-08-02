@@ -1,5 +1,11 @@
 # RAMA Phase 0 — Capability Coverage Audit
 
+> Historical baseline. The percentages below describe the original 88-tool
+> surface and are retained to explain why the capability-contract work was
+> necessary. The current registry has 174 tools, every scanned landlord-facing
+> mutation is now curated by `scripts/rama_api_parity_report.py`, and CI checks
+> the General's callable allowlist. See `RAMA_API_PARITY.md` for current status.
+
 > Companion to `RAMA_SMARTNESS_ARCHITECTURE.md`. This is the **evidence**: a
 > concrete measure of how much of the domain RAMA can actually reach today,
 > produced by introspecting the live models and the 88 registered tools. It
@@ -34,7 +40,7 @@ set" counts fields writable through some tool.
 |---|---:|---:|---:|---|
 | **Property** | ~23 | ~10 | ~43% | `building_amenities`, `default_bills_included`, `neighbourhood`, `available_from`, beds/baths/size, lat/long, default deposit |
 | **Lease** | ~30 | ~12 | ~40% | **`bills_included` on an existing lease**, `parking_*`, `occupants`, `rent_due_day`, `pets_terms`/`smoking_terms`, the 5 `landlord_service_*` contact fields, `custom_tenant_notice_months`, `fixed_term_end_*`, `move_in/out_date`, deposit-received dates |
-| **LeaseTenant** | ~10 | ~4 | ~40% | `tenant_notes`, per-tenant `cleaning_fee`, `individual_start/end_date`, `is_primary_tenant` |
+| **LeaseTenant** | ~10 | ~4 | ~40% | `tenant_notes`, per-tenant `cleaning_deposit`, `individual_start/end_date`, `is_primary_tenant` |
 | **WorkOrder** | ~12 | ~8 | ~65% | `cost`, `completed_date` (except via complete), SLA fields |
 | **InventoryItem** | 5 | 5 | **100%** | — (create/update/delete all present) |
 | **ConditionInspection** | ~27 | ~0 (create only) | **~0%** | every field: deductions, move-in/out signatures & dates, agreement flags, `tenant_forwarding_address`, report-delivered timestamps |

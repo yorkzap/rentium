@@ -184,14 +184,17 @@ def test_the_treasurer_can_read_them(landlord):
     assert {"list_import_batches", "read_staged_entries"} <= names
 
 
-def test_committing_a_batch_is_not_a_tool_in_any_role():
-    """The Treasurer must never turn provisional history into ledger rows —
-    and neither should any other role by accident. commit_batch is reachable
-    from the import UI only."""
-    from rentium.rama import registry
+def test_only_the_general_can_commit_a_batch():
+    """The landlord-facing General has guarded UI parity; analysts stay read-only."""
+    from rentium.rama.roles import role_tool_schemas
 
-    for name in registry.REGISTRY:
-        assert "commit" not in name or "batch" not in name
+    general = {tool["name"] for tool in role_tool_schemas("general")}
+    fsa = {tool["name"] for tool in role_tool_schemas("fsa")}
+    treasurer = {tool["name"] for tool in role_tool_schemas("treasurer")}
+
+    assert "commit_import_batch" in general
+    assert "commit_import_batch" not in fsa
+    assert "commit_import_batch" not in treasurer
 
 
 def test_no_treasurer_tool_can_write(landlord):

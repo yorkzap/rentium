@@ -106,3 +106,39 @@ def test_capability_maps_furnishing_and_start_date_to_adjust_lease():
         )
         == "adjust_lease"
     )
+
+
+def test_siya_deposits_preview_and_update_use_refundable_cleaning_deposit(
+    pending_lease, landlord
+):
+    preview = registry.execute(
+        "update_lease",
+        {
+            "lease_number": "RMT415536-0617",
+            "security_deposit": "200",
+            "cleaning_deposit": "200",
+        },
+        landlord=landlord,
+    )
+
+    assert preview.get("needs_confirm"), preview
+    assert preview["preview"]["changes"] == {
+        "security_deposit": "200.00",
+        "cleaning_deposit": "200.00",
+    }
+    assert "cleaning_fee" not in str(preview)
+
+    done = registry.execute(
+        "update_lease",
+        {
+            "lease_number": "RMT415536-0617",
+            "security_deposit": "200",
+            "cleaning_deposit": "200",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert done.get("updated"), done
+    pending_lease.refresh_from_db()
+    assert pending_lease.security_deposit == Decimal("200.00")
+    assert pending_lease.cleaning_deposit == Decimal("200.00")

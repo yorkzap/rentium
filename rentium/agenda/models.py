@@ -31,6 +31,9 @@ class AgendaEvent(models.Model):
     end_date = models.DateField(null=True, blank=True)
     property = models.ForeignKey(Property, on_delete=models.SET_NULL, null=True, blank=True, related_name="agenda_events")
     lease = models.ForeignKey(Lease, on_delete=models.SET_NULL, null=True, blank=True, related_name="agenda_events")
+    # RAMA archives manual events instead of deleting them.  The UI's existing
+    # DELETE remains available, while chat gets a reversible cancel/restore path.
+    archived_at = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

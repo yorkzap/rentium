@@ -130,6 +130,12 @@ class AgreementTerms(models.Model):
     pet_deposit_received_date = models.DateField(
         _("Pet Damage Deposit Received On"), null=True, blank=True
     )
+    # The cleaning deposit is refundable (see the GENERIC_ROOMMATE deposit_terms
+    # clause), so its receipt starts the same clock the other two do. It used to
+    # be a fee, which is why only LeaseTenant.cleaning_deposit_paid tracked it.
+    cleaning_deposit_received_date = models.DateField(
+        _("Cleaning Deposit Received On"), null=True, blank=True
+    )
 
     # --- Conduct terms ------------------------------------------------------
     # pets_allowed / smoking_allowed already exist as booleans on Lease. These

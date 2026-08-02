@@ -16,6 +16,7 @@ from rentium.users.models import TenantProfile
 from .agreement import AgreementTerms
 from .inspections import AreaConditionState  # noqa: E402,F401
 from .inspections import ConditionInspection  # noqa: E402,F401
+from .inspections import DepositDeduction  # noqa: E402,F401
 from .inspections import InspectionItem  # noqa: E402,F401
 from .inspections import InspectionKeyRow  # noqa: E402,F401
 from .inspections import InspectionTemplate  # noqa: E402,F401
@@ -109,13 +110,14 @@ class Lease(AgreementTerms):
     pet_deposit = models.DecimalField(
         _("Pet Deposit"), max_digits=10, decimal_places=2, default=0
     )
-    cleaning_fee = models.DecimalField(
-        _("Cleaning Fee (Overall Lease)"),
+    cleaning_deposit = models.DecimalField(
+        _("Cleaning Deposit (Overall Lease)"),
         max_digits=10,
         decimal_places=2,
         default=0,
         help_text=_(
-            "Overall fee for complete units; individual fees are in LeaseTenant for roommates"
+            "Refundable cleaning deposit for the lease; individual roommate "
+            "deposits may be recorded on LeaseTenant"
         ),
     )
     # Additional details
@@ -984,17 +986,19 @@ class LeaseTenant(models.Model):
             "Specific room assignment within a group lease (Roommate Agreements only)"
         ),
     )
-    # Individual cleaning fee for roommate agreements
-    cleaning_fee = models.DecimalField(
-        _("Individual Cleaning Fee"),
+    # Individual refundable cleaning deposit for roommate agreements
+    cleaning_deposit = models.DecimalField(
+        _("Individual Cleaning Deposit"),
         max_digits=10,
         decimal_places=2,
         default=0,
         help_text=_(
-            "Cleaning fee charged specifically to this tenant (for roommate leases)"
+            "Cleaning deposit charged specifically to this tenant (for roommate leases)"
         ),
     )
-    cleaning_fee_paid = models.BooleanField(_("Cleaning Fee Paid"), default=False)
+    cleaning_deposit_paid = models.BooleanField(
+        _("Cleaning Deposit Paid"), default=False
+    )
     is_primary_tenant = models.BooleanField(
         _("Primary Tenant"),
         default=False,
@@ -1103,10 +1107,10 @@ class LeaseTenant(models.Model):
                     f"The assigned room '{self.room.name}' does not belong to the lease's group '{self.lease.group.name}'."
                 )
             )
-        if self.cleaning_fee != 0 and not ("ROOMMATE" in self.lease.lease_type):
+        if self.cleaning_deposit != 0 and not ("ROOMMATE" in self.lease.lease_type):
             raise ValidationError(
                 _(
-                    "Individual cleaning fees should only be set for tenants on Roommate agreement types."
+                    "Individual cleaning deposits should only be set for tenants on Roommate agreement types."
                 )
             )
         if self.is_primary_tenant:
@@ -1233,6 +1237,12 @@ class LeaseInviteEvent(models.Model):
         SIGNED = "SIGNED", _("Lease signed")
         DECLINED = "DECLINED", _("Lease declined")
         RESENT = "RESENT", _("Invite resent")
+        # A lease term changed AFTER this person signed. Recorded against
+        # them, not sent to them: the landlord keeps control of the document
+        # and decides who to tell, but the record of what changed and when is
+        # append-only, because "they signed a different lease" is exactly the
+        # claim this evidence has to answer.
+        TERMS_AMENDED = "TERMS_AMENDED", _("Terms amended after signing")
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     lease_tenant = models.ForeignKey(
@@ -1506,7 +1516,7 @@ class Payment(models.Model):
         RENT = "RENT", _("Rent Payment")
         SECURITY_DEPOSIT = "SECURITY_DEPOSIT", _("Security Deposit")
         PET_DEPOSIT = "PET_DEPOSIT", _("Pet Deposit")
-        CLEANING_FEE = "CLEANING_FEE", _("Cleaning Fee")
+        CLEANING_DEPOSIT = "CLEANING_DEPOSIT", _("Cleaning Deposit")
         LATE_FEE = "LATE_FEE", _("Late Fee")
         UTILITY = "UTILITY", _("Utility Payment")
         MAINTENANCE = "MAINTENANCE", _("Maintenance Fee/Chargeback")

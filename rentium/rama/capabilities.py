@@ -147,9 +147,30 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "condition codes",
         "inspection items",
     ),
-    "mark_cleaning_fee_paid": (
+    "mark_cleaning_deposit_paid": (
+        "cleaning deposit paid",
+        "paid cleaning deposit",
         "cleaning fee paid",
         "paid cleaning fee",
+    ),
+    "record_deposit_deduction": (
+        "deduct from deposit",
+        "deposit deduction",
+        "charge for cleaning",
+        "cleaning cost",
+        "cleaning hours",
+        "professional cleaners",
+        "garbage removal",
+        "dump run",
+        "keep some of the deposit",
+    ),
+    "return_deposits": (
+        "return the deposit",
+        "return deposits",
+        "give the deposit back",
+        "refund the deposit",
+        "pay back the deposit",
+        "send the deposit back",
     ),
     "create_payment_reminder": (
         "payment reminder",
@@ -169,6 +190,19 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "change rent",
         "update pending lease",
         "change end date",
+        # Setting a deposit on a lease that already exists. Without these the
+        # ranker offered create_lease and mark_cleaning_deposit_paid for
+        # "add a $200 cleaning deposit to lease RMT415536-0617" and never
+        # offered the tool that does it.
+        "add deposit",
+        "set deposit",
+        "change deposit",
+        "edit deposit",
+        "cleaning deposit amount",
+        "security deposit amount",
+        "add cleaning deposit to lease",
+        "edit lease deposit",
+        "lease deposit field",
     ),
     "invite_tenant_to_lease": (
         "send lease",
@@ -258,6 +292,94 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "file receipt expense",
         "expense already paid",
         "record paid invoice",
+    ),
+    "rename_business_document": (
+        "rename receipt",
+        "rename invoice",
+        "change document name",
+        "fix receipt title",
+        "edit document title",
+    ),
+    "manage_business_documents": (
+        "tag receipts",
+        "move documents",
+        "restore receipt from trash",
+        "trash invoice",
+        "rerun ocr",
+        "mark receipt expense paid",
+        "bulk document edit",
+    ),
+    "reorder_listing_media": (
+        "reorder listing photos",
+        "make photo first",
+        "sort gallery",
+    ),
+    "manage_property_group": (
+        "edit property group",
+        "edit shared inventory",
+        "update common area",
+        "move room into group",
+    ),
+    "update_lease_roster": (
+        "edit tenant rent share",
+        "change tenant email",
+        "make primary tenant",
+        "edit lease roster",
+    ),
+    "schedule_appointment": (
+        "schedule inspection",
+        "book contractor",
+        "calendar appointment",
+    ),
+    "manage_viewing_availability": (
+        "edit viewing hours",
+        "remove availability",
+        "replace showing window",
+    ),
+    "manage_agenda_event": (
+        "calendar reminder",
+        "edit calendar event",
+        "archive agenda event",
+    ),
+    "update_condition_inspection": (
+        "edit inspection header",
+        "add inspection item",
+        "update keys handed over",
+    ),
+    "manage_import_rows": (
+        "fix imported row",
+        "map bank statement columns",
+        "exclude import row",
+    ),
+    "manage_showcase_settings": (
+        "change public listing slug",
+        "edit showcase text",
+        "publish showcase",
+    ),
+    "manage_insight": (
+        "acknowledge insight",
+        "dismiss recommendation",
+        "reopen insight",
+    ),
+    "manage_notification_channel": (
+        "link telegram",
+        "notification channel settings",
+        "disable whatsapp notifications",
+    ),
+    "update_treasurer_settings": (
+        "treasurer consent",
+        "tax rate settings",
+        "tax province",
+    ),
+    "save_last_workflow": (
+        "save this workflow",
+        "remember this chain",
+        "make this a macro",
+    ),
+    "run_saved_workflow": (
+        "run saved workflow",
+        "use my macro",
+        "repeat saved chain",
     ),
     "business_document_status": (
         "what did ocr find",
@@ -433,6 +555,33 @@ def supported_tool_for_request(request: str) -> str | None:
         text,
     ):
         return "viewing_invite_status"
+    # Existing document metadata edits are not a new upload/catalog request.
+    if re.search(
+        r"\b(rename|retitle|change|fix|edit)\b.*\b"
+        r"(receipt|invoice|document|notice|pdf)\b"
+        r"|\b(receipt|invoice|document|notice|pdf)\b.*\b"
+        r"(rename|retitle|change (?:the )?(?:name|title)|fix (?:the )?(?:name|title))\b",
+        text,
+    ):
+        return "rename_business_document"
+    if re.search(
+        r"\b(tag|trash|restore|re-?ocr|move)\b.*\b"
+        r"(receipt|invoice|document|pdf)\b"
+        r"|\b(receipt|invoice|document|pdf)\b.*\b"
+        r"(tag|trash|restore|re-?ocr|move)\b",
+        text,
+    ):
+        return "manage_business_documents"
+    if re.search(
+        r"\b(save|remember|name)\b.*\b(workflow|macro|chain)\b",
+        text,
+    ):
+        return "save_last_workflow"
+    if re.search(
+        r"\b(run|repeat|use)\b.*\b(saved workflow|macro|saved chain)\b",
+        text,
+    ):
+        return "run_saved_workflow"
     # Receipts / PDFs / OCR — never allow a false "I can't scan" gap.
     if re.search(
         r"\b(ocr|scan|scanned|scanner)\b"
@@ -461,7 +610,11 @@ def supported_tool_for_request(request: str) -> str | None:
     if re.search(
         r"\b(end|ending|terminate)\b.+\b(tenancy|move[- ]?out)\b"
         r"|\b(move[- ]?out|mutual agreement)\b.+\b(end|notice|deposit)\b"
-        r"|\b(settle|return)\b.+\b(deposit|security deposit)\b"
+        # "settle the deposit" is the compliance record (which of the three
+        # lawful routes was taken). "return the deposit" is the money going
+        # back, which is return_deposits — a different tool since deposits are
+        # returned one by one.
+        r"|\bsettle\b.+\b(deposit|security deposit)\b"
         r"|\blandlord notice\b.+\b(end|vacate)\b",
         text,
     ):
@@ -531,10 +684,51 @@ def supported_tool_for_request(request: str) -> str | None:
     ):
         return "cancel_viewing"
     if re.search(
-        r"\b(cleaning fee)\b.+\bpaid\b|\bpaid\b.+\bcleaning fee\b",
+        r"\b(cleaning (?:deposit|fee))\b.+\bpaid\b"
+        r"|\bpaid\b.+\bcleaning (?:deposit|fee)\b",
         text,
     ):
-        return "mark_cleaning_fee_paid"
+        return "mark_cleaning_deposit_paid"
+    # Deposits out. Kept ahead of create_lease, whose "rent ... deposit" rule
+    # would otherwise swallow "return their deposit" on a lease with rent in
+    # the same sentence.
+    if re.search(
+        r"\b(return|refund|give|send|pay|hand)\w*\b.{0,30}\bdeposits?\b"
+        r"|\bdeposits?\b.{0,30}\b(back|returned|refunded)\b",
+        text,
+    ):
+        return "return_deposits"
+    if re.search(
+        r"\b(deduct\w*|withhold\w*|keep|retain\w*)\b.{0,30}\bdeposits?\b"
+        r"|\bdeposits?\b.{0,30}\bdeduct"
+        r"|\b(garbage|rubbish|junk)\b.{0,20}\b(removal|haul|run|fee)\b"
+        r"|\bdump(ing)?\b.{0,10}\b(run|fee|charge)\b"
+        r"|\b(cleaning|cleaners?)\b.{0,20}\b(cost|charge|bill|invoice|hours)\b",
+        text,
+    ):
+        return "record_deposit_deduction"
+    # Setting a deposit on a lease that ALREADY EXISTS. Asked to "add a $200
+    # cleaning deposit to lease RMT415536-0617", retrieval offered create_lease,
+    # adjust_lease and mark_cleaning_deposit_paid and never offered
+    # update_lease — so the model reported, accurately for the menu it had,
+    # that it could only set deposits while creating a lease. It then went on
+    # to invent a reason ("already signed and active, so the deposit fields are
+    # locked") for a PENDING lease that was editable the whole time. Pinning
+    # the tool removes the opportunity: the tool's own guard answers the lock
+    # question truthfully, and the model never has to guess it.
+    #
+    # Kept ahead of create_lease, whose "rent … deposit" rule would otherwise
+    # swallow this, and behind the paid/deduction/return rules, which are more
+    # specific things to do with a deposit.
+    if not re.search(
+        r"\b(create|draft|make|new)\b.{0,30}\b(lease|tenancy|agreement)\b", text
+    ) and re.search(
+        r"\b(add|set|change|update|edit|correct|fix|amend|put)\b"
+        r"[^.?!]{0,60}\b(?:security |pet |cleaning )?deposits?\b"
+        r"|\b(edit|update|change|amend)\b[^.?!]{0,25}\blease\b",
+        text,
+    ):
+        return "update_lease"
     if re.search(
         r"\b(payment|rent)\b.+\breminder\b|\bremind\b.+\b(rent|payment)\b",
         text,

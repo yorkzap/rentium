@@ -12,6 +12,7 @@ from .models import (
     RamaDocumentEvent,
     RamaMemory,
     RamaPreferences,
+    RamaSavedWorkflow,
     RamaTask,
 )
 
@@ -131,6 +132,36 @@ class RamaTaskAdmin(admin.ModelAdmin):
         "outcome",
         "idempotency_key",
         "error",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(RamaSavedWorkflow)
+class RamaSavedWorkflowAdmin(admin.ModelAdmin):
+    """Support visibility; workflow changes must use the audited RAMA tools."""
+
+    list_display = ("name", "version", "landlord", "archived_at", "updated_at")
+    list_filter = ("archived_at", "version")
+    search_fields = ("name", "landlord__user__email")
+    readonly_fields = (
+        "landlord",
+        "name",
+        "version",
+        "parameter_schema",
+        "steps",
+        "capability_contract_version",
+        "created_from_task",
+        "archived_at",
         "created_at",
         "updated_at",
     )

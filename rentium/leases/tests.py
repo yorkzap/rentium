@@ -75,6 +75,7 @@ def roommate_lease(landlord):
         is_month_to_month=True,
         total_rent="800.00",
         security_deposit="400.00",
+        cleaning_deposit="200.00",
     )
 
 
@@ -89,11 +90,35 @@ def test_roommate_has_landlord_protective_terms(roommate_lease):
     assert "sublet" in text.lower()                  # no subletting
     assert "deduct from the deposit" in text         # deposit-deduction grounds
     assert "one clear month" in text                 # notice to end
+    assert "not a cleaning fee" in text
+    assert "return the security deposit and any cleaning deposit separately" in text
+
+    money = next(section for section in doc.sections if section.id == "money")
+    amounts = {row.label: row.value for row in money.rows}
+    assert amounts["Cleaning deposit"] == "$200.00"
 
     # It must NOT masquerade as a statutory tenancy form (s.4(c) restraint).
     assert doc.format_id == "GENERIC_ROOMMATE"
     assert "Residential Tenancy Act" not in text
 
+
+@pytest.mark.django_db
+def test_roommate_cleaning_deposit_is_a_liability_not_fee_income(roommate_lease):
+    from rentium.ledger.billing import generate_initial_charges
+    from rentium.ledger.models import EntryType, LedgerEntry
+
+    generate_initial_charges(roommate_lease)
+
+    cleaning = LedgerEntry.objects.get(
+        lease=roommate_lease,
+        metadata__kind="cleaning_deposit_lease",
+    )
+    assert cleaning.entry_type == EntryType.DEPOSIT_CHARGE
+    assert not LedgerEntry.objects.filter(
+        lease=roommate_lease,
+        entry_type=EntryType.FEE_CHARGE,
+        description__icontains="cleaning",
+    ).exists()
 
 # --------------------------------------------------------- immutability
 @pytest.mark.django_db

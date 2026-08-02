@@ -5,7 +5,7 @@ charges and repost them as household charges (tenant=NULL).
 
 Only touches charges the billing engine itself generated (recognised by
 their natural idempotency keys: rent:/security_deposit:/pet_deposit:/
-cleaning_fee_lease:) — manual one-off charges are left alone. Charges that
+cleaning_deposit_lease:) — manual one-off charges are left alone. Charges that
 already have live payments/credits on them are SKIPPED and reported, since
 received money is historical fact; resolve those by hand (void the payment,
 re-run, re-record the payment against the new joint charge).
@@ -27,7 +27,7 @@ GENERATED_KEY_PREFIXES = (
     "rent:",
     "security_deposit:",
     "pet_deposit:",
-    "cleaning_fee_lease:",
+    "cleaning_deposit_lease:",
 )
 
 

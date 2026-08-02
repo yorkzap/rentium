@@ -611,6 +611,299 @@ def test_soft_delete_trashes_and_restore_works(landlord):
     assert document.deleted_at is None
 
 
+def test_document_rename_is_metadata_only_and_audited(landlord):
+    """Library rename must not touch preserved files, status, or ledger links."""
+    from rentium.rama.models import RamaDocumentEvent
+    from rest_framework.test import APIClient
+
+    upload = SimpleUploadedFile(
+        "IMG_4021.jpg", b"rename-document-unique", content_type="image/jpeg"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.canonical_filename = "2026-07-15__maintenance__window-screens.pdf"
+    document.status = RamaDocument.Status.FILED
+    document.save(update_fields=["canonical_filename", "status", "updated_at"])
+    original_file = document.original_file.name
+
+    client = APIClient()
+    client.force_authenticate(user=landlord.user)
+    response = client.post(
+        f"/api/rama/documents/{document.pk}/",
+        {"title": "  McKenzie window screens  "},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["display_title"] == "McKenzie window screens"
+    document.refresh_from_db()
+    assert document.title == "McKenzie window screens"
+    assert document.status == RamaDocument.Status.FILED
+    assert document.original_filename == "IMG_4021.jpg"
+    assert document.original_file.name == original_file
+    assert document.canonical_filename == (
+        "2026-07-15__maintenance__window-screens.pdf"
+    )
+    event = document.events.filter(kind=RamaDocumentEvent.Kind.CLARIFIED).last()
+    assert event is not None
+    assert event.detail["field"] == "title"
+    assert event.detail["after"] == "McKenzie window screens"
+
+
+def test_document_rename_rejects_blank_name(landlord):
+    from rest_framework.test import APIClient
+
+    upload = SimpleUploadedFile(
+        "notice.pdf", b"rename-blank-unique", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    client = APIClient()
+    client.force_authenticate(user=landlord.user)
+
+    response = client.post(
+        f"/api/rama/documents/{document.pk}/", {"title": "   "}, format="json"
+    )
+
+    assert response.status_code == 400
+    assert "required" in response.json()["detail"].lower()
+
+
+def test_rama_renames_one_of_two_vendor_receipts_by_exact_amount(landlord):
+    from decimal import Decimal
+
+    from rentium.rama import registry
+    from rentium.rama.models import RamaDocumentEvent
+
+    documents = []
+    for index, amount in enumerate(("250.00", "39.36"), start=1):
+        upload = SimpleUploadedFile(
+            f"pnr-{index}.pdf",
+            f"%PDF-pnr-rename-{index}".encode(),
+            content_type="application/pdf",
+        )
+        document, _ = ingest_document(landlord=landlord, upload=upload)
+        document.title = "PNR Screens LTD receipt"
+        document.issuer = "PNR Screens LTD"
+        document.amount = Decimal(amount)
+        document.status = RamaDocument.Status.FILED
+        document.canonical_filename = f"pnr-{index}-archived.pdf"
+        document.save()
+        documents.append(document)
+
+    preview = registry.execute(
+        "rename_business_document",
+        {
+            "document_query": "PNR Screens LTD",
+            "amount": "$39.36 CAD",
+            "new_title": "PNV Screens Ltd",
+        },
+        landlord=landlord,
+    )
+
+    assert preview["needs_confirm"] is True
+    assert preview["preview"]["document_id"] == str(documents[1].pk)
+    assert preview["preview"]["amount"] == "39.36"
+    assert preview["preview"]["current_title"] == "PNR Screens LTD receipt"
+    assert preview["resolved_arguments"] == {
+        "document_id": str(documents[1].pk),
+        "new_title": "PNV Screens Ltd",
+        "expected_title": "PNR Screens LTD receipt",
+    }
+    assert RamaDocument.objects.get(pk=documents[1].pk).title == (
+        "PNR Screens LTD receipt"
+    )
+
+    result = registry.execute(
+        "rename_business_document",
+        {**preview["resolved_arguments"], "confirm": "yes"},
+        landlord=landlord,
+    )
+
+    assert result["updated"] is True
+    documents[0].refresh_from_db()
+    documents[1].refresh_from_db()
+    assert documents[0].title == "PNR Screens LTD receipt"
+    assert documents[0].amount == Decimal("250.00")
+    assert documents[1].title == "PNV Screens Ltd"
+    assert documents[1].amount == Decimal("39.36")
+    assert documents[1].canonical_filename == "pnr-2-archived.pdf"
+    assert documents[1].events.filter(
+        kind=RamaDocumentEvent.Kind.CLARIFIED,
+        detail__source="document_library_rename",
+    ).exists()
+
+
+def test_rama_document_rename_asks_when_ambiguous_or_missing(landlord):
+    from datetime import date
+    from decimal import Decimal
+
+    from rentium.rama import registry
+
+    for index in range(2):
+        upload = SimpleUploadedFile(
+            f"same-{index}.pdf",
+            f"%PDF-same-rename-{index}".encode(),
+            content_type="application/pdf",
+        )
+        document, _ = ingest_document(landlord=landlord, upload=upload)
+        document.title = f"PNR receipt {index + 1}"
+        document.issuer = "PNR Screens LTD"
+        document.amount = Decimal("39.36")
+        document.document_date = date(2026, 7, index + 1)
+        document.status = RamaDocument.Status.FILED
+        document.save()
+
+    ambiguous = registry.execute(
+        "rename_business_document",
+        {
+            "document_query": "PNR Screens LTD",
+            "amount": "39.36",
+            "new_title": "PNV Screens Ltd",
+        },
+        landlord=landlord,
+    )
+    assert ambiguous["needs_input"] is True
+    assert len(ambiguous["candidates"]) == 2
+    assert "Which one" in ambiguous["question_for_user"]
+
+    narrowed = registry.execute(
+        "rename_business_document",
+        {
+            "document_query": "PNR Screens LTD",
+            "amount": "39.36",
+            "document_date": "2026-07-02",
+            "new_title": "PNV Screens Ltd",
+        },
+        landlord=landlord,
+    )
+    assert narrowed["needs_confirm"] is True
+    assert narrowed["preview"]["document_date"] == "2026-07-02"
+
+    unrelated_upload = SimpleUploadedFile(
+        "xyz.pdf", b"%PDF-xyz-overlap", content_type="application/pdf"
+    )
+    unrelated, _ = ingest_document(landlord=landlord, upload=unrelated_upload)
+    unrelated.title = "XYZ Screens LTD receipt"
+    unrelated.issuer = "XYZ Screens LTD"
+    unrelated.amount = Decimal("99.99")
+    unrelated.status = RamaDocument.Status.FILED
+    unrelated.save()
+
+    missing = registry.execute(
+        "rename_business_document",
+        {
+            "document_query": "PNR Screens LTD",
+            "amount": "99.99",
+            "new_title": "PNV Screens Ltd",
+        },
+        landlord=landlord,
+    )
+    assert missing["needs_input"] is True
+    assert missing["candidates"] == []
+    assert "couldn't find" in missing["question_for_user"]
+    assert not RamaDocument.objects.filter(
+        landlord=landlord, title="PNV Screens Ltd"
+    ).exists()
+
+
+def test_rama_document_rename_scopes_owner_and_refuses_trash(landlord):
+    from django.utils import timezone
+
+    from rentium.rama import registry
+    from rentium.users.models import LandlordProfile
+    from rentium.users.tests.factories import UserFactory
+
+    other_landlord = LandlordProfile.objects.create(user=UserFactory())
+    upload = SimpleUploadedFile(
+        "private.pdf", b"%PDF-private-rename", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=other_landlord, upload=upload)
+    document.title = "Private receipt"
+    document.save(update_fields=["title", "updated_at"])
+
+    hidden = registry.execute(
+        "rename_business_document",
+        {"document_id": str(document.pk), "new_title": "Leaked"},
+        landlord=landlord,
+    )
+    assert "error" in hidden
+    assert hidden["error"] == "No business document with that ID was found."
+    document.refresh_from_db()
+    assert document.title == "Private receipt"
+
+    document.landlord = landlord
+    document.deleted_at = timezone.now()
+    document.save(update_fields=["landlord", "deleted_at", "updated_at"])
+    trashed = registry.execute(
+        "rename_business_document",
+        {"document_id": str(document.pk), "new_title": "Still no"},
+        landlord=landlord,
+    )
+    assert "trash" in trashed["error"].lower()
+    document.refresh_from_db()
+    assert document.title == "Private receipt"
+
+
+def test_rama_document_rename_guards_stale_preview_and_invalid_input(landlord):
+    from decimal import Decimal
+
+    from rentium.rama import registry
+
+    upload = SimpleUploadedFile(
+        "guarded.pdf", b"%PDF-guarded-rename", content_type="application/pdf"
+    )
+    document, _ = ingest_document(landlord=landlord, upload=upload)
+    document.title = "Original receipt title"
+    document.issuer = "Guarded Vendor"
+    document.amount = Decimal("10.00")
+    document.status = RamaDocument.Status.FILED
+    document.save()
+
+    preview = registry.execute(
+        "rename_business_document",
+        {
+            "document_query": "Guarded Vendor",
+            "amount": "10.00",
+            "new_title": "Approved future title",
+        },
+        landlord=landlord,
+    )
+    document.title = "Changed somewhere else"
+    document.save(update_fields=["title", "updated_at"])
+    stale = registry.execute(
+        "rename_business_document",
+        {**preview["resolved_arguments"], "confirm": "yes"},
+        landlord=landlord,
+    )
+    assert "changed after the preview" in stale["error"]
+    document.refresh_from_db()
+    assert document.title == "Changed somewhere else"
+
+    same = registry.execute(
+        "rename_business_document",
+        {"document_id": str(document.pk), "new_title": "Changed somewhere else"},
+        landlord=landlord,
+    )
+    assert same["already_done"] is True
+    assert same.get("needs_confirm") is None
+
+    invalid_amount = registry.execute(
+        "rename_business_document",
+        {
+            "document_query": "Guarded Vendor",
+            "amount": "about ten dollars",
+            "new_title": "No",
+        },
+        landlord=landlord,
+    )
+    assert "positive amount" in invalid_amount["error"]
+    blank = registry.execute(
+        "rename_business_document",
+        {"document_id": str(document.pk), "new_title": "   "},
+        landlord=landlord,
+    )
+    assert blank["error"] == "new_title is required."
+
+
 def test_hard_delete_cascades_events(landlord):
     """Hard DELETE must not 500 on RamaDocumentEvent PROTECT; events go with the doc."""
     from rentium.rama.document_services import delete_document

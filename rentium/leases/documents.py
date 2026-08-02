@@ -311,6 +311,17 @@ class BCResidentialFormat(LeaseFormat):
                 unit_rows.append(
                     Row("Size", f"{prop.bedrooms} bed · {prop.bathrooms or '—'} bath")
                 )
+            from rentium.properties.furnishing import furnishing_label
+
+            unit_rows.append(Row("Furnishing", furnishing_label(prop)))
+            if (getattr(prop, "furnishing_details", None) or "").strip():
+                unit_rows.append(
+                    Row(
+                        "Furnishing details",
+                        prop.furnishing_details.strip(),
+                        block=True,
+                    )
+                )
         if lease.occupants:
             unit_rows.append(
                 Row(
@@ -411,8 +422,16 @@ class BCResidentialFormat(LeaseFormat):
                     else "Not yet received",
                 ),
             ]
-        if Decimal(str(lease.cleaning_fee or 0)) > 0:
-            dep_rows.append(Row("Cleaning fee", money(lease.cleaning_fee)))
+        if Decimal(str(lease.cleaning_deposit or 0)) > 0:
+            dep_rows += [
+                Row("Cleaning deposit", money(lease.cleaning_deposit)),
+                Row(
+                    "Received on",
+                    fmt_date(lease.cleaning_deposit_received_date)
+                    if lease.cleaning_deposit_received_date
+                    else "Not yet received",
+                ),
+            ]
 
         out.append(
             Section(
@@ -743,8 +762,32 @@ class RoommateFormat(LeaseFormat):
                     else "Not yet received",
                 )
             )
-        if this_tenant and Decimal(str(this_tenant.cleaning_fee or 0)) > 0:
-            money_rows.append(Row("Cleaning fee", money(this_tenant.cleaning_fee)))
+        tenant_cleaning_deposit = (
+            Decimal(str(this_tenant.cleaning_deposit or 0))
+            if this_tenant
+            else Decimal("0")
+        )
+        cleaning_deposit = tenant_cleaning_deposit or Decimal(
+            str(lease.cleaning_deposit or 0)
+        )
+        if cleaning_deposit > 0:
+            money_rows.append(Row("Cleaning deposit", money(cleaning_deposit)))
+            # A per-tenant cleaning deposit is that roommate's own money, so its
+            # receipt is their cleaning_deposit_paid flag; only the lease-level
+            # one has a lease-level date to print.
+            if tenant_cleaning_deposit:
+                received = (
+                    "Received"
+                    if (this_tenant and this_tenant.cleaning_deposit_paid)
+                    else "Not yet received"
+                )
+            else:
+                received = (
+                    fmt_date(lease.cleaning_deposit_received_date)
+                    if lease.cleaning_deposit_received_date
+                    else "Not yet received"
+                )
+            money_rows.append(Row("Cleaning deposit received on", received))
         if lease.get_bills_summary():
             money_rows.append(Row("Utilities", lease.get_bills_summary(), block=True))
 
@@ -755,7 +798,10 @@ class RoommateFormat(LeaseFormat):
                 rows=money_rows,
                 clauses=(
                     self.clauses(lease, "deposit_terms")
-                    if Decimal(str(lease.security_deposit or 0)) > 0
+                    if (
+                        Decimal(str(lease.security_deposit or 0)) > 0
+                        or cleaning_deposit > 0
+                    )
                     else []
                 ),
             )

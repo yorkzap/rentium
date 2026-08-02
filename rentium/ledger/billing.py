@@ -205,7 +205,7 @@ def generate_rent_charges_for_lease(
 
 def generate_initial_charges(lease: Lease) -> None:
     """
-    Called once when the lease flips ACTIVE: deposits + cleaning fees +
+    Called once when the lease flips ACTIVE: deposits + rent +
     the rent schedule (first charge = prorated move-in period).
     Idempotent via natural keys.
 
@@ -225,9 +225,9 @@ def generate_initial_charges(lease: Lease) -> None:
                     lease activated retroactively (backdated paperwork) doesn't
                     end up with a deposit due AFTER the tenancy already began.
 
-    JOINT leases: the security/pet deposit and lease-level cleaning fee are
+    JOINT leases: the security, pet, and lease-level cleaning deposits are
     HOUSEHOLD charges (tenant=None) — "their deposit is together". Only the
-    explicitly individual per-tenant cleaning fees stay per-tenant.
+    explicitly individual per-tenant cleaning deposits stay per-tenant.
     SPLIT leases: one-time charges go to the primary tenant.
     """
     from django.utils import timezone
@@ -279,10 +279,10 @@ def generate_initial_charges(lease: Lease) -> None:
         )
         _one_time(
             None,
-            EntryType.FEE_CHARGE,
-            lease.cleaning_fee,
-            "cleaning_fee_lease",
-            "Cleaning fee — due on signing",
+            EntryType.DEPOSIT_CHARGE,
+            lease.cleaning_deposit,
+            "cleaning_deposit_lease",
+            "Cleaning deposit — due on signing",
             joint_charge=True,
         )
     else:
@@ -309,21 +309,23 @@ def generate_initial_charges(lease: Lease) -> None:
         )
         _one_time(
             primary_tenant,
-            EntryType.FEE_CHARGE,
-            lease.cleaning_fee,
-            "cleaning_fee_lease",
-            "Cleaning fee — due on signing",
+            EntryType.DEPOSIT_CHARGE,
+            lease.cleaning_deposit,
+            "cleaning_deposit_lease",
+            "Cleaning deposit — due on signing",
         )
 
-    # A per-tenant cleaning fee is that person's own obligation in either mode
+    # A per-tenant cleaning deposit is that person's own obligation in either mode
     # (it was negotiated individually on their LeaseTenant row).
-    for lt in lease.lease_tenants.filter(tenant__isnull=False, cleaning_fee__gt=0):
+    for lt in lease.lease_tenants.filter(
+        tenant__isnull=False, cleaning_deposit__gt=0
+    ):
         _one_time(
             lt.tenant,
-            EntryType.FEE_CHARGE,
-            lt.cleaning_fee,
-            "cleaning_fee_individual",
-            "Cleaning fee (individual) — due on signing",
+            EntryType.DEPOSIT_CHARGE,
+            lt.cleaning_deposit,
+            "cleaning_deposit_individual",
+            "Cleaning deposit (individual) — due on signing",
         )
 
     generate_rent_charges_for_lease(lease)
@@ -332,9 +334,10 @@ def generate_initial_charges(lease: Lease) -> None:
 def stamp_deposit_received(charge: LedgerEntry) -> bool:
     """
     When a DEPOSIT_CHARGE is fully settled, record the date on the LEASE
-    (Lease.security_deposit_received_date / pet_deposit_received_date).
+    (Lease.security_deposit_received_date / pet_deposit_received_date /
+    cleaning_deposit_received_date).
 
-    Those two fields already exist on AgreementTerms, already print on the
+    Those fields already exist on AgreementTerms, already print on the
     agreement, and — until now — nothing ever set them. They are not decoration:
     the date the landlord RECEIVES a deposit is what starts the statutory clock
     for returning it at the end of the tenancy. A lease that says "Received on:
@@ -349,16 +352,31 @@ def stamp_deposit_received(charge: LedgerEntry) -> bool:
         return False
 
     kind = (charge.metadata or {}).get("kind")
+    flipped = False
+    if kind in {"cleaning_deposit_lease", "cleaning_deposit_individual"}:
+        slots = charge.lease.lease_tenants.filter(declined=False)
+        if kind == "cleaning_deposit_individual" and charge.tenant_id:
+            slots = slots.filter(tenant_id=charge.tenant_id)
+        flipped = bool(
+            slots.filter(cleaning_deposit_paid=False).update(
+                cleaning_deposit_paid=True
+            )
+        )
+
     field = {
         "security_deposit": "security_deposit_received_date",
         "pet_deposit": "pet_deposit_received_date",
+        # Only the LEASE-level cleaning deposit gets a lease-level date. A
+        # per-tenant one is that roommate's own money and stays on their
+        # cleaning_deposit_paid flag — one date can't describe three roommates.
+        "cleaning_deposit_lease": "cleaning_deposit_received_date",
     }.get(kind)
     if not field:
-        return False
+        return flipped
 
     lease = charge.lease
     if getattr(lease, field):
-        return False  # already stamped — first receipt is the one that counts
+        return flipped  # already stamped — first receipt is the one that counts
 
     # The date the last dollar landed, not today: a deposit paid in two
     # instalments is "received" when it's whole.
@@ -372,7 +390,7 @@ def stamp_deposit_received(charge: LedgerEntry) -> bool:
         .first()
     )
     if not last:
-        return False
+        return flipped
 
     setattr(lease, field, last.effective_date)
     lease.save(update_fields=[field, "updated_at"])

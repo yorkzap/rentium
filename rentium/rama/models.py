@@ -354,6 +354,14 @@ class RamaPlanStep(models.Model):
         RamaPendingPlan, on_delete=models.CASCADE, related_name="steps"
     )
     order = models.PositiveIntegerField()
+    # Stable symbolic handle used by dependent steps.  ``order`` is presentation
+    # only and may change when a pending plan is amended; step_id is the durable
+    # binding target for {"$step": "...", "path": "..."} arguments.
+    step_id = models.CharField(max_length=80, blank=True, default="")
+    # Explicit dependency edges.  item_key remains the backwards-compatible
+    # same-target failure group; new workflows use these step ids instead of
+    # inferring dependencies from a shared property/name.
+    depends_on = models.JSONField(default=list, blank=True)
     tool = models.CharField(max_length=100)
     capability_key = models.CharField(max_length=120, blank=True, default="")
     arguments = models.JSONField(default=dict)
@@ -381,11 +389,62 @@ class RamaPlanStep(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["plan", "order"], name="rama_plan_step_order_unique"
-            )
+            ),
+            models.UniqueConstraint(
+                fields=["plan", "step_id"],
+                condition=~models.Q(step_id=""),
+                name="rama_plan_step_id_unique",
+            ),
         ]
 
     def __str__(self):
         return f"step {self.order}: {self.tool} ({self.status})"
+
+
+class RamaSavedWorkflow(models.Model):
+    """An explicitly saved, parameterised plan owned by one landlord.
+
+    It stores capability keys and typed bindings, never confirmation state,
+    attachments, provider credentials, or executable code.  Every run is
+    revalidated against the current registry and produces a normal preview.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_saved_workflows",
+    )
+    name = models.CharField(max_length=120)
+    version = models.PositiveIntegerField(default=1)
+    parameter_schema = models.JSONField(default=dict, blank=True)
+    steps = models.JSONField(default=list)
+    capability_contract_version = models.CharField(
+        max_length=40, default="landlord-v1"
+    )
+    created_from_task = models.ForeignKey(
+        RamaTask,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="saved_workflows",
+    )
+    archived_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name", "-version"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["landlord", "name"],
+                condition=models.Q(archived_at__isnull=True),
+                name="rama_saved_workflow_live_name_unique",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.name} v{self.version} for {self.landlord_id}"
 
 
 class RamaConstitutionSection(models.Model):

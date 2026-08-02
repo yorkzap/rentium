@@ -25,8 +25,10 @@ LANDLORD posting {lease, kind, requested_end_date, reason?, rent_handling?}:
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from rest_framework import serializers
 from rest_framework import status
 from rest_framework import viewsets
@@ -38,6 +40,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from rentium.leases.inspection_services import agreed_deductions
 from rentium.leases.models import Lease
 from rentium.leases.models import MoveOutRequest
 from rentium.leases.tenancy_rules import earliest_landlord_end_date
@@ -482,6 +485,10 @@ class MoveOutViewSet(viewsets.ModelViewSet):
             fields.append("forwarding_address_received_on")
 
         settlement = request.data.get("deposit_settlement")
+        deposit_returns = []
+        deductions = {}
+        return_method = ""
+        return_day = None
         if settlement:
             valid = {c for c, _ in MoveOutRequest.DepositSettlement.choices}
             if settlement not in valid:
@@ -511,11 +518,139 @@ class MoveOutViewSet(viewsets.ModelViewSet):
                     )
                 move_out.rtb_file_number = file_no[:50]
                 fields.append("rtb_file_number")
+            # Both "returned in full" and "the tenant agreed to a deduction"
+            # move real money — the second one just keeps part of it. Only an
+            # RTB application settles without paying anything out yet, because
+            # the arbitrator hasn't ruled.
+            pays_out = settlement in (
+                MoveOutRequest.DepositSettlement.RETURNED_IN_FULL,
+                MoveOutRequest.DepositSettlement.TENANT_AGREED,
+            )
+            if pays_out:
+                from rentium.ledger import services as ledger_services
+                from rentium.ledger.services import LedgerError
+
+                try:
+                    deposit_returns = ledger_services.refundable_deposit_balances(
+                        landlord=request.user.landlord_profile,
+                        lease=move_out.lease,
+                    )
+                    if settlement == MoveOutRequest.DepositSettlement.TENANT_AGREED:
+                        deductions = agreed_deductions(
+                            move_out.lease, deposit_returns
+                        )
+                        if not deductions:
+                            raise ValidationError(
+                                {
+                                    "deposit_settlement": (
+                                        "No agreed deductions are recorded on this "
+                                        "tenancy's move-out inspection. Add the "
+                                        "deduction lines and mark them agreed "
+                                        "before settling this way."
+                                    )
+                                }
+                            )
+                except LedgerError as exc:
+                    raise ValidationError({"deposit_settlement": str(exc)})
+                if deposit_returns:
+                    method_map = {
+                        "ETRANSFER": "ETRANSFER",
+                        "E-TRANSFER": "ETRANSFER",
+                        "E TRANSFER": "ETRANSFER",
+                        "CASH": "CASH",
+                        "CHEQUE": "CHEQUE",
+                        "CHECK": "CHEQUE",
+                        "OTHER": "OTHER",
+                    }
+                    return_method = method_map.get(
+                        str(request.data.get("deposit_return_method") or "")
+                        .strip()
+                        .upper(),
+                        "",
+                    )
+                    if not return_method:
+                        raise ValidationError(
+                            {
+                                "deposit_return_method": (
+                                    "Required when returning held deposits; use "
+                                    "ETRANSFER, CASH, CHEQUE, or OTHER."
+                                )
+                            }
+                        )
+                    raw_return_day = request.data.get("deposit_return_date")
+                    if raw_return_day:
+                        return_day = _parse_date(
+                            raw_return_day, "deposit_return_date"
+                        )
             move_out.deposit_settlement = settlement
             fields.append("deposit_settlement")
 
-        move_out.save(update_fields=fields)
+        with transaction.atomic():
+            move_out.save(update_fields=fields)
+            if deposit_returns:
+                try:
+                    ledger_services.return_refundable_deposits(
+                        landlord=request.user.landlord_profile,
+                        lease=move_out.lease,
+                        payment_method=return_method,
+                        effective_date=return_day,
+                        created_by=request.user,
+                        deductions=deductions,
+                    )
+                except ledger_services.LedgerError as exc:
+                    raise ValidationError({"deposit_settlement": str(exc)})
         return Response(self.get_serializer(move_out).data)
+
+    @action(detail=True, methods=["get"], url_path="deposit_balances")
+    def deposit_balances(self, request, pk=None):
+        """What is held, per deposit, and what would be returned or kept.
+
+        The deposits are separate charges precisely so they can be settled
+        separately, so the screen that settles them has to show them apart —
+        a single "deposit held" number is what makes a landlord return the
+        cleaning deposit by accident.
+        """
+        move_out = self.get_object()
+        if not hasattr(request.user, "landlord_profile"):
+            raise PermissionDenied("Only the landlord can see deposit balances.")
+
+        from rentium.ledger import services as ledger_services
+
+        try:
+            balances = ledger_services.refundable_deposit_balances(
+                landlord=request.user.landlord_profile, lease=move_out.lease
+            )
+        except ledger_services.LedgerError as exc:
+            return Response({"blocked": str(exc), "deposits": []})
+
+        deductions = agreed_deductions(move_out.lease, balances, require_agreed=False)
+        agreed = agreed_deductions(move_out.lease, balances)
+        rows = []
+        for item in balances:
+            proposed = deductions.get(item["charge_id"], Decimal("0.00"))
+            rows.append(
+                {
+                    "charge_id": item["charge_id"],
+                    "kind": item["kind"],
+                    "label": item["label"],
+                    "held": str(item["balance"]),
+                    "proposed_deduction": str(proposed),
+                    "returning": str(item["balance"] - proposed),
+                    "tenant": (
+                        item["tenant"].user.name
+                        if item["tenant"] and item["tenant"].user_id
+                        else None
+                    ),
+                }
+            )
+        return Response(
+            {
+                "blocked": None,
+                "deposits": rows,
+                "deductions_agreed": bool(agreed),
+                "total_held": str(sum(b["balance"] for b in balances) or Decimal("0")),
+            }
+        )
 
 
 @api_view(["GET"])

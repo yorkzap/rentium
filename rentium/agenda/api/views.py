@@ -46,7 +46,7 @@ class AgendaEventViewSet(viewsets.ModelViewSet):
         return AgendaEvent.objects.filter(
             scope_q(u, landlord_field="owner", property_field="property",
                     lease_field="lease")
-        ).distinct()
+        ).filter(archived_at__isnull=True).distinct()
 
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user.landlord_profile)
@@ -72,7 +72,8 @@ def agenda_feed(request):
 
     # custom entries
     custom = AgendaEvent.objects.filter(
-        owner=landlord, start_date__gte=start, start_date__lte=end
+        owner=landlord, archived_at__isnull=True,
+        start_date__gte=start, start_date__lte=end
     )
     if prop:
         custom = custom.filter(property_id=prop)

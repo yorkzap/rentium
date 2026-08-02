@@ -175,6 +175,33 @@ references, verification evidence, and links. Repeated confirmations are
 recognized as already applied, and tool-specific `already_done` guards run both
 before preview and immediately before execution.
 
+Plan steps also have a stable `step_id`, explicit `depends_on` edges, and typed
+result bindings such as
+`{"$step": "create-room", "path": "property.id"}`. The runner resolves a
+binding only from an earlier verified result, then reruns blockers and duplicate
+checks against the resolved IDs immediately before execution. A failed step
+skips its dependants; RAMA never guesses a newly created row from its name or
+reconstructs a chain after confirmation.
+
+`rama/capability_contract.py` is the fail-closed landlord capability policy.
+The parity scanner compares landlord-facing mutating REST actions against the
+General's callable allowlist, not merely the registry, and CI fails for a
+missing mapped tool or an unreviewed mutation. Permanent property, draft-lease,
+and inventory deletion and engineering capability-gap triage remain outside
+chat. Reversible document, calendar, insight, notification-channel, import-row,
+showcase, shared-inventory, lease-roster, appointment, and Treasurer-setting
+operations are exposed through guarded composites.
+
+### Explicit saved workflows
+
+`RamaSavedWorkflow` stores only a landlord-approved sequence of capability keys,
+typed parameters, stable step dependencies, and a contract version. RAMA never
+learns or executes a chain silently. `save_last_workflow` requires its own
+preview and confirmation and rejects files, credentials, tokens, passwords, and
+prior confirmation state. Running a saved workflow compiles supplied parameters,
+revalidates every current tool schema/blocker, and creates the ordinary complete
+pending-plan preview; the landlord must confirm that run normally.
+
 ### Attachments and listing media
 
 Chat files are grouped in a conversation-owned `RamaAttachmentBatch`. The
@@ -242,6 +269,9 @@ previously drifted:
 - `ledger.services.record_payment` remains the immutable, idempotent settlement
   boundary; a partial payment settles the original charge and leaves its
   computed balance without rewriting that charge.
+- `ledger.services.return_refundable_deposits` is the move-out return boundary.
+  It derives what was actually received per deposit charge and posts separate,
+  idempotent security, pet, and cleaning-deposit return rows.
 
 Lease invitations additionally have an append-only `LeaseInviteEvent` stream:
 `SENT`, `LINK_OPENED`, `ACCOUNT_LINKED`, `SIGNED`, `DECLINED`, and `RESENT`.
@@ -262,6 +292,23 @@ crossed. Expense creation follows the append-only ledger rules and can be
 scoped directly to a holding through `LedgerEntry.holding`. Signed leases,
 inspection evidence, and originals are immutable evidence rather than editable
 content.
+
+The Documents UI and RAMA may rename only `RamaDocument.title`, the human-facing
+library label. The original filename, canonical archive key, file bytes, hash,
+filing state, and linked ledger entry are unchanged, and the rename is appended
+to `RamaDocumentEvent`. RAMA resolves rename requests with strict combined
+selectors (vendor/title/OCR words plus exact amount, and optionally date or
+holding), refuses zero/multiple matches, previews the exact record, then stores
+its UUID and expected title in the confirmation plan so approval cannot drift
+to a similar or newly uploaded document.
+
+The dashboard obtains previews through the authenticated download endpoint and
+renders supported images/PDFs without exposing storage URLs. Document cards show
+the extracted amount and payment state as first-class metadata. Tagging,
+soft-trash/restore, re-OCR, holding moves, and marking a linked expense paid are
+available to RAMA through the same document services. A statement with no
+attached file is never catalogued as a document: purchase language creates a
+ledger expense directly, and a receipt can be attached later if one arrives.
 
 Local document files live below Django `MEDIA_ROOT` in the bind-mounted backend
 checkout. Production uses the configured S3 storage backend with overwrite
@@ -318,6 +365,13 @@ against.
 Deposits are never netted automatically — see `ledger.services.deposit_position`
 and the RAMA guide for why (BC RTA: written agreement or an RTB application
 within 15 days, else the claim is lost and double the deposit is payable).
+
+The Standard Roommate Agreement has a refundable `cleaning_deposit`, never a
+cleaning fee. It is a `DEPOSIT_CHARGE`, excluded from income exactly like the
+security deposit. A single incoming e-transfer may be allocated across both
+open charges, but those allocations remain distinct. On a full move-out return,
+the security and cleaning deposits are posted as separate `DEPOSIT_RETURN`
+entries. A lease with no cleaning deposit produces no cleaning return.
 
 ### The 15-day deposit clock
 

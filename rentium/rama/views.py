@@ -774,6 +774,7 @@ def document_detail_view(request, document_id):
     from .document_services import DuplicateExpenseError
     from .document_services import delete_document
     from .document_services import file_document
+    from .document_services import rename_document
     from .document_services import set_document_tags
     from .models import RamaDocument
 
@@ -817,6 +818,23 @@ def document_detail_view(request, document_id):
         return Response(payload)
 
     data = request.data or {}
+    # Renaming is metadata-only. It must never re-file a record, post an
+    # expense, or rewrite the preserved original/canonical archive filenames.
+    if set(data.keys()) == {"title"}:
+        try:
+            rename_document(
+                landlord=landlord,
+                document=document,
+                title=data.get("title"),
+                actor=request.user,
+            )
+        except DocumentError as exc:
+            return Response(
+                {"detail": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        document.refresh_from_db()
+        return Response(_document_payload(document, request))
+
     if "tags" in data:
         raw_tags = data.get("tags") or []
         if isinstance(raw_tags, str):

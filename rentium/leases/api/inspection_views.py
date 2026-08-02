@@ -19,6 +19,7 @@ from rest_framework.response import Response
 from rentium.leases import inspection_services as services
 from rentium.leases.inspections import (
     ConditionInspection,
+    DepositDeduction,
     InspectionItem,
     InspectionKeyRow,
     InspectionPass,
@@ -27,6 +28,7 @@ from rentium.leases.models import Lease, LeaseTenant
 
 from .inspection_serializers import (
     CustomItemSerializer,
+    DepositDeductionSerializer,
     InspectionCreateSerializer,
     InspectionDetailSerializer,
     InspectionItemSerializer,
@@ -46,6 +48,17 @@ def _svc(callable_, *args, **kwargs):
         raise ValidationError({"detail": str(exc)})
 
 
+def _clean(instance):
+    """Run model validation and surface it as a 400 rather than a 500."""
+    from django.core.exceptions import ValidationError as DjangoValidationError
+    from rest_framework import serializers as drf_serializers
+
+    try:
+        instance.full_clean(exclude=["created_by"])
+    except DjangoValidationError as exc:
+        raise ValidationError(drf_serializers.as_serializer_error(exc))
+
+
 class ConditionInspectionViewSet(viewsets.ModelViewSet):
     """
     list / retrieve             landlord: theirs; tenant: their own
@@ -54,6 +67,9 @@ class ConditionInspectionViewSet(viewsets.ModelViewSet):
     POST {id}/items_bulk/       [{id, move_in_condition_code, ...}]
     POST {id}/add_item/         {section, label}        (landlord)
     POST {id}/keys_bulk/        [{id?, key_type, issued_count, ...}]
+    GET/POST {id}/deductions/   deposit-deduction lines  (landlord)
+    PATCH/DELETE {id}/deductions/{line_pk}/              (landlord)
+    POST {id}/agree_deductions/ {signed_on?}             (landlord)
     POST {id}/landlord_sign/    {inspection_pass, name}
     POST {id}/tenant_sign/      {inspection_pass, name, agrees, reason?}
     POST {id}/start_move_out/   {move_out_date?}
@@ -271,6 +287,122 @@ class ConditionInspectionViewSet(viewsets.ModelViewSet):
                 next_sort += 10
             out.append(key)
         return Response(InspectionKeyRowSerializer(out, many=True).data)
+
+    # ------------------------------------------------- deposit deductions
+    #
+    # What the landlord proposes to keep, costed line by line, attached to the
+    # report row it came from. Recording lines keeps NO money: the deposit is
+    # only reduced once `agree_deductions` stamps the tenant's written consent
+    # (or the move-out request carries an RTB file number). See
+    # MoveOutRequest.deposit_status() — there are three lawful routes out and
+    # this is not a fourth.
+    @action(detail=True, methods=["get", "post"], url_path="deductions")
+    def deductions(self, request, pk=None):
+        self._landlord()
+        inspection = self.get_object()
+        if request.method == "GET":
+            return Response(
+                DepositDeductionSerializer(
+                    inspection.deposit_deductions.all(), many=True
+                ).data
+            )
+
+        self._deductions_editable(inspection)
+        payload = DepositDeductionSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        line = DepositDeduction(
+            inspection=inspection,
+            created_by=request.user,
+            **payload.validated_data,
+        )
+        _clean(line)
+        line.save()
+        inspection.refresh_deduction_totals()
+        return Response(
+            DepositDeductionSerializer(line).data, status=status.HTTP_201_CREATED
+        )
+
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path="deductions/(?P<line_pk>[^/.]+)",
+    )
+    def deduction_detail(self, request, pk=None, line_pk=None):
+        self._landlord()
+        inspection = self.get_object()
+        self._deductions_editable(inspection)
+        line = inspection.deposit_deductions.filter(pk=line_pk).first()
+        if line is None:
+            raise ValidationError({"detail": "No such deduction on this inspection."})
+
+        if request.method == "DELETE":
+            line.delete()
+            inspection.refresh_deduction_totals()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        payload = DepositDeductionSerializer(line, data=request.data, partial=True)
+        payload.is_valid(raise_exception=True)
+        for field, value in payload.validated_data.items():
+            setattr(line, field, value)
+        _clean(line)
+        line.save()
+        inspection.refresh_deduction_totals()
+        return Response(DepositDeductionSerializer(line).data)
+
+    @action(detail=True, methods=["post"], url_path="agree_deductions")
+    def agree_deductions(self, request, pk=None):
+        """Record that the tenant agreed IN WRITING to these deductions.
+
+        Body: {signed_on: YYYY-MM-DD}. This is the consent that lets deposit
+        money be kept at all, so it freezes the totals as they stand: a line
+        edited afterwards no longer matches what was agreed, and the mismatch
+        is visible rather than silent.
+        """
+        from datetime import datetime
+
+        from django.utils import timezone
+
+        self._landlord()
+        inspection = self.get_object()
+        totals = inspection.deduction_totals()
+        if not any(amount > 0 for amount in totals.values()):
+            raise ValidationError(
+                {"detail": "There are no deduction lines to agree to."}
+            )
+
+        raw = request.data.get("signed_on")
+        if raw:
+            try:
+                signed = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                raise ValidationError({"signed_on": "Use YYYY-MM-DD."})
+            stamp = timezone.make_aware(
+                datetime.combine(signed, datetime.min.time())
+            )
+        else:
+            stamp = timezone.now()
+
+        inspection.deduction_agreed_at = stamp
+        inspection.save(update_fields=["deduction_agreed_at", "updated_at"])
+        inspection.refresh_deduction_totals()
+        return Response(InspectionDetailSerializer(inspection).data)
+
+    def _deductions_editable(self, inspection):
+        """Once the tenant has signed off, the figures are a signed agreement.
+
+        Changing them then is exactly the silent edit the RTB tells you to
+        replace with an addendum — so it is refused, not warned about.
+        """
+        if inspection.deduction_agreed_at:
+            raise ValidationError(
+                {
+                    "detail": (
+                        "The tenant has already agreed to these deductions in "
+                        "writing. Changing them now would alter a signed "
+                        "agreement — record a new agreement instead."
+                    )
+                }
+            )
 
     # ------------------------------------------------------------ signatures
     @action(detail=True, methods=["post"])

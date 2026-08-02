@@ -295,6 +295,9 @@ def correct_ledger_entry(
     description: str = "",
     category: str = "",
     vendor: str = "",
+    due_date: str = "",
+    effective_date: str = "",
+    reference_number: str = "",
     reason: str = "Correction",
     confirm: str = "",
 ) -> dict:
@@ -315,6 +318,17 @@ def correct_ledger_entry(
             changes["category"] = category.strip()[:40]
         if vendor != "":
             changes["vendor"] = (vendor or "")[:120]
+        if due_date != "":
+            changes["due_date"] = (
+                None if due_date.strip().lower() in {"clear", "none", "null"}
+                else _parse_date(due_date, "due_date")
+            )
+        if effective_date != "":
+            changes["effective_date"] = _parse_date(
+                effective_date, "effective_date"
+            )
+        if reference_number != "":
+            changes["reference_number"] = (reference_number or "")[:100]
     except ValueError as exc:
         return {"error": str(exc)}
     if not changes:
@@ -327,6 +341,9 @@ def correct_ledger_entry(
             "description": entry.description,
             "category": entry.category,
             "vendor": entry.vendor,
+            "due_date": str(entry.due_date) if entry.due_date else None,
+            "effective_date": str(entry.effective_date),
+            "reference_number": entry.reference_number,
         },
         "to": {k: (str(v) if not isinstance(v, str) else v) for k, v in changes.items()},
         "reason": (reason or "Correction")[:200],
@@ -957,11 +974,11 @@ def cancel_viewing(
 
 
 # ---------------------------------------------------------------------------
-# Cleaning fee + payment reminders + inquiry
+# Cleaning deposit + payment reminders + inquiry
 # ---------------------------------------------------------------------------
 
 
-def mark_cleaning_fee_paid(
+def mark_cleaning_deposit_paid(
     landlord,
     *,
     lease_number: str = "",
@@ -969,7 +986,7 @@ def mark_cleaning_fee_paid(
     tenant_email: str = "",
     confirm: str = "",
 ) -> dict:
-    """Mark a lease tenant's cleaning fee as paid."""
+    """Mark a lease tenant's refundable cleaning deposit as paid."""
     lease, err = _resolve_lease(
         landlord, property_query=property_query, lease_number=lease_number,
     )
@@ -1002,33 +1019,339 @@ def mark_cleaning_fee_paid(
             "tenants": [_em(lt) or lt.display_name for lt in lts],
         }
 
-    if chosen.cleaning_fee_paid:
+    if chosen.cleaning_deposit_paid:
         return {
             "already_done": True,
-            "message": f"Cleaning fee already marked paid for {chosen.display_name}.",
+            "message": f"Cleaning deposit already marked paid for {chosen.display_name}.",
         }
-    if (chosen.cleaning_fee or 0) <= 0:
-        return {"error": "No cleaning fee was set for this tenant."}
+    if (chosen.cleaning_deposit or 0) <= 0:
+        return {"error": "No cleaning deposit was set for this tenant."}
 
     preview = {
         "lease_number": lease.lease_number,
         "tenant": chosen.display_name,
-        "cleaning_fee": str(chosen.cleaning_fee),
+        "cleaning_deposit": str(chosen.cleaning_deposit),
     }
     if not _confirmed(confirm):
         return _preview(
-            "mark_cleaning_fee_paid",
+            "mark_cleaning_deposit_paid",
             preview,
-            "Marks cleaning_fee_paid=True on the lease tenant.",
+            "Marks cleaning_deposit_paid=True on the lease tenant.",
         )
-    chosen.cleaning_fee_paid = True
-    chosen.save(update_fields=["cleaning_fee_paid", "updated_at"])
+    chosen.cleaning_deposit_paid = True
+    chosen.save(update_fields=["cleaning_deposit_paid", "updated_at"])
     return {
         "updated": True,
         "lease_number": lease.lease_number,
         "tenant": chosen.display_name,
-        "cleaning_fee": str(chosen.cleaning_fee),
-        "message": f"Marked cleaning fee paid for {chosen.display_name}.",
+        "cleaning_deposit": str(chosen.cleaning_deposit),
+        "message": f"Marked cleaning deposit paid for {chosen.display_name}.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Deposit deductions and separate returns
+# ---------------------------------------------------------------------------
+
+
+_DEPOSIT_KIND_WORDS = {
+    "security": "SECURITY",
+    "damage": "SECURITY",
+    "pet": "PET",
+    "cleaning": "CLEANING",
+    "clean": "CLEANING",
+}
+
+_DEDUCTION_BASIS_WORDS = {
+    "labour": "LABOUR",
+    "labor": "LABOUR",
+    "time": "LABOUR",
+    "hours": "LABOUR",
+    "supplies": "SUPPLIES",
+    "materials": "SUPPLIES",
+    "cleaner": "CLEANER",
+    "cleaners": "CLEANER",
+    "professional": "CLEANER",
+    "garbage": "GARBAGE",
+    "rubbish": "GARBAGE",
+    "dump": "GARBAGE",
+    "dumping": "GARBAGE",
+    "junk": "GARBAGE",
+    "other": "OTHER",
+}
+
+
+def _resolve_move_out_inspection(landlord, lease, tenant_email: str = ""):
+    """The inspection a deduction belongs on. -> (inspection, error_dict)."""
+    inspections = list(lease.inspections.select_related("lease_tenant").all())
+    if not inspections:
+        return None, {
+            "error": (
+                f"Lease {lease.lease_number} has no condition inspection yet. "
+                "Deductions are evidenced by the move-out report, so start it "
+                "first (complete_inspection_package)."
+            )
+        }
+    q = (tenant_email or "").strip().lower()
+    if q:
+        for insp in inspections:
+            lt = insp.lease_tenant
+            if not lt:
+                continue
+            emails = {(lt.invited_email or "").lower()}
+            user = getattr(getattr(lt, "tenant", None), "user", None)
+            emails.add((getattr(user, "email", "") or "").lower())
+            if q in {e for e in emails if e}:
+                return insp, None
+        return None, {"error": f"No inspection for a tenant matching {tenant_email!r}."}
+    if len(inspections) == 1:
+        return inspections[0], None
+    return None, {
+        "error": "This lease has one inspection per tenant — pass tenant_email.",
+        "tenants": [
+            insp.lease_tenant.display_name if insp.lease_tenant else "whole unit"
+            for insp in inspections
+        ],
+    }
+
+
+def record_deposit_deduction(
+    landlord,
+    *,
+    lease_number: str = "",
+    property_query: str = "",
+    tenant_email: str = "",
+    deposit: str = "cleaning",
+    basis: str = "",
+    hours: str = "",
+    hourly_rate: str = "",
+    amount: str = "",
+    note: str = "",
+    confirm: str = "",
+) -> dict:
+    """Record one costed line of what the landlord proposes to keep."""
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return _prop_err(err)
+    inspection, err = _resolve_move_out_inspection(landlord, lease, tenant_email)
+    if err:
+        return err
+    if inspection.deduction_agreed_at:
+        return {
+            "error": (
+                "The tenant has already agreed to this inspection's deductions "
+                "in writing. Adding to them now would change a signed "
+                "agreement — record a new agreement instead."
+            )
+        }
+
+    from rentium.leases.inspections import DepositDeduction
+
+    deposit_kind = _DEPOSIT_KIND_WORDS.get((deposit or "").strip().lower())
+    if deposit_kind is None:
+        return {
+            "question_for_user": (
+                "Which deposit does this come out of — the security deposit, "
+                "the pet damage deposit, or the cleaning deposit? They are held "
+                "and returned separately, so I can't guess."
+            ),
+            "needs": "deposit",
+        }
+
+    basis_code = _DEDUCTION_BASIS_WORDS.get((basis or "").strip().lower())
+    if basis_code is None:
+        return {
+            "question_for_user": (
+                "What is this for — your own labour (hours × rate), cleaning "
+                "supplies, professional cleaners, or garbage removal?"
+            ),
+            "needs": "basis",
+        }
+
+    line = DepositDeduction(
+        inspection=inspection,
+        deposit_kind=deposit_kind,
+        basis=basis_code,
+        note=(note or "").strip(),
+    )
+    try:
+        if basis_code == DepositDeduction.Basis.LABOUR:
+            if not hours or not hourly_rate:
+                return {
+                    "question_for_user": (
+                        "How many hours, and at what hourly rate? A lump sum "
+                        "for your own time isn't defensible at a hearing."
+                    ),
+                    "needs": "hours_and_rate",
+                }
+            line.hours = _money(hours)
+            line.hourly_rate = _money(hourly_rate)
+        else:
+            if not amount:
+                return {
+                    "question_for_user": "How much was it?",
+                    "needs": "amount",
+                }
+            line.amount = _money(amount)
+        line.full_clean(exclude=["created_by"])
+    except ValidationError as exc:
+        return _validation_error_payload(exc)
+    except (ValueError, ArithmeticError) as exc:
+        return {"error": str(exc)}
+
+    totals = inspection.deduction_totals()
+    preview = {
+        "lease_number": lease.lease_number,
+        "deposit": line.get_deposit_kind_display(),
+        "basis": line.get_basis_display(),
+        "amount": str(line.line_amount()),
+        "note": line.note or "(none)",
+        "running_total_for_this_deposit": str(
+            totals[deposit_kind] + line.line_amount()
+        ),
+        "keeps_money": False,
+        "rule": (
+            "Recording this keeps nothing. Deposit money can only be kept with "
+            "the tenant's written agreement or an RTB order."
+        ),
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "record_deposit_deduction",
+            preview,
+            "Adds a costed line to the move-out inspection. Nothing is deducted "
+            "until the tenant agrees in writing.",
+        )
+
+    line.save()
+    inspection.refresh_deduction_totals()
+    return {
+        "recorded": True,
+        "lease_number": lease.lease_number,
+        "deduction_id": str(line.pk),
+        "deposit": line.get_deposit_kind_display(),
+        "amount": str(line.line_amount()),
+        "totals": {k: str(v) for k, v in inspection.deduction_totals().items()},
+        "message": (
+            f"Recorded ${line.line_amount()} against the "
+            f"{line.get_deposit_kind_display().lower()} "
+            f"({line.get_basis_display().lower()}). Nothing is deducted yet — "
+            f"you need the tenant's written agreement, or an RTB order."
+        ),
+    }
+
+
+def return_deposits(
+    landlord,
+    *,
+    lease_number: str = "",
+    property_query: str = "",
+    payment_method: str = "",
+    return_date: str = "",
+    confirm: str = "",
+) -> dict:
+    """Return each held deposit as its own transfer, net of agreed deductions."""
+    from rentium.ledger import services as ledger_services
+
+    lease, err = _resolve_lease(
+        landlord, property_query=property_query, lease_number=lease_number
+    )
+    if err:
+        return _prop_err(err)
+
+    try:
+        balances = ledger_services.refundable_deposit_balances(
+            landlord=landlord, lease=lease
+        )
+    except ledger_services.LedgerError as exc:
+        return {"error": str(exc)}
+    if not balances:
+        return {
+            "already_done": True,
+            "message": (
+                f"No deposit money is held on lease {lease.lease_number} — "
+                f"there is nothing left to return."
+            ),
+        }
+
+    from rentium.leases.inspection_services import agreed_deductions
+
+    try:
+        deductions = agreed_deductions(lease, balances)
+    except ledger_services.LedgerError as exc:
+        return {"error": str(exc)}
+
+    from .domain_actions import _parse_payment_method
+
+    method_out = _parse_payment_method(payment_method, amount_label="deposit return")
+    if "method" not in method_out:
+        return method_out
+    method = method_out["method"]
+
+    day = None
+    if return_date.strip():
+        try:
+            day = _parse_date(return_date, "return_date")
+        except ValidationError as exc:
+            return _validation_error_payload(exc)
+
+    lines = []
+    for item in balances:
+        deducted = deductions.get(item["charge_id"], Decimal("0.00"))
+        lines.append(
+            {
+                "deposit": item["label"],
+                "held": str(item["balance"]),
+                "kept_by_agreement": str(deducted),
+                "returning": str(item["balance"] - deducted),
+            }
+        )
+
+    preview = {
+        "lease_number": lease.lease_number,
+        "method": method,
+        "return_date": (day or date.today()).isoformat(),
+        "deposits": lines,
+        "rule": (
+            "Each deposit is returned as its own transfer. Only deductions the "
+            "tenant agreed to in writing are held back."
+        ),
+    }
+    if not _confirmed(confirm):
+        return _preview(
+            "return_deposits",
+            preview,
+            "Posts one deposit return per deposit type. Use when the tenancy "
+            "has ended and you are paying the deposits back.",
+        )
+
+    try:
+        with transaction.atomic():
+            ledger_services.return_refundable_deposits(
+                landlord=landlord,
+                lease=lease,
+                payment_method=method,
+                effective_date=day,
+                deductions=deductions,
+            )
+    except ledger_services.LedgerError as exc:
+        return {"error": str(exc)}
+
+    total = sum(
+        (Decimal(row["returning"]) for row in lines), Decimal("0.00")
+    )
+    return {
+        "returned": True,
+        "lease_number": lease.lease_number,
+        "method": method,
+        "deposits": lines,
+        "message": (
+            f"Returned ${total} across {len(lines)} deposit(s) as separate "
+            f"transfers ({method}): "
+            + "; ".join(f'{row["deposit"]} ${row["returning"]}' for row in lines)
+        ),
     }
 
 

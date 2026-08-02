@@ -10,6 +10,7 @@ a plain upsert, and pass completion is guarded by status.
 """
 
 import logging
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
@@ -645,3 +646,59 @@ def _publish(event_type: str, inspection: ConditionInspection, extra: dict) -> N
         )
     except Exception:
         logger.exception("Failed to publish %s for inspection %s", event_type, inspection.pk)
+
+
+def agreed_deductions(lease, balances, *, require_agreed=True) -> dict:
+    """{charge_id: Decimal} — what the move-out inspections say may be kept.
+
+    The deduction lines live on the inspection (that is the document that
+    records the state the place was left in, signed by both parties), and the
+    money lives in the ledger as separate deposit charges. This maps one onto
+    the other.
+
+    `require_agreed=False` gives the same figures as a PROPOSAL, for the screen
+    that shows the landlord what a settlement would look like. Only the agreed
+    ones may actually be posted — under the BC RTA a landlord keeps deposit
+    money with the tenant's written agreement or an RTB order, and nothing else.
+
+    A roommate lease has one inspection per tenant, so each is allocated only
+    against charges that could be theirs (their own, or the household's).
+    Allocation is sequential, and each pass sees what the previous ones left.
+    """
+    from rentium.ledger.services import allocate_deductions
+
+    inspections = lease.inspections.all()
+    if require_agreed:
+        inspections = inspections.filter(deduction_agreed_at__isnull=False)
+
+    remaining = [dict(item) for item in balances]
+    allocated: dict = {}
+    for inspection in inspections:
+        totals = {
+            kind: amount
+            for kind, amount in inspection.deduction_totals().items()
+            if amount > 0
+        }
+        if not totals:
+            continue
+        pool = remaining
+        if inspection.lease_tenant_id:
+            tenant_id = inspection.lease_tenant.tenant_id
+            pool = [
+                item
+                for item in remaining
+                if item["tenant"] is None
+                or (tenant_id and item["tenant"].pk == tenant_id)
+            ]
+        share = allocate_deductions(pool, totals)
+        for charge_id, amount in share.items():
+            allocated[charge_id] = allocated.get(charge_id, Decimal("0.00")) + amount
+        remaining = [
+            {
+                **item,
+                "balance": item["balance"] - share.get(item["charge_id"], Decimal("0")),
+            }
+            for item in remaining
+        ]
+        remaining = [item for item in remaining if item["balance"] > 0]
+    return allocated

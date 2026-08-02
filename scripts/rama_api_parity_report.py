@@ -50,6 +50,7 @@ from rest_framework.views import APIView  # noqa: E402
 from rest_framework.viewsets import ViewSetMixin  # noqa: E402
 
 from rentium.rama.registry import REGISTRY  # noqa: E402
+from rentium.rama.roles import GENERAL_TOOLS  # noqa: E402
 from rentium.rama.tool_meta import meta_for  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -63,7 +64,7 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "leases:LeaseViewSet.create": ["create_lease"],
     "leases:LeaseViewSet.partial_update": ["update_lease", "adjust_lease"],
     "leases:LeaseViewSet.update": ["update_lease", "adjust_lease"],
-    "leases:LeaseViewSet.destroy": ["delete_draft_lease"],
+    "leases:LeaseViewSet.destroy": None,  # permanent deletion stays UI-only
     "leases:LeaseViewSet.terminate": ["terminate_lease"],
     "leases:LeaseViewSet.renew": ["renew_lease"],
     "leases:LeaseViewSet.landlord_sign": ["landlord_sign_lease"],
@@ -76,18 +77,26 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "leases:LeaseViewSet.all_bill_shares": ["lease_state"],
     "leases:LeaseViewSet.bill_providers": ["lease_state"],
     "leases:LeaseViewSet.calculate_bill_share": ["lease_state"],
-    "leases:LeaseViewSet.create_utility_payment": ["record_utility_bill", "record_payment"],
+    "leases:LeaseViewSet.create_utility_payment": [
+        "record_utility_bill",
+        "record_payment",
+    ],
     "leases:lease_pdf": ["lease_pdf_info", "deliver_lease_pdf", "link"],
     "leases:lease_document": ["lease_pdf_info", "link"],
     "leases:lease_moveout_rules": ["settle_moveout", "list_move_events"],
     "leases:lease_types_view": ["create_lease"],
     "leases:check_overlap_view": ["list_leases"],
-    "leases:LeaseTenantViewSet.create": ["invite_tenant_to_lease", "add_roommate_to_lease"],
+    "leases:LeaseTenantViewSet.create": [
+        "invite_tenant_to_lease",
+        "add_roommate_to_lease",
+    ],
     "leases:LeaseTenantViewSet.resend_invite": ["resend_lease_invite"],
     "leases:LeaseTenantViewSet.destroy": ["cancel_lease_invite"],
-    "leases:LeaseTenantViewSet.partial_update": ["rebalance_lease_rents", "update_lease"],
-    "leases:LeaseTenantViewSet.update": ["rebalance_lease_rents", "update_lease"],
-    "leases:LeaseTenantViewSet.mark_cleaning_fee_paid": ["mark_cleaning_fee_paid"],
+    "leases:LeaseTenantViewSet.partial_update": ["update_lease_roster"],
+    "leases:LeaseTenantViewSet.update": ["update_lease_roster"],
+    "leases:LeaseTenantViewSet.mark_cleaning_deposit_paid": [
+        "mark_cleaning_deposit_paid",
+    ],
     "leases:LeaseTenantViewSet.sign": None,
     "leases:LeaseTenantViewSet.claim": None,
     "leases:LeaseTenantViewSet.activate_account": None,
@@ -97,22 +106,48 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "leases:RentAdjustmentViewSet.partial_update": ["apply_rent_adjustment"],
     "leases:RentAdjustmentViewSet.update": ["apply_rent_adjustment"],
     "leases:RentAdjustmentViewSet.destroy": None,
-    "leases:ConditionInspectionViewSet.create": ["create_condition_inspection", "complete_inspection_package"],
+    "leases:ConditionInspectionViewSet.create": [
+        "create_condition_inspection",
+        "complete_inspection_package",
+    ],
     "leases:ConditionInspectionViewSet.start_move_out": ["complete_inspection_package"],
     "leases:ConditionInspectionViewSet.landlord_sign": ["complete_inspection_package"],
     "leases:ConditionInspectionViewSet.mark_delivered": ["mark_inspection_delivered"],
-    "leases:ConditionInspectionViewSet.items_bulk": ["update_inspection_items"],
-    "leases:ConditionInspectionViewSet.keys_bulk": ["update_inspection_items"],
-    "leases:ConditionInspectionViewSet.add_item": ["update_inspection_items"],
-    "leases:ConditionInspectionViewSet.approve_suggestion": ["approve_inspection_suggestion"],
-    "leases:ConditionInspectionViewSet.dismiss_suggestion": ["dismiss_inspection_suggestion"],
+    "leases:ConditionInspectionViewSet.items_bulk": [
+        "update_inspection_items",
+        "update_condition_inspection",
+    ],
+    "leases:ConditionInspectionViewSet.keys_bulk": [
+        "update_inspection_items",
+        "update_condition_inspection",
+    ],
+    "leases:ConditionInspectionViewSet.add_item": ["update_condition_inspection"],
+    "leases:ConditionInspectionViewSet.approve_suggestion": [
+        "approve_inspection_suggestion",
+    ],
+    "leases:ConditionInspectionViewSet.dismiss_suggestion": [
+        "dismiss_inspection_suggestion",
+    ],
     "leases:ConditionInspectionViewSet.suggestions": ["list_inspections"],
+    "leases:ConditionInspectionViewSet.deductions": ["record_deposit_deduction"],
+    "leases:ConditionInspectionViewSet.deduction_detail": [
+        "record_deposit_deduction",
+    ],
+    # The tenant's written agreement is recorded in the flow that acts on it.
+    "leases:ConditionInspectionViewSet.agree_deductions": ["settle_moveout"],
     "leases:ConditionInspectionViewSet.tenant_sign": None,
     "leases:ConditionInspectionViewSet.destroy": None,
-    "leases:ConditionInspectionViewSet.partial_update": ["complete_inspection_package"],
-    "leases:ConditionInspectionViewSet.update": ["complete_inspection_package"],
+    "leases:ConditionInspectionViewSet.partial_update": [
+        "update_condition_inspection",
+        "complete_inspection_package",
+    ],
+    "leases:ConditionInspectionViewSet.update": [
+        "update_condition_inspection",
+        "complete_inspection_package",
+    ],
     "leases:MoveOutViewSet.create": ["settle_moveout"],
-    "leases:MoveOutViewSet.settle_deposit": ["settle_moveout"],
+    "leases:MoveOutViewSet.settle_deposit": ["settle_moveout", "return_deposits"],
+    "leases:MoveOutViewSet.deposit_balances": ["deposit_position"],
     "leases:MoveOutViewSet.accept": ["settle_moveout"],
     "leases:MoveOutViewSet.cancel": ["settle_moveout"],
     "leases:MoveOutViewSet.decline": ["settle_moveout"],
@@ -139,6 +174,10 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "ledger:LedgerEntryViewSet.create": ["create_expense", "record_payment"],
     "ledger:LedgerEntryViewSet.expense": ["create_expense"],
     "ledger:LedgerEntryViewSet.record_payment": ["record_payment"],
+    # One transfer across several charges. RAMA reaches the same service through
+    # record_payment, which auto-splits a deposit-shaped amount.
+    "ledger:LedgerEntryViewSet.record_split_payment": ["record_payment"],
+    "ledger:LedgerEntryViewSet.suggest_split": ["record_payment"],
     "ledger:LedgerEntryViewSet.reallocate": ["reallocate_expense"],
     "ledger:LedgerEntryViewSet.void": ["void_ledger_entry"],
     "ledger:LedgerEntryViewSet.correct": ["correct_ledger_entry"],
@@ -152,26 +191,34 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "ledger:tenant_statement_view": ["tenant_statement"],
     "ledger:batches_view": ["list_import_batches"],
     "ledger:batch_rows_view": ["read_staged_entries"],
-    "ledger:row_detail_view": ["read_staged_entries"],
-    "ledger:apply_mapping_view": None,
+    "ledger:row_detail_view": ["read_staged_entries", "manage_import_rows"],
+    "ledger:apply_mapping_view": ["manage_import_rows"],
     "ledger:commit_batch_view": ["commit_import_batch"],
     "ledger:discard_batch_view": ["discard_import_batch"],
     # ---------------------------------------------------------- appointments
-    "appointments:AppointmentViewSet.create": ["schedule_viewing"],
+    "appointments:AppointmentViewSet.create": ["schedule_appointment"],
     "appointments:AppointmentViewSet.reschedule": ["reschedule_viewing"],
     "appointments:AppointmentViewSet.confirm": ["respond_to_viewing_request"],
     "appointments:AppointmentViewSet.counter": ["respond_to_viewing_request"],
     "appointments:AppointmentViewSet.decline": ["respond_to_viewing_request"],
     "appointments:AppointmentViewSet.destroy": ["cancel_viewing"],
     "appointments:AppointmentViewSet.schedule_respond": ["respond_to_viewing_request"],
-    "appointments:AppointmentViewSet.propose_inspection": ["create_condition_inspection", "complete_inspection_package"],
+    "appointments:AppointmentViewSet.propose_inspection": [
+        "create_condition_inspection",
+        "complete_inspection_package",
+    ],
     "appointments:AppointmentViewSet.tenant_respond": None,
     "appointments:AppointmentViewSet.partial_update": ["reschedule_viewing"],
     "appointments:AppointmentViewSet.update": ["reschedule_viewing"],
-    "appointments:AvailabilityWindowViewSet.create": ["set_viewing_availability"],
-    "appointments:AvailabilityWindowViewSet.partial_update": ["set_viewing_availability"],
-    "appointments:AvailabilityWindowViewSet.update": ["set_viewing_availability"],
-    "appointments:AvailabilityWindowViewSet.destroy": ["set_viewing_availability"],
+    "appointments:AvailabilityWindowViewSet.create": [
+        "set_viewing_availability",
+        "manage_viewing_availability",
+    ],
+    "appointments:AvailabilityWindowViewSet.partial_update": [
+        "manage_viewing_availability",
+    ],
+    "appointments:AvailabilityWindowViewSet.update": ["manage_viewing_availability"],
+    "appointments:AvailabilityWindowViewSet.destroy": ["manage_viewing_availability"],
     # -------------------------------------------------------------- showcase
     "showcase:InquiryViewSet.mark_replied": ["mark_inquiry_replied"],
     "showcase:InquiryViewSet.to_appointment": ["convert_inquiry_to_viewing"],
@@ -180,7 +227,7 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "showcase:InquiryViewSet.update": ["update_inquiry"],
     "showcase:InquiryViewSet.destroy": ["update_inquiry"],
     "showcase:InquiryViewSet.create": None,
-    "showcase:ShowcaseSettingsViewSet.update_settings": None,
+    "showcase:ShowcaseSettingsViewSet.update_settings": ["manage_showcase_settings"],
     "showcase:ShowcaseSettingsViewSet.check_slug": None,
     "showcase:public_listings": None,
     "showcase:public_property_detail": None,
@@ -201,27 +248,49 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "maintenance:WorkOrderViewSet.destroy": None,
     "maintenance:areas_view": ["list_properties", "read"],
     # ------------------------------------------------------------- properties
-    "properties:PropertyViewSet.create": ["create_property", "create_property_structure"],
+    "properties:PropertyViewSet.create": [
+        "create_property",
+        "create_property_structure",
+    ],
     "properties:PropertyViewSet.partial_update": ["update_property"],
     "properties:PropertyViewSet.update": ["update_property"],
-    "properties:PropertyViewSet.destroy": ["delete_property"],
-    "properties:PropertyViewSet.images": ["attach_photo_to_listing", "list_listing_media"],
-    "properties:PropertyViewSet.image_detail": ["remove_photo_from_listing", "list_listing_media"],
-    "properties:PropertyViewSet.media": ["list_listing_media", "attach_photo_to_listing"],
+    "properties:PropertyViewSet.destroy": None,  # permanent deletion stays UI-only
+    "properties:PropertyViewSet.images": [
+        "attach_photo_to_listing",
+        "list_listing_media",
+    ],
+    "properties:PropertyViewSet.image_detail": [
+        "remove_photo_from_listing",
+        "list_listing_media",
+    ],
+    "properties:PropertyViewSet.media": [
+        "list_listing_media",
+        "attach_photo_to_listing",
+    ],
     "properties:PropertyViewSet.media_detail": ["remove_photo_from_listing"],
-    "properties:PropertyViewSet.inventory": ["list_inventory", "create_inventory_item", "bulk_add_inventory"],
-    "properties:PropertyViewSet.inventory_detail": ["update_inventory_item", "delete_inventory_item"],
+    "properties:PropertyViewSet.inventory": [
+        "list_inventory",
+        "create_inventory_item",
+        "bulk_add_inventory",
+    ],
+    "properties:PropertyViewSet.inventory_detail": ["update_inventory_item"],
     "properties:PropertyViewSet.areas": ["update_unit_layout", "read"],
     "properties:PropertyViewSet.area_detail": ["update_unit_layout"],
     "properties:PropertyViewSet.invite_co_landlord": ["add_co_landlord"],
     "properties:PropertyGroupViewSet.create": ["create_property_group"],
     "properties:PropertyGroupViewSet.add_property": ["assign_property_to_group"],
     "properties:PropertyGroupViewSet.remove_property": ["assign_property_to_group"],
-    "properties:PropertyGroupViewSet.partial_update": ["update"],
-    "properties:PropertyGroupViewSet.update": ["update"],
+    "properties:PropertyGroupViewSet.partial_update": ["manage_property_group"],
+    "properties:PropertyGroupViewSet.update": ["manage_property_group"],
     "properties:PropertyGroupViewSet.destroy": None,
-    "properties:PropertyGroupViewSet.shared_inventory": ["create_shared_inventory_item", "list_inventory"],
-    "properties:PropertyGroupViewSet.shared_inventory_detail": ["delete_shared_inventory_item", "list_inventory"],
+    "properties:PropertyGroupViewSet.shared_inventory": [
+        "create_shared_inventory_item",
+        "list_inventory",
+    ],
+    "properties:PropertyGroupViewSet.shared_inventory_detail": [
+        "manage_property_group",
+        "list_inventory",
+    ],
     "properties:PropertyUnitViewSet.create": ["create_property_structure"],
     "properties:PropertyUnitViewSet.set_rental_mode_action": ["set_unit_rental_mode"],
     "properties:PropertyUnitViewSet.rental_mode_preview": ["set_unit_rental_mode"],
@@ -237,10 +306,10 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "messaging:ConversationViewSet.update": None,
     "messaging:ConversationViewSet.destroy": None,
     # ----------------------------------------------------------------- agenda (calendar/viewings cover primary use)
-    "agenda:AgendaEventViewSet.create": None,
-    "agenda:AgendaEventViewSet.partial_update": None,
-    "agenda:AgendaEventViewSet.update": None,
-    "agenda:AgendaEventViewSet.destroy": None,
+    "agenda:AgendaEventViewSet.create": ["manage_agenda_event"],
+    "agenda:AgendaEventViewSet.partial_update": ["manage_agenda_event"],
+    "agenda:AgendaEventViewSet.update": ["manage_agenda_event"],
+    "agenda:AgendaEventViewSet.destroy": ["manage_agenda_event"],
     "agenda:agenda_feed": ["list_appointments"],
     # ---------------------------------------------------------------- events
     "events:NotificationViewSet.read": ["mark_notifications_read"],
@@ -269,9 +338,9 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     # ------------------------------------------------------------------ comms
     "comms:telegram_webhook": None,
     "comms:whatsapp_webhook": None,
-    "comms:create_link_code": None,
+    "comms:create_link_code": ["manage_notification_channel"],
     "comms:list_channels": ["get_notification_channels"],
-    "comms:channel_detail": None,
+    "comms:channel_detail": ["manage_notification_channel"],
     # ------------------------------------------------------------------- rama HTTP
     "rama:chat_view": None,
     "rama:general_chat_view": None,
@@ -284,13 +353,13 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "rama:documents_view": ["list_documents", "catalog_business_document"],
     "rama:document_detail_view": ["list_documents", "catalog_business_document"],
     "rama:document_download_view": ["list_documents", "link"],
-    "rama:document_reocr_view": ["catalog_business_document"],
-    "rama:document_tags_view": ["list_documents", "catalog_business_document"],
-    "rama:document_restore_view": ["list_documents", "catalog_business_document"],
-    "rama:document_mark_paid_view": ["mark_ledger_paid", "list_documents"],
-    "rama:document_move_view": ["reallocate_expense", "catalog_business_document"],
-    "rama:documents_bulk_view": ["list_documents", "catalog_business_document"],
-    "rama:capability_gaps_view": ["list_capability_gaps", "triage_capability_gap"],
+    "rama:document_reocr_view": ["manage_business_documents"],
+    "rama:document_tags_view": ["manage_business_documents"],
+    "rama:document_restore_view": ["manage_business_documents"],
+    "rama:document_mark_paid_view": ["manage_business_documents"],
+    "rama:document_move_view": ["manage_business_documents"],
+    "rama:documents_bulk_view": ["manage_business_documents"],
+    "rama:capability_gaps_view": ["list_capability_gaps"],
     "rama:constitution_view": ["read_constitution", "amend_constitution"],
     "rama:memory_view": ["list_memories", "remember"],
     "rama:memory_delete_view": ["forget"],
@@ -300,9 +369,9 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "rama:holdings_view": ["list_holdings"],
     "rama:portfolios_view": ["portfolio_snapshot"],
     "rama:union_view": ["portfolio_snapshot"],
-    "rama:insights_view": None,
-    "rama:insight_detail_view": None,
-    "rama:treasurer_view": None,
+    "rama:insights_view": ["manage_insight"],
+    "rama:insight_detail_view": ["manage_insight"],
+    "rama:treasurer_view": ["update_treasurer_settings"],
 }
 
 # API apps we care about for landlord operations (skip auth/admin noise).
@@ -418,7 +487,7 @@ def _endpoint_from_viewset(cls: type) -> list[ApiEndpoint]:
                     action=action,
                     methods=methods,
                     detail=detail,
-                )
+                ),
             )
 
     # @action methods
@@ -432,15 +501,15 @@ def _endpoint_from_viewset(cls: type) -> list[ApiEndpoint]:
             mapping = getattr(attr, "kwargs", {}).get("url_path")
         if not isinstance(getattr(attr, "mapping", None), (dict, MethodMapper)):
             # Check for detail/url_path on action decorator
-            if not getattr(attr, "detail", None) and not getattr(attr, "url_path", None):
+            if not getattr(attr, "detail", None) and not getattr(
+                attr, "url_path", None,
+            ):
                 # DRF marks actions with .mapping
                 if not hasattr(attr, "mapping"):
                     continue
         if not hasattr(attr, "mapping"):
             continue
-        methods = sorted(
-            m.upper() for m, bound in dict(attr.mapping).items() if bound
-        )
+        methods = sorted(m.upper() for m, bound in dict(attr.mapping).items() if bound)
         if not methods:
             continue
         action_name = attr_name
@@ -452,7 +521,7 @@ def _endpoint_from_viewset(cls: type) -> list[ApiEndpoint]:
                 action=action_name,
                 methods=methods,
                 detail=bool(getattr(attr, "detail", True)),
-            )
+            ),
         )
     return rows
 
@@ -460,7 +529,7 @@ def _endpoint_from_viewset(cls: type) -> list[ApiEndpoint]:
 def _endpoint_from_api_view_fn(export_name: str, fn) -> list[ApiEndpoint]:
     """Handle @api_view function views (e.g. utility_bill_view)."""
     module = getattr(fn, "__module__", "") or getattr(
-        getattr(fn, "cls", None), "__module__", ""
+        getattr(fn, "cls", None), "__module__", "",
     )
     app = _app_label(module)
     cls = getattr(fn, "cls", None)
@@ -482,7 +551,7 @@ def _endpoint_from_api_view_fn(export_name: str, fn) -> list[ApiEndpoint]:
             action="call",
             methods=methods,
             detail=None,
-        )
+        ),
     ]
 
 
@@ -525,7 +594,7 @@ def collect_rama_tools() -> list[dict]:
                 "risk": meta.risk,
                 "has_confirm": "confirm" in tool.parameters.get("properties", {}),
                 "autonomy": getattr(meta.autonomy, "value", str(meta.autonomy)),
-            }
+            },
         )
     return rows
 
@@ -540,7 +609,10 @@ def classify(endpoints: list[ApiEndpoint], tools: set[str]) -> list[GapRow]:
                 status = "unmapped"
                 note = "No curated map; often covered by list_* / read tools"
                 mapped_tools = None
-            elif ep.action in ("update",) and f"{ep.app}:{ep.view}.partial_update" in COVERAGE_MAP:
+            elif (
+                ep.action in ("update",)
+                and f"{ep.app}:{ep.view}.partial_update" in COVERAGE_MAP
+            ):
                 status = "unmapped"
                 note = "Full PUT often unused; partial_update is mapped"
                 mapped_tools = None
@@ -556,7 +628,10 @@ def classify(endpoints: list[ApiEndpoint], tools: set[str]) -> list[GapRow]:
             missing = [t for t in mapped if t not in tools]
             if missing:
                 status = "missing_tool"
-                note = f"Mapped tools missing from REGISTRY: {missing}"
+                note = (
+                    "Mapped tools unavailable to the landlord-facing General: "
+                    f"{missing}"
+                )
                 mapped_tools = mapped
             else:
                 status = "covered"
@@ -569,7 +644,7 @@ def classify(endpoints: list[ApiEndpoint], tools: set[str]) -> list[GapRow]:
                 mapped_tools=mapped_tools,
                 status=status,
                 note=note,
-            )
+            ),
         )
     return out
 
@@ -590,19 +665,19 @@ def render_markdown(
         "",
         "## Summary",
         "",
-        f"| Status | Count |",
-        f"|---|---:|",
+        "| Status | Count |",
+        "|---|---:|",
         f"| covered | {len(by_status['covered'])} |",
         f"| missing_tool | {len(by_status['missing_tool'])} |",
         f"| unmapped | {len(by_status['unmapped'])} |",
         f"| intentional | {len(by_status['intentional'])} |",
         "",
-        "## High-priority gaps (mapped but tool missing)",
+        "## High-priority gaps (mapped but unavailable to the General)",
         "",
     ]
     missing = by_status["missing_tool"]
     if not missing:
-        lines.append("_None — every curated mapping points at a registered tool._")
+        lines.append("_None — every curated mapping is callable by the General._")
         lines.append("")
     else:
         lines.append("| API | Methods | Expected RAMA tools |")
@@ -610,7 +685,7 @@ def render_markdown(
         for g in missing:
             lines.append(
                 f"| `{g.api_key}` | {', '.join(g.methods)} | "
-                f"{', '.join(g.mapped_tools or [])} |"
+                f"{', '.join(g.mapped_tools or [])} |",
             )
         lines.append("")
 
@@ -662,7 +737,7 @@ def render_markdown(
     lines.append("---")
     lines.append(
         "Update `COVERAGE_MAP` in `scripts/rama_api_parity_report.py` when "
-        "adding composites. Re-run after each phase."
+        "adding composites. Re-run after each phase.",
     )
     lines.append("")
     return "\n".join(lines)
@@ -677,7 +752,9 @@ def main(argv: list[str] | None = None) -> int:
 
     endpoints = collect_api_endpoints()
     tools = collect_rama_tools()
-    tool_names = {t["name"] for t in tools}
+    # Coverage means callable by the landlord-facing General, not merely
+    # registered for backwards-compatible/internal use.
+    tool_names = set(GENERAL_TOOLS)
     gaps = classify(endpoints, tool_names)
 
     if args.json:
@@ -700,7 +777,17 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.out).write_text(md, encoding="utf-8")
             print(f"\n# wrote {args.out}", file=sys.stderr)
 
-    if args.fail_on_gap and any(g.status == "missing_tool" for g in gaps):
+    unmapped_mutations = [
+        gap
+        for gap in gaps
+        if gap.status == "unmapped"
+        and any(
+            method.upper() not in {"GET", "HEAD", "OPTIONS"} for method in gap.methods
+        )
+    ]
+    if args.fail_on_gap and (
+        any(g.status == "missing_tool" for g in gaps) or unmapped_mutations
+    ):
         return 1
     return 0
 

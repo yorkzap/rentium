@@ -27,16 +27,84 @@ through the SAME validation + runner without new safety code.
 from __future__ import annotations
 
 import json
+import re
 
 from django.utils import timezone
 
-from .command_engine import create_task, record_receipt
-from .models import RamaPendingPlan, RamaPlanStep, RamaTask
-from .outcomes import CommandOutcome, OutcomeKind
-from .registry import REGISTRY, execute
-from .tool_meta import already_done_for, blockers_for, meta_for
+from .command_engine import create_task
+from .command_engine import record_receipt
+from .models import RamaPendingPlan
+from .models import RamaPlanStep
+from .models import RamaTask
+from .outcomes import CommandOutcome
+from .outcomes import OutcomeKind
+from .registry import REGISTRY
+from .registry import execute
+from .tool_meta import already_done_for
+from .tool_meta import blockers_for
+from .tool_meta import meta_for
 
 PENDING_PLAN_TTL_SECONDS = 30 * 60
+_STEP_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,79}$")
+
+
+def _argument_step_refs(value) -> set[str]:
+    """Collect typed result references from a nested argument payload."""
+    refs: set[str] = set()
+    if isinstance(value, dict):
+        if "$step" in value:
+            refs.add(str(value.get("$step") or ""))
+        else:
+            for child in value.values():
+                refs.update(_argument_step_refs(child))
+    elif isinstance(value, list):
+        for child in value:
+            refs.update(_argument_step_refs(child))
+    return refs
+
+
+def _result_path(value, path: str):
+    """Resolve a dotted/list-index path from one verified step result."""
+    current = value
+    for token in re.findall(r"[^.\[\]]+|\[\d+\]", str(path or "")):
+        if token.startswith("["):
+            if not isinstance(current, list):
+                raise KeyError(path)
+            current = current[int(token[1:-1])]
+        else:
+            if not isinstance(current, dict) or token not in current:
+                raise KeyError(path)
+            current = current[token]
+    if current in (None, ""):
+        raise KeyError(path)
+    return current
+
+
+def _resolve_argument_refs(value, results_by_step: dict[str, dict]):
+    """Replace {"$step": id, "path": result.path} values recursively."""
+    if isinstance(value, dict):
+        if "$step" in value:
+            step_id = str(value.get("$step") or "")
+            path = str(value.get("path") or "")
+            if set(value) != {"$step", "path"} or not step_id or not path:
+                raise ValueError(
+                    "A step result reference must contain only $step and path.",
+                )
+            if step_id not in results_by_step:
+                raise ValueError(f"Dependency {step_id!r} has no verified result.")
+            try:
+                return _result_path(results_by_step[step_id], path)
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Dependency {step_id!r} did not return {path!r}.",
+                ) from exc
+        return {
+            key: _resolve_argument_refs(child, results_by_step)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_resolve_argument_refs(child, results_by_step) for child in value]
+    return value
 
 
 # ------------------------------------------------------------- validation
@@ -45,7 +113,25 @@ def validate_plan(steps: list[dict], landlord) -> list[str]:
     errors: list[str] = []
     if not steps:
         errors.append("Plan has no steps.")
+    seen_step_ids: set[str] = set()
     for i, step in enumerate(steps, start=1):
+        step_id = str(step.get("step_id") or f"step-{i}")
+        if not _STEP_ID_RE.fullmatch(step_id):
+            errors.append(
+                f"Step {i}: step_id must start with a letter and contain only "
+                "letters, numbers, underscores, or hyphens.",
+            )
+        if step_id in seen_step_ids:
+            errors.append(f"Step {i}: duplicate step_id {step_id!r}.")
+        dependencies = [str(dep) for dep in (step.get("depends_on") or [])]
+        implicit_refs = _argument_step_refs(step.get("arguments") or {})
+        for dependency in sorted(set(dependencies) | implicit_refs):
+            if dependency not in seen_step_ids:
+                errors.append(
+                    f"Step {i} ({step_id}): dependency {dependency!r} must "
+                    "name an earlier step.",
+                )
+        seen_step_ids.add(step_id)
         tool_name = step.get("tool") or ""
         tool = REGISTRY.get(tool_name)
         if tool is None:
@@ -56,7 +142,7 @@ def validate_plan(steps: list[dict], landlord) -> list[str]:
         unknown = [k for k in args if k not in allowed]
         if unknown:
             errors.append(
-                f"Step {i} ({tool_name}): unknown arguments {', '.join(unknown)}."
+                f"Step {i} ({tool_name}): unknown arguments {', '.join(unknown)}.",
             )
         missing = [
             k
@@ -65,27 +151,37 @@ def validate_plan(steps: list[dict], landlord) -> list[str]:
         ]
         if missing:
             errors.append(
-                f"Step {i} ({tool_name}): missing required {', '.join(missing)}."
+                f"Step {i} ({tool_name}): missing required {', '.join(missing)}.",
             )
         # Blocker precheck runs on the schema-allowed args only — anything
         # else (incl. a smuggled `landlord`) was already reported above.
         safe_args = {k: v for k, v in args.items() if k in allowed and k != "confirm"}
-        for blocker in blockers_for(tool_name, landlord, **safe_args):
-            errors.append(f"Step {i} ({tool_name}): {blocker['detail']}")
+        # Dependent values do not exist until an earlier verified step returns.
+        # The same blockers run again immediately before execution, after refs
+        # are resolved, so preview validation must not pass placeholder dicts
+        # into legacy scalar guards.
+        has_result_refs = bool(_argument_step_refs(safe_args))
+        if not has_result_refs:
+            for blocker in blockers_for(tool_name, landlord, **safe_args):
+                errors.append(f"Step {i} ({tool_name}): {blocker['detail']}")
         # Second of the two sites the check runs at. Preview time catches it
         # before the landlord is ever shown the proposal; this catches the
         # window between them seeing it and saying yes — a payment can land by
         # another route in between, and confirming a stale preview would then
         # record the same money twice.
-        duplicate = already_done_for(tool_name, landlord, **safe_args)
-        if duplicate:
-            errors.append(f"Step {i} ({tool_name}): {duplicate}")
+        if not has_result_refs:
+            duplicate = already_done_for(tool_name, landlord, **safe_args)
+            if duplicate:
+                errors.append(f"Step {i} ({tool_name}): {duplicate}")
     return errors
 
 
 # ------------------------------------------------------------ persistence
 def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
     """Persist a playbook plan payload (latest plan per conversation wins)."""
+    errors = validate_plan(plan_payload.get("steps") or [], landlord)
+    if errors:
+        raise ValueError("Invalid RAMA plan: " + " ".join(errors))
     clear_plan(landlord, conversation_id)
     task = create_task(
         landlord=landlord,
@@ -113,6 +209,8 @@ def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
         RamaPlanStep(
             plan=plan,
             order=i,
+            step_id=s.get("step_id") or f"step-{i + 1}",
+            depends_on=list(s.get("depends_on") or []),
             tool=s["tool"],
             capability_key=s.get("capability_key") or s["tool"],
             arguments=s.get("arguments") or {},
@@ -125,7 +223,9 @@ def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
     return plan
 
 
-def save_single(landlord, conversation_id, tool: str, arguments: dict) -> RamaPendingPlan:
+def save_single(
+    landlord, conversation_id, tool: str, arguments: dict,
+) -> RamaPendingPlan:
     """Wrap a single previewed write tool as a one-step plan — one code path
     for every confirmation."""
     label = ""
@@ -148,7 +248,7 @@ def save_single(landlord, conversation_id, tool: str, arguments: dict) -> RamaPe
                     "target": label,
                     "item_key": "single",
                     "requires_own_confirm": meta_for(tool).own_confirm,
-                }
+                },
             ],
         },
     )
@@ -185,9 +285,7 @@ def save_batch(
                             "tool": spec["tool"],
                             "arguments": {
                                 key: value
-                                for key, value in (
-                                    spec.get("arguments") or {}
-                                ).items()
+                                for key, value in (spec.get("arguments") or {}).items()
                                 if key != "confirm"
                             },
                             "target": str(spec["target"]).strip(),
@@ -215,8 +313,7 @@ def save_batch(
             for step_index, step in enumerate(payload.get("steps") or []):
                 copied = dict(step)
                 copied["item_key"] = (
-                    copied.get("item_key")
-                    or f"plan-{spec_index}-step-{step_index}"
+                    copied.get("item_key") or f"plan-{spec_index}-step-{step_index}"
                 )
                 steps.append(copied)
             continue
@@ -272,9 +369,7 @@ def save_batch(
         conversation_id,
         {
             "operation": "preview_batch",
-            "summary": (
-                f"{len(steps)} previewed changes collected from one request."
-            ),
+            "summary": (f"{len(steps)} previewed changes collected from one request."),
             "steps": steps,
             "blocked": blocked,
         },
@@ -285,7 +380,7 @@ def load_fresh_plan(landlord, conversation_id) -> RamaPendingPlan | None:
     """The still-valid outstanding plan for this conversation, or None."""
     plan = (
         RamaPendingPlan.objects.filter(
-            conversation_id=conversation_id, landlord=landlord
+            conversation_id=conversation_id, landlord=landlord,
         )
         .select_related("task")
         .prefetch_related("steps")
@@ -309,7 +404,7 @@ def load_fresh_plan(landlord, conversation_id) -> RamaPendingPlan | None:
 
 def clear_plan(landlord, conversation_id) -> None:
     plans = RamaPendingPlan.objects.filter(
-        conversation_id=conversation_id, landlord=landlord
+        conversation_id=conversation_id, landlord=landlord,
     ).select_related("task")
     for plan in plans:
         if plan.task_id and plan.task.status not in RamaTask.TERMINAL_STATUSES:
@@ -333,6 +428,8 @@ def plan_to_payload(plan: RamaPendingPlan) -> dict:
         "blocked": plan.blocked,
         "steps": [
             {
+                "step_id": s.step_id,
+                "depends_on": s.depends_on,
                 "tool": s.tool,
                 "arguments": s.arguments,
                 "target": s.target_label,
@@ -361,6 +458,8 @@ def plan_brief(plan: RamaPendingPlan) -> dict:
         "steps": [
             {
                 "n": s.order + 1,
+                "step_id": s.step_id,
+                "depends_on": s.depends_on,
                 "tool": s.tool,
                 "target": s.target_label,
                 "status": s.status,
@@ -376,6 +475,8 @@ def plan_brief(plan: RamaPendingPlan) -> dict:
 def _step_outcome(step: RamaPlanStep) -> dict:
     return {
         "n": step.order + 1,
+        "step_id": step.step_id,
+        "depends_on": step.depends_on,
         "tool": step.tool,
         # The plan row is deleted as soon as execution finishes, so anything a
         # caller needs afterwards (autonomy.record_auto_actions builds each
@@ -413,16 +514,47 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
     executed: list[dict] = []
     failed: list[dict] = []
     skipped: list[dict] = []
-    dead_items: set[str] = set()
+    dead_items: set[str] = {
+        step.item_key
+        for step in steps
+        if step.status in {RamaPlanStep.Status.FAILED, RamaPlanStep.Status.SKIPPED}
+    }
+    results_by_step: dict[str, dict] = {
+        step.step_id: step.result
+        for step in steps
+        if step.step_id and step.status == RamaPlanStep.Status.DONE
+    }
+    failed_step_ids: set[str] = {
+        step.step_id
+        for step in steps
+        if step.step_id
+        and step.status in {RamaPlanStep.Status.FAILED, RamaPlanStep.Status.SKIPPED}
+    }
     awaiting = None
 
     for step in steps:
         if step.order < plan.cursor or step.status != RamaPlanStep.Status.PENDING:
             continue
+        dependencies = set(str(dep) for dep in (step.depends_on or []))
+        dependencies.update(_argument_step_refs(step.arguments or {}))
+        dead_dependencies = sorted(dependencies & failed_step_ids)
+        if dead_dependencies:
+            step.status = RamaPlanStep.Status.SKIPPED
+            step.result = {
+                "skipped": "A required earlier step failed.",
+                "failed_dependencies": dead_dependencies,
+            }
+            step.save(update_fields=["status", "result", "updated_at"])
+            failed_step_ids.add(step.step_id)
+            skipped.append(_step_outcome(step))
+            continue
         if step.item_key in dead_items:
             step.status = RamaPlanStep.Status.SKIPPED
-            step.result = {"skipped": f"earlier step for {step.target_label or step.item_key} failed"}
+            step.result = {
+                "skipped": f"earlier step for {step.target_label or step.item_key} failed",
+            }
             step.save(update_fields=["status", "result", "updated_at"])
+            failed_step_ids.add(step.step_id)
             skipped.append(_step_outcome(step))
             continue
         if (
@@ -439,37 +571,75 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
                 "tool": step.tool,
                 "target": step.target_label,
                 "note": (
-                    "This step needs its own confirmation before anything "
-                    "else runs."
+                    "This step needs its own confirmation before anything else runs."
                 ),
             }
             break
 
-        result = execute(step.tool, {**step.arguments, "confirm": "yes"}, landlord=landlord)
+        try:
+            resolved_arguments = _resolve_argument_refs(
+                step.arguments or {}, results_by_step,
+            )
+        except ValueError as exc:
+            step.status = RamaPlanStep.Status.FAILED
+            step.result = {"error": str(exc), "code": "DEPENDENCY_RESULT_MISSING"}
+            step.save(update_fields=["status", "result", "updated_at"])
+            dead_items.add(step.item_key)
+            failed_step_ids.add(step.step_id)
+            failed.append(_step_outcome(step))
+            continue
+
+        execution_blockers = blockers_for(step.tool, landlord, **resolved_arguments)
+        duplicate = already_done_for(step.tool, landlord, **resolved_arguments)
+        if execution_blockers or duplicate:
+            detail = (
+                execution_blockers[0].get("detail", "The step is now blocked.")
+                if execution_blockers
+                else duplicate
+            )
+            step.status = RamaPlanStep.Status.FAILED
+            step.result = {
+                "error": detail,
+                "code": "STALE_PLAN_BLOCKED" if execution_blockers else "ALREADY_DONE",
+            }
+            step.save(update_fields=["status", "result", "updated_at"])
+            dead_items.add(step.item_key)
+            failed_step_ids.add(step.step_id)
+            failed.append(_step_outcome(step))
+            continue
+
+        result = execute(
+            step.tool,
+            {**resolved_arguments, "confirm": "yes"},
+            landlord=landlord,
+        )
         safe_result = json.loads(json.dumps(result, default=str))
         if audit is not None:
             audit(
                 {
                     "tool": step.tool,
-                    "arguments": {**step.arguments, "confirm": "yes"},
+                    "arguments": {**resolved_arguments, "confirm": "yes"},
                     "result": safe_result,
                     "auto_confirmed": True,
                     "plan_operation": plan.operation,
                     "plan_step": step.order + 1,
-                }
+                },
             )
         step.result = safe_result
         if isinstance(result, dict) and result.get("error"):
             step.status = RamaPlanStep.Status.FAILED
             dead_items.add(step.item_key)
+            failed_step_ids.add(step.step_id)
             failed.append(_step_outcome(step))
         else:
             step.status = RamaPlanStep.Status.DONE
+            if step.step_id:
+                results_by_step[step.step_id] = safe_result
             if task is not None:
                 receipt, _ = record_receipt(
                     task=task,
                     capability_key=step.capability_key or step.tool,
-                    inputs=step.arguments,
+                    inputs=resolved_arguments,
                     effects=safe_result,
                     verification={
                         "verified": True,
@@ -537,7 +707,9 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
     if skipped:
         bits.append(f"{len(skipped)} skipped")
     if awaiting:
-        bits.append(f"paused at step {awaiting['n']} ({awaiting['target']}) for its own confirmation")
+        bits.append(
+            f"paused at step {awaiting['n']} ({awaiting['target']}) for its own confirmation",
+        )
     summary = "; ".join(bits) or "nothing to do"
 
     return {

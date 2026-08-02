@@ -396,6 +396,132 @@ class LedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
 
+    @action(detail=False, methods=["get"])
+    def suggest_split(self, request):
+        """
+        "A $400 e-transfer landed" -> which open charges add up to exactly that?
+
+        Deposits are due together and arrive as one bank line, but they are
+        separate charges because they are RETURNED separately. Query:
+        ?amount=400&lease=<uuid> (or &property=<uuid>). Returns
+        {matched: bool, allocations: [{charge_id, description, amount}]}.
+        Suggestion only — nothing is written, and `matched: false` means the
+        landlord should pick the charges themselves.
+        """
+        _landlord(request)
+        amount = _decimal(request.query_params.get("amount"), "amount")
+
+        open_charges = [
+            row
+            for row in self.get_queryset().filter(entry_type__in=CHARGE_TYPES)
+            if row.charge_status() not in (ChargeStatus.PAID, ChargeStatus.VOIDED)
+        ]
+        for field in ("lease", "property"):
+            value = request.query_params.get(field)
+            if value:
+                open_charges = [
+                    row
+                    for row in open_charges
+                    if str(getattr(row, f"{field}_id")) == str(value)
+                ]
+
+        chosen = services.suggest_deposit_split(open_charges, amount) or []
+        return Response(
+            {
+                "matched": bool(chosen),
+                "amount": str(amount),
+                "allocations": [
+                    {
+                        "charge_id": str(charge.pk),
+                        "description": charge.description,
+                        "amount": str(services.outstanding_on(charge)),
+                    }
+                    for charge in chosen
+                ],
+            }
+        )
+
+    @action(detail=False, methods=["post"])
+    def record_split_payment(self, request):
+        """
+        One payment, several charges — the $400 e-transfer that is $200
+        security deposit plus $200 cleaning deposit.
+
+        Body: {payment_method, payment_date?, reference_number?, notes?,
+               tenant?, allocations: [{charge_id, amount}], amount?}
+
+        Posts one PAYMENT row per charge so each charge keeps its own balance
+        and its own history; `amount`, if sent, must equal the allocation total
+        (it is the landlord's own arithmetic check against their bank line).
+        Use /suggest_split/ first to propose the split.
+        """
+        landlord = _landlord(request)
+
+        rows = request.data.get("allocations") or []
+        if not isinstance(rows, list) or not rows:
+            raise ValidationError(
+                {"allocations": "Send [{charge_id, amount}] — at least one."}
+            )
+
+        allocations = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict) or not row.get("charge_id"):
+                raise ValidationError(
+                    {"allocations": f"Row {index + 1} needs a charge_id."}
+                )
+            charge = get_object_or_404(
+                LedgerEntry, pk=row["charge_id"], landlord=landlord
+            )
+            allocations.append(
+                (charge, _decimal(row.get("amount"), f"allocations[{index}].amount"))
+            )
+
+        total = sum((amount for _, amount in allocations), Decimal("0"))
+        if request.data.get("amount") not in (None, ""):
+            stated = _decimal(request.data.get("amount"), "amount")
+            if stated != total:
+                raise ValidationError(
+                    {
+                        "amount": (
+                            f"${stated} does not match the allocation total "
+                            f"${total}. Adjust the split or the total."
+                        )
+                    }
+                )
+
+        # Who paid is a property of the transfer, not of each charge, so it is
+        # validated once against the first charge's lease.
+        paid_by = _payer_from_request(request, allocations[0][0])
+
+        try:
+            posted = services.record_split_payment(
+                landlord=landlord,
+                allocations=allocations,
+                payment_method=request.data.get("payment_method", "ETRANSFER"),
+                payment_date=_date(
+                    request.data.get("payment_date"), "payment_date", required=False
+                ),
+                reference_number=request.data.get("reference_number", ""),
+                notes=request.data.get("notes", ""),
+                paid_by=paid_by,
+                created_by=request.user,
+            )
+        except services.LedgerError as exc:
+            raise ValidationError({"detail": str(exc)})
+
+        created_any = any(created for _, created in posted)
+        return Response(
+            {
+                "total": str(total),
+                "payments": LedgerEntrySerializer(
+                    [entry for entry, _ in posted], many=True
+                ).data,
+            },
+            status=(
+                status.HTTP_201_CREATED if created_any else status.HTTP_200_OK
+            ),
+        )
+
     @action(detail=True, methods=["post"])
     def credit(self, request, pk=None):
         """One-off discount/goodwill credit against this charge."""

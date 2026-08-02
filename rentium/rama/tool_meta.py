@@ -232,6 +232,9 @@ TOOL_META: dict[str, ToolMeta] = {
     "catalog_business_document": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
     # Read-only library search (OCR/title/tags/filters).
     "search_business_documents": ToolMeta(risk="low"),
+    # Metadata-only, but still previewed: the landlord chooses the exact receipt.
+    "rename_business_document": ToolMeta(risk="low", autonomy=Autonomy.NEVER),
+    "manage_business_documents": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
     # Posts an immutable ledger expense from a catalogued invoice/receipt.
     "file_business_document": ToolMeta(
         risk="high", own_confirm=True, autonomy=Autonomy.NEVER
@@ -258,6 +261,7 @@ TOOL_META: dict[str, ToolMeta] = {
     "duplicate_listing": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
     # Changes what the public sees and consumes a single-use RamaUpload.
     "attach_photo_to_listing": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    "reorder_listing_media": ToolMeta(risk="low", autonomy=Autonomy.NEVER),
     # Removes one public-facing image by a stable handle. Storage is retained by
     # the backend, but restoring it is not yet a first-class inverse.
     "remove_photo_from_listing": ToolMeta(
@@ -300,10 +304,26 @@ TOOL_META: dict[str, ToolMeta] = {
     "set_unit_rental_mode": ToolMeta(risk="high", own_confirm=True),
     "configure_unit_room_offerings": ToolMeta(risk="high", own_confirm=True),
     "create_group_room": ToolMeta(risk="medium"),
+    "manage_property_group": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
     "reschedule_viewing": ToolMeta(risk="medium", own_confirm=True),
+    "schedule_appointment": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
+    "manage_viewing_availability": ToolMeta(risk="low", autonomy=Autonomy.NEVER),
+    "manage_agenda_event": ToolMeta(risk="low", autonomy=Autonomy.NEVER),
     # ----------------------------------------------------------- leases
     "create_lease": ToolMeta(risk="medium"),
     "update_lease": ToolMeta(risk="medium"),
+    "update_lease_roster": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    "update_condition_inspection": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
+    "manage_import_rows": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    "manage_showcase_settings": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    "manage_insight": ToolMeta(risk="low", autonomy=Autonomy.NEVER),
+    "manage_notification_channel": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    "update_treasurer_settings": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
+    "save_last_workflow": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    "run_saved_workflow": ToolMeta(risk="medium", autonomy=Autonomy.NEVER),
+    "rename_saved_workflow": ToolMeta(risk="low", autonomy=Autonomy.NEVER),
+    "archive_saved_workflow": ToolMeta(risk="low", autonomy=Autonomy.NEVER),
+    "restore_saved_workflow": ToolMeta(risk="low", autonomy=Autonomy.NEVER),
     "adjust_lease": ToolMeta(risk="medium", own_confirm=True),
     # Legal: renew marks old RENEWED and opens a new DRAFT — own confirm.
     "renew_lease": ToolMeta(risk="legal", own_confirm=True),
@@ -342,7 +362,15 @@ TOOL_META: dict[str, ToolMeta] = {
     "dismiss_inspection_suggestion": ToolMeta(risk="low"),
     "mark_inspection_delivered": ToolMeta(risk="low"),
     "cancel_viewing": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
-    "mark_cleaning_fee_paid": ToolMeta(risk="low"),
+    "mark_cleaning_deposit_paid": ToolMeta(risk="low"),
+    # Records what a landlord PROPOSES to keep; keeps nothing on its own.
+    # Its own confirm because a deduction line is evidence at a hearing.
+    "record_deposit_deduction": ToolMeta(risk="medium", own_confirm=True),
+    # Pays deposit money back out and closes the statutory clock — legal, and
+    # never autonomous.
+    "return_deposits": ToolMeta(
+        risk="legal", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
     "create_payment_reminder": ToolMeta(risk="medium"),
     "mark_payment_reminder_sent": ToolMeta(risk="low"),
     "update_inquiry": ToolMeta(risk="low"),
