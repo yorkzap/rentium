@@ -351,7 +351,13 @@ def test_telegram_bank_document_routes_to_physical_holding_not_listing(
     step = plan.steps.get()
     assert step.tool == "catalog_business_document"
     assert step.arguments["scope_query"] == "950 McKenzie Ave"
-    assert "upload_id" in step.arguments
+    # Cataloguing a photo is two calls, not one: upload_id ONLY on the first
+    # turn so OCR runs against the file (comms/tasks.py), then the document it
+    # produced plus the address on the second — "then catalog with document_id
+    # + scope_query" (service.py). So the SCOPE turn carries document_id; the
+    # upload handle has already done its job and the file is now a document.
+    assert "document_id" in step.arguments
+    assert "upload_id" not in step.arguments
 
 
 def test_telegram_conversation_id_is_stable_per_chat():
