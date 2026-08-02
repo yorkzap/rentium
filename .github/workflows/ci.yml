@@ -40,6 +40,31 @@ jobs:
       - name: Checkout Code Repository
         uses: actions/checkout@v4
 
+      # docker-compose.local.yml declares .envs/.local/* as env_file, and
+      # .gitignore excludes .envs/* — so a fresh checkout has neither, every
+      # compose command below aborts before it starts, and the job has never
+      # been able to pass. Throwaway values for a container that is destroyed
+      # at the end of the job; nothing here is a secret and nothing here is
+      # reachable from outside the runner. The entrypoint builds DATABASE_URL
+      # from the POSTGRES_* vars.
+      - name: Write CI env files
+        run: |
+          mkdir -p .envs/.local
+          cat > .envs/.local/.postgres <<'EOF'
+          POSTGRES_HOST=postgres
+          POSTGRES_PORT=5432
+          POSTGRES_DB=rentium
+          POSTGRES_USER=rentium_ci
+          POSTGRES_PASSWORD=rentium_ci
+          EOF
+          cat > .envs/.local/.django <<'EOF'
+          USE_DOCKER=yes
+          IPYTHONDIR=/app/.ipython
+          REDIS_URL=redis://redis:6379/0
+          CELERY_FLOWER_USER=ci
+          CELERY_FLOWER_PASSWORD=ci
+          EOF
+
       - name: Build the Stack
         run: docker compose -f docker-compose.local.yml build django
 
