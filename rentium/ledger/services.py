@@ -227,12 +227,35 @@ def suggest_deposit_split(candidates, amount) -> list | None:
             continue
         scored.append((kind, out, charge))
 
-    # Deposit-like charges first; fall back to everything open if there are none.
-    pool = [(out, c) for kind, out, c in scored if kind >= 2] or [
-        (out, c) for kind, out, c in scored
-    ]
-    pool = pool[:8]  # 2**8 subsets is the ceiling on an interactive path
-    n = len(pool)
+    # Oldest first. Two $850 rent charges are interchangeable to a subset sum,
+    # so without this the August payment could land on September and leave
+    # August open — the tenant would be shown as in arrears for a month they
+    # had actually paid.
+    scored.sort(key=lambda row: (row[2].due_date or date.max, row[2].created_at))
+
+    deposit_like = [(out, c) for kind, out, c in scored if kind >= 2]
+    everything = [(out, c) for kind, out, c in scored]
+
+    # Deposit-like charges are the likelier reading, so try them alone first —
+    # but only PREFER them, never restrict to them. Restricting is what made a
+    # tenant's $1,175 unmatchable in August 2026: it was the $325 left on her
+    # deposit plus her $850 August rent, and because a deposit charge existed at
+    # all, rent was never in the pool. The landlord had said in as many words
+    # what the payment was, and the split still came back None.
+    for pool in (deposit_like, everything):
+        match = _exact_subset(pool[:8], amount)
+        if match is not None:
+            return match
+    return None
+
+
+def _exact_subset(pool, amount) -> list | None:
+    """The subset of `pool` whose outstanding amounts sum to exactly `amount`.
+
+    Exact full-pay only. A guess that leaves a stray $3 owing on a deposit is
+    worse than no guess, so anything inexact returns None and the caller asks.
+    """
+    n = len(pool)  # 2**8 subsets is the ceiling on an interactive path
     best = None
     for mask in range(1, 1 << n):
         total = Decimal("0")
@@ -242,9 +265,15 @@ def suggest_deposit_split(candidates, amount) -> list | None:
                 total += pool[i][0]
                 chosen.append(pool[i][1])
         if total == amount and 1 < len(chosen) <= 4:
-            # Fewer charges first, then the more deposit-like reading.
+            # Fewer charges first; then the set that clears the OLDEST debt,
+            # because that is what paying a bill means; then the more
+            # deposit-like reading.
+            latest_due = max(
+                (c.due_date.toordinal() for c in chosen if c.due_date), default=0
+            )
             score = (
                 -len(chosen),
+                -latest_due,
                 sum(1 for c in chosen if "deposit" in (c.description or "").casefold()),
             )
             if best is None or score > best[0]:

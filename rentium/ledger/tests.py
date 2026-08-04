@@ -765,3 +765,140 @@ def test_the_split_endpoint_refuses_a_total_that_does_not_add_up(landlord, bc_le
 
     assert response.status_code == 400
     assert services.outstanding_on(security) == Decimal("200.00")
+
+
+# ---------------------------------------------------------------------------
+# August 2026: "$1,175 = the rest of her deposit + her August rent"
+# ---------------------------------------------------------------------------
+
+
+def _open_charges_for(lease):
+    from rentium.ledger.models import CHARGE_TYPES, LedgerEntry
+
+    return list(
+        LedgerEntry.objects.with_settlement().filter(
+            lease=lease, entry_type__in=CHARGE_TYPES, reversed_by__isnull=True
+        )
+    )
+
+
+@pytest.mark.django_db
+def test_one_transfer_can_cover_a_part_paid_deposit_and_the_rent(landlord, bc_lease):
+    """A deposit charge in the pool used to hide rent from the split entirely.
+
+    The landlord said in as many words what the $1,175 was; the suggestion still
+    came back None because deposit-like charges REPLACED the pool rather than
+    being preferred within it.
+    """
+    from datetime import date
+
+    from rentium.ledger.models import EntryType, LedgerEntry
+    from rentium.ledger.services import record_payment, suggest_deposit_split
+
+    deposit = LedgerEntry.objects.create(
+        landlord=landlord,
+        lease=bc_lease,
+        property=bc_lease.property,
+        entry_type=EntryType.DEPOSIT_CHARGE,
+        amount=Decimal("425.00"),
+        due_date=date(2026, 7, 22),
+        effective_date=date(2026, 7, 22),
+        description="Security deposit — due on signing",
+    )
+    record_payment(charge=deposit, amount=Decimal("100.00"), payment_method="ETRANSFER")
+    august = LedgerEntry.objects.create(
+        landlord=landlord,
+        lease=bc_lease,
+        property=bc_lease.property,
+        entry_type=EntryType.RENT_CHARGE,
+        amount=Decimal("850.00"),
+        due_date=date(2026, 8, 1),
+        effective_date=date(2026, 8, 1),
+        description="Monthly rent — period starting 2026-08-01",
+    )
+
+    split = suggest_deposit_split(_open_charges_for(bc_lease), Decimal("1175.00"))
+
+    assert split is not None, "$325 owing + $850 rent is exactly $1,175"
+    assert {c.pk for c in split} == {deposit.pk, august.pk}
+
+
+@pytest.mark.django_db
+def test_a_split_settles_the_oldest_charge_first(landlord, bc_lease):
+    """Two identical rent charges are interchangeable to a subset sum.
+
+    Without an ordering rule the August payment can land on September, leaving
+    August open — the tenant shows as in arrears for a month they have paid.
+    """
+    from datetime import date
+
+    from rentium.ledger.models import EntryType, LedgerEntry
+    from rentium.ledger.services import suggest_deposit_split
+
+    common = {
+        "landlord": landlord,
+        "lease": bc_lease,
+        "property": bc_lease.property,
+        "entry_type": EntryType.RENT_CHARGE,
+        "amount": Decimal("850.00"),
+    }
+    august = LedgerEntry.objects.create(
+        **common,
+        due_date=date(2026, 8, 1),
+        effective_date=date(2026, 8, 1),
+        description="Monthly rent — August",
+    )
+    LedgerEntry.objects.create(
+        **common,
+        due_date=date(2026, 9, 1),
+        effective_date=date(2026, 9, 1),
+        description="Monthly rent — September",
+    )
+    fee = LedgerEntry.objects.create(
+        landlord=landlord,
+        lease=bc_lease,
+        property=bc_lease.property,
+        entry_type=EntryType.FEE_CHARGE,
+        amount=Decimal("19.78"),
+        due_date=date(2026, 7, 26),
+        effective_date=date(2026, 7, 26),
+        description="Damage recovery",
+    )
+
+    split = suggest_deposit_split(_open_charges_for(bc_lease), Decimal("869.78"))
+
+    assert split is not None
+    assert {c.pk for c in split} == {august.pk, fee.pk}, "September must not be paid first"
+
+
+@pytest.mark.django_db
+def test_an_inexact_amount_still_refuses_to_guess(landlord, bc_lease):
+    from datetime import date
+
+    from rentium.ledger.models import EntryType, LedgerEntry
+    from rentium.ledger.services import suggest_deposit_split
+
+    LedgerEntry.objects.create(
+        landlord=landlord,
+        lease=bc_lease,
+        property=bc_lease.property,
+        entry_type=EntryType.DEPOSIT_CHARGE,
+        amount=Decimal("425.00"),
+        due_date=date(2026, 7, 22),
+        effective_date=date(2026, 7, 22),
+        description="Security deposit",
+    )
+    LedgerEntry.objects.create(
+        landlord=landlord,
+        lease=bc_lease,
+        property=bc_lease.property,
+        entry_type=EntryType.RENT_CHARGE,
+        amount=Decimal("850.00"),
+        due_date=date(2026, 8, 1),
+        effective_date=date(2026, 8, 1),
+        description="Monthly rent",
+    )
+
+    # $1,200 is neither charge nor both — a split leaving a stray balance is
+    # worse than asking.
+    assert suggest_deposit_split(_open_charges_for(bc_lease), Decimal("1200.00")) is None

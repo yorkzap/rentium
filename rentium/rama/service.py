@@ -2553,7 +2553,14 @@ _CLAIMED_WRITE = re.compile(
     # "...— I updated the rent": first person, anywhere in the sentence.
     r"\bi(?:'ve|’ve| have| just)?\s+" + _DID + r"\b" + _NOT_AN_ACTION
     # "Recorded the $100 payment...": bare past tense opening a sentence.
-    + r"|(?:^|[.!?]\s+|\n\s*|—\s*)" + _DID + r"\b" + _NOT_AN_ACTION,
+    #
+    # No _NOT_AN_ACTION here, deliberately. The exclusion exists for the
+    # DESCRIPTIVE form — "The deposit is recorded as $425" — which is always
+    # mid-sentence, behind its linking verb, and so cannot reach this branch
+    # anyway. Applying it here excused "Recorded as etransfer." instead: the
+    # same words with the opposite meaning, and a fabricated write that reached
+    # a landlord in August 2026 because of it.
+    + r"|(?:^|[.!?]\s+|\n\s*|—\s*)" + _DID + r"\b",
     re.IGNORECASE,
 )
 _NOT_A_CLAIM = re.compile(
@@ -2561,6 +2568,22 @@ _NOT_A_CLAIM = re.compile(
     r"|haven't|haven’t|cannot|can't|can’t|won't|won’t|couldn't|couldn’t)\b",
     re.IGNORECASE,
 )
+
+
+#: The model asking the landlord to approve something. Only the shapes that
+#: mean "say yes and I will act", not a general question — "Which room?" is a
+#: legitimate thing to ask with no plan pending.
+_SOLICITS_CONFIRM = re.compile(
+    r"(?:^|\n|\s)(?:confirm\?|confirm this|please confirm|shall i proceed"
+    r"|should i proceed|do you want me to proceed|reply (?:with )?yes"
+    r"|say yes|approve this|ok to (?:post|proceed|apply|record))",
+    re.IGNORECASE,
+)
+
+
+def _solicits_confirmation(text: str) -> bool:
+    """True when the reply asks the landlord to approve an action."""
+    return bool(_SOLICITS_CONFIRM.search(text or ""))
 
 
 def _sentences(text: str) -> list[str]:
@@ -6424,3 +6447,33 @@ def run_turn(
         deterministic=response_deterministic,
         auto_executed=delegated_auto,
     )
+
+    # A confirmation prompt with nothing behind it.
+    #
+    # Asked to apply a $1,175 e-transfer, the model wrote a whole preview —
+    # "Outstanding charges: $869.78 (2 items) … leave $305.22 as a credit …
+    # Confirm?" — having called no tool at all. Every figure was invented, and
+    # the real ledger disagreed with all of them. Worse than a wrong answer: it
+    # wears the exact shape of the genuine confirm flow, so "yes" would have
+    # arrived at a plan that does not exist.
+    #
+    # A real preview always persists a plan, so `outstanding` is set. Asking to
+    # confirm without one means there is nothing to confirm.
+    if (
+        not response_deterministic
+        and outstanding is None
+        and not _turn_wrote_anything(turn_writes, delegated_auto)
+        and _solicits_confirmation(reply)
+    ):
+        response_deterministic = True
+        audit(
+            RamaAudit.Kind.ERROR,
+            {"error": "confirmation_offered_without_a_plan", "claim": reply[:500]},
+        )
+        reply = (
+            "I asked you to confirm something I hadn't actually worked out — "
+            "there's no pending action behind that, and any figures in it were "
+            "mine rather than the ledger's. Ignore them.\n\n"
+            "Tell me again what to record and I'll price it from the ledger "
+            "first, then show you a real preview."
+        )

@@ -296,6 +296,14 @@ LEDGER_ENTRY = EntitySpec(
     label="Ledger entry (charge / payment / expense)",
     scope_path="landlord",  # idempotency_key / metadata are internal → not declared
     fields=[
+        # Without a way to narrow to ONE tenancy, every read of this entity was
+        # portfolio-wide. Asked why a Room C balance looked wrong, RAMA read
+        # every rent charge the landlord had, found another lease's $800, and
+        # explained the discrepancy with charges that belong to somebody else.
+        # Money questions are almost always about one lease; this is how you say
+        # which.
+        FieldSpec("lease__lease_number", "Lease number"),
+        FieldSpec("property__name", "Property / listing"),
         FieldSpec("entry_type", "Type", "enum", display="get_entry_type_display"),
         FieldSpec("amount", "Amount", "money"),
         FieldSpec("due_date", "Due date", "date"),

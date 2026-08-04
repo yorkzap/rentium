@@ -497,3 +497,99 @@ def test_a_fabrication_in_a_conversation_that_never_wrote_still_retracts(
         result = run_turn(landlord, "record it", uuid.uuid4())
 
     assert "Nothing was written" in result.reply
+
+
+# ---------------------------------------------------------------------------
+# August 2026: the $1,175 e-transfer that was never recorded
+#
+# A landlord said a tenant had paid $1,175. RAMA replied "Recorded as
+# etransfer." and, on the next turn, produced a full preview — "Outstanding
+# charges: $869.78 (2 items) … leave $305.22 as a credit … Confirm?" — having
+# called no tool on either turn. Every figure was invented; the real ledger held
+# $325 outstanding on the deposit and $850 of August rent, exactly what the
+# landlord had said. Two guards missed it, for two different reasons.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # The one that got through: the "recorded AS" exclusion was written for
+        # the DESCRIPTIVE form and swallowed the active report as well.
+        "Recorded as etransfer.",
+        "Recorded as etransfer. I'll apply it to the outstanding ledger items "
+        "for Room C and confirm the allocation with you before posting.",
+        "Recorded as an e-transfer against the deposit.",
+        "Logged as cash.",
+    ],
+)
+def test_reporting_an_action_in_the_passive_voice_is_still_a_claim(reply):
+    assert claims(reply) is True
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # ...while the descriptive form it was protecting still passes. The
+        # difference is the linking verb, not the word "as".
+        "The deposit is recorded as $425.00 with $325.00 outstanding.",
+        "The payment was recorded as an e-transfer on August 3.",
+        "That $100 shows as recorded against the security deposit.",
+    ],
+)
+def test_describing_the_books_is_still_not_a_claim(reply):
+    assert claims(reply) is False
+
+
+@pytest.mark.parametrize(
+    ("solicits", "reply"),
+    [
+        (True, "Preview:\n- Outstanding charges: $869.78 (2 items)\n\nConfirm?"),
+        (True, "I'll apply the $1,175 now. Please confirm."),
+        (True, "Reply yes to record it, or no to cancel."),
+        (True, "Shall I proceed?"),
+        # Questions that need an answer, not an approval — a plan cannot exist
+        # for these yet and they must not be intercepted.
+        (False, "Which charge was this payment for?"),
+        (False, "How did the $1,175 arrive — e-transfer, cash, or cheque?"),
+        (False, "Nidita Roy gave a $100.00 security deposit."),
+        (False, "Do you want the September rent prorated?"),
+    ],
+)
+def test_only_approval_shapes_count_as_soliciting_confirmation(solicits, reply):
+    from rentium.rama.service import _solicits_confirmation
+
+    assert _solicits_confirmation(reply) is solicits
+
+
+def test_a_preview_with_no_plan_behind_it_is_retracted(landlord, settings):
+    """The dangerous one: it wears the exact shape of the real confirm flow.
+
+    A genuine preview persists a plan, so "yes" runs a verified batch. This
+    reply persisted nothing, so "yes" would have arrived at an empty plan while
+    the landlord believed $1,175 had been allocated.
+    """
+    from unittest import mock
+
+    from rentium.rama.service import run_turn
+    from rentium.rama.tests import _enable_rama
+
+    _enable_rama(landlord, settings=settings)
+    fabricated = (
+        "I'll apply the $1,175 etransfer to Room C's ledger now. Preview:\n\n"
+        "- Outstanding charges: $869.78 (2 items)\n"
+        "- Deposits held: $100.00\n"
+        "- Total applied: $1,175.00\n\n"
+        "This will clear the outstanding balance and leave $305.22 as a credit "
+        "toward future rent or charges.\n\nConfirm?"
+    )
+    with mock.patch(
+        "rentium.rama.service.get_provider", return_value=_scripted(fabricated)
+    ):
+        result = run_turn(landlord, "yes")
+
+    assert result.deterministic is True
+    assert result.pending_plan is None
+    assert "869.78" not in result.reply
+    assert "305.22" not in result.reply
+    assert "no pending action" in result.reply.casefold()
