@@ -932,3 +932,56 @@ def test_signing_first_then_sending_leaves_only_the_tenant_outstanding(
     assert form.status == LeaseForm.Status.PARTIALLY_SIGNED
     # The landlord's earlier signature survives being sent.
     assert form.signatures.get().typed_name == "Raj Singh"
+
+
+def test_a_form_with_no_signers_can_be_repaired(pending_lease, rtb8):
+    """What migration 0026 does to forms attached before signers were bound.
+
+    Their symptom was a downloaded PDF with an empty signature block and no way
+    to change that: the Sign button is drawn from signer rows, so with none
+    there was nothing to press.
+    """
+    form = svc.attach_form(pending_lease, rtb8)
+    form.signers.all().delete()  # the state those forms were left in
+    assert svc.signer_for_user(form, pending_lease.landlord.user) is None
+
+    svc.bind_known_signers(form)
+
+    assert svc.signer_for_user(form, pending_lease.landlord.user) is not None
+    assert form.signers.count() == 2
+
+
+def test_binding_signers_twice_changes_nothing(pending_lease, rtb8):
+    form = svc.attach_form(pending_lease, rtb8)
+    before = sorted(str(s.pk) for s in form.signers.all())
+
+    svc.bind_known_signers(form)
+
+    assert sorted(str(s.pk) for s in form.signers.all()) == before
+
+
+def test_repairing_never_disturbs_a_signature_already_given(pending_lease, rtb8):
+    form = svc.attach_form(pending_lease, rtb8)
+    me = svc.signer_for_user(form, pending_lease.landlord.user)
+    svc.sign_form(me, typed_name="Raj Singh")
+
+    svc.bind_known_signers(form)
+
+    me.refresh_from_db()
+    assert me.signed_at is not None
+    assert svc.rendered_values(form)["signature6"] == "Raj Singh"
+
+
+def test_a_signature_reaches_the_downloadable_pdf(pending_lease, rtb8):
+    """The whole point, asserted on the bytes a landlord actually receives."""
+    import io
+
+    from pypdf import PdfReader
+
+    form = svc.attach_form(pending_lease, rtb8)
+    svc.sign_form(
+        svc.signer_for_user(form, pending_lease.landlord.user), typed_name="Raj Singh"
+    )
+
+    text = PdfReader(io.BytesIO(svc.render_form_pdf(form))).pages[0].extract_text()
+    assert "Raj Singh" in text
