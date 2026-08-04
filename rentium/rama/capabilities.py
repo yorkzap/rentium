@@ -19,6 +19,21 @@ _TOKEN = re.compile(r"[a-z0-9]+")
 # Business-language aliases that do not naturally occur in Python function
 # names.  Keep these focused: descriptions remain the general retrieval corpus.
 CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "manage_lease_forms": (
+        "attach a form",
+        "RTB-8",
+        "RTB8",
+        "mutual agreement to end tenancy",
+        "end of tenancy form",
+        "addendum",
+        "pet addendum",
+        "lease addendum",
+        "extra document to sign",
+        "send for signature",
+        "get this signed",
+        "custom form",
+        "sign this pdf",
+    ),
     "record_payment": (
         "received money",
         "partial payment",

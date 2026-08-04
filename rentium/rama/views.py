@@ -387,7 +387,7 @@ def attachment_detail_view(request, attachment_id):
     return Response(batch_payload(batch))
 
 
-def _attachment_batch_note(request, landlord, conversation_id) -> str:
+def _attachment_batch_note(request, landlord, conversation_id, caption: str = "") -> str:
     from .attachment_services import AttachmentError
     from .attachment_services import batch_chat_note
     from .attachment_services import seal_batch
@@ -404,7 +404,10 @@ def _attachment_batch_note(request, landlord, conversation_id) -> str:
         conversation_id=conversation_id,
         batch_id=batch_id,
     )
-    return batch_chat_note(batch)
+    # The message sent alongside the file decides where it should go: an RTB-8
+    # and an invoice are indistinguishable as bytes, but "get Sarah to sign
+    # this" is not ambiguous at all.
+    return batch_chat_note(batch, caption=caption)
 
 
 def _attachment_note(request, landlord) -> str:
@@ -508,7 +511,9 @@ def chat_view(request):
     # If the landlord attached photo(s) in the chat, tell the model so it can
     # attach_photo_to_listing them (the image itself is staged server-side).
     try:
-        batch_note = _attachment_batch_note(request, landlord, conversation_id)
+        batch_note = _attachment_batch_note(
+            request, landlord, conversation_id, caption=message
+        )
     except Exception as exc:
         from .attachment_services import AttachmentError
 
@@ -1198,7 +1203,9 @@ def general_chat_view(request):
     if err is not None:
         return err
     try:
-        message += _attachment_batch_note(request, landlord, conversation_id)
+        message += _attachment_batch_note(
+            request, landlord, conversation_id, caption=message
+        )
     except Exception as exc:
         from .attachment_services import AttachmentError
 

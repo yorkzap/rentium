@@ -94,6 +94,7 @@ def _stage_telegram_document(
     *,
     preferred_name: str = "",
     mime_type: str = "",
+    caption: str = "",
 ) -> str:
     """Download a Telegram document (PDF etc.) into a sealed attachment batch.
 
@@ -142,7 +143,10 @@ def _stage_telegram_document(
             batch_id=str(batch.pk),
         )
         batch.refresh_from_db()
-        return batch_chat_note(batch)
+        # What the landlord typed with the file is what routes it: a PDF sent
+        # with "get Sarah to sign this" belongs on a lease, not in the expense
+        # inbox. Telegram puts that text in the caption.
+        return batch_chat_note(batch, caption=caption)
     except AttachmentError:
         logger.exception(
             "telegram document rejected for landlord %s (name=%s mime=%s)",
@@ -213,6 +217,10 @@ def handle_telegram_message(
             document_file_id,
             preferred_name=document_name,
             mime_type=document_mime,
+            # `text` is Telegram's caption by the time it reaches here (the
+            # webhook falls back to message.caption when there is no text), and
+            # it is what decides whether this is a form to sign or a bill to file.
+            caption=text,
         )
         if note:
             default = "The landlord sent a file."

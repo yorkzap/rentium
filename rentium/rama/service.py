@@ -2783,6 +2783,9 @@ WRITE_RESULT_MARKERS = (
     "forgotten",
     # An OCR'd document row exists that didn't before.
     "prepared",
+    # A form template now has a stated purpose, which decides whether an
+    # unsigned copy of it holds up a tenancy. Small write, large consequence.
+    "classified",
 )
 
 
@@ -3280,7 +3283,16 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
     latest = (texts[0] if texts else "").casefold()
     claims_listing = bool(_CLAIMS_LISTING_PHOTO.search(latest))
     denies_business = bool(_DENIES_BUSINESS_RECORD.search(latest))
-    if denies_business or claims_listing:
+    # Third destination. A PDF the landlord wants SIGNED is neither listing
+    # media nor an expense — filing it in the document inbox puts it somewhere
+    # nobody can put their name on it. Checked against the latest message for
+    # the same reason as the other two overrides: the most recent words win.
+    from .attachment_services import looks_like_lease_form
+
+    claims_lease_form = looks_like_lease_form(latest)
+    if claims_lease_form:
+        business_record = False
+    elif denies_business or claims_listing:
         business_record = False
     elif not business_record:
         # DEFAULT: bare photo/file with no listing intent → document/OCR path.
@@ -3313,6 +3325,7 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         "document_ids": sorted(document_ids),
         "landlord_described_as_business_record": business_record,
         "landlord_claims_listing_photo": claims_listing,
+        "landlord_claims_lease_form": claims_lease_form,
         # Stated explicitly because the model was guessing at how many photos
         # it had and consistently guessing low.
         "pending_photo_count": pending_count,
@@ -3322,26 +3335,49 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
             f"The landlord has {pending_count} attached file(s) not yet placed "
             f"(attachment_batch_id={attachment_batch.pk if attachment_batch else None}; "
             f"attachment_ids={attachment_ids or sorted(upload_ids)}). "
-            + (
-                "DEFAULT = business document. Call catalog_business_document "
-                "with attachment_id/upload_id ONLY first (no scope_query) — "
-                "hash + OCR. Do NOT call attach_photo_to_listing. Do NOT say "
-                "this 'looks like a property/inspection photo'. Do NOT ask for "
-                "the address before that OCR call. Only if needs_input, ask the "
-                "holding address, then catalog with document_id + scope_query. "
-                "NEVER invent amounts. NEVER re-file duplicates. NEVER claim "
-                "you lack OCR."
-                if business_record
-                else (
-                    "Landlord indicated LISTING/property media. Call "
-                    "attach_photo_to_listing ONCE with attachment_batch_id from "
-                    "this focus (or upload_id for legacy). Never substitute an "
-                    "older batch. If they meant a receipt after all, use "
-                    "catalog_business_document (no address first) instead."
-                )
+            + _attachment_routing_instruction(
+                lease_form=claims_lease_form, business_record=business_record
             )
         ),
     }
+
+
+def _attachment_routing_instruction(*, lease_form: bool, business_record: bool) -> str:
+    """Which of the three places an attached file can go, in the model's words.
+
+    Split out of the focus payload because it grew a third branch and a
+    three-deep conditional expression is unreadable at exactly the moment it
+    matters — this string is the difference between a tenancy form landing on a
+    lease and landing in the expense inbox.
+    """
+    if lease_form:
+        return (
+            "The landlord wants this SIGNED, or is talking about a lease / "
+            "tenancy. Call manage_lease_forms with action=attach, this "
+            "attachment_id, and the lease (lease_query or lease_number). If the "
+            "tool asks what the form is FOR, relay its question_for_user VERBATIM "
+            "and wait — never choose a stage yourself. Do NOT call "
+            "catalog_business_document: this is paperwork to sign, not an expense "
+            "to file."
+        )
+    if business_record:
+        return (
+            "DEFAULT = business document. Call catalog_business_document "
+            "with attachment_id/upload_id ONLY first (no scope_query) — "
+            "hash + OCR. Do NOT call attach_photo_to_listing. Do NOT say "
+            "this 'looks like a property/inspection photo'. Do NOT ask for "
+            "the address before that OCR call. Only if needs_input, ask the "
+            "holding address, then catalog with document_id + scope_query. "
+            "NEVER invent amounts. NEVER re-file duplicates. NEVER claim "
+            "you lack OCR."
+        )
+    return (
+        "Landlord indicated LISTING/property media. Call "
+        "attach_photo_to_listing ONCE with attachment_batch_id from "
+        "this focus (or upload_id for legacy). Never substitute an "
+        "older batch. If they meant a receipt after all, use "
+        "catalog_business_document (no address first) instead."
+    )
 
 
 # Verbal expenses without a receipt photo this turn.
@@ -6419,35 +6455,6 @@ def run_turn(
                 "written, so please don't rely on that.\n\n" + gap
             )
 
-    # A warning the tool computed is not advice the model may edit out. Only
-    # appended when the reply does not already carry it, so a model that DID
-    # relay it is not made to repeat itself.
-    if outstanding is not None and preview_warnings:
-        missing = [w for w in preview_warnings if w not in reply]
-        if missing:
-            reply = reply.rstrip() + "\n\n" + "\n\n".join(f"⚠️ {w}" for w in missing)
-
-    audit(
-        RamaAudit.Kind.ASSISTANT_MESSAGE,
-        {
-            "text": reply,
-            "tools_used": tools_used,
-            **({"deterministic": True} if response_deterministic else {}),
-        },
-    )
-
-    return TurnResult(
-        conversation_id=conversation_id,
-        reply=reply,
-        provider=provider_name,
-        model=model,
-        tools_used=tools_used,
-        attachments=turn_attachments,
-        pending_plan=plan_brief(outstanding) if outstanding else None,
-        deterministic=response_deterministic,
-        auto_executed=delegated_auto,
-    )
-
     # A confirmation prompt with nothing behind it.
     #
     # Asked to apply a $1,175 e-transfer, the model wrote a whole preview —
@@ -6477,3 +6484,32 @@ def run_turn(
             "Tell me again what to record and I'll price it from the ledger "
             "first, then show you a real preview."
         )
+
+    # A warning the tool computed is not advice the model may edit out. Only
+    # appended when the reply does not already carry it, so a model that DID
+    # relay it is not made to repeat itself.
+    if outstanding is not None and preview_warnings:
+        missing = [w for w in preview_warnings if w not in reply]
+        if missing:
+            reply = reply.rstrip() + "\n\n" + "\n\n".join(f"⚠️ {w}" for w in missing)
+
+    audit(
+        RamaAudit.Kind.ASSISTANT_MESSAGE,
+        {
+            "text": reply,
+            "tools_used": tools_used,
+            **({"deterministic": True} if response_deterministic else {}),
+        },
+    )
+
+    return TurnResult(
+        conversation_id=conversation_id,
+        reply=reply,
+        provider=provider_name,
+        model=model,
+        tools_used=tools_used,
+        attachments=turn_attachments,
+        pending_plan=plan_brief(outstanding) if outstanding else None,
+        deterministic=response_deterministic,
+        auto_executed=delegated_auto,
+    )

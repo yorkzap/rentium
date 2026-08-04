@@ -2124,3 +2124,497 @@ def restore_saved_workflow(landlord, workflow_query: str, confirm: str = "") -> 
     workflow.archived_at = None
     workflow.save(update_fields=["archived_at", "updated_at"])
     return {"restored": True, "workflow_id": str(workflow.pk), "name": workflow.name}
+
+
+# ---------------------------------------------------------------------------
+# Lease form packs
+# ---------------------------------------------------------------------------
+
+_FORM_ACTIONS = {"catalog", "list", "attach", "send", "status", "void", "classify"}
+
+#: Plain-English names for the three things a form can be for. The stage is the
+#: fact that decides whether an unsigned form holds up a lease, so RAMA has to be
+#: able to say it out loud rather than passing an enum around.
+_STAGE_WORDS = {
+    "WITH_LEASE": "signed with the lease (the lease can't activate until it is)",
+    "ADDENDUM": "signed any time during the tenancy",
+    "MOVE_OUT": "signed to end the tenancy",
+    "UNCLASSIFIED": "not classified yet",
+}
+
+
+def _form_stage(raw: str) -> str:
+    value = str(raw or "").strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "LEASE": "WITH_LEASE",
+        "WITH_THE_LEASE": "WITH_LEASE",
+        "SIGNING": "WITH_LEASE",
+        "DURING": "ADDENDUM",
+        "ANYTIME": "ADDENDUM",
+        "END": "MOVE_OUT",
+        "MOVEOUT": "MOVE_OUT",
+        "END_OF_TENANCY": "MOVE_OUT",
+    }
+    return aliases.get(value, value)
+
+
+def _form_row(form) -> dict:
+    outstanding = [
+        signer.display_name
+        for signer in form.signers.all()
+        if not signer.has_signed and not signer.declined_at
+    ]
+    return {
+        "form_id": str(form.pk),
+        "title": form.title,
+        "lease": form.lease.lease_number or str(form.lease_id),
+        "status": form.status,
+        "stage": str(form.template.stage),
+        "what_it_is_for": _STAGE_WORDS.get(str(form.template.stage), ""),
+        "blocking_the_lease": form.blocks_activation,
+        "signed_by": [s.display_name for s in form.signers.all() if s.has_signed],
+        "waiting_on": outstanding,
+    }
+
+
+def _template_row(template) -> dict:
+    return {
+        "form_code": template.code or str(template.pk),
+        "name": template.name,
+        "purpose": template.purpose,
+        "jurisdiction": template.jurisdiction or "any",
+        "stage": str(template.stage),
+        "what_it_is_for": _STAGE_WORDS.get(str(template.stage), ""),
+        "available": template.is_selectable,
+        "note": (
+            ""
+            if template.is_selectable
+            else "Catalogued but not shipped yet — it can't be attached."
+        ),
+    }
+
+
+def _resolve_form_template(landlord, form_code: str):
+    from rentium.leases.form_services import catalog_for
+
+    wanted = str(form_code or "").strip()
+    if not wanted:
+        raise ValueError("Say which form — pass form_code, e.g. BC_RTB8.")
+    rows = catalog_for(landlord)
+    exact = [
+        row
+        for row in rows
+        if row.code.casefold() == wanted.casefold() or str(row.pk) == wanted
+    ]
+    if exact:
+        return exact[0]
+    partial = [row for row in rows if wanted.casefold() in row.name.casefold()]
+    if len(partial) == 1:
+        return partial[0]
+    if not partial:
+        raise ValueError(
+            f"No form matching {wanted!r}. Use action=catalog to see what exists."
+        )
+    names = "; ".join(f"{row.code or row.name}" for row in partial[:6])
+    raise ValueError(f"More than one form matches {wanted!r}: {names}.")
+
+
+def _params_lease_forms(fn):
+    fn.param_docs = {
+        "action": (
+            "catalog (what forms exist), list (forms on a lease), attach, send, "
+            "status, void, or classify (say what an uploaded form is for)."
+        ),
+        "lease_query": "Property name or address whose lease this is about.",
+        "lease_number": "Exact lease number, if you have it.",
+        "form_code": "Catalogue code such as BC_RTB8, or part of the form's name.",
+        "attachment_id": (
+            "The id from an attached PDF in this chat, to add it as a NEW custom "
+            "form instead of picking one from the catalogue."
+        ),
+        "stage": (
+            "What the form is for: WITH_LEASE, ADDENDUM, or MOVE_OUT. Required "
+            "when attaching a PDF the landlord just sent — never guess it."
+        ),
+        "title": "What to call this form on the lease.",
+        "signer_name": "Name of a signer who is not on the lease yet.",
+        "signer_email": "Where to send that person's signing link.",
+        "form_id": "Exact id of an already-attached form (for send/void).",
+        "confirm": "Pass yes to run the previewed action.",
+    }
+    return fn
+
+
+@_params_lease_forms
+def manage_lease_forms(  # noqa: PLR0913 - explicit public tool fields
+    landlord,
+    action: str,
+    lease_query: str = "",
+    lease_number: str = "",
+    form_code: str = "",
+    attachment_id: str = "",
+    stage: str = "",
+    title: str = "",
+    signer_name: str = "",
+    signer_email: str = "",
+    form_id: str = "",
+    confirm: str = "",
+) -> dict:
+    """Attach extra documents to a lease and send them for signature.
+
+    Use for RTB-8 (BC mutual agreement to end a tenancy), addendums, and any PDF
+    the landlord sends you. Each form has a STAGE that decides what it does:
+    WITH_LEASE holds up activation until signed, ADDENDUM is signed any time,
+    MOVE_OUT ends the tenancy. Never guess the stage of an uploaded PDF — ask.
+    Actions: catalog, list, attach, send, status, void, classify. Preview first,
+    then confirm=yes.
+    """
+    from rentium.leases import form_services as forms
+
+    op = str(action or "").strip().lower()
+    if op not in _FORM_ACTIONS:
+        return {"error": "action must be one of: " + ", ".join(sorted(_FORM_ACTIONS))}
+
+    if op == "catalog":
+        rows = forms.catalog_for(landlord)
+        return {
+            "forms": [_template_row(row) for row in rows],
+            "note": (
+                "Only forms marked available can be attached. To use one that "
+                "isn't listed, ask the landlord to send the PDF in this chat."
+            ),
+        }
+
+    try:
+        return _run_lease_form_action(
+            landlord,
+            op,
+            lease_query=lease_query,
+            lease_number=lease_number,
+            form_code=form_code,
+            attachment_id=attachment_id,
+            stage=stage,
+            title=title,
+            signer_name=signer_name,
+            signer_email=signer_email,
+            form_id=form_id,
+            confirm=confirm,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    except ValidationError as exc:
+        return {"error": "; ".join(exc.messages)}
+
+
+def _lease_form_by_id(landlord, form_id: str):
+    from rentium.leases.lease_forms import LeaseForm
+
+    form = (
+        LeaseForm.objects.filter(pk=str(form_id).strip(), lease__landlord=landlord)
+        .select_related("lease", "template")
+        .first()
+    )
+    if form is None:
+        raise ValueError(f"No attached form with id {form_id!r} on your leases.")
+    return form
+
+
+def _resolve_form_lease(landlord, *, lease_query: str, lease_number: str):
+    from .domain_crud import _resolve_lease
+
+    lease, error = _resolve_lease(
+        landlord, property_query=lease_query, lease_number=lease_number
+    )
+    if error:
+        raise ValueError(str(error))
+    return lease
+
+
+def _run_lease_form_action(  # noqa: PLR0911, PLR0912 - one branch per action
+    landlord,
+    op: str,
+    *,
+    lease_query: str,
+    lease_number: str,
+    form_code: str,
+    attachment_id: str,
+    stage: str,
+    title: str,
+    signer_name: str,
+    signer_email: str,
+    form_id: str,
+    confirm: str,
+) -> dict:
+    from rentium.leases import form_services as forms
+    from rentium.leases.lease_forms import LeaseForm
+
+    if op in {"send", "void", "status"} and str(form_id or "").strip():
+        form = _lease_form_by_id(landlord, form_id)
+    else:
+        form = None
+
+    # ------------------------------------------------------------- list
+    if op == "list":
+        lease = _resolve_form_lease(
+            landlord, lease_query=lease_query, lease_number=lease_number
+        )
+        rows = lease.lease_forms.select_related("template").prefetch_related("signers")
+        return {
+            "lease": lease.lease_number,
+            "forms": [_form_row(row) for row in rows],
+            "blocking_activation": [
+                str(row.title) for row in forms.blocking_forms(lease)
+            ],
+        }
+
+    # ----------------------------------------------------------- status
+    if op == "status":
+        if form is None:
+            lease = _resolve_form_lease(
+                landlord, lease_query=lease_query, lease_number=lease_number
+            )
+            return {
+                "lease": lease.lease_number,
+                "lease_status": lease.status,
+                "waiting_on": [str(r) for r in forms.activation_blockers(lease)],
+                "forms": [
+                    _form_row(row)
+                    for row in lease.lease_forms.select_related("template")
+                ],
+            }
+        payload = _form_row(form)
+        if form.moveout_request_id:
+            payload["ends_tenancy_on"] = str(form.moveout_request.requested_end_date)
+        return payload
+
+    # --------------------------------------------------------- classify
+    if op == "classify":
+        template = _resolve_form_template(landlord, form_code)
+        wanted = _form_stage(stage)
+        if wanted not in {"WITH_LEASE", "ADDENDUM", "MOVE_OUT"}:
+            return _ask_form_stage(template)
+        if template.landlord_id is None:
+            return {"error": "Built-in forms already have a purpose set."}
+        if not _confirmed(confirm):
+            return _preview(
+                "manage_lease_forms",
+                {
+                    "action": "classify",
+                    "form": template.name,
+                    "stage": wanted,
+                    "means": _STAGE_WORDS[wanted],
+                },
+                "Only records what the form is for; nothing is sent to anyone.",
+            )
+        template.stage = wanted
+        template.save(update_fields=["stage", "updated_at"])
+        return {
+            "classified": True,
+            "form_code": template.code or str(template.pk),
+            "stage": wanted,
+        }
+
+    # ----------------------------------------------------------- attach
+    if op == "attach":
+        lease = _resolve_form_lease(
+            landlord, lease_query=lease_query, lease_number=lease_number
+        )
+        if str(attachment_id or "").strip():
+            template, question = _template_from_attachment(
+                landlord, attachment_id, stage=stage, title=title
+            )
+            if question is not None:
+                return question
+        else:
+            template = _resolve_form_template(landlord, form_code)
+            if str(template.stage) == "UNCLASSIFIED":
+                return _ask_form_stage(template)
+        if not template.is_selectable:
+            return {
+                "error": (
+                    f"{template.name} is in the catalogue but isn't shipped yet, "
+                    "so it can't be attached."
+                )
+            }
+
+        preview = {
+            "action": "attach",
+            "form": template.name,
+            "lease": lease.lease_number,
+            "property": lease.property.name if lease.property_id else "",
+            "stage": str(template.stage),
+            "means": _STAGE_WORDS.get(str(template.stage), ""),
+            "holds_up_activation": (
+                str(template.stage) == "WITH_LEASE"
+                and lease.status != lease.LeaseStatus.ACTIVE
+            ),
+        }
+        if not _confirmed(confirm):
+            return _preview(
+                "manage_lease_forms",
+                preview,
+                "Attaches the blank form to the lease. Nobody is emailed until "
+                "you send it.",
+            )
+        attached = forms.attach_form(
+            lease,
+            template,
+            title=title,
+            created_via=LeaseForm.CreatedVia.RAMA,
+            source_attachment_id=attachment_id,
+        )
+        # "created", not "attached": the claimed-write guard reads result flags
+        # to decide whether a turn really wrote anything, and `attached` is
+        # already used elsewhere as descriptive data about a file. A write it
+        # cannot see gets reported to the landlord as not having happened.
+        return {"created": True, **_form_row(attached)}
+
+    # ------------------------------------------------------------- send
+    if op == "send":
+        if form is None:
+            lease = _resolve_form_lease(
+                landlord, lease_query=lease_query, lease_number=lease_number
+            )
+            pending = list(
+                lease.lease_forms.filter(status=LeaseForm.Status.DRAFT).select_related(
+                    "template"
+                )
+            )
+            if not pending:
+                return {
+                    "already_done": True,
+                    "message": "Every form on that lease has already been sent.",
+                }
+            if len(pending) > 1:
+                return {
+                    "needs_input": True,
+                    "question_for_user": (
+                        "Which form should I send? "
+                        + "; ".join(f"{row.title}" for row in pending)
+                    ),
+                    "candidates": [_form_row(row) for row in pending],
+                    "relay_instruction": (
+                        "Ask question_for_user VERBATIM, then STOP and wait."
+                    ),
+                }
+            form = pending[0]
+
+        manual = {}
+        if signer_email:
+            manual["TENANT:0"] = {"name": signer_name, "email": signer_email}
+
+        roster = forms.roster_candidates(form.lease)
+        recipients = []
+        for role, index in forms.required_roles(form):
+            details = roster.get((role, index)) or {}
+            name = details.get("name") or signer_name
+            email = details.get("email") or signer_email
+            recipients.append(
+                {"role": role, "name": name or "(nobody assigned)", "email": email}
+            )
+
+        if not _confirmed(confirm):
+            return _preview(
+                "manage_lease_forms",
+                {
+                    "action": "send",
+                    "form": form.title,
+                    "lease": form.lease.lease_number,
+                    "emails": recipients,
+                },
+                "Emails each person a personal signing link they can use without "
+                "a Rentium account.",
+            )
+        forms.send_form(form, manual_signers=manual)
+        form.refresh_from_db()
+        return {"sent": True, **_form_row(form)}
+
+    # ------------------------------------------------------------- void
+    if form is None:
+        raise ValueError("Pass form_id to void a specific form.")
+    if not _confirmed(confirm):
+        return _preview(
+            "manage_lease_forms",
+            {"action": "void", "form": form.title, "lease": form.lease.lease_number},
+            "Withdraws the form. Signatures already collected are kept as "
+            "evidence but the document is no longer live.",
+        )
+    forms.void_form(form)
+    form.refresh_from_db()
+    return {"voided": True, **_form_row(form)}
+
+
+def _ask_form_stage(template) -> dict:
+    """Ask what a form is for, offering the reading OCR came up with.
+
+    A yes/no ("is this an RTB-8?") invites a weak model to answer on the
+    landlord's behalf. Three named options do not.
+    """
+    hint = ""
+    if template.suggested_stage:
+        hint = (
+            f" It reads like something {_STAGE_WORDS.get(template.suggested_stage, '')}"
+            f"{' — ' + template.suggested_purpose if template.suggested_purpose else ''}"
+        )
+    return {
+        "needs_input": True,
+        "question_for_user": (
+            f"What is {template.name} for?{hint} Is it signed with the lease, "
+            f"signed any time during the tenancy, or signed to end the tenancy?"
+        ),
+        "form_code": template.code or str(template.pk),
+        "suggested_stage": template.suggested_stage or None,
+        "relay_instruction": (
+            "Ask the landlord question_for_user VERBATIM, then STOP and wait. Do "
+            "NOT attach or classify anything yet, and do NOT pick a stage yourself."
+        ),
+    }
+
+
+def _template_from_attachment(landlord, attachment_id: str, *, stage: str, title: str):
+    """Turn a PDF the landlord sent in chat into a reusable form template.
+
+    Returns (template, question). A question means we read the file but still do
+    not know what it is for, and guessing that would decide whether an unsigned
+    document holds up somebody's tenancy.
+    """
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from rentium.leases import form_services as forms
+
+    from .models import RamaAttachment
+
+    attachment = (
+        RamaAttachment.objects.select_related("batch")
+        .filter(pk=str(attachment_id).strip(), batch__landlord=landlord)
+        .first()
+    )
+    if attachment is None:
+        raise ValueError(
+            f"No attachment {attachment_id!r} in this conversation. Ask the "
+            "landlord to send the PDF again."
+        )
+    if not str(attachment.original_filename or "").casefold().endswith(".pdf"):
+        raise ValueError("Lease forms have to be PDFs.")
+
+    attachment.original.open("rb")
+    try:
+        data = attachment.original.read()
+    finally:
+        attachment.original.close()
+
+    template, _created = forms.upload_template(
+        landlord,
+        SimpleUploadedFile(
+            attachment.original_filename, data, content_type="application/pdf"
+        ),
+        name=title,
+        stage=_form_stage(stage) if stage else "",
+    )
+    attachment.classification = RamaAttachment.Classification.DOCUMENT
+    attachment.target_type = "leases.LeaseFormTemplate"
+    attachment.target_id = str(template.pk)
+    attachment.save(update_fields=["classification", "target_type", "target_id"])
+
+    if str(template.stage) == "UNCLASSIFIED":
+        return template, _ask_form_stage(template)
+    return template, None

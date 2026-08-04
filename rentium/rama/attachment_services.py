@@ -208,7 +208,32 @@ def resolve_batch_attachments(
     return batch, list(queryset)
 
 
-def batch_chat_note(batch: RamaAttachmentBatch) -> str:
+#: Words that mean "this PDF is paperwork for a tenancy", not an expense to file.
+#: Checked against the caption the landlord sent WITH the file, never against the
+#: file itself: a landlord who says "get Sarah to sign this" has told us what
+#: they want, and a filename never has.
+_LEASE_FORM_WORDS = (
+    "sign",
+    "signature",
+    "signed",
+    "lease",
+    "tenancy",
+    "tenant",
+    "addendum",
+    "rtb-8",
+    "rtb8",
+    "mutual agreement",
+    "end the tenancy",
+    "form",
+)
+
+
+def looks_like_lease_form(caption: str) -> bool:
+    text = str(caption or "").casefold()
+    return any(word in text for word in _LEASE_FORM_WORDS)
+
+
+def batch_chat_note(batch: RamaAttachmentBatch, caption: str = "") -> str:
     rows = list(batch.attachments.order_by("sequence"))
     labels = ", ".join(
         f"{row.sequence + 1}:{row.pk}:{row.original_filename}" for row in rows
@@ -232,20 +257,34 @@ def batch_chat_note(batch: RamaAttachmentBatch) -> str:
         )
         for row in rows
     )
-    routing = (
-        "These files look like business documents (PDF/receipt/invoice). "
-        "Call catalog_business_document with attachment_id for each file "
-        "(OCR first, no scope_query required on the first call). That path "
-        "runs OCR, files the archival PDF, and can propose a maintenance "
-        "expense against the holding — never say you lack OCR or a PDF scanner. "
-        if looks_document
-        else (
+    # Third branch. A PDF sent with "get Sarah to sign this" is a tenancy
+    # document, not an expense — filing it in the document inbox would put it
+    # somewhere nobody can sign it. The caption is the only reliable signal:
+    # an RTB-8 and an invoice are both just PDFs to a file sniffer.
+    if looks_like_lease_form(caption):
+        routing = (
+            "The landlord is talking about SIGNING this, or about a lease/tenancy. "
+            "Call manage_lease_forms with action=attach, attachment_id, and the "
+            "lease (lease_query or lease_number). If you do not already know what "
+            "the form is FOR, the tool will ask — relay that question verbatim and "
+            "never pick a stage yourself. Do NOT call catalog_business_document "
+            "for this file: it is paperwork to be signed, not an expense to file. "
+        )
+    elif looks_document:
+        routing = (
+            "These files look like business documents (PDF/receipt/invoice). "
+            "Call catalog_business_document with attachment_id for each file "
+            "(OCR first, no scope_query required on the first call). That path "
+            "runs OCR, files the archival PDF, and can propose a maintenance "
+            "expense against the holding — never say you lack OCR or a PDF scanner. "
+        )
+    else:
+        routing = (
             "DEFAULT: business document path. Call catalog_business_document "
             "with attachment_id ONLY first (OCR). Do NOT assume listing/"
             "inspection photos and do NOT call attach_photo_to_listing unless "
             "the landlord clearly said gallery/listing/main photo/for Room X. "
         )
-    )
     return (
         f"\n\n[RAMA attachment batch {batch.pk}; exactly {len(rows)} file(s); "
         f"items={labels}]\n"

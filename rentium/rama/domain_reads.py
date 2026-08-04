@@ -1118,7 +1118,7 @@ def list_documents(
     lease_id: str = "",
     limit: int = 50,
 ) -> dict:
-    from rentium.leases.models import Lease, LeaseDocument
+    from rentium.leases.models import Lease, LeaseDocument, LeaseForm
 
     today = date.today()
     rows = []
@@ -1163,6 +1163,51 @@ def list_documents(
                 "uploaded_at": doc.uploaded_at.isoformat()
                 if doc.uploaded_at
                 else None,
+            }
+        )
+
+    # Form packs: the documents that are actually SIGNABLE, with who still owes
+    # a signature. LeaseDocument above is a passive upload with a landlord-set
+    # `is_signed` flag; these carry real signature state, which is what a
+    # landlord asking "what's outstanding?" means.
+    form_qs = LeaseForm.objects.filter(lease__landlord=landlord).select_related(
+        "lease", "lease__property", "lease__group", "template"
+    )
+    if lease_id:
+        form_qs = form_qs.filter(lease_id=lease_id)
+    if pq:
+        form_qs = form_qs.filter(
+            Q(lease__property__name__icontains=pq)
+            | Q(lease__group__name__icontains=pq)
+            | Q(title__icontains=pq)
+            | Q(lease__lease_number__icontains=pq)
+        )
+    for form in form_qs.order_by("-created_at")[: max(1, min(limit, 100))]:
+        place = (
+            form.lease.property.name
+            if form.lease.property_id
+            else (form.lease.group.name if form.lease.group_id else "")
+        )
+        rows.append(
+            {
+                "kind": "lease_form",
+                "id": str(form.pk),
+                "title": form.title,
+                "form_code": form.template.code or "",
+                "stage": str(form.template.stage),
+                "purpose": form.template.purpose,
+                "status": form.status,
+                "blocking_the_lease": form.blocks_activation,
+                "signed_by": [s.display_name for s in form.signers.all() if s.has_signed],
+                "waiting_on": [
+                    s.display_name
+                    for s in form.signers.all()
+                    if not s.has_signed and not s.declined_at
+                ],
+                "lease_id": str(form.lease_id),
+                "lease_number": form.lease.lease_number or "",
+                "property": place,
+                "uploaded_at": form.created_at.isoformat() if form.created_at else None,
             }
         )
 

@@ -40,6 +40,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from rentium.leases.form_services import ensure_mutual_agreement_form
 from rentium.leases.inspection_services import agreed_deductions
 from rentium.leases.models import Lease
 from rentium.leases.models import MoveOutRequest
@@ -277,6 +278,10 @@ class MoveOutViewSet(viewsets.ModelViewSet):
             )
             mo.sign(as_landlord=False)
             mo.save()
+            # The province's written agreement (RTB-8 in BC) is the document
+            # this request is asking for. Attaching it here means the landlord
+            # has something to send rather than a status row with no paper.
+            ensure_mutual_agreement_form(mo, actor=request.user)
             mo._publish("lease.moveout_requested")
             return Response(
                 self.get_serializer(mo).data, status=status.HTTP_201_CREATED
@@ -350,6 +355,7 @@ class MoveOutViewSet(viewsets.ModelViewSet):
         )
         mo.sign(as_landlord=True)
         mo.save()
+        ensure_mutual_agreement_form(mo, actor=request.user)
         mo._publish("lease.moveout_requested")
         return Response(self.get_serializer(mo).data, status=status.HTTP_201_CREATED)
 

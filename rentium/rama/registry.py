@@ -177,6 +177,7 @@ TOOL_FUNCTIONS: tuple[Callable, ...] = (
     tool_functions.assign_property_to_group,
     tool_functions.create_lease,
     tool_functions.update_lease,
+    landlord_capabilities.manage_lease_forms,
     landlord_capabilities.update_lease_roster,
     tool_functions.delete_draft_lease,
     tool_functions.terminate_lease,

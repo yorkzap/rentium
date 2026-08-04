@@ -279,6 +279,68 @@ Lease invitations additionally have an append-only `LeaseInviteEvent` stream:
 described as proof that the recipient read the lease. RAMA and the lease API
 project the same lifecycle facts.
 
+## Lease form packs (August 2026)
+
+A tenancy is executed against one document — the agreement rendered by
+`leases/documents.py`. Form packs are the extra paper a real tenancy needs:
+BC's RTB-8, a pet addendum, a guarantor form, a landlord's own PDF.
+
+```text
+LeaseFormTemplate          catalogue entry (system form, or a landlord's upload)
+  └── LeaseFormPlacement   reusable field boxes, in page fractions
+LeaseForm                  one template attached to one lease
+  ├── placements_snapshot  frozen at attach time
+  ├── LeaseFormSigner      who signs; carries the public sign_token
+  ├── LeaseFormSignature   immutable evidence, one per signature
+  └── LeaseFormEvent       immutable lifecycle stream
+```
+
+**Stage is what makes a form mean something.** `WITH_LEASE` is part of executing
+the lease and an unsigned one blocks `check_and_activate()`; `ADDENDUM` is
+signed at any point and never blocks; `MOVE_OUT` (RTB-8) ends a tenancy and
+drives `MoveOutRequest`. A form attached to an already-ACTIVE lease is recorded
+as outstanding and raises an attention item, but never pushes that lease
+backwards. `form_services.blocking_forms` is the single source of truth, read by
+the FSM, the attention feed, the lease API and RAMA.
+
+**Nothing infers a stage.** `form_intel.suggest_form_purpose` reads OCR text and
+form-field names, scores the evidence deterministically, and writes only
+`suggested_stage`. A human — in the picker, or by answering RAMA's
+`question_for_user` — promotes it. The same rule the document inbox applies to
+amounts.
+
+**Rendering.** `form_render` reads geometry and AcroForm widgets with pypdf,
+rasterises pages with Ghostscript (already present for OCRmyPDF), and stamps a
+reportlab overlay. Output is always flattened: `/AcroForm` and every page's
+`/Annots` are removed, so an executed document has no editable layer. AcroForm
+widgets are used only to derive suggested placements, never to fill — one code
+path for a government form and a scanned addendum. Placements are page
+fractions (0..1, top-left origin), the only representation that survives a
+browser at arbitrary zoom.
+
+**Signing.** Lease parties sign in-app; anyone else uses `/sign/<sign_token>`, a
+single-slot, single-use, expiring capability under `/api/public/`. The lease
+itself is still not signable without an account. Every signature stores the
+typed legal name, timestamp, IP, user agent, and the checksums of both the blank
+form and the values shown — more than the lease-signing path records. On the
+last required signature the form is stamped once, hashed, and stored;
+`render_form_pdf` returns those bytes forever after, never a re-render.
+
+`send_form` refuses while any required non-signature field is blank: a mutual
+agreement to end a tenancy with no end date on it is not a document anyone
+should be asked to sign. Signatures fill signature boxes and date-signed boxes
+(`auto_source=today`) and nothing else — they never populate an empty name box,
+because a single name string cannot honestly fill a form that splits first and
+last names.
+
+No lease-form file is served from `FileField.url`; production sets
+`AWS_QUERYSTRING_AUTH = False`, so bytes go through auth- or token-gated views.
+
+RAMA reaches all of this through one confirm-gated tool, `manage_lease_forms`
+(`risk="legal"`, `own_confirm`, `autonomy=NEVER`). A PDF sent in chat with
+signing/lease wording routes to it rather than to `catalog_business_document` —
+the third branch in `batch_chat_note` and the attachment focus block.
+
 ## Document intelligence
 
 `RamaDocument` is the document inbox record. Uploads preserve the original

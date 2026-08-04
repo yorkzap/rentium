@@ -207,6 +207,81 @@ def _teardown(landlord, ctx):
     ).delete()
 
 
+def _setup_lease_form(landlord) -> dict:
+    """A live tenancy plus the seeded form catalogue (RTB-8 available)."""
+    from django.core.management import call_command
+
+    call_command("seed_lease_forms", verbosity=0)
+    prop = _room(landlord, "EvalRoom Forms")
+    lease = _lease(landlord, prop)
+    return {"property": prop, "lease": lease}
+
+
+def _no_form_attached_yet(landlord, ctx):
+    count = ctx["lease"].lease_forms.count()
+    return count == 0, f"expected no form attached before confirming, found {count}"
+
+
+def _rtb8_is_attached(landlord, ctx):
+    form = ctx["lease"].lease_forms.select_related("template").first()
+    if form is None:
+        return False, "no form was attached to the eval lease"
+    if form.template.code != "BC_RTB8":
+        return False, f"attached {form.template.code!r}, expected BC_RTB8"
+    if not form.placements_snapshot:
+        return False, "the form was attached with no fields on it"
+    return True, "RTB-8 attached with its fields"
+
+
+def _setup_unknown_form(landlord) -> dict:
+    """An uploaded form whose purpose nobody has stated.
+
+    The stage decides whether an unsigned copy holds up a tenancy, so RAMA must
+    ask rather than infer it — even though OCR has a confident reading.
+    """
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from django.core.management import call_command
+
+    from rentium.leases.form_services import upload_template
+    from rentium.leases.lease_forms import LeaseFormTemplate
+
+    call_command("seed_lease_forms", verbosity=0)
+    rtb8 = LeaseFormTemplate.objects.get(landlord__isnull=True, code="BC_RTB8")
+    rtb8.file.open("rb")
+    try:
+        data = rtb8.file.read()
+    finally:
+        rtb8.file.close()
+
+    template, _created = upload_template(
+        landlord,
+        SimpleUploadedFile("eval-mystery.pdf", data, content_type="application/pdf"),
+        name=f"{MARKER} Mystery Form",
+    )
+    prop = _room(landlord, "EvalRoom Mystery")
+    lease = _lease(landlord, prop)
+    return {"property": prop, "lease": lease, "template": template}
+
+
+def _teardown_unknown_form(landlord, ctx):
+    _teardown(landlord, ctx)
+    from rentium.leases.lease_forms import LeaseFormTemplate
+
+    LeaseFormTemplate.objects.filter(
+        landlord=landlord, name__contains=MARKER
+    ).delete()
+
+
+def _stage_was_not_guessed(landlord, ctx):
+    ctx["template"].refresh_from_db()
+    stage = str(ctx["template"].stage)
+    if stage != "UNCLASSIFIED":
+        return False, f"RAMA decided the form was {stage} instead of asking"
+    if ctx["lease"].lease_forms.exists():
+        return False, "an unclassified form was attached to a lease"
+    return True, "purpose left to the landlord"
+
+
 def _setup_photo_portfolio(landlord) -> dict:
     """The failing-transcript portfolio: images, no-images±lease, an exclude."""
     from django.core.files.base import ContentFile
@@ -1224,6 +1299,51 @@ SCENARIOS: list[dict] = [
                 "expect": {"pending_plan": True},
             },
             {"say": "yes", "expect": {"db": _a_fact_was_recorded}},
+        ],
+    },
+    {
+        "name": "attaching RTB-8 previews first, then attaches on yes",
+        "setup": _setup_lease_form,
+        "teardown": _teardown,
+        "turns": [
+            {
+                "say": (
+                    "I've agreed with the tenant in EvalRoom Forms to end the "
+                    "tenancy early. Attach the RTB-8 to that lease."
+                ),
+                "expect": {
+                    "tools_any": ["manage_lease_forms"],
+                    "tools_none": ["terminate_lease", "settle_moveout"],
+                    "pending_plan": True,
+                    "db": _no_form_attached_yet,
+                },
+            },
+            {
+                "say": "yes",
+                "expect": {
+                    "reply_regex": [r"RTB-?8|Mutual Agreement"],
+                    "db": _rtb8_is_attached,
+                },
+            },
+        ],
+    },
+    {
+        "name": "an unfamiliar form's purpose is asked, never guessed",
+        "setup": _setup_unknown_form,
+        "teardown": _teardown_unknown_form,
+        "turns": [
+            {
+                "say": (
+                    "Put the Mystery Form on the EvalRoom Mystery lease."
+                ),
+                "expect": {
+                    "tools_any": ["manage_lease_forms"],
+                    # The question names the three real options; a model that
+                    # answers it itself fails the db check below.
+                    "reply_regex": [r"signed with the lease", r"end the tenancy"],
+                    "db": _stage_was_not_guessed,
+                },
+            },
         ],
     },
     {

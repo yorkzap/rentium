@@ -179,6 +179,51 @@ def _stalled_signatures(landlord) -> list[ActionItem]:
     return items
 
 
+def _unsigned_lease_forms(landlord) -> list[ActionItem]:
+    """Attached forms nobody has finished signing.
+
+    Two severities, because they are two different problems. A form that is
+    holding up activation is urgent: rent isn't being charged and the tenant
+    can't move in, and the landlord's screen otherwise just shows a lease
+    stubbornly refusing to go active. A form outstanding on a tenancy that is
+    already running is only informational — the tenancy works, the paperwork
+    is behind.
+    """
+    from rentium.leases.lease_forms import LeaseForm
+
+    items: list[ActionItem] = []
+    rows = (
+        LeaseForm.objects.filter(lease__landlord=landlord, required=True)
+        .exclude(status__in=[LeaseForm.Status.COMPLETED, LeaseForm.Status.VOID])
+        .select_related("lease", "lease__property", "lease__group", "template")
+    )
+    for form in rows:
+        blocking = form.blocks_activation
+        waiting = [
+            signer.display_name
+            for signer in form.signers.filter(
+                signed_at__isnull=True, declined_at__isnull=True
+            )
+        ]
+        who = ", ".join(waiting) if waiting else "nobody has been sent it yet"
+        items.append(
+            ActionItem(
+                key=f"lease.form:{form.pk}",
+                severity="urgent" if blocking else "info",
+                title=(
+                    f"{form.title} is holding up the lease"
+                    if blocking
+                    else f"{form.title} is still unsigned"
+                ),
+                detail=f"{_place(form.lease)} — waiting on {who}",
+                url=f"/dashboard/leases/{form.lease_id}",
+                due_date=form.lease.start_date if blocking else None,
+                source="lease",
+            )
+        )
+    return items
+
+
 def _expiring_leases(landlord) -> list[ActionItem]:
     from rentium.leases.models import Lease
 
@@ -359,6 +404,7 @@ SOURCES = (
     _missing_move_in_inspections,
     _inspection_delivery_due,
     _stalled_signatures,
+    _unsigned_lease_forms,
     _expiring_leases,
     _overdue_charges,
     _stale_work_orders,

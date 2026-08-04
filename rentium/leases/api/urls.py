@@ -4,9 +4,17 @@ from rest_framework_nested import routers
 
 from .document_views import lease_document
 from .document_views import lease_pdf
+from .form_views import LeaseFormTemplateViewSet
+from .form_views import LeaseFormViewSet
+from .form_views import lease_activation_status
 from .inspection_views import ConditionInspectionViewSet
 from .moveout_views import MoveOutViewSet
 from .moveout_views import lease_moveout_rules
+from .public_form_views import public_form_decline
+from .public_form_views import public_form_detail
+from .public_form_views import public_form_page
+from .public_form_views import public_form_pdf
+from .public_form_views import public_form_sign
 from .views import LeaseDocumentViewSet
 from .views import LeaseTenantViewSet
 from .views import LeaseViewSet
@@ -34,6 +42,10 @@ leases_router.register("payments", PaymentViewSet, basename="lease-payment")
 leases_router.register(
     "rent-adjustments", RentAdjustmentViewSet, basename="rent-adjustment"
 )
+leases_router.register(
+    "form-templates", LeaseFormTemplateViewSet, basename="lease-form-template"
+)
+leases_router.register("forms", LeaseFormViewSet, basename="lease-form")
 leases_router.register("inspections", ConditionInspectionViewSet, basename="inspection")
 leases_router.register("moveouts", MoveOutViewSet, basename="lease-moveout")
 leases_router.register(
@@ -99,10 +111,51 @@ urlpatterns = [
     # used to live on LeaseViewSet (see the deletion note below).
     path("<uuid:lease_id>/document/", lease_document, name="lease-document-render"),
     path("<uuid:lease_id>/pdf/", lease_pdf, name="lease-pdf"),
+    # "Why hasn't this lease activated?" — including any form pack it waits on.
+    path(
+        "<uuid:lease_id>/activation-status/",
+        lease_activation_status,
+        name="lease-activation-status",
+    ),
     path("", include(leases_router.urls)),
     path("", include(lease_nested_router.urls)),
     path("", include(lease_tenant_nested_router.urls)),
     path("", include(payment_nested_router.urls)),
+]
+
+# --- PUBLIC, UNAUTHENTICATED (mounted under /api/public/ by config/urls.py) ---
+#
+# Signing an attached form does not require a Rentium account. The lease itself
+# still does — an account is worth the friction for the document a tenant needs
+# ongoing access to. A guarantor putting their name on one page is not.
+# `sign_token` is a single-slot, single-use, expiring capability; see
+# leases/api/public_form_views.py for the full reasoning.
+public_urlpatterns = [
+    path(
+        "lease-forms/<uuid:token>/",
+        public_form_detail,
+        name="public-lease-form",
+    ),
+    path(
+        "lease-forms/<uuid:token>/pdf/",
+        public_form_pdf,
+        name="public-lease-form-pdf",
+    ),
+    path(
+        "lease-forms/<uuid:token>/page/<int:page>/",
+        public_form_page,
+        name="public-lease-form-page",
+    ),
+    path(
+        "lease-forms/<uuid:token>/sign/",
+        public_form_sign,
+        name="public-lease-form-sign",
+    ),
+    path(
+        "lease-forms/<uuid:token>/decline/",
+        public_form_decline,
+        name="public-lease-form-decline",
+    ),
 ]
 
 # --- Endpoint summary this produces (all under /api/leases/...) ---

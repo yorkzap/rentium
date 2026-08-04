@@ -12,6 +12,7 @@ from drf_spectacular.views import SpectacularSwaggerView
 
 from rentium.appointments.api import urls as appointments_urls
 from rentium.comms.api import urls as comms_urls
+from rentium.leases.api import urls as leases_urls
 from rentium.messaging.api import urls as messaging_urls
 from rentium.showcase.api import urls as showcase_urls
 from rentium.users.api.views import CustomObtainAuthToken
@@ -154,6 +155,16 @@ urlpatterns += [
         include(
             (messaging_urls.public_urlpatterns, "messaging_public"),
             namespace="messaging_public",
+        ),
+    ),
+    # Signing an attached form (RTB-8, an addendum) without an account: auth is
+    # a single-slot, single-use, expiring sign_token in the URL. The lease
+    # itself is NOT signable this way — see leases/api/public_form_views.py.
+    path(
+        "api/public/",
+        include(
+            (leases_urls.public_urlpatterns, "leases_public"),
+            namespace="leases_public",
         ),
     ),
     # Landlord-authenticated showcase surface: the opt-in settings page, the

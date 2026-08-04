@@ -55,6 +55,7 @@ GENERAL_WRITE_TOOLS: tuple[str, ...] = (
     "rebalance_lease_rents",
     "create_lease",
     "landlord_sign_lease",
+    "manage_lease_forms",
     "terminate_lease",
     "adjust_lease",
     "renew_lease",

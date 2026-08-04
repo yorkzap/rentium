@@ -387,6 +387,12 @@ TOOL_META: dict[str, ToolMeta] = {
         risk="legal", own_confirm=True, blockers=terminate_lease_blockers
     ),
     "landlord_sign_lease": ToolMeta(risk="legal", own_confirm=True),
+    # Attaches and sends documents that are part of a tenancy agreement, and can
+    # hold up (or end) a tenancy. Same class as signing the lease: its own
+    # confirmation, never inside an autonomous batch.
+    "manage_lease_forms": ToolMeta(
+        risk="legal", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
     # ------------------------------------------------------- lease roster
     "invite_tenant_to_lease": ToolMeta(risk="medium"),
     "resend_lease_invite": ToolMeta(risk="low"),

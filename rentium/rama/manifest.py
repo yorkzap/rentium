@@ -404,12 +404,39 @@ BUSINESS_DOCUMENT = EntitySpec(
     ),
 )
 
+LEASE_FORM = EntitySpec(
+    key="lease_form",
+    model="leases.LeaseForm",
+    label="Lease form (RTB-8, addendum)",
+    scope_path="lease__landlord",
+    lookup=("title", "lease__lease_number", "template__code"),
+    label_field="title",
+    # Every field is read-only. A form's title, status and stage are all facts
+    # about a document people sign; changing any of them through a generic
+    # `update` would edit the paperwork out from under a signature. Writes go
+    # through manage_lease_forms, which previews and confirms.
+    fields=[
+        FieldSpec("title", "Title"),
+        FieldSpec("status", "Status", "enum", display="get_status_display"),
+        FieldSpec("blocks_activation", "Holding up the lease", "bool"),
+        FieldSpec("required", "Required", "bool"),
+        FieldSpec("completed_at", "Fully signed on", "date"),
+        FieldSpec("created_at", "Attached on", "date"),
+    ],
+    links=LinkSpec(
+        page="/dashboard/leases/{lease_id}",
+        lookup=("id", "title"),
+        label_field="title",
+        downloads=("signed PDF",),
+    ),
+)
+
 MANIFEST: dict[str, EntitySpec] = {
     e.key: e
     for e in (
         PROPERTY, LEASE, LEASE_TENANT, WORK_ORDER, INQUIRY, APPOINTMENT,
         LEDGER_ENTRY, INSPECTION, INVENTORY, CONVERSATION, PROPERTY_GROUP,
-        BUSINESS_DOCUMENT,
+        BUSINESS_DOCUMENT, LEASE_FORM,
     )
 }
 

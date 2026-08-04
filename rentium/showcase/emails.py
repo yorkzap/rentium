@@ -117,3 +117,41 @@ def send_tenant_invite(lease_tenant):
             "invite_url": url,
         },
     )
+
+
+def send_lease_form_signature_request(form, signer):
+    """The signing link for one attached form (RTB-8, an addendum, anything).
+
+    Separate from send_tenant_invite because it is a different ask with a
+    different consequence: the invite says "here is a lease, decide", this says
+    "here is one document, sign it", and when the form is what a lease is
+    waiting on, the mail has to say so — otherwise a tenant who already signed
+    the lease has no way to know anything is outstanding.
+    """
+    from rentium.leases.form_services import frontend_base_url
+
+    email = signer.email or (signer.user.email if signer.user_id else "")
+    if not email:
+        return False
+
+    lease = form.lease
+    template = form.template
+    return send(
+        "lease_form_signature_request",
+        to=[email],
+        subject=f"{lease.landlord.user.name} needs your signature on {form.title}",
+        context={
+            "name": signer.display_name,
+            "landlord_name": lease.landlord.user.name,
+            "form_title": form.title,
+            "purpose": template.purpose or template.suggested_purpose,
+            "blocks_activation": form.blocks_activation,
+            "property_label": (
+                lease.property.name
+                if lease.property_id
+                else (lease.group.name if lease.group_id else lease.lease_number)
+            ),
+            "sign_url": signer.sign_url(frontend_base_url()),
+            "expires_on": signer.token_expires_at,
+        },
+    )

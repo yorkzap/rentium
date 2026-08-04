@@ -21,6 +21,14 @@ from .inspections import InspectionItem  # noqa: E402,F401
 from .inspections import InspectionKeyRow  # noqa: E402,F401
 from .inspections import InspectionTemplate  # noqa: E402,F401
 from .inspections import InspectionTemplateItem  # noqa: E402,F401
+from .lease_forms import FormStage  # noqa: E402,F401
+from .lease_forms import LeaseForm  # noqa: E402,F401
+from .lease_forms import LeaseFormEvent  # noqa: E402,F401
+from .lease_forms import LeaseFormPlacement  # noqa: E402,F401
+from .lease_forms import LeaseFormSignature  # noqa: E402,F401
+from .lease_forms import LeaseFormSigner  # noqa: E402,F401
+from .lease_forms import LeaseFormTemplate  # noqa: E402,F401
+from .lease_forms import SignerRole  # noqa: E402,F401
 from .moveout import MoveOutRequest  # noqa: E402,F401
 from .occupancy import Occupancy  # noqa: E402,F401
 
@@ -578,6 +586,14 @@ class Lease(AgreementTerms):
         jurisdiction and the actual lease document text. Confirm this
         matches the legal agreement's own wording before relying on it.
         Idempotent / safe to call repeatedly.
+
+        --- Attached forms ---
+        A landlord can attach extra documents to a lease (a pet addendum, a
+        guarantor form). Those marked "signed with the lease" are part of what
+        is being executed, so an unsigned one holds activation here rather than
+        letting a tenancy start on half its paperwork. Only forms attached
+        BEFORE the lease went live can block — see form_services.attach_form,
+        which never lets a form drag an already-ACTIVE lease backwards.
         """
         if self.status != Lease.LeaseStatus.PENDING_SIGNATURES:
             return False
@@ -587,6 +603,10 @@ class Lease(AgreementTerms):
         all_co_landlords_signed = not self.landlord_signatories.filter(
             has_signed=False
         ).exists()
+        from rentium.leases.form_services import blocking_forms
+
+        if blocking_forms(self).exists():
+            return False
         if self.landlord_signed and all_co_landlords_signed and any_tenant_signed:
             self.status = Lease.LeaseStatus.ACTIVE
             self.save(update_fields=["status", "updated_at"])
