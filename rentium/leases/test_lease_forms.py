@@ -862,3 +862,73 @@ def test_a_repeated_label_still_says_which_block_it_means(landlord, bc_property,
     # A label that appears once is left alone — "Landlord's time" would be a
     # worse name for the hour the tenant vacates than "time" is.
     assert "time" in missing
+
+
+# ---------------------------------------------------------------------------
+# Sign first, then send — the order a landlord actually works in
+# ---------------------------------------------------------------------------
+
+
+def test_the_landlord_can_sign_before_the_form_is_sent(pending_lease, rtb8):
+    """Signer rows used to appear only inside send_form.
+
+    So the order was: email the tenant a link to a document with an empty
+    landlord signature, and only then get the ability to sign it yourself.
+    """
+    form = svc.attach_form(pending_lease, rtb8)
+
+    assert form.status == LeaseForm.Status.DRAFT
+    me = svc.signer_for_user(form, pending_lease.landlord.user)
+    assert me is not None, "the landlord must be able to sign their own form"
+
+    svc.sign_form(me, typed_name="Raj Singh")
+    assert svc.rendered_values(form)["signature6"] == "Raj Singh"
+
+
+def test_slots_the_lease_cannot_fill_stay_unbound(landlord, bc_property, rtb8):
+    """A tenant nobody has invited yet is still nobody."""
+    lease = Lease.objects.create(
+        landlord=landlord,
+        property=bc_property,
+        lease_type=Lease.LeaseType.BC_RESIDENTIAL_TENANCY,
+        status=Lease.LeaseStatus.DRAFT,
+        start_date=date.today(),
+        is_month_to_month=True,
+        total_rent="900.00",
+    )
+    form = svc.attach_form(lease, rtb8)
+
+    assert form.signers.filter(role=SignerRole.LANDLORD).exists()
+    assert not form.signers.filter(role=SignerRole.TENANT).exists()
+
+
+def test_a_token_that_was_never_sent_does_not_work(pending_lease, rtb8):
+    """Rows now exist before anything is emailed, so an unissued credential
+    must not authenticate."""
+    form = svc.attach_form(pending_lease, rtb8)
+    signer = form.signers.get(role=SignerRole.TENANT, order=0)
+
+    assert signer.sent_at is None
+    assert signer.token_is_live is False
+
+    svc.send_form(_fill_required(form), notify=False)
+    signer.refresh_from_db()
+    assert signer.sent_at is not None
+    assert signer.token_is_live is True
+
+
+def test_signing_first_then_sending_leaves_only_the_tenant_outstanding(
+    pending_lease, rtb8
+):
+    form = svc.attach_form(pending_lease, rtb8)
+    svc.sign_form(
+        svc.signer_for_user(form, pending_lease.landlord.user), typed_name="Raj Singh"
+    )
+    svc.send_form(_fill_required(form), notify=False)
+    form.refresh_from_db()
+
+    outstanding = [s.display_name for s in form.signers.filter(signed_at__isnull=True)]
+    assert len(outstanding) == 1
+    assert form.status == LeaseForm.Status.PARTIALLY_SIGNED
+    # The landlord's earlier signature survives being sent.
+    assert form.signatures.get().typed_name == "Raj Singh"

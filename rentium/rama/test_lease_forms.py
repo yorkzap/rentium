@@ -224,7 +224,12 @@ def test_sending_previews_who_will_be_emailed(landlord, lease, catalogue):
 
     assert result["needs_confirm"] is True
     assert result["preview"]["emails"]
-    assert not form.signers.exists()
+    # Signer rows exist from attach time now, so the landlord can sign before
+    # sending. What a preview must not do is SEND: nothing is stamped as sent,
+    # so no link is live and no email has gone anywhere.
+    assert form.signers.exists()
+    assert not form.signers.filter(sent_at__isnull=False).exists()
+    assert not any(signer.token_is_live for signer in form.signers.all())
 
 
 def test_a_form_that_is_not_shipped_cannot_be_attached(landlord, lease, catalogue):

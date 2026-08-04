@@ -555,6 +555,8 @@ def attach_form(
         form.values.update(_moveout_values(form, moveout_request))
     form.save(update_fields=["values", "updated_at"])
 
+    bind_known_signers(form)
+
     record_form_event(
         form,
         LeaseFormEvent.Kind.CREATED,
@@ -717,6 +719,41 @@ def roster_candidates(lease) -> dict[tuple[str, int], dict]:
             "phone": _tenant_phone(lease_tenant),
         }
     return candidates
+
+
+def bind_known_signers(form: LeaseForm) -> list[LeaseFormSigner]:
+    """Create a signer row for every slot the lease can already fill.
+
+    Called at attach time, so the landlord can sign their own document straight
+    away. Signer rows used to appear only inside send_form, which meant the
+    order of operations was: email the tenant a link to an unsigned form, and
+    only then get a Sign button yourself. The real order is the reverse — you
+    sign, then send it to be countersigned — and an RTB-8 with an empty landlord
+    signature is not something to be asking a tenant to agree to.
+
+    Binds nobody it does not know. A slot with no one on the lease stays empty
+    until send_form is given a name and email for it.
+    """
+    roster = roster_candidates(form.lease)
+    bound: list[LeaseFormSigner] = []
+    for role, index in required_roles(form):
+        details = roster.get((role, index))
+        if not details or not (details.get("email") or details.get("user")):
+            continue
+        signer = form.signers.filter(role=role, order=index).first()
+        if signer is None:
+            signer = LeaseFormSigner(form=form, role=role, order=index)
+        elif signer.has_signed:
+            bound.append(signer)
+            continue
+        signer.lease_tenant = details.get("lease_tenant")
+        signer.landlord_signatory = details.get("landlord_signatory")
+        signer.user = details.get("user")
+        signer.name = (details.get("name") or "")[:200]
+        signer.email = (details.get("email") or "")[:254]
+        signer.save()
+        bound.append(signer)
+    return bound
 
 
 @transaction.atomic

@@ -564,6 +564,16 @@ class LeaseFormSigner(models.Model):
 
     @property
     def token_is_live(self) -> bool:
+        """Whether the public signing link works right now.
+
+        Signer rows are created when a form is attached, so the landlord can
+        sign their own document before sending it. That means a row — and its
+        token — can exist for somebody who has never been sent anything, and a
+        credential that was never issued must not authenticate. `sent_at` is
+        what marks it issued.
+        """
+        if not self.sent_at:
+            return False
         if self.declined_at or self.signed_at:
             return False
         if self.token_expires_at and self.token_expires_at < timezone.now():
