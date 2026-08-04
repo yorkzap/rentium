@@ -960,6 +960,48 @@ def decline_form(
     return signer
 
 
+def signer_for_user(form: LeaseForm, user) -> LeaseFormSigner | None:
+    """Which signature slot belongs to this logged-in person, if any.
+
+    Matched by linked account first, then by lease-tenant, then by the landlord
+    owning the lease, then by email — so somebody who signed up after the link
+    was sent still lands on their own slot rather than being told the form is
+    not theirs. Returns None rather than raising, because "can this person sign"
+    is a question the UI asks about every form it lists.
+    """
+    if not getattr(user, "pk", None):
+        return None
+    signers = list(form.signers.all())
+
+    for signer in signers:
+        if signer.user_id and signer.user_id == user.pk:
+            return signer
+
+    tenant_profile = getattr(user, "tenant_profile", None)
+    if tenant_profile:
+        for signer in signers:
+            if (
+                signer.lease_tenant_id
+                and signer.lease_tenant.tenant_id == tenant_profile.pk
+            ):
+                return signer
+
+    landlord_profile = getattr(user, "landlord_profile", None)
+    if landlord_profile and form.lease.landlord_id == landlord_profile.pk:
+        owner_slot = next(
+            (s for s in signers if s.role == SignerRole.LANDLORD), None
+        )
+        if owner_slot is not None:
+            return owner_slot
+
+    email = (getattr(user, "email", "") or "").casefold()
+    if email:
+        for signer in signers:
+            if signer.email and signer.email.casefold() == email:
+                return signer
+    return None
+
+
 def signature_images_for(form: LeaseForm) -> dict[str, bytes]:
     """Drawn-signature PNGs, keyed by the placement they belong in."""
     images: dict[str, bytes] = {}

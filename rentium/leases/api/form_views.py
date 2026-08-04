@@ -287,10 +287,10 @@ class LeaseFormViewSet(viewsets.ViewSet):
             .prefetch_related("signers")
             .order_by("-created_at")
         )
-        return Response(LeaseFormSerializer(rows, many=True).data)
+        return Response(LeaseFormSerializer(rows, many=True, context={"request": request}).data)
 
     def retrieve(self, request, pk=None):
-        return Response(LeaseFormSerializer(_form_for(request, pk)).data)
+        return Response(LeaseFormSerializer(_form_for(request, pk), context={"request": request}).data)
 
     def create(self, request):
         lease = _lease_for_landlord(request, request.data.get("lease"))
@@ -306,7 +306,7 @@ class LeaseFormViewSet(viewsets.ViewSet):
         except DjangoValidationError as exc:
             raise _translate(exc) from exc
         return Response(
-            LeaseFormSerializer(form).data, status=status.HTTP_201_CREATED
+            LeaseFormSerializer(form, context={"request": request}).data, status=status.HTTP_201_CREATED
         )
 
     @action(detail=True, methods=["post"])
@@ -330,7 +330,7 @@ class LeaseFormViewSet(viewsets.ViewSet):
         base = svc.frontend_base_url()
         return Response(
             {
-                "form": LeaseFormSerializer(form).data,
+                "form": LeaseFormSerializer(form, context={"request": request}).data,
                 "links": {
                     f"{signer.role}:{signer.order}": signer.sign_url(base)
                     for signer in form.signers.all()
@@ -369,7 +369,7 @@ class LeaseFormViewSet(viewsets.ViewSet):
         except DjangoValidationError as exc:
             raise _translate(exc) from exc
         form.refresh_from_db()
-        return Response(LeaseFormSerializer(form).data)
+        return Response(LeaseFormSerializer(form, context={"request": request}).data)
 
     @action(detail=True, methods=["post"])
     def void(self, request, pk=None):
@@ -380,7 +380,7 @@ class LeaseFormViewSet(viewsets.ViewSet):
             )
         except DjangoValidationError as exc:
             raise _translate(exc) from exc
-        return Response(LeaseFormSerializer(form).data)
+        return Response(LeaseFormSerializer(form, context={"request": request}).data)
 
     @action(detail=True, methods=["patch"], url_path="values")
     def set_values(self, request, pk=None):
@@ -409,7 +409,7 @@ class LeaseFormViewSet(viewsets.ViewSet):
             )
         form.values.update({key: str(value) for key, value in updates.items()})
         form.save(update_fields=["values", "updated_at"])
-        return Response(LeaseFormSerializer(form).data)
+        return Response(LeaseFormSerializer(form, context={"request": request}).data)
 
     @action(detail=True, methods=["get"])
     def events(self, request, pk=None):
@@ -444,33 +444,11 @@ class LeaseFormViewSet(viewsets.ViewSet):
 
 
 def _signer_for_user(form: LeaseForm, user):
-    """Which signature slot belongs to the logged-in caller.
-
-    Matched by linked account first and email second, so a tenant who signs up
-    after the link was sent still lands on their own slot rather than being told
-    the form is not theirs.
-    """
-    signers = form.signers.all()
-    for signer in signers:
-        if signer.user_id and signer.user_id == user.pk:
-            return signer
-    tenant_profile = getattr(user, "tenant_profile", None)
-    if tenant_profile:
-        for signer in signers:
-            if (
-                signer.lease_tenant_id
-                and signer.lease_tenant.tenant_id == tenant_profile.pk
-            ):
-                return signer
-    landlord_profile = getattr(user, "landlord_profile", None)
-    if landlord_profile and form.lease.landlord_id == landlord_profile.pk:
-        landlord_slot = form.signers.filter(role="LANDLORD").first()
-        if landlord_slot:
-            return landlord_slot
-    for signer in signers:
-        if signer.email and signer.email.casefold() == (user.email or "").casefold():
-            return signer
-    raise PermissionDenied("This form isn't waiting on your signature.")
+    """Which signature slot belongs to the caller, or 403."""
+    signer = svc.signer_for_user(form, user)
+    if signer is None:
+        raise PermissionDenied("This form isn't waiting on your signature.")
+    return signer
 
 
 def _client_ip(request) -> str:
@@ -503,7 +481,9 @@ def lease_activation_status(request, lease_id):
             and lease.status == Lease.LeaseStatus.PENDING_SIGNATURES,
             "blockers": [str(reason) for reason in blockers],
             "blocking_forms": LeaseFormSerializer(
-                svc.blocking_forms(lease).select_related("template"), many=True
+                svc.blocking_forms(lease).select_related("template"),
+                many=True,
+                context={"request": request},
             ).data,
         }
     )

@@ -168,6 +168,7 @@ class LeaseFormSerializer(serializers.ModelSerializer):
     stage = serializers.CharField(read_only=True)
     outstanding = serializers.SerializerMethodField()
     needs_filling = serializers.SerializerMethodField()
+    my_signature = serializers.SerializerMethodField()
     placements = serializers.JSONField(source="placements_snapshot", read_only=True)
 
     class Meta:
@@ -187,6 +188,7 @@ class LeaseFormSerializer(serializers.ModelSerializer):
             "signers",
             "outstanding",
             "needs_filling",
+            "my_signature",
             "executed_sha256",
             "completed_at",
             "created_via",
@@ -199,6 +201,36 @@ class LeaseFormSerializer(serializers.ModelSerializer):
             for signer in obj.signers.all()
             if not signer.has_signed and not signer.declined_at
         ]
+
+    def get_my_signature(self, obj) -> dict | None:
+        """The caller's own signature slot, when they have one outstanding.
+
+        Without this the dashboard had no way to offer a landlord the Sign
+        button on their own form — they could only sign through the emailed
+        link, which is an absurd round trip for the person who created it.
+        """
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user is None or not getattr(user, "is_authenticated", False):
+            return None
+
+        from rentium.leases.form_services import signer_for_user
+
+        signer = signer_for_user(obj, user)
+        if signer is None:
+            return None
+        return {
+            "signer_id": str(signer.pk),
+            "role": signer.role,
+            "name": signer.display_name,
+            "has_signed": signer.has_signed,
+            "declined": signer.declined_at is not None,
+            "can_sign": (
+                not signer.has_signed
+                and signer.declined_at is None
+                and obj.status not in {obj.Status.COMPLETED, obj.Status.VOID}
+            ),
+        }
 
     def get_needs_filling(self, obj) -> list[str]:
         """Content the form insists on that is still blank.

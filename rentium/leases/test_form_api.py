@@ -412,3 +412,102 @@ def test_everyone_signing_executes_the_document(anon, sent_form):
     sent_form.refresh_from_db()
     assert sent_form.status == LeaseForm.Status.COMPLETED
     assert sent_form.executed_sha256
+
+
+# ---------------------------------------------------------------------------
+# The landlord's own two jobs: correct the details, and sign
+# ---------------------------------------------------------------------------
+
+
+def test_the_landlord_is_told_they_have_a_signature_outstanding(
+    api, lease_with_tenant, rtb8
+):
+    """Without this the dashboard cannot offer a Sign button at all, and the
+    person who created the document has to go find their own email."""
+    form = svc.attach_form(lease_with_tenant, rtb8)
+    svc.send_form(_fill_required(form), notify=False)
+
+    row = api.get(f"/api/leases/forms/{form.pk}/").data
+    assert row["my_signature"]["role"] == "LANDLORD"
+    assert row["my_signature"]["can_sign"] is True
+    assert row["my_signature"]["has_signed"] is False
+
+
+def test_the_landlord_can_sign_in_the_dashboard(api, lease_with_tenant, rtb8):
+    form = svc.attach_form(lease_with_tenant, rtb8)
+    svc.send_form(_fill_required(form), notify=False)
+
+    response = api.post(
+        f"/api/leases/forms/{form.pk}/sign/",
+        {"typed_name": "Raj Singh", "method": "TYPED"},
+        format="json",
+    )
+    assert response.status_code == 200
+    assert response.data["my_signature"]["has_signed"] is True
+    assert response.data["my_signature"]["can_sign"] is False
+
+    # Same evidence as the public link — not a weaker in-app shortcut.
+    signature = form.signatures.get()
+    assert signature.typed_name == "Raj Singh"
+    assert signature.template_sha256 == rtb8.sha256
+    assert signature.values_sha256
+
+
+def test_a_tenant_is_never_offered_the_landlords_slot(
+    lease_with_tenant, rtb8, tenant
+):
+    form = svc.attach_form(lease_with_tenant, rtb8)
+    svc.send_form(_fill_required(form), notify=False)
+
+    client = APIClient()
+    client.force_authenticate(user=tenant.user)
+    row = client.get(f"/api/leases/forms/{form.pk}/").data
+
+    assert row["my_signature"]["role"] == "TENANT"
+
+
+def test_a_landlord_can_correct_a_prefilled_name_and_add_their_address(
+    api, lease_with_tenant, rtb8
+):
+    """The two things they said they had no way to do."""
+    form = svc.attach_form(lease_with_tenant, rtb8)
+
+    response = api.patch(
+        f"/api/leases/forms/{form.pk}/values/",
+        {
+            "values": {
+                "last_name_s": "de la Cruz",
+                "street__and_name": "12 Fort St",
+                "city": "Victoria",
+                "postal_code": "V8W 1H8",
+            }
+        },
+        format="json",
+    )
+    assert response.status_code == 200
+    assert response.data["values"]["last_name_s"] == "de la Cruz"
+    assert response.data["values"]["street__and_name"] == "12 Fort St"
+    # The tenant's own block is untouched by any of it.
+    assert response.data["values"]["street__and_name_2"] == "1234 Oak Ave"
+
+
+def test_details_stay_editable_after_sending_until_someone_signs(
+    api, lease_with_tenant, rtb8
+):
+    form = svc.attach_form(lease_with_tenant, rtb8)
+    svc.send_form(_fill_required(form), notify=False)
+
+    sent = api.patch(
+        f"/api/leases/forms/{form.pk}/values/",
+        {"values": {"time": "9:00 AM"}},
+        format="json",
+    )
+    assert sent.status_code == 200, "a typo must be fixable before anyone signs"
+
+    svc.sign_form(form.signers.first(), typed_name="Raj Singh")
+    frozen = api.patch(
+        f"/api/leases/forms/{form.pk}/values/",
+        {"values": {"time": "10:00 AM"}},
+        format="json",
+    )
+    assert frozen.status_code == 400
