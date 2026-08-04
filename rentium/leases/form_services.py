@@ -34,6 +34,7 @@ import binascii
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
@@ -98,66 +99,74 @@ def _landlord_user(lease):
     return getattr(landlord, "user", None) if landlord else None
 
 
+@dataclass(frozen=True)
+class Party:
+    """Whoever a given box belongs to — a tenant, a co-landlord, a guarantor."""
+
+    name: str = ""
+    email: str = ""
+    phone: str = ""
+
+
 #: Whitelisted prefill keys. A placement's `auto_source` must be one of these
 #: or attaching the form fails loudly — see the module docstring.
 #:
-#: Each entry takes (lease, signer_or_None) and returns a string. Signer-scoped
-#: sources return "" when there is no signer yet, which is correct: the value
-#: genuinely is not known until send time, and gets resolved again then.
+#: Each entry takes (lease, party) and returns a string. `party` is whoever the
+#: BOX belongs to, resolved from the lease roster by the placement's own role
+#: and index — not from whoever happens to be signing. Keying it on the signer
+#: meant nothing party-scoped resolved until send_form created signer rows, so
+#: RTB-8's tenant block sat empty on a lease whose tenant was right there in the
+#: roster. The landlord was then asked to type it, into a box labelled
+#: identically to their own, and their name went into the tenant's block.
 AUTO_SOURCES: dict[str, object] = {
-    "tenant.display_name": lambda lease, signer: (
-        signer.display_name if signer and signer.lease_tenant_id else ""
-    ),
+    "tenant.display_name": lambda lease, party: party.name,
     # For forms that split a party across two boxes. Naive split — see _surname.
-    "tenant.first_name": lambda lease, signer: (
-        _given_names(signer.display_name) if signer and signer.lease_tenant_id else ""
-    ),
-    "tenant.last_name": lambda lease, signer: (
-        _surname(signer.display_name) if signer and signer.lease_tenant_id else ""
-    ),
-    "tenant.email": lambda lease, signer: (
-        _tenant_email(signer.lease_tenant) if signer and signer.lease_tenant_id else ""
-    ),
-    "tenant.phone": lambda lease, signer: (
-        _tenant_phone(signer.lease_tenant) if signer and signer.lease_tenant_id else ""
-    ),
-    "signer.name": lambda lease, signer: (signer.display_name if signer else ""),
-    "signer.email": lambda lease, signer: (signer.email if signer else ""),
-    "landlord.display_name": lambda lease, signer: (
+    "tenant.first_name": lambda lease, party: _given_names(party.name),
+    "tenant.last_name": lambda lease, party: _surname(party.name),
+    "tenant.email": lambda lease, party: party.email,
+    "tenant.phone": lambda lease, party: party.phone,
+    "signer.name": lambda lease, party: party.name,
+    "signer.first_name": lambda lease, party: _given_names(party.name),
+    "signer.last_name": lambda lease, party: _surname(party.name),
+    "signer.email": lambda lease, party: party.email,
+    "signer.phone": lambda lease, party: party.phone,
+    "landlord.display_name": lambda lease, party: (
         getattr(_landlord_user(lease), "name", "") or ""
     ),
-    "landlord.first_name": lambda lease, signer: _given_names(
+    "landlord.first_name": lambda lease, party: _given_names(
         getattr(_landlord_user(lease), "name", "") or ""
     ),
-    "landlord.last_name": lambda lease, signer: _surname(
+    "landlord.last_name": lambda lease, party: _surname(
         getattr(_landlord_user(lease), "name", "") or ""
     ),
-    "landlord.email": lambda lease, signer: (
+    "landlord.email": lambda lease, party: (
         getattr(_landlord_user(lease), "email", "") or ""
     ),
-    "landlord.phone": lambda lease, signer: (
+    "landlord.phone": lambda lease, party: (
         getattr(_landlord_user(lease), "phone", "") or ""
     ),
-    "property.address": lambda lease, signer: (
+    "property.address": lambda lease, party: (
         getattr(_property_of(lease), "address", "") or ""
     ),
-    "property.city": lambda lease, signer: (
+    "property.city": lambda lease, party: (
         getattr(_property_of(lease), "city", "") or ""
     ),
-    "property.province": lambda lease, signer: (
+    # Stored lowercase ("bc") for slugs and lookups; a government form prints
+    # the province code.
+    "property.province": lambda lease, party: (
         getattr(_property_of(lease), "province", "") or ""
-    ),
-    "property.postal_code": lambda lease, signer: (
+    ).upper(),
+    "property.postal_code": lambda lease, party: (
         getattr(_property_of(lease), "postal_code", "") or ""
     ),
-    "lease.number": lambda lease, signer: lease.lease_number or "",
-    "lease.start_date": lambda lease, signer: _date(lease.start_date),
-    "lease.end_date": lambda lease, signer: _date(lease.end_date),
-    "lease.rent": lambda lease, signer: (
+    "lease.number": lambda lease, party: lease.lease_number or "",
+    "lease.start_date": lambda lease, party: _date(lease.start_date),
+    "lease.end_date": lambda lease, party: _date(lease.end_date),
+    "lease.rent": lambda lease, party: (
         f"{lease.total_rent:.2f}" if lease.total_rent else ""
     ),
-    "moveout.end_date": lambda lease, signer: "",  # filled by bind_moveout_values
-    "today": lambda lease, signer: _date(timezone.localdate()),
+    "moveout.end_date": lambda lease, party: "",  # filled by bind_moveout_values
+    "today": lambda lease, party: _date(timezone.localdate()),
 }
 
 
@@ -186,8 +195,43 @@ def _surname(full_name: str) -> str:
     return parts[-1] if parts else ""
 
 
+def party_for(form: LeaseForm, row: dict) -> Party:
+    """Who a given box belongs to, from the lease itself.
+
+    Read off the placement's own role and index — TENANT/0 is "the first tenant
+    on this lease" — so a form knows the tenant's name the moment it is
+    attached, long before anybody is sent a link. A bound signer wins when one
+    exists, because that is the person who was actually invited.
+    """
+    role = str(row.get("signer_role") or "")
+    index = int(row.get("signer_index") or 0)
+
+    signer = next(
+        (s for s in form.signers.all() if s.role == role and s.order == index), None
+    )
+    if signer is not None:
+        phone = (
+            _tenant_phone(signer.lease_tenant) if signer.lease_tenant_id else ""
+        ) or (getattr(signer.user, "phone", "") or "")
+        return Party(name=signer.display_name, email=signer.email, phone=phone)
+
+    details = roster_candidates(form.lease).get((role, index))
+    if not details:
+        return Party()
+    return Party(
+        name=details.get("name") or "",
+        email=details.get("email") or "",
+        phone=details.get("phone") or "",
+    )
+
+
 def resolve_auto_values(form: LeaseForm, signer: LeaseFormSigner | None = None) -> dict:
-    """Every placement value we can derive right now, keyed by placement key."""
+    """Every placement value we can derive right now, keyed by placement key.
+
+    `signer` is accepted for callers that have one to hand; the party is worked
+    out per box regardless, so passing it is an optimisation rather than the
+    thing that makes tenant details appear.
+    """
     resolved: dict[str, str] = {}
     for row in form.placements_snapshot:
         source = (row.get("auto_source") or "").strip()
@@ -199,14 +243,7 @@ def resolve_auto_values(form: LeaseForm, signer: LeaseFormSigner | None = None) 
                   "Rentium knows. Fix the field on the form template.")
                 % {"source": source}
             )
-        # A signer-scoped source only resolves for its own signer's boxes.
-        row_signer = signer
-        if signer is not None and (
-            row.get("signer_role") != signer.role
-            or int(row.get("signer_index") or 0) != signer.order
-        ):
-            row_signer = None
-        value = AUTO_SOURCES[source](form.lease, row_signer)
+        value = AUTO_SOURCES[source](form.lease, party_for(form, row))
         if value:
             resolved[row["key"]] = str(value)
     return resolved
@@ -660,6 +697,7 @@ def roster_candidates(lease) -> dict[tuple[str, int], dict]:
         "user": landlord_user,
         "name": getattr(landlord_user, "name", "") or "",
         "email": getattr(landlord_user, "email", "") or "",
+        "phone": getattr(landlord_user, "phone", "") or "",
     }
     for index, signatory in enumerate(lease.landlord_signatories.order_by("created_at")):
         candidates[(SignerRole.CO_LANDLORD, index)] = {
@@ -667,6 +705,7 @@ def roster_candidates(lease) -> dict[tuple[str, int], dict]:
             "user": signatory.member,
             "name": signatory.name,
             "email": signatory.email,
+            "phone": signatory.phone or "",
         }
     tenants = lease.lease_tenants.filter(declined=False).order_by("created_at")
     for index, lease_tenant in enumerate(tenants):
@@ -675,6 +714,7 @@ def roster_candidates(lease) -> dict[tuple[str, int], dict]:
             "user": lease_tenant.tenant.user if lease_tenant.tenant_id else None,
             "name": lease_tenant.display_name,
             "email": _tenant_email(lease_tenant),
+            "phone": _tenant_phone(lease_tenant),
         }
     return candidates
 

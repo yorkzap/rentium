@@ -53,11 +53,16 @@ RTB8_FIELDS: dict[str, tuple[str, int, str]] = {
     # key:                        (signer_role,           index, auto_source)
     "first_and_middle_names": (SignerRole.LANDLORD, 0, "landlord.first_name"),
     "last_name_s": (SignerRole.LANDLORD, 0, "landlord.last_name"),
+    # The landlord's ADDRESS FOR SERVICE, which is not the rental unit unless
+    # they happen to live in it. Rentium holds no landlord mailing address, so
+    # these are left blank for the landlord to type rather than asserting the
+    # property as theirs — which printed the same address in both blocks and
+    # read, correctly, as the tenant's details having been overwritten.
     "siteunit": (SignerRole.LANDLORD, 0, ""),
-    "street__and_name": (SignerRole.LANDLORD, 0, "property.address"),
-    "city": (SignerRole.LANDLORD, 0, "property.city"),
-    "province": (SignerRole.LANDLORD, 0, "property.province"),
-    "postal_code": (SignerRole.LANDLORD, 0, "property.postal_code"),
+    "street__and_name": (SignerRole.LANDLORD, 0, ""),
+    "city": (SignerRole.LANDLORD, 0, ""),
+    "province": (SignerRole.LANDLORD, 0, ""),
+    "postal_code": (SignerRole.LANDLORD, 0, ""),
     "main_phone": (SignerRole.LANDLORD, 0, "landlord.phone"),
     "other_phone": (SignerRole.LANDLORD, 0, ""),
     "tenant_first_and_middle": (SignerRole.TENANT, 0, "tenant.first_name"),

@@ -229,9 +229,12 @@ def test_attaching_freezes_the_placements(bc_lease, rtb8):
 
 def test_attaching_prefills_what_the_lease_already_knows(bc_lease, rtb8):
     form = svc.attach_form(bc_lease, rtb8)
-    assert form.values["street__and_name"] == "1234 Oak Ave"
-    assert form.values["city"] == "Victoria"
-    assert form.values["province"] == "BC"
+    # The TENANT's address block — where the rental address belongs. The
+    # landlord block is their address for service, which Rentium does not hold
+    # and therefore does not invent.
+    assert form.values["street__and_name_2"] == "1234 Oak Ave"
+    assert form.values["city_2"] == "Victoria"
+    assert form.values["province_2"] == "BC"
 
 
 def test_an_unclassified_form_cannot_be_attached(bc_lease, landlord, rtb8):
@@ -528,13 +531,9 @@ def test_a_form_cannot_be_sent_with_its_key_facts_blank(pending_lease, rtb8):
     document anyone should be asked to sign."""
     form = svc.attach_form(pending_lease, rtb8)
     missing = svc.unfilled_required_fields(form)
-    # The vacate date and time — the whole point of the form.
-    assert "Date" in missing
-    assert "time" in missing
-    # RTB-8 labels its landlord and tenant blocks identically, so a repeated
-    # label has to say which block it means.
-    assert "Tenant's Last name (s)" in missing
-    assert "Last name (s)" not in missing
+    # The vacate date and time — the whole point of the form, and the only
+    # things Rentium cannot know. Both parties' names come off the lease.
+    assert missing == ["time", "Date"]
 
     with pytest.raises(ValidationError):
         svc.send_form(form, notify=False)
@@ -745,3 +744,121 @@ def test_a_blocking_form_is_urgent_and_an_outstanding_one_is_not(
     assert blocking_item.severity == "urgent"
     assert "holding up" in blocking_item.title
     assert [i for i in items.values() if i.severity == "info" and "form:" in i.key]
+
+
+# ---------------------------------------------------------------------------
+# August 2026: the landlord's details printed in the tenant's block
+# ---------------------------------------------------------------------------
+
+
+def test_the_tenant_block_fills_from_the_lease_the_moment_a_form_is_attached(
+    pending_lease, rtb8, tenant
+):
+    """It used to stay blank until send_form created signer rows.
+
+    So the landlord was asked to type the tenant's name — into a box labelled
+    identically to their own — and their name went into the tenant's block on a
+    government form.
+    """
+    form = svc.attach_form(pending_lease, rtb8)
+
+    assert form.values["tenant_first_and_middle"] == _given(tenant.user.name)
+    assert form.values["last_name_s_2"] == _surname_of(tenant.user.name)
+    # And it is no longer something the landlord is asked for.
+    assert not any(
+        "name" in field.casefold() for field in svc.unfilled_required_fields(form)
+    )
+
+
+def test_the_two_party_blocks_never_share_a_value(pending_lease, rtb8, landlord):
+    """The symptom the landlord reported: both blocks reading the same."""
+    form = svc.attach_form(pending_lease, rtb8)
+
+    assert form.values["first_and_middle_names"] == _given(landlord.user.name)
+    assert form.values["tenant_first_and_middle"] != form.values[
+        "first_and_middle_names"
+    ]
+    assert form.values["last_name_s_2"] != form.values["last_name_s"]
+
+
+def test_the_rental_address_is_never_claimed_as_the_landlords_own(pending_lease, rtb8):
+    """RTB-8's landlord block is an address for service, not the rental.
+
+    Rentium holds no landlord mailing address, so the honest output is a blank
+    box the landlord fills — not the property asserted as theirs.
+    """
+    form = svc.attach_form(pending_lease, rtb8)
+
+    assert form.values["street__and_name_2"] == "1234 Oak Ave"  # tenant lives there
+    assert not form.values.get("street__and_name")
+    assert not form.values.get("city")
+    assert not form.values.get("postal_code")
+
+
+def test_a_province_prints_in_the_case_a_form_expects(pending_lease, rtb8):
+    form = svc.attach_form(pending_lease, rtb8)
+    assert form.values["province_2"] == "BC"
+
+
+def test_a_second_tenant_gets_their_own_block_not_the_firsts(
+    pending_lease, rtb8, landlord
+):
+    """signer_index is what keeps two tenants apart before anyone is invited."""
+    from rentium.users.models import TenantProfile
+    from rentium.users.tests.factories import UserFactory
+
+    second = TenantProfile.objects.create(user=UserFactory(name="Wei Zhang"))
+    LeaseTenant.objects.create(
+        lease=pending_lease,
+        tenant=second,
+        rent_amount="0.00",
+        invited_email=second.user.email,
+    )
+    form = svc.attach_form(pending_lease, rtb8)
+
+    first_row = next(
+        r for r in form.placements_snapshot if r["key"] == "tenant_first_and_middle"
+    )
+    assert first_row["signer_index"] == 0
+    # TENANT/0 is still the first tenant, not whoever was added last.
+    assert form.values["tenant_first_and_middle"] == _given(
+        pending_lease.lease_tenants.order_by("created_at").first().display_name
+    )
+
+    roster = svc.roster_candidates(pending_lease)
+    assert roster[(SignerRole.TENANT, 1)]["name"] == "Wei Zhang"
+
+
+def _given(full_name):
+    parts = (full_name or "").split()
+    return " ".join(parts[:-1]) if len(parts) > 1 else ""
+
+
+def _surname_of(full_name):
+    parts = (full_name or "").split()
+    return parts[-1] if parts else ""
+
+
+def test_a_repeated_label_still_says_which_block_it_means(landlord, bc_property, rtb8):
+    """The safeguard for a lease with nobody on it yet.
+
+    Both parties' names normally come off the lease. When there is no tenant to
+    read, the landlord is asked — and RTB-8 prints "Last name (s)" over both
+    blocks, so an unqualified prompt is how their own name reached the tenant's.
+    """
+    lease = Lease.objects.create(
+        landlord=landlord,
+        property=bc_property,
+        lease_type=Lease.LeaseType.BC_RESIDENTIAL_TENANCY,
+        status=Lease.LeaseStatus.DRAFT,
+        start_date=date.today(),
+        is_month_to_month=True,
+        total_rent="900.00",
+    )
+    missing = svc.unfilled_required_fields(svc.attach_form(lease, rtb8))
+
+    assert "Tenant's Last name (s)" in missing
+    assert "Last name (s)" not in missing
+    # A label that appears once is left alone — "Landlord's time" would be a
+    # worse name for the hour the tenant vacates than "time" is.
+    assert "time" in missing
