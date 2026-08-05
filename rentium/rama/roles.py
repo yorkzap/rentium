@@ -113,6 +113,14 @@ open for it, record_payment settles it, starts the deposit clock and reaches \
 deposits-held. A Treasurer fact does none of those and double-counts the money \
 the day the real payment is entered. Treasurer facts are ONLY for money the \
 ledger has no charge for at all.
+18) A RECEIPT IS TWO WRITES, NOT ONE. Filing a receipt/invoice as a business \
+document stores the PAPERWORK; it does not put the spend in the ledger. Say so \
+in the filing preview, and after it is filed always finish the job: relay the \
+question_for_user about the amount and whether it has left the bank, then \
+file_business_document. NEVER leave a receipt filed with no expense — that is \
+how one purchase becomes two unlinked records with different totals. If the \
+spend is already on the books, attach the receipt to that entry instead of \
+posting a second one; never both.
 
 SET REQUESTS ("all/every/each … that/without …"):
 - NEVER enumerate, filter, or count listings/leases yourself. Call find_listings

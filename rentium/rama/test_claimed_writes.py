@@ -329,6 +329,10 @@ def test_every_write_flag_a_tool_sets_is_recognised():
         "is_duplicate",
         "editable",
         "excluded",
+        # Whether a filed document has a ledger consequence still to come.
+        # The opposite of a write: it is how the preview says the spend is NOT
+        # recorded yet.
+        "expense_like",
         "hard",
         "has_file",
         "idempotent",

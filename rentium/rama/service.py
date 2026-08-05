@@ -3961,6 +3961,32 @@ def _document_preview_reply(result: dict) -> str:
         parts.append("• Storage: OCR + archival PDF")
     if preview.get("create_holding"):
         parts.append("• A physical holding will be created for this exact address")
+
+    # The money, stated where the decision is made. Filing and expensing are
+    # two writes and this preview only ever described the first, so "yes"
+    # looked like recording the purchase when it only stored the paperwork.
+    if preview.get("expense_like"):
+        amount = preview.get("amount")
+        if preview.get("matches_existing_expense"):
+            parts.append(
+                f"• Matches an expense you already recorded: "
+                f"{preview['matches_existing_expense']} — I'll attach the "
+                f"receipt to it rather than post it twice",
+            )
+        elif preview.get("ledger_expense") == "NOT recorded yet":
+            parts.append(
+                f"• Receipt total: ${amount} (read by OCR — check it)"
+                if amount
+                else "• Receipt total: OCR couldn't read one — I'll ask you",
+            )
+            parts.append(
+                "• NOT in your ledger yet: filing stores the paperwork, it does "
+                "not record the spend. I'll post the expense right after this "
+                "and ask you the amount and whether it has left your bank.",
+            )
+        elif amount:
+            parts.append(f"• ${amount} — already recorded in your ledger")
+
     parts.append("Reply yes to apply this filing, or no to cancel.")
     return "\n".join(parts)
 

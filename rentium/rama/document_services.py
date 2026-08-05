@@ -689,6 +689,99 @@ def resolve_holding_scope(landlord, scope_query: str) -> dict:
 
 
 @transaction.atomic
+def _money_still_to_record(document: RamaDocument, *, caption: str = "") -> dict:
+    """What filing this paperwork will NOT do to the books.
+
+    Filing and expensing are two writes, and the preview only ever described
+    the first: "Ready to store this as a business document … Reply yes to apply
+    this filing." A landlord who bought landscaping sand, photographed the
+    receipt and said yes has every reason to believe they recorded the purchase
+    — and their ledger has nothing in it. There is already a receipt in this
+    portfolio filed exactly that way, with the expense later typed in by hand
+    two cents off, as two unlinked records of one purchase.
+
+    So the money is stated where the decision is made. Nothing here writes; it
+    reports whether the spend still needs recording, and the amount, because an
+    OCR figure that reads $3,000.00 for a bag of sand needs to be seen before
+    it is confirmed rather than after.
+    """
+    expense_like = document.kind in {
+        RamaDocument.Kind.EXPENSE,
+        RamaDocument.Kind.TAX,
+        RamaDocument.Kind.MORTGAGE,
+        RamaDocument.Kind.INSURANCE,
+        RamaDocument.Kind.MAINTENANCE,
+    }
+    # An amount on the record outranks the kind. The receipt this portfolio
+    # lost the expense for OCR'd to 116 characters of returns policy — no
+    # total, no keywords — so it filed as OTHER, and expense_like being false
+    # switched off every prompt about the money. Its $39.34 arrived afterwards,
+    # by which point nothing was asking. A document carrying a figure and no
+    # ledger entry has a spend to record whatever the classifier decided.
+    if document.amount is not None and not document.ledger_entry_id:
+        expense_like = True
+    if not expense_like:
+        return {"expense_like": False}
+
+    if document.ledger_entry_id:
+        return {
+            "expense_like": True,
+            "amount": str(document.amount) if document.amount is not None else None,
+            "ledger_expense": "already recorded — this filing adds no second entry",
+        }
+
+    matched = match_receipt_to_logged_expense(
+        document.landlord, document, caption=caption,
+    )
+    if matched:
+        return {
+            "expense_like": True,
+            "amount": str(document.amount) if document.amount is not None else None,
+            "matches_existing_expense": (
+                f"${matched['amount']} — {matched['description']}"
+            ),
+            "ledger_expense": (
+                "you already recorded this spend; the receipt will be attached to "
+                "that entry rather than posted a second time"
+            ),
+        }
+
+    return {
+        "expense_like": True,
+        "amount": str(document.amount) if document.amount is not None else None,
+        "amount_is_ocr_guess": document.amount is not None,
+        "ledger_expense": "NOT recorded yet",
+        "warning": (
+            "Filing stores the paperwork only — it does not put the spend in "
+            "your ledger. The expense is the next step and needs its own yes."
+        ),
+    }
+
+
+def _expense_follow_up_question(document: RamaDocument) -> str:
+    """The one question that turns a filed receipt into a recorded expense.
+
+    Deliberately asks only what no record holds — whether the OCR figure is
+    right and whether the money has left the bank. Everything else (which
+    property, what category, the date) is already on the document.
+    """
+    where = ""
+    if document.holding_id:
+        where = f" against {document.holding.address or document.holding.name}"
+    if document.amount is None:
+        return (
+            f"Filed. That receipt isn't in your ledger yet and OCR couldn't read "
+            f"a total — what did it come to? I'll post the expense{where} once "
+            f"you tell me, and whether it has already left your bank."
+        )
+    return (
+        f"Filed. Now the money: I read the total as ${document.amount}. If "
+        f"that's right, has it already left your bank, or is it still owing? "
+        f"I'll post it as an expense{where} — tell me the correct total if OCR "
+        f"got it wrong."
+    )
+
+
 def catalog_document_scope(
     landlord,
     *,
@@ -722,6 +815,7 @@ def catalog_document_scope(
             "to any individual room or unit."
         ),
     }
+    preview.update(_money_still_to_record(document))
     if not confirm:
         return {
             "needs_confirm": True,
@@ -731,6 +825,13 @@ def catalog_document_scope(
                 "Show this address-level filing preview. If approved, call "
                 "catalog_business_document again with the same arguments and "
                 "confirm=yes."
+            )
+            + (
+                " This is a receipt/invoice: say in the SAME message that filing "
+                "stores the paperwork only, and that you will record the ledger "
+                "expense straight after."
+                if preview.get("expense_like")
+                else ""
             ),
         }
 
@@ -782,6 +883,7 @@ def catalog_document_scope(
     )
     document = _ensure_ocr(document)
     intelligence = document_intelligence_payload(document)
+    money = _money_still_to_record(document)
     return {
         "updated": True,
         "catalogued": True,
@@ -804,11 +906,25 @@ def catalog_document_scope(
         ),
         # Chat must use these OCR facts — never invent amount/kind.
         "intelligence": intelligence,
+        "money": money,
         "relay_instruction": (
             "Relay the OCR intelligence to the landlord: kind, title, amount "
             "(verbatim), payment_state, and next_steps. If expense_like and "
             "payment_state is UNKNOWN, ASK whether it already left the bank. "
             "Then preview file_business_document — do not invent amounts."
+        ),
+        # The spend is a SECOND write, and prose telling the model to go and do
+        # it was not enough: this portfolio already holds a filed receipt whose
+        # expense never followed, and was later typed in by hand two cents off.
+        # question_for_user is the one channel the persona must relay verbatim
+        # and stop on, so the money question cannot be dropped on the way out.
+        **(
+            {
+                "question_for_user": _expense_follow_up_question(document),
+                "needs": "expense_decision",
+            }
+            if money.get("ledger_expense") == "NOT recorded yet"
+            else {}
         ),
     }
 
@@ -1707,6 +1823,20 @@ def _classify(text: str, filename: str) -> dict:
             kind, category = candidate_kind, candidate_category
             confidence = min(Decimal("0.70") + Decimal("0.08") * hits, Decimal("0.98"))
             break
+
+    # A till receipt that OCR'd badly keeps its money and loses its words. One
+    # in this portfolio came back as "within 90 devs inal packeses pliances end
+    # other exceptions" — not one rule word survived, so it was filed as OTHER,
+    # which switches off expense_like and with it every prompt to record the
+    # spend. The $39.34 was typed in by hand later, two cents off, as a second
+    # unlinked record of one purchase.
+    #
+    # So a total on the page counts as evidence when the words did not survive.
+    # Only ever an upgrade FROM Other: a bank statement is full of amounts and
+    # matched its own rule first, and must stay what it is.
+    if kind == RamaDocument.Kind.OTHER and _money_candidates(text):
+        kind, category = RamaDocument.Kind.EXPENSE, ExpenseCategory.OTHER
+        confidence = Decimal("0.55")  # weaker than a keyword match, and it shows
 
     expense_like = kind in {
         RamaDocument.Kind.EXPENSE,
