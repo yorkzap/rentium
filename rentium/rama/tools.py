@@ -1377,9 +1377,14 @@ def create_expense(
 
 @_params(
     amount="How much ARRIVED, e.g. '100.00'. A partial payment is normal — "
-    "record what was actually received, never the balance still owing.",
+    "record what was actually received, never the balance still owing. LEAVE "
+    "BLANK when the landlord did not state a figure ('her deposits were "
+    "received'): the charges already say how much, and this tool reads it from "
+    "them. Never ask the landlord for an amount their own books hold.",
     charge_query="Words from the charge this settles, e.g. 'deposit' or "
-    "'August rent'. Money is always recorded against a charge.",
+    "'August rent'. Money is always recorded against a charge. Pass the "
+    "landlord's whole phrase — a tenant's name in it narrows the search to "
+    "that person's charges.",
     property_query="The listing, to narrow it down when several charges match.",
     payment_method="etransfer | cash | cheque. Take it from what the landlord said; leave BLANK if they did not say and the tool will ask. Never guess.",
     payment_date="The day the money ARRIVED, YYYY-MM-DD. Leave blank if they did not say — it then dates from today, which is when they are telling you.",
@@ -1389,7 +1394,7 @@ def create_expense(
 )
 def record_payment(
     landlord,
-    amount: str,
+    amount: str = "",
     charge_query: str = "",
     property_query: str = "",
     payment_method: str = "",
@@ -1401,8 +1406,11 @@ def record_payment(
 ) -> dict:
     """Record money RECEIVED against a charge — rent arrived, deposit paid,
     damage claim settled. Handles PARTIAL payments: $100 against a $425 deposit
-    leaves $325 owing, which the preview shows before you confirm. This is the
-    ONLY way money-in reaches the ledger. Preview first; confirm=yes."""
+    leaves $325 owing, which the preview shows before you confirm. `amount` is
+    OPTIONAL: told only that a tenant's deposits were received, this finds their
+    open charges and settles the full outstanding balance, so the landlord is
+    never asked for a figure their books already hold. This is the ONLY way
+    money-in reaches the ledger. Preview first; confirm=yes."""
     from .domain_actions import record_payment as _fn
 
     return _fn(

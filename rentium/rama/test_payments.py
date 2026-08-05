@@ -331,7 +331,12 @@ def test_one_etransfer_splits_security_and_cleaning_deposits(landlord, bc_lease)
         charge_query="deposit",
         payment_method="etransfer",
     )
-    assert preview["action"] == "record_payment_allocation"
+    # Relayed under record_payment, NOT under the internal helper that built
+    # it: record_payment_allocation is not in the registry, so "call
+    # record_payment_allocation again with confirm=yes" named a tool the model
+    # cannot call, and the landlord's yes had nowhere to land.
+    assert preview["action"] == "record_payment"
+    assert "record_payment_allocation" not in preview["instruction"]
     assert {row["payment"] for row in preview["preview"]["allocations"]} == {
         "200.00"
     }

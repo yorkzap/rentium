@@ -188,8 +188,17 @@ def test_a_qualitative_fact_is_never_refused(landlord, bc_lease, hundred_receive
 
 
 def test_an_unpaid_charge_is_not_evidence_the_money_arrived(landlord, deposit_charge):
-    """A $425 CHARGE is a receivable, not a record that $425 turned up. A fact
-    asserting the money was received must not be refused by the charge alone."""
+    """A $425 CHARGE is a receivable, not a record that $425 turned up — so the
+    refusal here must not be the "already in the ledger" one. That distinction
+    is what stops `already_in_ledger` from quietly widening to charge types and
+    telling a landlord their money is recorded when nothing has been received.
+
+    The fact is still refused, for the opposite reason: the ledger is holding a
+    charge this money was posted against, so it belongs in record_payment,
+    where it settles the charge, starts the deposit clock and reaches
+    deposits-held. See test_deposits_received.py — a Treasurer fact would have
+    left all three untouched.
+    """
     detail = already_done_for(
         "record_treasurer_fact",
         landlord,
@@ -198,7 +207,8 @@ def test_an_unpaid_charge_is_not_evidence_the_money_arrived(landlord, deposit_ch
         amount="425.00",
         period="ONE_TIME",
     )
-    assert detail is None
+    assert "already in the ledger" not in (detail or "")
+    assert "record_payment" in detail
 
 
 def test_a_holding_scoped_fact_sees_entries_written_per_property(landlord, bc_lease):

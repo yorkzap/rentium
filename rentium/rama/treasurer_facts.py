@@ -126,6 +126,77 @@ def already_in_ledger(
     )
 
 
+def waiting_as_an_open_charge(
+    landlord,
+    *,
+    amount,
+    statement: str = "",
+    holding=None,
+) -> str | None:
+    """The open charge this money belongs against, described — or None.
+
+    The sibling of `already_in_ledger`, for the case that comes BEFORE the
+    money lands rather than after. Asked to record that a tenant's cleaning and
+    security deposits had been received, RAMA offered to file "$400.00 income"
+    as a Treasurer fact — while two deposit charges totalling exactly $400 sat
+    open on that tenant's lease. Both stores would then hold the event and
+    neither would be right: the charges stay unpaid, deposits-held stays at
+    zero, the money is counted as income when a deposit is a liability, and the
+    day the real payment is entered the $400 is on the books twice.
+
+    So the test is not "has this already happened" but "is there somewhere this
+    was always supposed to go". Matching on the total rather than a single
+    charge is deliberate — a landlord reports one transfer, the books hold it
+    as several charges, and the assertion is about the transfer.
+    """
+    from itertools import combinations
+
+    from rentium.ledger.models import CHARGE_TYPES, ChargeStatus, LedgerEntry
+    from rentium.ledger.services import outstanding_on
+
+    if amount is None:
+        return None
+    amount = Decimal(amount)
+    if amount <= 0:
+        return None
+
+    rows = LedgerEntry.objects.not_voided().filter(
+        landlord=landlord, entry_type__in=CHARGE_TYPES,
+    )
+    if holding is not None:
+        rows = rows.filter(Q(holding=holding) | Q(property__holding=holding))
+    settled = (ChargeStatus.PAID, ChargeStatus.VOIDED)
+    open_charges = [
+        row
+        for row in rows.select_related("property", "lease").order_by("-effective_date")
+        if row.charge_status() not in settled
+    ][:12]
+    if not open_charges:
+        return None
+
+    balances = [(row, outstanding_on(row)) for row in open_charges]
+    match = None
+    for size in (1, 2, 3):
+        for combo in combinations(balances, size):
+            if sum((bal for _, bal in combo), Decimal("0.00")) == amount:
+                match = combo
+                break
+        if match:
+            break
+    if not match:
+        return None
+
+    where = ", ".join(f"{row.description[:60]} (${bal})" for row, bal in match)
+    return (
+        f"That is money against charges you have already posted: {where}. "
+        f"Record it with record_payment so it settles them — a Treasurer fact "
+        f"would leave those charges unpaid, keep the deposit out of "
+        f"deposits-held, and count the same ${amount} twice the day the "
+        f"payment is entered properly. Treasurer facts are only for money the "
+        f"ledger has no charge for at all."
+    )
+
+
 # ------------------------------------------------------------------ guards
 def rejects(statement: str, *, value_numeric=None) -> str | None:
     """Reason to refuse recording this, or None.

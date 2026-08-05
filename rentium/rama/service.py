@@ -2670,6 +2670,100 @@ _DELIVER_NOW = (
 )
 
 
+# ------------------------------------------------- asking for its own data
+#
+# The sibling failure to the stall, and the more insulting one. Told "Siya's
+# cleaning and security deposits were received", RAMA replied:
+#
+#   "I need the exact amounts from the lease to record the payments. What are
+#    the cleaning deposit and security deposit amounts for Siya's lease?"
+#
+# Both figures were on a lease it had already quoted the number of. The
+# landlord answered "you should know it, u have access", and they were right:
+# a question whose answer is in the database is not a clarifying question, it
+# is RAMA making the landlord do a lookup on its behalf — and the landlord
+# reading their own records back to it is how a typo becomes a ledger entry.
+#
+# What separates this from a legitimate question is WHO holds the answer.
+# Amounts on a lease, balances, lease numbers, dates on record: RAMA's. How the
+# money arrived, which day it landed, whether a thing happened at all: the
+# landlord's, and those must still be asked.
+_STORED_FIGURE = re.compile(
+    r"\b(?:what|which|how much)\b[^.?!]{0,80}?\b("
+    r"deposit|deposits|rent|amount|amounts|figure|balance|total|owing|"
+    r"outstanding|lease number|lease id|charge|charges|address|start date|"
+    r"end date"
+    r")\b[^.?!]{0,60}\?",
+    re.IGNORECASE,
+)
+_ASKS_LANDLORD_TO_LOOK_UP = re.compile(
+    r"\b(?:"
+    r"i need (?:the |their |her |his |your )?(?:exact |precise )?"
+    r"(?:amount|amounts|figure|figures|number|numbers|value|values)"
+    r"|can you (?:tell me|confirm|check|look up|give me)"
+    r"|could you (?:tell me|confirm|check|look up|give me)"
+    r"|please (?:tell me|confirm|check|look up|give me)"
+    r"|(?:tell|let) me know (?:the|what|how much)"
+    r")\b",
+    re.IGNORECASE,
+)
+# Facts that live outside the database no matter how complete it is. A question
+# about any of these is a real one and must survive the guard — refusing to ask
+# how money arrived would push RAMA into guessing a payment method, which is a
+# worse failure than one extra question.
+_ONLY_THE_LANDLORD_KNOWS = re.compile(
+    r"\b(e-?transfer|cash|cheque|check|payment method|how did|how was|"
+    r"when did|what day|which day|did (?:you|they|she|he)|has (?:it|she|he|"
+    r"they)|do you want|would you like|should i|shall i|is that right|"
+    r"correct\?|instead|approve|go ahead)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_for_what_the_books_hold(text: str) -> bool:
+    """True when the reply asks the landlord for a figure RAMA can look up.
+
+    Per SENTENCE, like the other two reply guards, so one legitimate question
+    ("was it an e-transfer?") does not excuse a lookup demand beside it, and a
+    stored-figure NOUN appearing in an otherwise fine sentence does not condemn
+    it. Deliberately conservative in both directions: it needs an asking shape
+    AND a stored figure AND no sign that the answer lives outside the database.
+    """
+    for sentence in _sentences(text):
+        if "?" not in sentence and not _ASKS_LANDLORD_TO_LOOK_UP.search(sentence):
+            continue
+        if _ONLY_THE_LANDLORD_KNOWS.search(sentence):
+            continue
+        if _STORED_FIGURE.search(sentence) or (
+            _ASKS_LANDLORD_TO_LOOK_UP.search(sentence)
+            and re.search(
+                r"\b(deposit|deposits|rent|lease|charge|charges|balance)\b",
+                sentence,
+                re.IGNORECASE,
+            )
+        ):
+            return True
+    return False
+
+
+_LOOK_IT_UP = (
+    "You just asked the landlord for something that is in their records, which "
+    "you have full read access to. They should never have to read their own "
+    "data back to you — that is the lookup you exist to do, and their retyped "
+    "figure is how a typo reaches the ledger.\n\n"
+    "Answer it yourself NOW, in this turn. Resolve the person or property they "
+    "named, then read the record: tenant_statement for what a tenant owes and "
+    "has paid, charge_schedule for what is billed, find_leases / read for the "
+    "lease itself, deposit_position for deposits. Money-in tools take the "
+    "figure from the open charges — call record_payment WITHOUT an amount "
+    "rather than asking for one.\n\n"
+    "Then do what they asked and show the numbers you found in the preview. "
+    "Ask only for what no record can hold — how the money arrived, which day "
+    "it landed, whether to go ahead. If the record genuinely does not have it, "
+    "say which record you checked and what was missing from it."
+)
+
+
 def _capability_gap_hint(landlord, message: str, conversation_id) -> str:
     """What to say after refusing a fabricated claim.
 
@@ -6274,21 +6368,45 @@ def run_turn(
                 auto_executed=delegated_auto + auto_executed,
             )
 
-    # ---- turn contract: a promise is not an answer ------------------------
+    # ---- turn contract: a promise is not an answer, and neither is a
+    # ---- question the database can answer ---------------------------------
     # `if not turn.tool_calls: break` treats ANY tool-call-free turn as
     # finished, so "Checking the ledger now." shipped as a complete reply. One
     # continuation round is pushed back through the model before the landlord
     # is made to ask "and?". Only on the stall path, so the ordinary turn costs
     # nothing extra.
-    if (
+    #
+    # "What are the deposit amounts on Siya's lease?" is the same turn ending
+    # in the same place, one word short of a promise — the work handed back to
+    # the landlord instead of announced. It takes the same continuation round,
+    # with an instruction naming the tools that hold the answer.
+    _stalled = (
         not pending_specs
         and turn.text
         and promises_without_delivering(turn.text, tools_used)
-    ):
-        audit(RamaAudit.Kind.ERROR, {"error": "promised_without_delivering",
-                                     "text": turn.text[:500]})
+    )
+    _asked_for_own_data = (
+        not pending_specs
+        and turn.text
+        and not _stalled
+        and asks_for_what_the_books_hold(turn.text)
+    )
+    if _stalled or _asked_for_own_data:
+        audit(
+            RamaAudit.Kind.ERROR,
+            {
+                "error": (
+                    "promised_without_delivering"
+                    if _stalled
+                    else "asked_landlord_for_stored_data"
+                ),
+                "text": turn.text[:500],
+            },
+        )
         messages.append({"role": "assistant", "text": turn.text})
-        messages.append({"role": "user", "text": _DELIVER_NOW})
+        messages.append(
+            {"role": "user", "text": _DELIVER_NOW if _stalled else _LOOK_IT_UP},
+        )
         try:
             follow_up = provider.complete(
                 model=model,
@@ -6385,6 +6503,31 @@ def run_turn(
                 "I'll give you the answer instead of the intention."
             )
         )
+    # Asked for its own data twice. The question still ships — a second guess
+    # at what the landlord meant is worse than one more question, and the
+    # record may genuinely be missing the figure. But it goes on the capability
+    # backlog either way, because a landlord being asked to read out their own
+    # books twice in one turn is a gap in RAMA, not in their memory.
+    if _asked_for_own_data and asks_for_what_the_books_hold(reply):
+        audit(
+            RamaAudit.Kind.ERROR,
+            {"error": "asked_landlord_for_stored_data_twice", "text": reply[:500]},
+        )
+        try:
+            execute(
+                "log_capability_gap",
+                {
+                    "request": (message or "")[:400],
+                    "note": (
+                        "Asked the landlord for a figure their own records "
+                        "hold, and asked again after being told to look it up."
+                    ),
+                },
+                landlord=landlord,
+            )
+        except Exception:
+            logger.exception("capability gap logging failed")
+
     if outstanding is None and _looks_like_confirmation_request(reply):
         # A model cannot create a confirmation contract with prose. If no
         # persisted plan backs its "reply yes", replace that claim with the

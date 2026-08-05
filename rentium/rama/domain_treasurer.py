@@ -58,12 +58,23 @@ def treasurer_fact_already_done(
 
     start, _ = _day(effective_from, "effective_from")
     end, _ = _day(effective_to, "effective_to")
-    return facts.already_in_ledger(
+    landed = facts.already_in_ledger(
         landlord,
         amount=parsed_amount,
         holding=holding,
         effective_from=start,
         effective_to=end,
+    )
+    if landed:
+        return landed
+    # Nothing has landed — but the ledger may already be holding the charge
+    # this money was posted for, in which case the fact store is the wrong
+    # place for it and record_payment is the right one.
+    return facts.waiting_as_an_open_charge(
+        landlord,
+        amount=parsed_amount,
+        statement=fact or subject,
+        holding=holding,
     )
 
 

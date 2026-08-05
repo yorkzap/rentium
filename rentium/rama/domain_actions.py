@@ -3570,11 +3570,62 @@ _PAYMENT_METHODS = {
 }
 
 
-def _open_charges(landlord, query: str = "", property_query: str = ""):
+# Charge vocabulary is never a person, even when somebody is called Summer.
+# The words a landlord uses to describe money are a closed enough set to list,
+# and reading one of them as a name would scope a payment to the wrong tenant.
+_NOT_A_NAME = {
+    "deposit", "deposits", "rent", "rental", "cleaning", "security", "damage",
+    "pet", "utilities", "utility", "payment", "payments", "paid", "received",
+    "charge", "charges", "fee", "fees", "balance", "owing", "outstanding",
+    "the", "and", "for", "her", "his", "their", "was", "were", "this", "that",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+}
+
+
+def _tenant_named_in(landlord, text: str):
+    """The tenant this sentence names, or None. Never a guess.
+
+    "Siya's cleaning and security deposits were received" arrives as one blob
+    in `charge_query`, and no charge description has ever contained a tenant's
+    name — so without this the name is dead weight that matches nothing, and
+    RAMA falls back to asking the landlord which charge they meant.
+
+    Matching runs from the names actually in this landlord's portfolio out to
+    the sentence, never the other way round: a word is only a person because a
+    person of that name exists here. One match scopes; several match nothing,
+    because picking between two tenants to decide whose debt was settled is
+    exactly the guess that must never be made silently.
+    """
+    from rentium.leases.models import LeaseTenant
+
+    # Letters only, so "Siya's" and "O'Brien" break the same way on both sides
+    # of the comparison and a possessive still finds its person.
+    words = {w.casefold() for w in re.findall(r"[A-Za-z]{3,}", text or "")} - _NOT_A_NAME
+    if not words:
+        return None
+
+    found = {}
+    rows = LeaseTenant.objects.filter(
+        lease__landlord=landlord, tenant__isnull=False,
+    ).select_related("tenant__user")
+    for slot in rows:
+        full = f"{slot.tenant.user.name} {slot.invited_name or ''}"
+        parts = {p.casefold() for p in re.findall(r"[A-Za-z]{3,}", full)}
+        if parts & words:
+            found[slot.tenant_id] = slot.tenant
+    if len(found) != 1:
+        return None
+    return next(iter(found.values()))
+
+
+def _open_charges(landlord, query: str = "", property_query: str = "", tenant=None):
     """Charges with something still owing, newest first.
 
     Query words are OR-matched against description (and rent month tokens).
     Empty query returns all open charges for the landlord (optionally scoped).
+    `tenant` narrows to what that person is liable for, including the household
+    charges of their lease — a joint deposit carries no tenant of its own.
     """
     from django.db.models import Q
 
@@ -3586,6 +3637,10 @@ def _open_charges(landlord, query: str = "", property_query: str = ""):
         .select_related("property", "tenant", "tenant__user", "lease")
         .order_by("-effective_date")
     )
+    if tenant is not None:
+        rows = rows.filter(
+            Q(tenant=tenant) | Q(lease__lease_tenants__tenant=tenant),
+        ).distinct()
     if property_query:
         rows = rows.filter(
             Q(property__name__icontains=property_query)
@@ -3625,6 +3680,11 @@ def _open_charges(landlord, query: str = "", property_query: str = ""):
                 tokens.append("pet")
             if w in {"rent", "rental"}:
                 tokens.append("rent")
+            # "her deposits were received" is how this is said; every charge
+            # description says "deposit". A plural that matches nothing sent
+            # the whole request back to the landlord as a question.
+            if w.endswith("s") and len(w) > 3:
+                tokens.append(w[:-1])
         tokens = list(dict.fromkeys(tokens))
         q_filter = Q()
         for t in tokens:
@@ -3683,10 +3743,60 @@ def _suggest_deposit_split(candidates: list, amount: Decimal) -> list | None:
     return suggest_deposit_split(candidates, amount)
 
 
+# How many open charges one unqualified "it was received" is allowed to settle.
+# Two deposits and a prorated first month is a sentence a landlord really does
+# say; twelve charges is a scope that was never meant as one payment.
+DERIVABLE_MAX_CHARGES = 6
+
+_AMOUNT_FROM_THE_BOOKS = (
+    "You did not state an amount, so this is the full outstanding balance on "
+    "the charge(s) below, taken from your books."
+)
+
+
+def _amount_undeducible(candidates: list, *, scoped: bool) -> dict | None:
+    """Why the books cannot state the figure here — or None if they can.
+
+    "Siya's deposits were received" is a complete instruction: the charges say
+    how much. "A payment came in" is not, and settling every open charge in the
+    portfolio is not a reading of it. The line between them is whether the
+    landlord narrowed it to something the ledger can total.
+    """
+    if not scoped:
+        return {
+            "question_for_user": (
+                "How much came in, and what was it for? Name the tenant, the "
+                "property or the charge and I will take the amount from the "
+                "books myself."
+            ),
+            "needs": "amount",
+        }
+
+    def bucket(charge):
+        return charge.lease_id or ("property", charge.property_id)
+
+    spread = {bucket(c) for c in candidates}
+    if len(spread) > 1 or len(candidates) > DERIVABLE_MAX_CHARGES:
+        return {
+            "question_for_user": (
+                "That matches more than one tenancy's charges, so I can't tell "
+                "which of them the money settles:\n"
+                + "\n".join(
+                    f"• {_charge_label(c)} — ${_outstanding_on(c)} still owing"
+                    for c in candidates[:6]
+                )
+                + "\n\nName the tenant or the amount and I'll record it."
+            ),
+            "candidates": [_charge_label(c) for c in candidates[:6]],
+            "needs": "amount",
+        }
+    return None
+
+
 def record_payment(
     landlord,
     *,
-    amount: str,
+    amount: str = "",
     charge_query: str = "",
     property_query: str = "",
     payment_method: str = "",
@@ -3700,17 +3810,43 @@ def record_payment(
 
     If the amount exactly matches several open deposit/cleaning charges, offers
     a multi-charge split (or use record_payment_allocation explicitly).
+
+    `amount` is optional because the books usually already know it. Told only
+    that "Siya's cleaning and security deposits were received", this settles
+    the full outstanding balance on exactly those charges rather than asking
+    the landlord to read their own lease back to RAMA. The figure it derived is
+    named in the preview, and the preview still has to be confirmed.
     """
     from rentium.ledger import services as ledger_services
 
-    try:
-        amt = Decimal(str(amount).replace("$", "").replace(",", "").strip())
-    except (InvalidOperation, ValueError):
-        return {"error": f"Invalid amount {amount!r}."}
-    if amt <= 0:
-        return {"error": "A payment must be a positive amount."}
+    stated = str(amount or "").replace("$", "").replace(",", "").strip()
+    amt = None
+    if stated:
+        try:
+            amt = Decimal(stated)
+        except (InvalidOperation, ValueError):
+            return {"error": f"Invalid amount {amount!r}."}
+        if amt <= 0:
+            return {"error": "A payment must be a positive amount."}
 
-    candidates = _open_charges(landlord, charge_query, property_query)
+    # Who the money is about is resolved BEFORE which charge it settles: a
+    # deposit description never carries a tenant's name, so a sentence naming
+    # one has to narrow the charges or the name matches nothing at all.
+    payer = None
+    if (tenant_query or "").strip():
+        from .domain_crud import _resolve_tenant_profile
+
+        payer, payer_error = _resolve_tenant_profile(landlord, tenant_query)
+        if payer_error:
+            return payer_error
+    # A name merely mentioned in the sentence scopes the search but is NOT
+    # recorded as the payer: on a joint lease either tenant may have sent the
+    # money, and which one is a fact only the landlord has.
+    scope_tenant = payer or _tenant_named_in(landlord, charge_query)
+
+    candidates = _open_charges(
+        landlord, charge_query, property_query, tenant=scope_tenant,
+    )
     if not candidates:
         return {
             "error": "no_matching_charge",
@@ -3721,31 +3857,64 @@ def record_payment(
             ),
         }
 
+    derived = False
+    if amt is None:
+        blocked = _amount_undeducible(
+            candidates,
+            scoped=bool(
+                scope_tenant
+                or (property_query or "").strip()
+                or (charge_query or "").strip(),
+            ),
+        )
+        if blocked:
+            return blocked
+        derived = True
+        amt = sum((_outstanding_on(c) for c in candidates), Decimal("0.00"))
+        if len(candidates) > 1:
+            return _relay_as_record_payment(
+                record_payment_allocation(
+                    landlord,
+                    charge_ids=",".join(str(c.pk) for c in candidates),
+                    payment_method=payment_method,
+                    payment_date=payment_date,
+                    confirm=confirm,
+                    amount_source=_AMOUNT_FROM_THE_BOOKS,
+                ),
+            )
+
     # Auto multi-charge when one transfer covers security + cleaning, etc.
     if len(candidates) > 1:
         split = _suggest_deposit_split(candidates, amt)
         if split is not None:
-            return record_payment_allocation(
-                landlord,
-                amount=str(amt),
-                charge_ids=",".join(str(c.pk) for c in split),
-                payment_method=payment_method,
-                payment_date=payment_date,
-                confirm=confirm,
+            return _relay_as_record_payment(
+                record_payment_allocation(
+                    landlord,
+                    amount=str(amt),
+                    charge_ids=",".join(str(c.pk) for c in split),
+                    payment_method=payment_method,
+                    payment_date=payment_date,
+                    confirm=confirm,
+                ),
             )
         # Prefer a unique high-signal match over asking every time.
+        #
+        # Scored, not filtered. "Siya security deposit" against a security and
+        # a cleaning deposit used to keep BOTH — each description contains
+        # "deposit" — and ask which one the landlord meant, having been told.
+        # Counting how many of their words each description carries separates
+        # them (2 against 1) and only asks when nothing stands out.
         q = (charge_query or "").casefold()
         if q:
-            tight = [
-                c
+            tokens = set(re.findall(r"[a-z]{3,}", q))
+            scored = [
+                (sum(tok in (c.description or "").casefold() for tok in tokens), c)
                 for c in candidates
-                if any(
-                    tok in (c.description or "").casefold()
-                    for tok in re.findall(r"[a-z]{3,}", q)
-                )
             ]
-            if len(tight) == 1:
-                candidates = tight
+            best = max(score for score, _ in scored)
+            top = [c for score, c in scored if score == best]
+            if best and len(top) == 1:
+                candidates = top
         if len(candidates) > 1:
             return {
                 "question_for_user": (
@@ -3776,14 +3945,8 @@ def record_payment(
     if "method" not in method_out:
         return method_out
     method = method_out["method"]
-    payer = None
-    if (tenant_query or "").strip():
-        from .domain_crud import _resolve_tenant_profile
-
-        payer, payer_error = _resolve_tenant_profile(landlord, tenant_query)
-        if payer_error:
-            return payer_error
-        if charge.lease_id and not charge.lease.lease_tenants.filter(tenant=payer).exists():
+    if payer is not None and charge.lease_id:
+        if not charge.lease.lease_tenants.filter(tenant=payer).exists():
             return {"error": "That payer is not on the selected charge's lease."}
 
     preview = {
@@ -3800,6 +3963,8 @@ def record_payment(
             charge.tenant.user.name if charge.tenant_id else None
         ),
     }
+    if derived:
+        preview["amount_source"] = _AMOUNT_FROM_THE_BOOKS
     if amt > outstanding:
         preview["overpayment_warning"] = (
             f"That is ${amt - outstanding} MORE than the ${outstanding} still "
@@ -3855,6 +4020,28 @@ def record_payment(
     }
 
 
+def _relay_as_record_payment(result: dict) -> dict:
+    """Point a delegated split's confirmation back at the tool the model has.
+
+    `record_payment_allocation` is an internal helper — it is not in the
+    registry, so the model cannot call it. Its preview nonetheless told the
+    model to "call record_payment_allocation again with confirm=yes", which is
+    an instruction to call a tool that does not exist: the landlord approves,
+    and the approval has nowhere to land. Every split reached from
+    record_payment is therefore relayed under record_payment's own name, which
+    forwards confirm to exactly the same place.
+    """
+    if not isinstance(result, dict) or not result.get("needs_confirm"):
+        return result
+    result["action"] = "record_payment"
+    result["instruction"] = (
+        "Show this preview to the landlord. If they approve, call record_payment "
+        "again with the same arguments AND confirm=yes. One payment row is "
+        "posted per charge (append-only), all with the same method and date."
+    )
+    return result
+
+
 def record_payment_allocation(
     landlord,
     *,
@@ -3864,6 +4051,7 @@ def record_payment_allocation(
     payment_method: str = "",
     payment_date: str = "",
     property_query: str = "",
+    amount_source: str = "",
     confirm: str = "",
 ) -> dict:
     """Split one real-world payment across several open charges.
@@ -3992,6 +4180,8 @@ def record_payment_allocation(
         "allocations": lines,
         "rule": "One payment row per charge (append-only). Same method and date.",
     }
+    if amount_source:
+        preview["amount_source"] = amount_source
     if not _confirmed(confirm):
         return _preview(
             "record_payment_allocation",
