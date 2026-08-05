@@ -746,18 +746,30 @@ def _expense_bank_correction(message: str) -> str | None:
     low = (message or "").casefold().replace("’", "'")
     unpaid = re.search(
         r"\b(?:hasn'?t|has not|wasn'?t|was not|isn'?t|is not)\s+"
-        r"(?:been\s+)?(?:paid|taken|come|came|cleared)\b"
-        r"|\bnot\s+(?:yet\s+)?(?:paid|taken from|out of|cleared)\b"
-        r"|\b(?:leave|keep|mark)\s+(?:it\s+)?unpaid\b",
+        r"(?:been\s+)?(?:paid|taken|come|came|cleared|left|gone)\b"
+        r"|\bnot\s+(?:yet\s+)?(?:paid|taken from|out of|cleared|left|gone)\b"
+        r"|\b(?:leave|keep|mark)\s+(?:it\s+)?unpaid\b"
+        r"|\bstill\s+(?:unpaid|owing|owed|outstanding|to pay)\b"
+        r"|\bunpaid\b",
         low,
     )
     if unpaid:
         return "unpaid"
+    # "yes, and its left the bank" — the commonest way a landlord says this,
+    # and it matched nothing here. RAMA asked "has it already left your bank?",
+    # got the answer in the words of the question, and read it as no answer at
+    # all; the turn then fell through to prose and was retracted by the empty-
+    # confirm guard. Money LEAVING is the same fact as the bill being paid, so
+    # every ordinary way of saying it belongs in one place.
     paid = re.search(
         r"\b(?:already\s+)?paid\b"
-        r"|\b(?:taken|came|come)\s+(?:out\s+of|from)\s+(?:the\s+)?bank\b"
+        r"|\b(?:taken|came|come|left|gone|went)\s+"
+        r"(?:out\s+of|from|through)?\s*(?:the\s+|my\s+|our\s+)?"
+        r"(?:bank|account|chequing|checking)\b"
         r"|\bbank\s+(?:has\s+|already\s+)?(?:cleared|charged|processed)\b"
-        r"|\bcleared\s+(?:the\s+)?bank\b",
+        r"|\bcleared\s+(?:the\s+)?bank\b"
+        r"|\b(?:it|money|payment|amount)\s+(?:is|has|'s)\s*(?:been\s+)?gone\b"
+        r"|\bwent\s+through\b",
         low,
     )
     return "paid" if paid else None
@@ -3704,6 +3716,122 @@ def _pending_unscoped_document_id(landlord, conversation_id) -> str:
     return ""
 
 
+def _awaiting_expense_decision(landlord, conversation_id):
+    """The document RAMA last asked the expense question about, or None.
+
+    Read from the audit rather than a new column: `needs: "expense_decision"`
+    is already stamped on the tool result that asked, so the state is on the
+    record that produced it and cannot drift from it.
+    """
+    from .models import RamaDocument
+
+    rows = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+    ).order_by("-created_at")[:12]
+    for row in rows:
+        result = (row.content or {}).get("result") or {}
+        if not isinstance(result, dict):
+            continue
+        if result.get("needs") != "expense_decision":
+            continue
+        doc_id = str(result.get("document_id") or "")
+        if not doc_id:
+            continue
+        return (
+            RamaDocument.objects.filter(
+                pk=doc_id,
+                landlord=landlord,
+                deleted_at__isnull=True,
+                ledger_entry__isnull=True,
+            )
+            .select_related("holding")
+            .first()
+        )
+    return None
+
+
+def _finish_document_expense_from_answer(
+    landlord, conversation_id, document, message: str,
+) -> str | None:
+    """Turn the landlord's answer to the expense question into a real preview.
+
+    THE FAILURE THIS EXISTS FOR
+    ---------------------------
+    They answered both halves — "the amount is 37.16 and not 3000", then "yes,
+    and its left the bank" — and RAMA replied that there was no pending action
+    and they should say it all again. Everything needed was on the record; what
+    was missing was anything that MADE the next call. Finishing was left to the
+    model, the model wrote confirmation prose instead, and the empty-confirm
+    guard refused it — correctly, and to the landlord's cost.
+
+    So the answer is parsed and executed here. Returns the reply to show, or
+    None when this turn is not an answer to that question.
+    """
+    if document is None or document.ledger_entry_id:
+        return None
+
+    amount = _amount_from_message(message)
+    if amount:
+        _apply_document_amount_correction(landlord, str(document.pk), amount)
+        document.refresh_from_db()
+
+    state = _expense_bank_correction(message)
+    if state is None:
+        if not amount:
+            return None  # not an answer to this question at all
+        # They fixed the figure but said nothing about the money moving. Which
+        # month a cost lands in follows from paid_on, so it is asked, never
+        # assumed.
+        return (
+            f"Got it — using ${document.amount}.\n\n"
+            "Has that already left your bank, or is it still owing?"
+        )
+
+    arguments = {
+        "document_id": str(document.pk),
+        "amount": str(document.amount) if document.amount is not None else "",
+        "payment_state": "PAID" if state == "paid" else "UNPAID",
+    }
+    if not arguments["amount"]:
+        return (
+            "I still don't have a total for that receipt — OCR couldn't read "
+            "one. What did it come to?"
+        )
+
+    result = execute("file_business_document", arguments, landlord=landlord)
+    if not isinstance(result, dict):
+        return None
+    if result.get("error") or result.get("question_for_user"):
+        return str(
+            result.get("question_for_user") or result.get("error") or "",
+        ) or None
+    if not result.get("needs_confirm"):
+        return None
+
+    save_single(landlord, conversation_id, "file_business_document", arguments)
+    where = ""
+    if document.holding_id:
+        where = document.holding.address or document.holding.name
+    return "\n".join(
+        part
+        for part in (
+            "Ready to post this to your ledger:",
+            f"• ${document.amount} — {document.title or 'receipt'}",
+            f"• Against: {where}" if where else "",
+            (
+                "• Already left your bank, so it is dated as paid"
+                if state == "paid"
+                else "• Still owing — recorded as unpaid"
+            ),
+            "• The receipt stays attached to this entry",
+            "Reply yes to post it, or no to cancel.",
+        )
+        if part
+    )
+
+
 def _focus_has_pending_file(focus: dict | None) -> bool:
     focus = focus or {}
     return bool(
@@ -5297,6 +5425,19 @@ def run_turn(
         if result.get("created") or result.get("voided"):
             return _write_result_message(intent["tool"], result)
         return str(result.get("message") or result)
+
+    # Answering the expense question RAMA asked after filing a receipt. First,
+    # because it is the narrowest reading of this turn: a document is sitting
+    # scoped with no ledger entry and the landlord is replying to a question
+    # about that exact document. Left to the model it produced confirmation
+    # prose with nothing behind it, and the empty-confirm guard retracted the
+    # whole thing after they had already answered everything.
+    if deterministic_reply is None and pending_plan is None:
+        awaiting = _awaiting_expense_decision(landlord, conversation_id)
+        if awaiting is not None:
+            deterministic_reply = _finish_document_expense_from_answer(
+                landlord, conversation_id, awaiting, message,
+            )
 
     # Void/reverse expenses BEFORE create_expense — "void the $125…" must not
     # post a new expense named "void the $125…".
