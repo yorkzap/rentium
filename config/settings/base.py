@@ -523,6 +523,15 @@ RAMA_MODEL = env("RAMA_MODEL", default="grok-4.3")
 # full set listings never truncate mid-answer.
 RAMA_TEMPERATURE = env.float("RAMA_TEMPERATURE", default=0.0)
 RAMA_MAX_TOKENS = env.int("RAMA_MAX_TOKENS", default=4096)
+# Semantic interpretation (rama/interpret.py): where a deterministic path needs
+# to know what the landlord MEANT, the model classifies into a closed set the
+# caller lists, and Python validates and executes. There is no finite list of
+# ways to say "it's left the bank", and enumerating phrasings was losing turns.
+# Off falls every call site back to its pattern matching — less smart, still
+# correct — which is also what happens when no key is configured.
+RAMA_SEMANTIC_INTERPRETATION = env.bool(
+    "RAMA_SEMANTIC_INTERPRETATION", default=True
+)
 # Command-engine v2 retrieves a compact, request-relevant capability set
 # instead of sending the full 100+ operation surface to every model turn.
 RAMA_COMMAND_ENGINE_V2 = env.bool("RAMA_COMMAND_ENGINE_V2", default=True)

@@ -775,13 +775,64 @@ def _expense_bank_correction(message: str) -> str | None:
     return "paid" if paid else None
 
 
+def _expense_bank_status(landlord, message: str, conversation_id=None) -> str | None:
+    """"paid" / "unpaid" / None — asking what they MEANT, not what they typed.
+
+    The landlord's objection to the alternative, in their words: "we cannot
+    come up with each wording or pattern for this. RAMA should be smart enough
+    to know what it means. That's the whole point of an LLM." They are right —
+    there is no finite list of ways to say money has left an account, and
+    `_expense_bank_correction` had already missed the most ordinary one.
+
+    So the model reads the sentence and the regex catches it if the model
+    cannot be reached. That ordering matters: the pattern list is a floor to
+    degrade to, not the ceiling on what RAMA can understand.
+
+    Safe because of what it is allowed to return. Three words, validated
+    against a closed set (see interpret.py), no figure and no date among them —
+    the amount is read from the document either way, and whatever this decides
+    still produces a preview the landlord has to approve. The worst a wrong
+    reading does is offer to record a paid expense as unpaid, in writing, on
+    screen, before anything is written.
+    """
+    from .interpret import classify
+
+    verdict = classify(
+        landlord,
+        question=(
+            "Is the landlord saying that money has ALREADY left their bank "
+            "account, or that it is still owing / not yet taken?"
+        ),
+        message=message,
+        options=("paid", "unpaid", "unclear"),
+        conversation_id=conversation_id,
+        context=(
+            "They were just asked: 'Has that already left your bank, or is it "
+            "still owing?' Answer paid if the money has gone (any phrasing — "
+            "left the bank, came out, went through, already paid, it's done). "
+            "Answer unpaid if it has not gone yet. Answer unclear if they are "
+            "talking about something else entirely."
+        ),
+    )
+    if verdict in ("paid", "unpaid"):
+        return verdict
+    if verdict == "unclear":
+        # A real abstention, not a failure. Do not then let the pattern list
+        # override the model's considered "I can't tell" — that is how a guess
+        # gets in through the back door.
+        return None
+    # None: no key, no provider, timed out, or answered off-contract. Fall back
+    # to the words we do recognise rather than losing the turn.
+    return _expense_bank_correction(message)
+
+
 def _amend_pending_expense_from_message(
     landlord, conversation_id, pending_plan, message: str,
 ) -> str | None:
     """Replace a pending expense preview when its bank status is corrected."""
     if _is_expense_paid_status_question(message):
         return None
-    correction = _expense_bank_correction(message)
+    correction = _expense_bank_status(landlord, message, conversation_id)
     if pending_plan is None or correction is None:
         return None
     steps = list(pending_plan.steps.order_by("order"))
@@ -3777,7 +3828,7 @@ def _finish_document_expense_from_answer(
         _apply_document_amount_correction(landlord, str(document.pk), amount)
         document.refresh_from_db()
 
-    state = _expense_bank_correction(message)
+    state = _expense_bank_status(landlord, message, conversation_id)
     if state is None:
         if not amount:
             return None  # not an answer to this question at all
@@ -4520,8 +4571,8 @@ def run_turn(
                 conversation_id,
                 safe_context,
             )
-            if forced_expense_intent is not None and _expense_bank_correction(
-                message,
+            if forced_expense_intent is not None and _expense_bank_status(
+                landlord, message, conversation_id,
             ) == "paid":
                 forced_expense_intent["arguments"]["paid_on"] = "today"
             clear_plan(landlord, conversation_id)
@@ -4558,8 +4609,8 @@ def run_turn(
             conversation_id,
             safe_context,
         )
-        if forced_expense_intent is not None and _expense_bank_correction(
-            message,
+        if forced_expense_intent is not None and _expense_bank_status(
+            landlord, message, conversation_id,
         ) == "paid":
             forced_expense_intent["arguments"]["paid_on"] = "today"
         if forced_expense_intent is None:
