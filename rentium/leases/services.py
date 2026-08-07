@@ -78,13 +78,70 @@ MATERIAL_LEASE_FIELDS = frozenset(
 )
 
 
+# What a LIVE tenancy can still have changed.
+#
+# A signed lease was frozen completely, which is right for the deal and wrong
+# for everything around it: a landlord who agreed a new quiet-hours rule, or
+# whose service address changed, had no route but Django admin. Real tenancies
+# get amended by mutual agreement all the time, and BC expects the current
+# terms to be recorded.
+#
+# So this list is defined by what does NOT have machinery behind it. Deliberately
+# absent: every field in MATERIAL_LEASE_FIELDS. Rent and deposits have ledger
+# charges already posted against them, and the dates drive statutory clocks —
+# notice periods, the deposit-return deadline. Changing those on a live tenancy
+# needs the ledger to move too, which is what terminate/renew and the rent
+# adjustment tools are for, not a text box.
+AMENDABLE_WHEN_ACTIVE = frozenset(
+    {
+        "special_terms",
+        "house_rules",
+        "pets_terms",
+        "smoking_terms",
+        "parking_description",
+        "services_and_facilities",
+        "occupants",
+        "bills_summary",
+        "common_space_shared_with",
+        "common_space_clause_text",
+        "landlord_service_address",
+        "landlord_service_email",
+        "landlord_daytime_phone",
+        "landlord_other_phone",
+        "landlord_fax",
+        "etransfer_email",
+        "co_hosts",
+    }
+)
+
+
+def amendable_fields_for(lease) -> frozenset | None:
+    """Which fields this lease will accept, or None for "all of them".
+
+    None       — not executed yet; the landlord still owns the document.
+    a set      — live tenancy; wording may be amended, the deal may not.
+    empty set  — expired, terminated or superseded. History is not editable:
+                 those records are what a dispute is argued from.
+    """
+    from rentium.leases.models import Lease
+
+    if not lease.is_locked():
+        return None
+    if lease.status == Lease.LeaseStatus.ACTIVE:
+        return AMENDABLE_WHEN_ACTIVE
+    return frozenset()
+
+
 @transaction.atomic
 def update_lease_record(*, landlord, lease, values: dict, actor=None) -> dict:
     """Edit one lease through the single boundary the API and RAMA both use.
 
-    A lease is editable until it is executed — `Lease.is_locked()` (ACTIVE and
-    beyond), which is also what the LeaseNotLocked permission enforces. Re-checked
-    here so no caller can reach a locked lease by picking a different door.
+    Before execution the landlord owns the document and everything is editable.
+    Once the lease is ACTIVE the deal is fixed but its WORDING is not — see
+    `amendable_fields_for`. Past ACTIVE nothing is editable at all.
+
+    Re-checked here rather than trusted from the permission class, so no caller
+    can reach a locked lease by picking a different door.
 
     Before then a lease can already carry signatures: the landlord's, and any
     tenant who signed early. Editing is still allowed — the landlord owns the
@@ -101,13 +158,28 @@ def update_lease_record(*, landlord, lease, values: dict, actor=None) -> dict:
 
     if lease.landlord_id != landlord.pk:
         raise ValidationError("That lease is outside this portfolio.")
-    if lease.is_locked():
-        raise ValidationError(
-            f"Lease {lease.lease_number} is {lease.get_status_display().lower()} "
-            f"and can no longer be edited."
-        )
 
     data = dict(values)
+    allowed = amendable_fields_for(lease)
+    if allowed is not None:
+        refused = sorted(set(data) - allowed)
+        if not allowed:
+            raise ValidationError(
+                f"Lease {lease.lease_number} is "
+                f"{lease.get_status_display().lower()} and can no longer be "
+                f"edited — that record is what a dispute is argued from."
+            )
+        if refused:
+            raise ValidationError(
+                f"Lease {lease.lease_number} is active, so its wording can be "
+                f"amended but the deal itself cannot: {', '.join(refused)} "
+                f"{'have' if len(refused) > 1 else 'has'} charges or notice "
+                f"periods already running against "
+                f"{'them' if len(refused) > 1 else 'it'}. Use a rent "
+                f"adjustment, or terminate and re-issue, so the ledger moves "
+                f"with the change."
+            )
+
     # Never settable through an edit: identity, ownership, and the two fields
     # that are the signed document's own tamper evidence.
     for protected in (

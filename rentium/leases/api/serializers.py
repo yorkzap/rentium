@@ -1,3 +1,4 @@
+import uuid
 from decimal import Decimal
 
 from django.conf import settings
@@ -275,6 +276,9 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
             Decimal(self.instance.rent_amount) if self.instance else None
         )
         name_before = self.instance.invited_name if self.instance else None
+        # Same trap, same reason: update() decides whether this is a REDIRECT,
+        # and by then the instance is already carrying the new address.
+        self._email_before = self.instance.invited_email if self.instance else None
         tenant = data.get("tenant")
         invited_email = data.get("invited_email")
         if not self.instance:
@@ -431,7 +435,51 @@ class LeaseTenantSerializer(serializers.ModelSerializer):
         than no event at all.
         """
         amendment = getattr(self, "_amends_signed_rent", None)
+
+        # --- Redirecting an invite has to KILL the old link ---
+        # The reason a landlord edits this field is that the invite went to the
+        # wrong address. Changing the email alone left invite_token untouched,
+        # so the stranger who received it kept a working link to read the
+        # tenancy — names, rent, the property — and to sign it. Rotating the
+        # token is what actually redirects the invite rather than just
+        # relabelling it.
+        #
+        # Only for a slot nobody has claimed: once an account is linked the
+        # token is not how they get in, and once they have signed the signature
+        # is against this row and must not be disturbed.
+        new_email = validated_data.get("invited_email")
+        redirecting = (
+            new_email
+            and instance.tenant_id is None
+            and not instance.has_signed
+            and (new_email or "").casefold()
+            != (getattr(self, "_email_before", None) or "").casefold()
+        )
+        if redirecting:
+            validated_data["invite_token"] = uuid.uuid4()
+            # Not sent to the new address yet. Leaving the old timestamp would
+            # show the landlord a delivery they never made.
+            validated_data["invite_sent_at"] = None
+            # LINK_OPENED events are deliberately NOT cleared. If the wrong
+            # recipient opened the invite, that happened, and it is exactly the
+            # fact worth keeping — who saw the tenancy before it was redirected.
+
         updated = super().update(instance, validated_data)
+        if redirecting:
+            from rentium.leases.models import LeaseInviteEvent
+
+            request = self.context.get("request")
+            actor = getattr(request, "user", None)
+            LeaseInviteEvent.objects.create(
+                lease_tenant=updated,
+                kind=LeaseInviteEvent.Kind.INVITE_REDIRECTED,
+                actor=actor if getattr(actor, "pk", None) else None,
+                metadata={
+                    "from": getattr(self, "_email_before", None),
+                    "to": updated.invited_email,
+                    "old_link_revoked": True,
+                },
+            )
         if amendment:
             from rentium.leases.models import LeaseInviteEvent
 

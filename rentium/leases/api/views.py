@@ -37,6 +37,7 @@ from rentium.users.models import TenantProfile
 from .permissions import IsLandlordOrTenantMember
 from .permissions import IsLandlordOwner
 from .permissions import LeaseNotLocked
+from .permissions import LeaseNotLockedOrAmendable
 from .serializers import LeaseDocumentSerializer
 from .serializers import LeaseListSerializer
 from .serializers import LeaseSerializer
@@ -186,7 +187,11 @@ def check_overlap_view(request):
 class LeaseViewSet(viewsets.ModelViewSet):
     """ViewSet for managing leases. Supports different views for landlords and tenants."""
 
-    permission_classes = [IsLandlordOrTenantMember, LeaseNotLocked]
+    # Amendable rather than strictly locked: an ACTIVE lease still accepts a
+    # PATCH of its WORDING (special terms, house rules, contact details) while
+    # rent, deposits and dates stay frozen. See LeaseNotLockedOrAmendable and
+    # services.AMENDABLE_WHEN_ACTIVE.
+    permission_classes = [IsLandlordOrTenantMember, LeaseNotLockedOrAmendable]
     filter_backends = [
         DjangoFilterBackend,
         filters.SearchFilter,

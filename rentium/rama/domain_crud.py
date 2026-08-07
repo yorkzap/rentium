@@ -2841,13 +2841,19 @@ def update_lease(
     if err:
         return _prop_err(err)
 
-    # Match LeaseNotLocked: ACTIVE+ cannot be edited via API
-    if lease.is_locked():
+    # Mirrors the UI exactly (leases/services.amendable_fields_for): a live
+    # tenancy still accepts amendments to its WORDING, and only a lease past
+    # ACTIVE is frozen outright. The per-field rule is enforced below by
+    # update_lease_record, which both doors go through — this is the early exit
+    # for the case where nothing at all can be changed.
+    from rentium.leases.services import amendable_fields_for
+
+    if amendable_fields_for(lease) == frozenset():
         return {
             "error": (
-                f"Lease {lease.lease_number} is locked (status={lease.status}). "
-                "ACTIVE/EXPIRED/TERMINATED/RENEWED leases cannot be field-edited "
-                "(same as UI LeaseNotLocked). Use terminate_lease or admin."
+                f"Lease {lease.lease_number} is {lease.get_status_display().lower()} "
+                f"and can no longer be edited — that record is what a dispute "
+                f"is argued from. Use renew_lease to issue a new one."
             ),
         }
 

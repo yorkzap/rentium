@@ -2856,6 +2856,14 @@ def test_create_lease_draft_type_auto_room(landlord):
 
 
 def test_update_lease_blocked_when_active(landlord, bc_lease):
+    """An ACTIVE lease refuses a rent change: charges are already posted
+    against it.
+
+    The lease is no longer frozen WHOLESALE — its wording can be amended by
+    agreement (see leases/test_lease_editing.py) — so this asserts the rent is
+    refused and unchanged rather than matching on the word "locked", which is
+    no longer what the refusal is about.
+    """
     from rentium.rama import domain_crud as crud
 
     out = crud.update_lease(
@@ -2865,7 +2873,9 @@ def test_update_lease_blocked_when_active(landlord, bc_lease):
         confirm="yes",
     )
     assert "error" in out
-    assert "locked" in out["error"].lower()
+    assert "total_rent" in out["error"]
+    bc_lease.refresh_from_db()
+    assert bc_lease.total_rent == Decimal("850.00")
 
 
 def test_delete_draft_only(landlord, bc_property, bc_lease):

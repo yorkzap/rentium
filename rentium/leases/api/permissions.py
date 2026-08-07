@@ -129,3 +129,58 @@ class LeaseNotLocked(BasePermission):
             return True  # not lease-related; let other permission classes decide
 
         return not lease.is_locked()
+
+
+class LeaseNotLockedOrAmendable(LeaseNotLocked):
+    """LeaseNotLocked, except that a LIVE tenancy may have its wording amended.
+
+    Freezing an executed lease completely was right for the deal and wrong for
+    everything around it — a landlord who agreed a new house rule, or whose
+    service address changed, had no route but Django admin. Tenancies really do
+    get amended by agreement, and BC expects the current terms to be recorded.
+
+    Only for the Lease endpoint, and only for the fields in
+    `AMENDABLE_WHEN_ACTIVE` — rent, deposits and dates stay frozen because
+    ledger charges and statutory clocks are already running against them.
+    Anything past ACTIVE stays frozen entirely: those records are what a
+    dispute is argued from.
+
+    The real enforcement is in `services.update_lease_record`, the boundary the
+    API and RAMA share. This exists so the request is refused at the door with
+    a useful message rather than deep inside a serializer.
+    """
+
+    def has_object_permission(self, request, view, obj):
+        from rentium.leases.services import amendable_fields_for
+
+        if super().has_object_permission(request, view, obj):
+            return True
+
+        lease = _resolve_lease(obj)
+        if lease is None or lease is not obj:
+            # Only the lease itself is amendable this way. Anything hanging off
+            # it (a tenant slot, a document) keeps the strict rule.
+            return False
+
+        allowed = amendable_fields_for(lease)
+        if not allowed:
+            return False
+        if request.method != "PATCH":
+            # A PUT replaces the whole record, which on a live lease means
+            # sending the frozen fields back too. Amendments are partial.
+            self.message = (
+                "This lease is active. Send just the wording you are changing "
+                "as a PATCH — a full replace would rewrite terms that have "
+                "charges and notice periods running against them."
+            )
+            return False
+
+        refused = sorted(set(request.data or {}) - allowed)
+        if refused:
+            self.message = (
+                f"This lease is active, so its wording can be amended but the "
+                f"deal cannot: {', '.join(refused)}. Use a rent adjustment, or "
+                f"terminate and re-issue, so the ledger moves with the change."
+            )
+            return False
+        return True

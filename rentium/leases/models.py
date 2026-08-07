@@ -1263,6 +1263,11 @@ class LeaseInviteEvent(models.Model):
         # append-only, because "they signed a different lease" is exactly the
         # claim this evidence has to answer.
         TERMS_AMENDED = "TERMS_AMENDED", _("Terms amended after signing")
+        # The invite was sent to the wrong address and has been redirected.
+        # Recorded because it REVOKES something: the old link stops working,
+        # and "why can't I open my lease" from the first recipient needs an
+        # answer that is on the record rather than in someone's memory.
+        INVITE_REDIRECTED = "INVITE_REDIRECTED", _("Invite redirected to a new email")
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     lease_tenant = models.ForeignKey(

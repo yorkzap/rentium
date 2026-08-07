@@ -316,3 +316,115 @@ def test_services_included_are_editable_and_change_the_agreement(
     )
     assert "Heat: the tenant should not run the heating" in text
     assert "Water: taps, showers and hoses" in text
+
+
+# ------------------------------------------- amending a lease that is LIVE
+#
+# "in the leases edit ui, there should be option to edit the special terms too"
+#
+# Freezing an executed lease completely was right for the deal and wrong for
+# everything around it. A landlord who agrees a new house rule mid-tenancy, or
+# whose service address changes, had no route but Django admin — while BC
+# expects the current terms to be the ones on record.
+#
+# So the split is by what has machinery behind it: wording may be amended, the
+# deal may not, and a lease past ACTIVE is not editable at all.
+def test_an_active_lease_accepts_an_amendment_to_its_wording(landlord, bc_lease):
+    response = _client(landlord).patch(
+        f"/api/leases/{bc_lease.pk}/",
+        {"special_terms": "Tenant maintains the garden beds from June."},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.data
+    bc_lease.refresh_from_db()
+    assert bc_lease.special_terms == "Tenant maintains the garden beds from June."
+
+
+def test_an_active_lease_still_refuses_the_deal_itself(landlord, bc_lease):
+    """Rent has charges posted against it and the dates drive notice periods
+    and the deposit-return clock. Those move through the ledger, not a text
+    box — which is the whole reason the lock existed."""
+    for field, value in (
+        ("total_rent", "9999.00"),
+        ("security_deposit", "1.00"),
+        ("end_date", "2030-01-01"),
+        ("start_date", "2020-01-01"),
+    ):
+        response = _client(landlord).patch(
+            f"/api/leases/{bc_lease.pk}/", {field: value}, format="json",
+        )
+        assert response.status_code == 403, (field, response.data)
+
+    bc_lease.refresh_from_db()
+    assert bc_lease.total_rent == Decimal("850.00")
+
+
+def test_one_frozen_field_refuses_the_whole_patch(landlord, bc_lease):
+    """A mixed PATCH must not half-apply — the wording landing while the rent
+    is rejected would leave the landlord believing both went through."""
+    before = bc_lease.special_terms
+    response = _client(landlord).patch(
+        f"/api/leases/{bc_lease.pk}/",
+        {"special_terms": "Amended.", "total_rent": "9999.00"},
+        format="json",
+    )
+
+    assert response.status_code == 403
+    bc_lease.refresh_from_db()
+    assert bc_lease.special_terms == before
+    assert bc_lease.total_rent == Decimal("850.00")
+
+
+def test_the_refusal_says_what_to_do_instead(landlord, bc_lease):
+    response = _client(landlord).patch(
+        f"/api/leases/{bc_lease.pk}/", {"total_rent": "9999.00"}, format="json",
+    )
+    detail = str(response.data.get("detail") or response.data)
+    assert "rent adjustment" in detail.casefold()
+
+
+def test_an_ended_lease_is_frozen_completely(landlord, bc_lease):
+    """History is not editable. A terminated tenancy's record is what a dispute
+    is argued from, so even its wording stops moving."""
+    from rentium.leases.models import Lease
+
+    bc_lease.status = Lease.LeaseStatus.TERMINATED
+    bc_lease.save(update_fields=["status"])
+
+    response = _client(landlord).patch(
+        f"/api/leases/{bc_lease.pk}/",
+        {"special_terms": "Rewriting history."},
+        format="json",
+    )
+    assert response.status_code == 403
+
+
+def test_a_full_replace_is_refused_on_a_live_lease(landlord, bc_lease):
+    """A PUT sends the frozen fields back too. Amendments are partial."""
+    response = _client(landlord).put(
+        f"/api/leases/{bc_lease.pk}/",
+        {"special_terms": "Amended."},
+        format="json",
+    )
+    assert response.status_code == 403
+
+
+def test_rama_and_the_ui_agree_about_what_is_amendable(landlord, bc_lease):
+    """Two doors, one rule. RAMA used to refuse every ACTIVE lease outright;
+    a landlord told 'yes' by the dashboard and 'no' by RAMA on the same edit
+    is the inconsistency this pair of checks exists to prevent."""
+    from rentium.rama import registry
+
+    result = registry.execute(
+        "update_lease",
+        {
+            "lease_number": bc_lease.lease_number,
+            "special_terms": "Amended through RAMA.",
+            "confirm": "yes",
+        },
+        landlord=landlord,
+    )
+    assert not result.get("error"), result
+    bc_lease.refresh_from_db()
+    assert bc_lease.special_terms == "Amended through RAMA."
