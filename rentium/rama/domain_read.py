@@ -34,7 +34,14 @@ import re
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
-from .manifest import MANIFEST, EntitySpec, FieldSpec
+from .manifest import (
+    MANIFEST,
+    EntitySpec,
+    FieldSpec,
+    relation_label_path,
+    relations_for,
+    resolve_path,
+)
 
 # Longest operators first so ">=" isn't mis-split as ">".
 _OPS = [
@@ -62,38 +69,40 @@ def _coerce(fs: FieldSpec, raw: str):
     return v  # string / enum / date (Django parses ISO dates for gte/lte/exact)
 
 
-# Filter names weak models reach for that aren't fields on the entity, mapped
-# to the ORM lookup they actually mean. Whitelisted one by one — this is not a
-# general "pass any ORM path" escape hatch.
+# Names that mean a relation path but aren't spelled like one. What used to be
+# a hand-maintained table of five is now two shapes, because manifest.resolve_path
+# handles `lease__start_date` generically — every entry that table held was a
+# real call from the audit log that had failed, i.e. a landlord waiting for
+# somebody to notice.
 #
-# Every entry below is a real call from the audit log that failed with
-# "Can't filter on X". Rejecting them taught the model nothing: `name_contains`
-# is the obvious name for a contains filter, and asking for a lease by its
-# property's name is a reasonable thing to want.
-_RELATION_FILTERS = {
-    ("lease", "property_name"): "property__name__icontains",
-    ("lease", "property_query"): "property__name__icontains",
-    ("lease", "tenant_name"): "lease_tenants__tenant__user__name__icontains",
-    ("work_order", "property_name"): "property__name__icontains",
-    ("inventory_item", "property_name"): "property__name__icontains",
-}
+# `<relation>_name` / `<relation>_query` survive as sugar: "give me the leases
+# for Maple Street" is a substring match on the related entity's human label,
+# not on a field the model can name.
+_RELATION_SUGAR = re.compile(r"^(?P<rel>\w+?)_(?:name|query)$")
 
 
-def _alias_lookup(entity: str, fname: str, fmap: dict[str, FieldSpec]):
+def _alias_lookup(entity_spec, fname: str, fmap: dict[str, FieldSpec]):
     """Resolve a non-field filter name to an ORM lookup, or None.
 
-    Handles the declared relation filters above plus the generic
-    `<field>_contains` form, which is what a model naturally writes when it
-    wants a substring match and hasn't noticed the `~` operator.
+    Two generic forms: `<field>_contains`, which is what a model writes when it
+    wants a substring match and hasn't noticed the `~` operator; and
+    `<relation>_name`, a substring match against the related entity's label.
     """
-    direct = _RELATION_FILTERS.get((entity, fname))
-    if direct:
-        return direct
     if fname.endswith("_contains"):
         base = fname[: -len("_contains")]
         fs = fmap.get(base)
         if fs is not None and fs.filterable and fs.type in ("string", "enum"):
             return f"{base}__icontains"
+        # `lease_number_contains` style across a relation.
+        path, spec_, _err = resolve_path(entity_spec, base)
+        if path and spec_ is not None and spec_.type in ("string", "enum"):
+            return f"{path}__icontains"
+
+    match = _RELATION_SUGAR.match(fname)
+    if match:
+        label_path = relation_label_path(entity_spec, match.group("rel"))
+        if label_path:
+            return f"{label_path}__icontains"
     return None
 
 
@@ -137,7 +146,23 @@ def _emptiness_clause(clause: str, fmap: dict[str, FieldSpec]):
     return True, blank_forms, {}, None
 
 
-def _parse_filters(filters: str, fmap: dict[str, FieldSpec], entity: str = ""):
+def _filterable_names(spec: EntitySpec) -> str:
+    """What to offer when a filter name is rejected.
+
+    Includes the relation prefixes, because the model cannot guess that
+    `lease__start_date` is legal from a list that only shows local fields —
+    that is precisely how it ended up reading the ledger once per lease.
+    """
+    local = [k for k, f in spec.field_map().items() if f.filterable]
+    rels = sorted(relations_for(spec))
+    if rels:
+        local.append(
+            "and through relations: " + ", ".join(f"{r}__…" for r in rels),
+        )
+    return ", ".join(local)
+
+
+def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = None):
     """Returns (include_kwargs, exclude_kwargs, error)."""
     include: dict = {}
     exclude: dict = {}
@@ -160,30 +185,57 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], entity: str = ""):
                 op_tok, suffix = tok, suf
                 break
         if op_tok is None:
-            return None, None, f"Bad filter {clause!r} — use field=value, >, <, >=, <=, ~ (contains), or != ."
+            return None, None, (
+                f"Bad filter {clause!r} — use field=value, >, <, >=, <=, "
+                f"~ (contains), != , 'field is empty', or a range "
+                f"field=2026-08-01..2026-08-31 ."
+            )
         fname, raw = clause.split(op_tok, 1)
         fname = fname.strip()
+
+        # Local field, then a relation path (lease__start_date), then sugar.
         fs = fmap.get(fname)
-        if fs is None or not fs.filterable:
-            aliased = _alias_lookup(entity, fname, fmap)
+        path = fs.lookup_path if (fs is not None and fs.filterable) else None
+        if path is None:
+            path, fs, err = resolve_path(spec, fname)
+            if err:
+                return None, None, err
+        if path is None or fs is None or not fs.filterable:
+            aliased = _alias_lookup(spec, fname, fmap)
             if aliased is not None:
                 # Aliases are always substring/text lookups, so the raw value
                 # goes through as-is.
                 include[aliased] = raw.strip()
                 continue
-            allowed = ", ".join(k for k, f in fmap.items() if f.filterable)
-            return None, None, f"Can't filter on {fname!r}. Filterable fields: {allowed}."
+            return None, None, (
+                f"Can't filter on {fname!r}. Filterable fields: "
+                f"{_filterable_names(spec)}."
+            )
+
+        # A range on the field itself — `start_date=2026-08-01..2026-08-31`.
+        # This is what the model reaches for, on the field it actually cares
+        # about; `between=` only ever applied to the entity's default date.
+        if suffix == "=" and ".." in raw:
+            low, _, high = raw.partition("..")
+            try:
+                lo, hi = _coerce(fs, low), _coerce(fs, high)
+            except ValueError as exc:
+                return None, None, str(exc)
+            include[f"{path}__gte"] = lo
+            include[f"{path}__lte"] = hi
+            continue
+
         try:
             value = _coerce(fs, raw)
         except ValueError as exc:
             return None, None, str(exc)
         if suffix == "=":  # equality: iexact for text/enum, exact otherwise
-            key = f"{fname}__iexact" if fs.type in ("string", "enum") else fname
+            key = f"{path}__iexact" if fs.type in ("string", "enum") else path
             include[key] = value
         elif suffix == "!=":
-            exclude[fname] = value
+            exclude[path] = value
         else:
-            include[f"{fname}{suffix}"] = value
+            include[f"{path}{suffix}"] = value
     return include, exclude, None
 
 
@@ -229,13 +281,18 @@ def _parse_aggregate(aggregate: str, spec: EntitySpec):
                 f"Use one of {', '.join(_AGG_FUNCS)}."
             )
         fs = spec.field_map().get(fname)
+        path = fs.lookup_path if fs is not None else None
+        if fs is None:
+            path, fs, err = resolve_path(spec, fname)
+            if err:
+                return None, None, err
         if fs is None or not fs.aggregatable:
             allowed = ", ".join(spec.aggregatable_map()) or "none on this entity"
             return None, None, (
                 f"Can't aggregate on {fname!r}. Aggregatable fields: {allowed}."
             )
         referenced.add(fs.name)
-        specs.append((_agg_key(func, fs.name), builders[func](fs.lookup_path)))
+        specs.append((_agg_key(func, fname), builders[func](path)))
     return specs, referenced, None
 
 
@@ -264,6 +321,11 @@ def _parse_group_by(group_by: str, spec: EntitySpec):
                     f"{' or '.join(_TRUNC)}:<date field>."
                 )
             fs = spec.field_map().get(fname)
+            path = fs.lookup_path if fs is not None else None
+            if fs is None:
+                path, fs, err = resolve_path(spec, fname)
+                if err:
+                    return None, None, err
             if fs is None or fs.type != "date":
                 dates = ", ".join(
                     k for k, f in spec.field_map().items() if f.type == "date"
@@ -273,17 +335,34 @@ def _parse_group_by(group_by: str, spec: EntitySpec):
                     f"{dates or 'none on this entity'}."
                 )
             referenced.add(fs.name)
-            keys.append((f"{kind}_{fs.name}", truncs[kind](fs.lookup_path)))
+            keys.append((f"{kind}_{fname}", truncs[kind](path)))
             continue
+        # `group_by="lease"` — group by the RELATION, keyed on the related
+        # entity's human label rather than its UUID. Without this the only way
+        # to ask "deposits per lease" was one query per lease, which is how a
+        # turn burned its whole time budget and answered nothing.
+        label_path = relation_label_path(spec, token)
+        if label_path is not None:
+            referenced.add(token)
+            keys.append((token, label_path))
+            continue
+
         fs = spec.field_map().get(token)
+        path = fs.lookup_path if fs is not None else None
+        if fs is None:
+            path, fs, err = resolve_path(spec, token)
+            if err:
+                return None, None, err
         if fs is None or not fs.groupable:
             allowed = ", ".join(spec.groupable_map()) or "none on this entity"
+            rels = ", ".join(sorted(relations_for(spec)))
             return None, None, (
                 f"Can't group by {token!r}. Groupable fields: {allowed}. "
+                f"Relations (grouped by their name): {rels or 'none'}. "
                 f"(Also available: month:<date field>, year:<date field>.)"
             )
         referenced.add(fs.name)
-        keys.append((fs.name, fs.lookup_path))
+        keys.append((token, path))
     return keys, referenced, None
 
 
@@ -297,10 +376,16 @@ def _parse_order_by(order_by: str, spec: EntitySpec, agg_keys: set[str]):
     if name in agg_keys:  # order a grouped table by its own totals
         return ("-" if descending else "") + name, set(), None
     fs = spec.field_map().get(name)
+    path = fs.lookup_path if fs is not None else None
+    if fs is None:
+        path, fs, err = resolve_path(spec, name)
+        if err:
+            return None, None, err
     if fs is None or not fs.filterable:
-        allowed = ", ".join(k for k, f in spec.field_map().items() if f.filterable)
-        return None, None, f"Can't order by {name!r}. Orderable fields: {allowed}."
-    return ("-" if descending else "") + fs.lookup_path, {fs.name}, None
+        return None, None, (
+            f"Can't order by {name!r}. Orderable fields: {_filterable_names(spec)}."
+        )
+    return ("-" if descending else "") + path, {fs.name}, None
 
 
 def _parse_period(month: str, year: str, between: str, spec: EntitySpec):
@@ -396,10 +481,45 @@ def _referenced_names(text: str, spec: EntitySpec) -> set[str]:
     return {name for name in spec.field_map() if name in tokens}
 
 
-def read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
-         limit: str = "20", aggregate: str = "", group_by: str = "",
-         order_by: str = "", month: str = "", year: str = "",
-         between: str = "") -> dict:
+def read(landlord, **kwargs) -> dict:
+    """Guarded entry point: a raw exception must never reach the model.
+
+    Asked for a date range it spelled `start_date=2026-08-01..2026-08-31`, the
+    model got back a Django ValidationError verbatim. That taught it nothing —
+    every other error in this module names what IS allowed, which is how it
+    self-corrects mid-turn (see the _alias_lookup notes). It retried, learned
+    nothing again, and burned the turn's time budget.
+
+    So the last line of defence is structural: whatever goes wrong below, the
+    model receives a sentence describing the fix.
+    """
+    from django.core.exceptions import FieldError, ValidationError
+
+    try:
+        return _read(landlord, **kwargs)
+    except ValidationError as exc:
+        return {
+            "error": (
+                f"A filter value wasn't the right shape: "
+                f"{'; '.join(exc.messages)} "
+                f"Dates are YYYY-MM-DD (a range is start..end), money is a "
+                f"plain number, booleans are true/false."
+            ),
+        }
+    except (FieldError, ValueError, TypeError) as exc:
+        return {
+            "error": (
+                f"That query didn't work: {exc}. Call data_catalogue for this "
+                f"entity's fields, or read it directly instead of through a "
+                f"relation."
+            ),
+        }
+
+
+def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
+          limit: str = "20", aggregate: str = "", group_by: str = "",
+          order_by: str = "", month: str = "", year: str = "",
+          between: str = "") -> dict:
     spec = MANIFEST.get((entity or "").strip().lower())
     if spec is None:
         return {
@@ -411,7 +531,7 @@ def read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
     Model = apps.get_model(*spec.model.split("."))
     fmap = spec.field_map()
 
-    include, exclude, ferr = _parse_filters(filters or "", fmap, spec.key)
+    include, exclude, ferr = _parse_filters(filters or "", fmap, spec)
     if ferr:
         return {"error": ferr}
 

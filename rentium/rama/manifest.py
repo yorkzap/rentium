@@ -225,6 +225,27 @@ LEASE = EntitySpec(
         FieldSpec("security_deposit", "Security deposit", "money", editable=True),
         FieldSpec("pet_deposit", "Pet deposit", "money", editable=True),
         FieldSpec("cleaning_deposit", "Cleaning deposit", "money", editable=True),
+        # The lease paperwork's record of when a deposit was marked received —
+        # NOT the money. The ledger is the source of truth for that
+        # (DEPOSIT_CHARGE + charge_state), and on real data these two already
+        # disagree: leases with no date here have partial settlements there.
+        # The labels say so, because a field called "…received date" will
+        # otherwise be quoted as proof of payment. sergeants.py watches the gap.
+        FieldSpec(
+            "security_deposit_received_date",
+            "Security deposit marked received on the lease (not the ledger)",
+            "date", nullable=True,
+        ),
+        FieldSpec(
+            "pet_deposit_received_date",
+            "Pet deposit marked received on the lease (not the ledger)",
+            "date", nullable=True,
+        ),
+        FieldSpec(
+            "cleaning_deposit_received_date",
+            "Cleaning deposit marked received on the lease (not the ledger)",
+            "date", nullable=True,
+        ),
         FieldSpec("pets_allowed", "Pets allowed", "bool", editable=True),
         FieldSpec("smoking_allowed", "Smoking allowed", "bool", editable=True),
         FieldSpec("parking_included", "Parking included", "bool", editable=True),
@@ -545,6 +566,156 @@ LEASE_FORM = EntitySpec(
     ),
 )
 
+# --------------------------------------------------------------------------- #
+# The relation graph
+#
+# The manifest was a flat list of fields per entity, so a question spanning two
+# of them could not be asked. Told "have I received deposits from everyone
+# moving in from August?", RAMA read the ledger once PER LEASE — because
+# `lease__lease_number` was filterable on ledger_entry but not groupable, and
+# `lease__start_date` was not declared at all — then ran out of its 45-second
+# budget. Five hand-written aliases in domain_read._RELATION_FILTERS were the
+# entire cross-entity surface, each one added after a landlord hit its absence.
+#
+# Relations are DERIVED from the models, not declared, so the graph cannot drift
+# from the schema. Three rules make that safe:
+#
+#   1. Only relations whose TARGET MODEL IS ITSELF A MANIFEST ENTITY. This is
+#      the security boundary and it maintains itself: ledger_entry.lease
+#      resolves because `lease` is an entity; ledger_entry.created_by does not,
+#      because User is not one and nobody decided what of a user is safe to
+#      show.
+#   2. Only FORWARD relations (FK / OneToOne). A reverse or many-to-many join
+#      fans the parent row out, which silently multiplies every aggregate in
+#      the query — the same defect just removed from with_settlement() by
+#      making it a Subquery. Forbidding to-many traversal prevents it
+#      structurally rather than by remembering.
+#   3. A traversed field must still be DECLARED on the target entity. Reaching
+#      `lease__start_date` gives exactly what reading `lease.start_date` gives;
+#      default-deny is unchanged, and no field gains exposure by being
+#      approached from a second direction.
+# --------------------------------------------------------------------------- #
+
+#: Depth 1 answers every question observed so far (ledger → lease); depth 2
+#: covers the obvious next one (ledger → lease → property). Past that, join
+#: cost and path ambiguity grow with nothing asking for them.
+MAX_RELATION_DEPTH = 2
+
+
+@dataclass(frozen=True)
+class RelationSpec:
+    name: str  # the FK attribute, e.g. "lease"
+    target: str  # manifest entity key it points at
+    label: str
+
+
+def _model_label(model) -> str:
+    return f"{model._meta.app_label}.{model.__name__}"
+
+
+def relations_for(spec: EntitySpec) -> dict[str, RelationSpec]:
+    """Forward relations from `spec` to other manifest entities.
+
+    Derived from the model and cached, so declaring a new entity makes every
+    existing entity's path to it work with no further edits.
+    """
+    cached = _RELATION_CACHE.get(spec.key)
+    if cached is not None:
+        return cached
+
+    from django.apps import apps
+
+    by_model = {}
+    for key, other in MANIFEST.items():
+        by_model[other.model.lower()] = key
+
+    model = apps.get_model(*spec.model.split("."))
+    found: dict[str, RelationSpec] = {}
+    for field_ in model._meta.get_fields():
+        # Forward FK / O2O only — see rule 2 above.
+        if not (field_.many_to_one or field_.one_to_one):
+            continue
+        if not getattr(field_, "concrete", False):
+            continue
+        target_key = by_model.get(_model_label(field_.related_model).lower())
+        if target_key is None:
+            continue  # rule 1: not a manifest entity, not reachable
+        found[field_.name] = RelationSpec(
+            name=field_.name,
+            target=target_key,
+            label=str(getattr(field_, "verbose_name", field_.name)).title(),
+        )
+    _RELATION_CACHE[spec.key] = found
+    return found
+
+
+def resolve_path(spec: EntitySpec, path: str, _depth: int = 0):
+    """Resolve 'lease__start_date' to (orm_path, FieldSpec) or (None, error).
+
+    Returns the TARGET entity's own FieldSpec, so everything downstream —
+    filterability, type coercion, aggregatable, groupable, display — behaves
+    exactly as it does when reading that entity directly.
+    """
+    fieldspec = spec.field_map().get(path)
+    if fieldspec is not None:
+        return fieldspec.lookup_path, fieldspec, None
+
+    if "__" not in path:
+        return None, None, None  # not a path; caller reports it its own way
+
+    head, tail = path.split("__", 1)
+    relation = relations_for(spec).get(head)
+    if relation is None:
+        return None, None, None
+
+    if _depth + 1 >= MAX_RELATION_DEPTH and "__" in tail:
+        return None, None, (
+            f"{path!r} goes more than {MAX_RELATION_DEPTH} relations deep. "
+            f"Read {relation.target} directly instead."
+        )
+
+    target = MANIFEST[relation.target]
+    inner_path, inner_spec, error = resolve_path(target, tail, _depth + 1)
+    if error:
+        return None, None, error
+    if inner_spec is None:
+        allowed = ", ".join(
+            k for k, f in target.field_map().items() if f.filterable
+        )
+        return None, None, (
+            f"{relation.target} has no field {tail!r}. "
+            f"Available via {head}__: {allowed}."
+        )
+    if inner_spec.source:
+        # An annotation on the related entity is not produced by this query's
+        # queryset, so the path would resolve to a column that isn't there.
+        return None, None, (
+            f"{path!r} is a computed field on {relation.target} and can't be "
+            f"reached through a relation. Read {relation.target} directly."
+        )
+    return f"{head}__{inner_path}", inner_spec, None
+
+
+def relation_label_path(spec: EntitySpec, name: str) -> str | None:
+    """The human column to group a relation by — 'lease' → 'lease__lease_number'.
+
+    Grouping by the relation itself would key the table on a UUID, which is a
+    correct answer nobody can read. The manifest already knows each entity's
+    human name via resolve_label().
+    """
+    relation = relations_for(spec).get(name)
+    if relation is None:
+        return None
+    target = MANIFEST[relation.target]
+    label_field = target.resolve_label()
+    if not label_field or label_field not in target.field_map():
+        return None
+    return f"{name}__{label_field}"
+
+
+_RELATION_CACHE: dict[str, dict[str, RelationSpec]] = {}
+
+
 MANIFEST: dict[str, EntitySpec] = {
     e.key: e
     for e in (
@@ -604,6 +775,25 @@ def capability_digest() -> str:
             + "; ".join(totalling)
             + ".",
         )
+    # Traversal is useless if the model cannot tell it exists. Without this
+    # line it read the ledger once PER LEASE, because nothing said the two
+    # entities were connected.
+    edges = []
+    for key, spec in MANIFEST.items():
+        rels = relations_for(spec)
+        if rels:
+            edges.append(f"{key} → {', '.join(sorted(rels))}")
+    if edges:
+        lines.append(
+            "- FILTER AND GROUP ACROSS RELATIONS with `rel__field` — one query, "
+            "never one per row. `read(entity='ledger_entry', "
+            "filters='lease__start_date=2026-08-01..2026-08-31', "
+            "group_by='lease')` answers a question about leases FROM the "
+            "ledger. Grouping by a relation names it in the reply (a lease "
+            "number, not an id). Available: "
+            + "; ".join(edges)
+            + ".",
+        )
     lines.append(
         f"- EDIT via `update` (previews, then confirm): {'; '.join(editable_bits)}.",
     )
@@ -614,20 +804,60 @@ def capability_digest() -> str:
     return "\n".join(lines)
 
 
-def entity_catalogue() -> list[dict]:
-    """A compact description of every readable entity + its fields — handed to
-    RAMA so it knows what it can query without a bespoke tool per entity."""
-    out = []
+def _entity_detail(spec: EntitySpec) -> dict:
+    return {
+        "entity": spec.key,
+        "label": spec.label,
+        "relations": {
+            name: rel.target for name, rel in sorted(relations_for(spec).items())
+        },
+        "date_field": spec.date_field,
+        "scope_note": spec.scope_note,
+        "fields": [
+            {
+                "name": f.name,
+                "label": f.label,
+                "type": f.type,
+                "filterable": f.filterable,
+                **({"aggregatable": True} if f.aggregatable else {}),
+                **({"groupable": True} if f.groupable else {}),
+            }
+            for f in spec.fields
+        ],
+    }
+
+
+def entity_catalogue(entity: str = "") -> list[dict]:
+    """What `read` can query. An INDEX by default; one entity's fields on request.
+
+    Listing all 13 entities' fields is already ~3,300 tokens and grows with every
+    declaration. Most of that is wasted: a turn needs one entity's fields, not
+    thirteen. So the default answer is an index — names, counts and the relation
+    graph, which is what tells the model two entities can be queried together —
+    and the detail is a second call it makes only when it needs it.
+    """
+    wanted = (entity or "").strip().lower()
+    if wanted:
+        spec = MANIFEST.get(wanted)
+        if spec is None:
+            return [{"error": f"Unknown entity {entity!r}.",
+                     "entities": list(MANIFEST)}]
+        return [_entity_detail(spec)]
+
+    index = []
     for spec in MANIFEST.values():
-        out.append(
+        index.append(
             {
                 "entity": spec.key,
                 "label": spec.label,
-                "fields": [
-                    {"name": f.name, "label": f.label, "type": f.type,
-                     "filterable": f.filterable}
-                    for f in spec.fields
-                ],
-            }
+                "field_count": len(spec.fields),
+                "relations": {
+                    name: rel.target
+                    for name, rel in sorted(relations_for(spec).items())
+                },
+                "can_total": list(spec.aggregatable_map()),
+                "can_group_by": list(spec.groupable_map()),
+                "date_field": spec.date_field,
+            },
         )
-    return out
+    return index

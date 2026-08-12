@@ -67,7 +67,12 @@ logger = logging.getLogger(__name__)
 from .union import live_context
 
 MAX_TOOL_ROUNDS = 8
-TURN_BUDGET_SECONDS = 45
+# Insurance, not the remedy. A question spanning two entities used to cost one
+# query PER ROW and blew this budget without answering; relation traversal in
+# `read` turns that into a single call, which is the actual fix. The extra
+# headroom is for the genuinely multi-step turn, and the check runs at loop top
+# so one slow final call can still overshoot it.
+TURN_BUDGET_SECONDS = 75
 HISTORY_TURNS = 12
 MAX_MESSAGE_CHARS = 6000
 # A previewed plan is honored as "the thing the landlord just said yes to" only

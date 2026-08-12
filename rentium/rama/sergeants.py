@@ -376,6 +376,7 @@ def run_all() -> dict:
         ("valuation_staleness", check_valuation_staleness),
         ("spend_drift", check_spend_drift),
         ("ledger_integrity", check_ledger_integrity),
+        ("deposit_record_divergence", check_deposit_record_divergence),
     ):
         try:
             report[name] = fn()
@@ -636,6 +637,75 @@ def check_ledger_integrity() -> dict:
                 "invariant": "outstanding is NULL for non-charge entries",
                 "example_entry_id": str(entry.pk),
                 "entry_type": entry.entry_type,
+                "severity": "WARN",
+            },
+        ):
+            published += 1
+
+    return {"findings_published": published}
+
+
+def check_deposit_record_divergence() -> dict:
+    """Two records of the same deposit that disagree.
+
+    A deposit's receipt is written in two places: the lease carries
+    `security_deposit_received_date` and friends, and the ledger carries a
+    DEPOSIT_CHARGE with settlements against it. The ledger is the source of
+    truth — it is append-only and auditable — but the lease fields are what a
+    human sees on the lease page, and nothing has ever reconciled them.
+
+    On live data they already disagree, in both directions: leases with no
+    received-date whose deposit charge is partly settled, and the reverse. Each
+    is a question a landlord will eventually ask and get two answers to. Flag it
+    rather than let RAMA pick one and sound certain.
+    """
+    from rentium.ledger.models import EntryType, LedgerEntry
+    from rentium.leases.models import Lease
+
+    published = 0
+    pairs = (
+        ("security_deposit", "security_deposit_received_date"),
+        ("cleaning_deposit", "cleaning_deposit_received_date"),
+        ("pet_deposit", "pet_deposit_received_date"),
+    )
+
+    charges = (
+        LedgerEntry.objects.not_voided()
+        .filter(entry_type=EntryType.DEPOSIT_CHARGE, lease__isnull=False)
+        .with_charge_state()
+        .select_related("lease", "landlord")
+    )
+    settled_by_lease: dict = {}
+    for charge in charges:
+        bucket = settled_by_lease.setdefault(charge.lease_id, [])
+        bucket.append(charge)
+
+    leases = Lease.objects.filter(
+        pk__in=settled_by_lease.keys(),
+    ).select_related("landlord")
+    for lease in leases:
+        entries = settled_by_lease.get(lease.pk, [])
+        any_settled = any((c.settled_amount or 0) > 0 for c in entries)
+        any_marked = any(getattr(lease, field, None) for _amount, field in pairs)
+        if any_settled == any_marked:
+            continue
+        if _publish_finding(
+            "rama.sentinel.deposit_record_divergence",
+            f"depositdiverge:{lease.pk}:{date.today().strftime('%Y-%m')}",
+            lease.landlord,
+            {
+                "lease_id": str(lease.pk),
+                "lease_number": lease.lease_number,
+                "ledger_shows_money_received": any_settled,
+                "lease_marked_received": any_marked,
+                "ledger_settled_total": str(
+                    sum((c.settled_amount or Decimal("0.00")) for c in entries),
+                ),
+                "note": (
+                    "The ledger is authoritative for money. The lease's "
+                    "*_received_date fields are the paperwork's record and "
+                    "disagree with it here."
+                ),
                 "severity": "WARN",
             },
         ):

@@ -4973,6 +4973,10 @@ def test_run_all_never_raises_with_empty_portfolio(landlord):
         # abandoned voids, one work order paid twice at two scopes, a
         # receivable balance annotated onto something that isn't a receivable.
         "ledger_integrity",
+        # A deposit's receipt is recorded on the lease AND in the ledger, and
+        # nothing reconciled them. Asked "have I received the deposit?", RAMA
+        # would otherwise pick one of two disagreeing answers and sound sure.
+        "deposit_record_divergence",
     }
     assert all(not v.get("error") for v in report.values())
 

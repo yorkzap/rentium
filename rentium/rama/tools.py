@@ -98,13 +98,22 @@ def list_leases(landlord, include_ended: str = "") -> dict:
     return _list(landlord, include_ended=flag)
 
 
-def data_catalogue(landlord) -> dict:
-    """What RAMA can query with the generic `read` tool: the entities and their
-    filterable/readable fields. Call this when a landlord asks a specific/composed
-    question (e.g. 'active leases with parking and rent over 800') to see what
-    fields exist, then use `read`."""
+@_params(
+    entity="Optional. Leave empty for the index of all entities (their relations "
+           "and what each can total/group by). Pass one entity name, e.g. "
+           "'lease', to get that entity's full field list.",
+)
+def data_catalogue(landlord, entity: str = "") -> dict:
+    """What `read` can query. Call with no argument for the index; call again with
+    one entity name for its fields.
+
+    The index shows each entity's RELATIONS — that is how you see two entities can
+    be queried together. `ledger_entry` relates to `lease`, so a question about
+    August move-ins is answered from the ledger in ONE call with
+    filters='lease__start_date=2026-08-01..2026-08-31', group_by='lease' — never
+    by reading the ledger once per lease."""
     from .manifest import entity_catalogue
-    return {"entities": entity_catalogue()}
+    return {"entities": entity_catalogue(entity)}
 
 
 def search_capabilities(landlord, query: str = "") -> dict:
@@ -126,15 +135,20 @@ def search_capabilities(landlord, query: str = "") -> dict:
            "property_group, business_document, lease_form. "
            "Call data_catalogue to see each one's fields.",
     filters="Comma list of 'field OP value'. OP is one of = > < >= <= ~ (contains) "
-            "!= . Also 'field is empty' / 'field is set'. "
+            "!= . Also 'field is empty' / 'field is set', and ranges with "
+            "'field=2026-08-01..2026-08-31'. You may filter on a RELATED "
+            "entity's field with 'rel__field', e.g. "
+            "'lease__start_date=2026-08-01..2026-08-31'. "
             "Example: 'status=active, total_rent>800, parking_included=true'.",
     fields="Optional comma list of fields to return. Default: all of them.",
     limit="Max rows to return, 1-100 (default 20). Does NOT limit totals.",
     aggregate="Comma list of 'count' or 'FUNC:field' with FUNC in "
               "sum/avg/min/max/count. Example: 'count, sum:amount'. "
               "Computed over EVERY matching row, not just the returned page.",
-    group_by="Up to two keys: a groupable field, or month:<date field> / "
-             "year:<date field>. Example: 'charge_state' or 'month:due_date'.",
+    group_by="Up to two keys: a groupable field, a RELATION name (groups by its "
+             "human label — 'lease' gives lease numbers, not ids), or "
+             "month:<date field> / year:<date field>. "
+             "Example: 'charge_state', 'lease', or 'month:due_date'.",
     order_by="One field, '-' for descending. May also name an aggregate you "
              "asked for, e.g. '-sum_amount'.",
     month="'YYYY-MM', or 'this' / 'last'. Narrows to that month on the entity's "
@@ -155,6 +169,25 @@ def read(landlord, entity: str = "", filters: str = "", fields: str = "",
     `totals` (and `groups`) computed across EVERY matching row — not just the
     page `limit` returns. Use it instead of listing rows and counting them.
 
+    ACROSS ENTITIES: filter and group on a related entity's fields with
+    `rel__field`. Call data_catalogue to see each entity's relations. Do this
+    instead of looping — one query per row will exhaust the turn before it
+    answers.
+
+    "EVERYONE" / "ALL" / "ANYONE" QUESTIONS NEED TWO READS. A group_by can only
+    show rows that EXIST, so grouping deposits by lease silently omits every
+    lease that has no deposit charge at all — and those are usually the answer.
+    Read the parent set first, then the child totals, and name the gap:
+      1. read(entity='lease', filters='start_date=2026-08-01..2026-08-31')
+      2. read(entity='ledger_entry', filters='entry_type=DEPOSIT_CHARGE,
+         lease__start_date=2026-08-01..2026-08-31', group_by='lease', …)
+      3. Any lease in (1) missing from (2) has nothing recorded — say so
+         explicitly rather than leaving it out of the list.
+
+    Deposits from everyone moving in during August, per lease:
+      entity='ledger_entry',
+      filters='entry_type=DEPOSIT_CHARGE, lease__start_date=2026-08-01..2026-08-31',
+      group_by='lease', aggregate='count, sum:amount, sum:settled_amount, sum:outstanding'
     Rents received vs still owed in August:
       entity='ledger_entry', filters='entry_type=RENT_CHARGE', month='2026-08',
       group_by='charge_state', aggregate='count, sum:amount, sum:outstanding'
@@ -179,6 +212,11 @@ def read(landlord, entity: str = "", filters: str = "", fields: str = "",
     - Deposits are refundable liabilities, not income. Filter
       `entry_type=RENT_CHARGE`, or group by entry_type, rather than summing
       every charge together.
+    - "Has a deposit been received?" is answered from the LEDGER —
+      `entry_type=DEPOSIT_CHARGE` with `charge_state` / `settled_amount`. The
+      lease also carries `security_deposit_received_date` and friends, but
+      those are the lease paperwork's record, not the money, and they are
+      known to disagree with the ledger. Never quote one as a payment.
     - A FEE_CHARGE with `is_damage_claim=true` is contested damage recovery,
       not expected income — exclude it with `is_damage_claim!=true` when
       reporting what you expect to collect.
