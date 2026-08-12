@@ -64,7 +64,19 @@ def _first_of_next_month(d: date) -> date:
 
 
 def _effective_start(lt: LeaseTenant) -> date:
-    return lt.individual_start_date or lt.lease.move_in_date or lt.lease.start_date
+    default = lt.individual_start_date or lt.lease.move_in_date or lt.lease.start_date
+    fixed_target = (
+        lt.rent_adjustments.filter(
+            is_recurring=False,
+            target_amount__isnull=False,
+            effective_date__gte=lt.lease.start_date,
+            effective_date__lt=default,
+        )
+        .order_by("effective_date")
+        .values_list("effective_date", flat=True)
+        .first()
+    )
+    return fixed_target or default
 
 
 def _effective_end(lt: LeaseTenant):
@@ -132,8 +144,21 @@ def _rent_due_dates(lt: LeaseTenant, until: date):
 
 
 def _lease_rent_due_dates(lease: Lease, until: date):
-    """Lease-level schedule for joint billing (no per-tenant dates)."""
+    """Lease-level schedule, including explicit pre-possession targets."""
     start = lease.move_in_date or lease.start_date
+    fixed_target = (
+        lease.lease_tenants.filter(
+            declined=False,
+            rent_adjustments__is_recurring=False,
+            rent_adjustments__target_amount__isnull=False,
+            rent_adjustments__effective_date__gte=lease.start_date,
+            rent_adjustments__effective_date__lt=start,
+        )
+        .order_by("rent_adjustments__effective_date")
+        .values_list("rent_adjustments__effective_date", flat=True)
+        .first()
+    )
+    start = fixed_target or start
     end = lease.end_date
     due = start
     while due <= until:
@@ -453,7 +478,10 @@ def apply_adjustment_to_ledger(lt: LeaseTenant, adjustment) -> dict:
                 description=charge.description,
                 # replaces the voided charge's natural slot
                 idempotency_key=_key(charge.due_date),
-                metadata={**charge.metadata, "adjustment_id": adjustment.pk},
+                metadata={
+                    **charge.metadata,
+                    "adjustment_id": str(adjustment.pk),
+                },
             )
             reposted += 1
         elif new_amount < charge.amount:
@@ -462,7 +490,7 @@ def apply_adjustment_to_ledger(lt: LeaseTenant, adjustment) -> dict:
                 amount=charge.amount - new_amount,
                 reason=f"Rent adjustment #{adjustment.pk}",
                 idempotency_key=f"adjcredit:{adjustment.pk}:{charge.pk}",
-                metadata={"adjustment_id": adjustment.pk},
+                metadata={"adjustment_id": str(adjustment.pk)},
             )
             credited += 1
         # An INCREASE on a partially-paid month: charge the delta separately.
@@ -476,7 +504,10 @@ def apply_adjustment_to_ledger(lt: LeaseTenant, adjustment) -> dict:
                 entry_type=EntryType.RENT_CHARGE,
                 description=f"Rent increase — period starting {charge.due_date}",
                 idempotency_key=f"adjdelta:{adjustment.pk}:{charge.pk}",
-                metadata={"adjustment_id": adjustment.pk, "delta_of": str(charge.pk)},
+                metadata={
+                    "adjustment_id": str(adjustment.pk),
+                    "delta_of": str(charge.pk),
+                },
             )
             reposted += 1
     return {"reposted": reposted, "credited": credited}

@@ -24,6 +24,7 @@ from rentium.rama.models import RamaPreferences
 from rentium.rama.providers import Turn
 from rentium.rama.service import _memory_intent
 from rentium.rama.service import run_turn
+from rentium.rama.providers.testing import assert_translatable
 
 pytestmark = pytest.mark.django_db
 
@@ -37,6 +38,7 @@ class ScriptedProvider:
         self.requests = []
 
     def complete(self, *, model, system, messages, tools, api_key=""):
+        assert_translatable(messages)
         self.requests.append({"system": system, "messages": list(messages)})
         return self.turns.pop(0) if self.turns else Turn(text="")
 

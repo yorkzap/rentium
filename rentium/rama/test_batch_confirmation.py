@@ -11,6 +11,7 @@ from rentium.rama.models import RamaPreferences
 from rentium.rama.models import RamaTask
 from rentium.rama.providers import ToolCall
 from rentium.rama.providers import Turn
+from rentium.rama.providers.testing import assert_translatable
 
 pytestmark = pytest.mark.django_db
 ROOM_COUNT = 5
@@ -25,6 +26,7 @@ class ScriptedProvider:
         self.requests = []
 
     def complete(self, *, model, system, messages, tools, api_key=""):
+        assert_translatable(messages)
         self.requests.append(
             {
                 "model": model,
@@ -191,7 +193,7 @@ def test_expired_confirmation_cancels_its_task(landlord):
 
     assert load_fresh_plan(landlord, conversation_id) is None
     task = RamaTask.objects.get(pk=task_id)
-    assert task.status == RamaTask.Status.CANCELLED
+    assert task.status == RamaTask.Status.EXPIRED
     assert "expired" in task.outcome["message"].casefold()
 
 

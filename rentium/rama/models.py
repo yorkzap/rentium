@@ -127,6 +127,163 @@ class RamaAudit(models.Model):
         return f"{self.kind} ({self.provider}/{self.model}) {self.created_at:%Y-%m-%d %H:%M}"
 
 
+class RamaConversation(models.Model):
+    """A durable channel thread.
+
+    ``RamaAudit`` remains the append-only diagnostic trail.  This model and
+    ``RamaMessage`` describe what the person could actually see, which is the
+    only safe source for pronouns, replies, and confirmation binding.
+    """
+
+    class Channel(models.TextChoices):
+        WEB = "web", "Web"
+        TELEGRAM = "telegram", "Telegram"
+        WHATSAPP = "whatsapp", "WhatsApp"
+        SYSTEM = "system", "System"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_conversations",
+    )
+    channel = models.CharField(max_length=20, choices=Channel.choices, default=Channel.WEB)
+    external_key = models.CharField(max_length=190, blank=True, default="", db_index=True)
+    active_episode = models.ForeignKey(
+        "RamaEpisode",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["landlord", "channel", "external_key"],
+                name="rama_conv_channel_idx",
+            ),
+        ]
+
+
+class RamaEpisode(models.Model):
+    """A short, coherent span inside a long-lived channel conversation."""
+
+    class EndReason(models.TextChoices):
+        IDLE = "IDLE", "Visible inactivity"
+        RESET = "RESET", "Explicit reset"
+        ROLLOUT = "ROLLOUT", "State-model rollout"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation = models.ForeignKey(
+        RamaConversation,
+        on_delete=models.CASCADE,
+        related_name="episodes",
+    )
+    started_at = models.DateTimeField(auto_now_add=True)
+    last_visible_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    ended_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    end_reason = models.CharField(
+        max_length=20, choices=EndReason.choices, blank=True, default=""
+    )
+
+    class Meta:
+        ordering = ["started_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["conversation"],
+                condition=models.Q(ended_at__isnull=True),
+                name="rama_one_open_episode",
+            ),
+        ]
+
+
+class RamaMessage(models.Model):
+    """One visible inbound or outbound message, with explicit reply context."""
+
+    class Direction(models.TextChoices):
+        INBOUND = "INBOUND", "Inbound"
+        OUTBOUND = "OUTBOUND", "Outbound"
+
+    class Kind(models.TextChoices):
+        CHAT = "CHAT", "Chat"
+        NOTIFICATION = "NOTIFICATION", "Notification"
+        PLAN_PROMPT = "PLAN_PROMPT", "Plan prompt"
+        RECOVERY = "RECOVERY", "Recovery"
+
+    class DeliveryStatus(models.TextChoices):
+        LOCAL = "LOCAL", "Visible in local client"
+        SENT = "SENT", "Sent"
+        FAILED = "FAILED", "Failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation = models.ForeignKey(
+        RamaConversation,
+        on_delete=models.CASCADE,
+        related_name="messages",
+    )
+    episode = models.ForeignKey(
+        RamaEpisode,
+        on_delete=models.PROTECT,
+        related_name="messages",
+    )
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_messages",
+    )
+    direction = models.CharField(max_length=10, choices=Direction.choices)
+    kind = models.CharField(max_length=20, choices=Kind.choices, default=Kind.CHAT)
+    text = models.TextField(blank=True, default="")
+    role = models.CharField(max_length=20, blank=True, default="")
+    channel = models.CharField(max_length=20, blank=True, default="")
+    external_message_id = models.CharField(max_length=190, blank=True, default="")
+    reply_to = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replies",
+    )
+    source_event = models.ForeignKey(
+        "events.DomainEvent",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="rama_messages",
+    )
+    attachment_batch = models.ForeignKey(
+        "RamaAttachmentBatch",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="messages",
+    )
+    semantic_payload = models.JSONField(default=dict, blank=True)
+    entity_refs = models.JSONField(default=list, blank=True)
+    delivery_status = models.CharField(
+        max_length=12,
+        choices=DeliveryStatus.choices,
+        default=DeliveryStatus.LOCAL,
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(
+                fields=["conversation", "episode", "created_at"],
+                name="rama_msg_episode_idx",
+            ),
+            models.Index(
+                fields=["conversation", "external_message_id"],
+                name="rama_msg_external_idx",
+            ),
+        ]
+
+
 class RamaTask(models.Model):
     """Durable state for one user request.
 
@@ -144,8 +301,12 @@ class RamaTask(models.Model):
         VERIFIED = "VERIFIED", "Verified"
         FAILED = "FAILED", "Failed"
         CANCELLED = "CANCELLED", "Cancelled"
+        SUSPENDED = "SUSPENDED", "Suspended"
+        EXPIRED = "EXPIRED", "Expired"
 
-    TERMINAL_STATUSES = frozenset({Status.VERIFIED, Status.FAILED, Status.CANCELLED})
+    TERMINAL_STATUSES = frozenset(
+        {Status.VERIFIED, Status.FAILED, Status.CANCELLED, Status.EXPIRED}
+    )
     ALLOWED_TRANSITIONS = {
         Status.RECEIVED: {
             Status.NEEDS_INPUT,
@@ -154,33 +315,44 @@ class RamaTask(models.Model):
             Status.EXECUTING,
             Status.FAILED,
             Status.CANCELLED,
+            Status.SUSPENDED,
+            Status.EXPIRED,
         },
         Status.NEEDS_INPUT: {
             Status.READY,
             Status.AWAITING_CONFIRMATION,
             Status.CANCELLED,
             Status.FAILED,
+            Status.SUSPENDED,
+            Status.EXPIRED,
         },
         Status.READY: {
             Status.AWAITING_CONFIRMATION,
             Status.EXECUTING,
             Status.CANCELLED,
             Status.FAILED,
+            Status.SUSPENDED,
+            Status.EXPIRED,
         },
         Status.AWAITING_CONFIRMATION: {
             Status.READY,
             Status.EXECUTING,
             Status.CANCELLED,
             Status.FAILED,
+            Status.SUSPENDED,
+            Status.EXPIRED,
         },
         Status.EXECUTING: {
             Status.AWAITING_CONFIRMATION,
             Status.VERIFIED,
             Status.FAILED,
+            Status.SUSPENDED,
         },
         Status.VERIFIED: set(),
         Status.FAILED: set(),
         Status.CANCELLED: set(),
+        Status.SUSPENDED: {Status.NEEDS_INPUT, Status.CANCELLED, Status.EXPIRED},
+        Status.EXPIRED: set(),
     }
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -190,6 +362,27 @@ class RamaTask(models.Model):
         related_name="rama_tasks",
     )
     conversation_id = models.UUIDField(db_index=True)
+    episode = models.ForeignKey(
+        RamaEpisode,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tasks",
+    )
+    source_message = models.ForeignKey(
+        RamaMessage,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tasks",
+    )
+    active_prompt = models.ForeignKey(
+        RamaMessage,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="prompted_tasks",
+    )
     capability_key = models.CharField(max_length=120, db_index=True)
     status = models.CharField(
         max_length=30, choices=Status.choices, default=Status.RECEIVED, db_index=True
@@ -199,6 +392,9 @@ class RamaTask(models.Model):
     outcome = models.JSONField(default=dict, blank=True)
     idempotency_key = models.CharField(max_length=160, blank=True, default="")
     error = models.TextField(blank=True, default="")
+    subject = models.CharField(max_length=80, blank=True, default="", db_index=True)
+    entity_refs = models.JSONField(default=list, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -306,6 +502,7 @@ class RamaPendingPlan(models.Model):
         AWAITING_STEP_CONFIRM = "AWAITING_STEP_CONFIRM", "Awaiting step confirmation"
 
     conversation_id = models.UUIDField(primary_key=True)
+    plan_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     landlord = models.ForeignKey(
         "users.LandlordProfile",
         on_delete=models.CASCADE,
@@ -318,6 +515,21 @@ class RamaPendingPlan(models.Model):
         null=True,
         blank=True,
     )
+    episode = models.ForeignKey(
+        RamaEpisode,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="pending_plans",
+    )
+    prompt_message = models.ForeignKey(
+        RamaMessage,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="pending_plans",
+    )
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
     operation = models.CharField(max_length=60, default="single")
     summary = models.TextField(blank=True, default="")
     status = models.CharField(

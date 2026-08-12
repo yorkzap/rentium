@@ -1399,6 +1399,17 @@ class RentAdjustment(models.Model):
             "Dollar amount off/on for FLAT_AMOUNT, or the % value for PERCENTAGE (ignored for EXACT_NIGHTLY, use nights fields)"
         ),
     )
+    target_amount = models.DecimalField(
+        _("Target Amount"),
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=_(
+            "Optional final rent amount. When set, this adjustment overrides "
+            "earlier proration/discount arithmetic for the period."
+        ),
+    )
     nights_charged = models.PositiveIntegerField(
         _("Nights Charged"), null=True, blank=True
     )
@@ -1468,6 +1479,8 @@ class RentAdjustment(models.Model):
         Positive adjustment_type=INCREASE adds; PRORATION/DISCOUNT reduce.
         """
         base_rent = Decimal(base_rent)
+        if self.target_amount is not None:
+            return Decimal(self.target_amount).quantize(Decimal("0.01"))
         if self.calculation_method == self.CalculationMethod.EXACT_NIGHTLY:
             per_night = base_rent / Decimal(self.nights_in_period)
             return (per_night * Decimal(self.nights_charged)).quantize(Decimal("0.01"))

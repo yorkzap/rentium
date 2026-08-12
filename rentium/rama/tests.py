@@ -18,6 +18,7 @@ from rentium.ledger.models import EntryType
 from rentium.rama import registry
 from rentium.rama.models import RamaAudit
 from rentium.rama.providers import ProviderError, ToolCall, Turn, get_provider
+from rentium.rama.providers.testing import assert_translatable
 from rentium.rama.providers.anthropic import AnthropicProvider
 from rentium.rama.providers.openai_compat import OpenAIProvider
 from rentium.users.tests.factories import UserFactory
@@ -72,7 +73,16 @@ def _rent_charge(landlord, lease, amount="850.00", due=None):
 
 
 class ScriptedProvider:
-    """Plays back a fixed sequence of Turns and records what it was sent."""
+    """Plays back a fixed sequence of Turns and records what it was sent.
+
+    Also enforces the neutral wire contract on every message it is handed. A
+    scripted provider that only records messages will happily accept a shape
+    no real adapter can translate: a user message carrying its text under
+    "text" instead of "content" passed the whole suite and raised KeyError in
+    production, where nothing catches it, so the landlord's turn 500'd with no
+    reply written. Translating through BOTH adapter families here makes every
+    test that uses this provider a wire-contract test for both.
+    """
 
     name = "scripted"
     api_key_setting = "ANTHROPIC_API_KEY"
@@ -82,6 +92,7 @@ class ScriptedProvider:
         self.requests = []
 
     def complete(self, *, model, system, messages, tools, api_key: str = ""):
+        assert_translatable(messages)
         self.requests.append(
             {
                 "model": model,
@@ -587,7 +598,8 @@ def test_config_endpoint(landlord, settings):
     assert data["enabled"] is False
     assert data["configured"] is False
     assert data["provider"] == "xai"
-    assert data["can_override"] is False
+    assert data["can_override"] is True
+    assert data["write_planning_certified"] is True
     assert "xai" in data["providers"]
     assert "models" in data
 
@@ -604,6 +616,34 @@ def test_config_endpoint(landlord, settings):
     assert data["provider"] == "xai"
     assert data["model"] == "grok-4.5"
     assert data["has_api_key"] is True
+
+
+def test_openai_gpt_5_mini_is_selectable_and_certified(landlord, settings):
+    """The dashboard model picker comes from this payload, and only certified
+    models receive RAMA's model-authored write tools.
+    """
+    settings.OPENAI_API_KEY = ""
+    client = _client_for(landlord)
+
+    settings_payload = client.get("/api/rama/settings/").json()
+    openai_models = {row["id"] for row in settings_payload["models"]["openai"]}
+    assert "gpt-5-mini" in openai_models
+
+    response = client.patch(
+        "/api/rama/settings/",
+        {
+            "enabled": True,
+            "provider": "openai",
+            "model": "gpt-5-mini",
+            "api_key": "sk-openai-test",
+        },
+        format="json",
+    )
+    assert response.status_code == 200
+    assert response.json()["model"] == "gpt-5-mini"
+
+    config = client.get("/api/rama/config/").json()
+    assert config["write_planning_certified"] is True
 
 
 def test_settings_patch_is_per_landlord(landlord, other_landlord, settings):
@@ -822,8 +862,10 @@ def test_document_directory_question_is_answered_deterministically(
 
     from django.core.files.uploadedfile import SimpleUploadedFile
 
+    from rentium.rama.conversations import record_visible_message
     from rentium.rama.document_services import ingest_document
     from rentium.rama.models import RamaAudit
+    from rentium.rama.models import RamaMessage
 
     _enable_rama(landlord, settings=settings)
     document, _ = ingest_document(
@@ -833,6 +875,12 @@ def test_document_directory_question_is_answered_deterministically(
         ),
     )
     conversation_id = uuid.uuid4()
+    record_visible_message(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        direction=RamaMessage.Direction.INBOUND,
+        text="File this notice",
+    )
     RamaAudit.objects.create(
         landlord=landlord,
         conversation_id=conversation_id,
@@ -883,7 +931,12 @@ def test_chat_uses_landlord_model_not_request_body(landlord, settings):
     body = _chat(
         _client_for(landlord),
         ScriptedProvider([Turn(text="ok")]),
-        {"message": "hi", "model": "gpt-x", "provider": "openai"},
+        {
+            "message": "hi",
+            "target_role": "ops",
+            "model": "gpt-x",
+            "provider": "openai",
+        },
     ).json()
     assert body["model"] == "claude-haiku-4-5"
     assert body["provider"] == "anthropic"
@@ -911,7 +964,7 @@ def test_chat_tool_round_limit(landlord, settings):
     )
     body = _chat(_client_for(landlord), endless, {"message": "loop"}).json()
     assert "steps" in body["reply"]  # softened dead-end, not a hard discard
-    assert len(endless.requests) == 20  # MAX_TOOL_ROUNDS
+    assert len(endless.requests) == 8  # bounded model loop; deterministic routes do more
 
 
 # ------------------------------------------------ deterministic confirm loop
@@ -2362,6 +2415,32 @@ def test_openai_wire_format():
         {"role": "tool", "tool_call_id": "c1", "name": "next_charge", "content": "{}"}
     )
     assert tool == {"role": "tool", "tool_call_id": "c1", "content": "{}"}
+
+
+def test_openai_gpt_5_uses_current_completion_parameters(settings):
+    """GPT-5 rejects max_tokens and an explicit temperature on Chat Completions."""
+    response = mock.Mock(status_code=200, text="")
+    response.json.return_value = {
+        "choices": [{"message": {"content": "ok", "tool_calls": []}}]
+    }
+
+    with mock.patch(
+        "rentium.rama.providers.openai_compat.requests.post",
+        return_value=response,
+    ) as post:
+        turn = OpenAIProvider().complete(
+            model="gpt-5-mini",
+            system="system",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            api_key="sk-openai-test",
+        )
+
+    payload = post.call_args.kwargs["json"]
+    assert turn.text == "ok"
+    assert payload["max_completion_tokens"] == settings.RAMA_MAX_TOKENS
+    assert "max_tokens" not in payload
+    assert "temperature" not in payload
 
 
 # --------------------------------------------------------------- domain reads

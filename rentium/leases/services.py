@@ -7,10 +7,12 @@ example); anything that's closer to "a calculation" than "a state change"
 lives here instead.
 """
 
+import calendar
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import Q
 
 
 @transaction.atomic
@@ -132,6 +134,45 @@ def amendable_fields_for(lease) -> frozenset | None:
     return frozenset()
 
 
+def _month_end(value):
+    return value.replace(day=calendar.monthrange(value.year, value.month)[1])
+
+
+def rebase_first_period_adjustments(lease, old_start, new_start) -> list[str]:
+    """Move automatic proration with a pre-activation possession-date edit.
+
+    Automatic proration describes possession and follows ``move_in_date``.
+    Landlord-authored target amounts describe an explicit legal lease period
+    and remain fixed to that period.
+    """
+    from rentium.leases.models import RentAdjustment
+
+    if not old_start or not new_start or old_start == new_start:
+        return []
+    candidates = RentAdjustment.objects.filter(
+        lease_tenant__lease=lease,
+        is_recurring=False,
+        effective_date=old_start,
+        end_date=_month_end(old_start),
+        adjustment_type=RentAdjustment.AdjustmentType.PRORATION,
+    )
+    rebased: list[str] = []
+    for adjustment in candidates:
+        adjustment.effective_date = new_start
+        adjustment.end_date = _month_end(new_start)
+        update_fields = ["effective_date", "end_date", "updated_at"]
+        if adjustment.adjustment_type == RentAdjustment.AdjustmentType.PRORATION:
+            adjustment.nights_in_period = adjustment.end_date.day
+            adjustment.nights_charged = (
+                adjustment.end_date - adjustment.effective_date
+            ).days + 1
+            adjustment.reason = f"Prorated for move-in on {new_start}"
+            update_fields.extend(["nights_in_period", "nights_charged", "reason"])
+        adjustment.save(update_fields=update_fields)
+        rebased.append(str(adjustment.pk))
+    return rebased
+
+
 @transaction.atomic
 def update_lease_record(*, landlord, lease, values: dict, actor=None) -> dict:
     """Edit one lease through the single boundary the API and RAMA both use.
@@ -150,8 +191,10 @@ def update_lease_record(*, landlord, lease, values: dict, actor=None) -> dict:
     the record exists so the landlord can see, and later prove, who agreed to
     what and when.
 
-    Returns {"lease", "changed", "amended_signers"} so callers can tell the
-    landlord what their edit actually did.
+    Returns {"lease", "before", "changed", "amended_signers"}.  The immutable
+    RAMA receipt keeps ``before`` so an incorrect edit can be recovered exactly
+    even when nobody had signed yet (signature amendment events are not a
+    general-purpose version history).
     """
     from rentium.leases.models import Lease
     from rentium.leases.models import LeaseInviteEvent
@@ -203,12 +246,29 @@ def update_lease_record(*, landlord, lease, values: dict, actor=None) -> dict:
         changed[field] = new
         setattr(lease, field, new)
     if not changed:
-        return {"lease": lease, "changed": {}, "amended_signers": []}
+        return {
+            "lease": lease,
+            "before": {},
+            "changed": {},
+            "amended_signers": [],
+        }
 
     lease.full_clean(
         exclude=[f.name for f in Lease._meta.fields if f.name not in changed]
     )
+    old_effective_start = before.get("move_in_date") or before.get("start_date")
+    if old_effective_start is None and (
+        "move_in_date" in changed or "start_date" in changed
+    ):
+        old_effective_start = (
+            before.get("move_in_date", lease.move_in_date)
+            or before.get("start_date", lease.start_date)
+        )
     lease.save()
+    new_effective_start = lease.move_in_date or lease.start_date
+    rebased_adjustments = rebase_first_period_adjustments(
+        lease, old_effective_start, new_effective_start,
+    )
 
     material = sorted(set(changed) & MATERIAL_LEASE_FIELDS)
     amended_signers = []
@@ -228,7 +288,13 @@ def update_lease_record(*, landlord, lease, values: dict, actor=None) -> dict:
             )
             amended_signers.append(slot.display_name)
 
-    return {"lease": lease, "changed": changed, "amended_signers": amended_signers}
+    return {
+        "lease": lease,
+        "before": {field: _jsonable(value) for field, value in before.items()},
+        "changed": changed,
+        "rebased_adjustments": rebased_adjustments,
+        "amended_signers": amended_signers,
+    }
 
 
 def _jsonable(value):

@@ -10,6 +10,72 @@
 
 ## STATUS: Phases 1–4 shipped and certified on the weak-model bar
 
+### August 2026 visible-state and orchestration addendum
+
+RAMA now separates the visible conversation from its diagnostic audit trail.
+`RamaConversation`, `RamaEpisode`, and `RamaMessage` record exactly what the
+landlord saw, including external domain notifications. Episodes split after 30
+minutes of visible inactivity. Attachments, pronouns, and confirmations cannot
+cross that boundary implicitly.
+
+Lease follow-ups retain exact landlord-authored lease numbers inside the active
+episode. When two open leases share a listing, property-only mutation lookup
+fails closed instead of silently choosing the newest. First-month rent targets
+use a deterministic composite that prices the household adjustment from live
+tenant allocations, persists the resolved lease and expected total, and bounds
+one-time adjustments to one month. Confirmations execute only a matching
+persisted plan; provider prose can never act as a substitute plan. Document
+recovery has no global-inbox fallback, preventing an old receipt or OCR amount
+from becoming the subject of a later lease conversation.
+
+Single and parallel period-rent instructions are effect-compiled, not left to a
+model tool loop. Requests such as “make Aug rent $400 for A and $1,900 for B”
+and “Aug rent for A and B can be $400” resolve each participant to one
+landlord-owned lease, bind the named billing period and final household total,
+preview live arithmetic for every item, and persist one version-2 contract whose
+effects must each appear exactly once. This path does not call the configured AI
+provider. One confirmation runs the complete approved batch; rent rows do not
+ask for another confirmation per step. Named periods are bounded by the legal lease term rather than the
+default move-in schedule. An explicit August target therefore remains August
+when move-in changes to September, creates that August charge on activation,
+and overrides existing proration before the preview is priced. Automatic
+proration still follows possession-date edits; landlord-authored period targets
+do not.
+
+Visible turns are serialized per conversation with a non-blocking PostgreSQL
+advisory lock (cache fallback outside PostgreSQL). A “?” arriving while another
+turn is running gets an immediate deterministic busy response instead of
+starting an overlapping model loop. Generic provider work is also bounded by a
+45-second loop budget, eight rounds, and a configurable 25-second per-request
+timeout; exhaustion produces an explicit no-change response rather than an
+inbound message with no outbound result.
+
+The dashboard has one AUTO conversation with optional Ops and Treasurer targets;
+switching a specialist no longer destroys the thread. Confirm/cancel controls
+address a specific persisted plan and prompt instead of sending magic chat
+words. Strategic Treasurer requests invoke the existing structured deliberation
+engine on demand. Capability parity reporting now publishes behavioural
+certification instead of equating a registered function name with a working
+capability.
+
+General architecture Markdown remains documentation for people and development
+agents, not runtime memory or portfolio truth. The narrow exception is
+`rama/policies/EXECUTION_CONTRACT.md`: versioned, generic model guidance loaded
+at runtime. It never contains portfolio facts and has no authority of its own.
+Runtime knowledge and enforcement still come from generated capability schemas,
+scoped resolvers, live database facts, visible messages, validated plans, and
+verified receipts.
+
+Certified models also have a generic plan-compilation recovery path. If a model
+understands a requested change but writes “reply confirm” without calling a
+tool, the engine feeds that proposal back once with a strict instruction to
+emit real preview tool calls. Capability retrieval is rerun over the original
+message plus the proposal, so terse follow-ups such as “the first one” can still
+reach the relevant operation. Valid previews become the ordinary persisted
+confirmation batch; failed compilation becomes an honest blocker. A “yes” to a
+previous orphan prompt compiles a preview but cannot execute it, because the
+landlord has not yet approved the validated contract.
+
 The proposal below has been **built**. Summary of what now exists in `rama/`:
 
 | Phase | What shipped | Files |

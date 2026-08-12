@@ -6,6 +6,8 @@ app_name = "rama"
 
 urlpatterns = [
     path("chat/", views.chat_view, name="chat"),
+    path("plans/<uuid:plan_id>/confirm/", views.plan_confirm_view, name="plan-confirm"),
+    path("plans/<uuid:plan_id>/cancel/", views.plan_cancel_view, name="plan-cancel"),
     path("upload/", views.upload_view, name="upload"),
     path(
         "attachment-batches/",

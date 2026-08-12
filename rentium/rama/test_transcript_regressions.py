@@ -718,6 +718,586 @@ def test_rama_shows_numbered_thumbnails_then_removes_exact_selection(landlord):
     assert not listing.property_images.exists()
 
 
+def test_first_month_discount_stays_on_exact_lease_and_executes_real_plan(
+    landlord,
+):
+    """Regression for two Garden Suite leases plus an old receipt in RAMA.
+
+    The landlord named the pending Naveen/Aishwarya lease. The preview must
+    remain bound to that lease, and the next yes must execute that exact plan
+    without switching to the newer active lease or reopening a document.
+    """
+    import uuid
+    from datetime import date
+
+    from rentium.leases.models import RentAdjustment
+    from rentium.ledger.billing import compute_joint_rent_for_due_date
+    from rentium.rama.conversations import record_visible_message
+    from rentium.rama.models import RamaDocument
+    from rentium.rama.models import RamaMessage
+    from rentium.rama.service import _pending_unscoped_document_id
+    from rentium.rama.service import _first_month_rent_adjustment_intent
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    garden = Property.objects.create(
+        landlord=landlord,
+        name="Garden Suite",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    target = Lease.objects.create(
+        landlord=landlord,
+        property=garden,
+        lease_number="RMT652523-C281",
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.PENDING_SIGNATURES,
+        start_date=date(2026, 8, 1),
+        end_date=date(2027, 5, 31),
+        total_rent=Decimal("2000.00"),
+        security_deposit=Decimal("1000.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=target,
+        invited_name="Aishwarya Chenthamara",
+        invited_email="aishwarya@example.com",
+        rent_amount=Decimal("0.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=target,
+        invited_name="Naveen Prasanth Singaravel",
+        invited_email="naveen@example.com",
+        rent_amount=Decimal("2000.00"),
+        is_primary_tenant=True,
+    )
+    other = Lease.objects.create(
+        landlord=landlord,
+        property=garden,
+        lease_number="RMT698948-2EA3",
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.ACTIVE,
+        start_date=date(2026, 8, 4),
+        end_date=date(2026, 8, 31),
+        total_rent=Decimal("1900.00"),
+        security_deposit=Decimal("950.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=other,
+        invited_name="Gurpreet Singh",
+        invited_email="gurpreet@example.com",
+        rent_amount=Decimal("1900.00"),
+        is_primary_tenant=True,
+        has_signed=True,
+    )
+
+    # An unscoped document can exist in the portfolio inbox, but it was not
+    # introduced in this chat episode and therefore is not conversation state.
+    RamaDocument.objects.create(
+        landlord=landlord,
+        original_file="business_documents/inbox/old-receipt.pdf",
+        original_filename="old-receipt.pdf",
+        sha256="f" * 64,
+        status=RamaDocument.Status.READY,
+        amount=Decimal("2.00"),
+    )
+    conversation_id = uuid.uuid4()
+    record_visible_message(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        direction=RamaMessage.Direction.INBOUND,
+        text=(
+            "the lease with Naveen and Aishwarya - lease "
+            f"{target.lease_number}"
+        ),
+        channel="telegram",
+    )
+    assert _pending_unscoped_document_id(
+        landlord, conversation_id
+    ) == ""
+    named_scope = _first_month_rent_adjustment_intent(
+        landlord,
+        conversation_id,
+        "adjust Aishwarya's first month rent to be $400 only",
+    )
+    assert named_scope is not None
+    assert "household" in named_scope["error"]
+    assert target.lease_number in named_scope["error"]
+    prorated_override = _first_month_rent_adjustment_intent(
+        landlord,
+        conversation_id,
+        (
+            f'For lease "{other.lease_number}", change the prorated rent that '
+            "was set at $1,716.13 to $1900 instead"
+        ),
+    )
+    assert prorated_override == {
+        "tool": "apply_rent_adjustment",
+        "arguments": {
+            "lease_number": other.lease_number,
+            "effective_date": "2026-08-04",
+            "is_recurring": "0",
+            "reason": "One-time first-month rent adjustment",
+            "target_lease_total": "1900",
+        },
+    }
+
+    provider = mock.Mock()
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(
+            landlord,
+            "can we discount their first month rent to $400?",
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert preview.deterministic is True
+    assert provider.complete.call_count == 0
+    assert target.lease_number in preview.reply
+    assert "$2000.00" in preview.reply
+    assert "$400.00" in preview.reply
+    assert "$1600.00" in preview.reply
+    assert "2026-08-31" in preview.reply
+    assert "document" not in preview.reply.casefold()
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    step = plan.steps.get()
+    assert step.tool == "apply_rent_adjustment"
+    assert step.arguments["lease_number"] == target.lease_number
+    assert step.arguments["target_lease_total"] == "400.00"
+    assert step.arguments["expected_current_total"] == "2000.00"
+    assert step.arguments["end_date"] == "2026-08-31"
+    assert not RentAdjustment.objects.exists()
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        applied = run_turn(
+            landlord,
+            "yes",
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert applied.deterministic is True
+    assert target.lease_number in applied.reply
+    assert "Applied one-time discount of 1600.00" in applied.reply
+    assert RentAdjustment.objects.filter(
+        lease_tenant__lease=target,
+        amount=Decimal("1600.00"),
+        effective_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 31),
+    ).count() == 1
+    assert not RentAdjustment.objects.filter(lease_tenant__lease=other).exists()
+    assert compute_joint_rent_for_due_date(
+        target, date(2026, 8, 1)
+    ) == Decimal("400.00")
+    assert compute_joint_rent_for_due_date(
+        target, date(2026, 9, 1)
+    ) == Decimal("2000.00")
+
+
+def test_named_tenant_rent_request_resolves_lease_and_never_edits_terms(
+    landlord, bc_lease,
+):
+    import uuid
+
+    from rentium.leases.models import RentAdjustment
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    bc_lease.special_terms = "Keep the original legal clause."
+    bc_lease.save(update_fields=["special_terms"])
+    LeaseTenant.objects.create(
+        lease=bc_lease,
+        invited_name="Aishwarya Chenthamara",
+        invited_email="aishwarya@example.com",
+        rent_amount=Decimal("0.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=bc_lease,
+        invited_name="Naveen Prasanth Singaravel",
+        invited_email="naveen@example.com",
+        rent_amount=bc_lease.total_rent,
+        is_primary_tenant=True,
+    )
+    conversation_id = uuid.uuid4()
+    provider = mock.Mock()
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        scoped = run_turn(
+            landlord,
+            "can u adjust Aishwarya's first month rent to be $400 only?",
+            conversation_id,
+            role="general",
+        )
+
+    assert scoped.deterministic is True
+    assert provider.complete.call_count == 0
+    assert bc_lease.lease_number in scoped.reply
+    assert "household" in scoped.reply
+    assert "Aishwarya" in scoped.reply
+    assert not RamaPendingPlan.objects.filter(
+        conversation_id=conversation_id,
+    ).exists()
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(
+            landlord,
+            "the entire household's first month total $400",
+            conversation_id,
+            role="general",
+        )
+
+    assert preview.deterministic is True
+    assert provider.complete.call_count == 0
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    step = plan.steps.get()
+    assert step.tool == "apply_rent_adjustment"
+    assert step.arguments["target_lease_total"] == "400.00"
+    assert "special_terms" not in step.arguments
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        done = run_turn(landlord, "yes", conversation_id, role="general")
+
+    bc_lease.refresh_from_db()
+    assert done.deterministic is True
+    assert bc_lease.special_terms == "Keep the original legal clause."
+    adjustment = RentAdjustment.objects.get(lease_tenant__lease=bc_lease)
+    assert adjustment.amount == bc_lease.total_rent - Decimal("400.00")
+
+
+def test_two_named_august_rent_targets_compile_to_one_confirmable_batch(landlord):
+    import uuid
+    from datetime import date
+
+    from rentium.leases.models import RentAdjustment
+    from rentium.ledger.billing import compute_joint_rent_for_due_date
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    garden = _room(landlord, "Garden Suite", "950 McKenzie Ave")
+    aishwarya_lease = Lease.objects.create(
+        landlord=landlord,
+        property=garden,
+        lease_number="RMT652523-C281",
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.PENDING_SIGNATURES,
+        start_date=date(2026, 8, 1),
+        move_in_date=date(2026, 9, 1),
+        end_date=date(2027, 5, 31),
+        total_rent=Decimal("2000.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=aishwarya_lease,
+        invited_name="Aishwarya Chenthamara",
+        invited_email="aishwarya@example.com",
+        rent_amount=Decimal("0.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=aishwarya_lease,
+        invited_name="Naveen Prasanth Singaravel",
+        invited_email="naveen@example.com",
+        rent_amount=Decimal("2000.00"),
+        is_primary_tenant=True,
+    )
+    gurpreet_lease = Lease.objects.create(
+        landlord=landlord,
+        property=garden,
+        lease_number="RMT698948-2EA3",
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.ACTIVE,
+        start_date=date(2026, 8, 4),
+        end_date=date(2026, 8, 31),
+        total_rent=Decimal("1900.00"),
+    )
+    gurpreet = LeaseTenant.objects.create(
+        lease=gurpreet_lease,
+        invited_name="Gurpreet Singh",
+        invited_email="gurpreet@example.com",
+        rent_amount=Decimal("1900.00"),
+        is_primary_tenant=True,
+        has_signed=True,
+    )
+    RentAdjustment.create_proration(
+        gurpreet,
+        date(2026, 8, 4),
+        date(2026, 8, 31),
+        landlord,
+    )
+    conversation_id = uuid.uuid4()
+    provider = mock.Mock()
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(
+            landlord,
+            (
+                "like make aug rent $400 for aishwarya and also make aug rent "
+                "$1900 for gurpreet singh"
+            ),
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert preview.deterministic is True
+    assert provider.complete.call_count == 0
+    assert "all 2 changes" in preview.reply
+    assert "RMT652523-C281" in preview.reply
+    assert "RMT698948-2EA3" in preview.reply
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    assert plan.steps.count() == 2
+    assert (plan.task.input or {})["intent_contract"]["version"] == 2
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        applied = run_turn(
+            landlord,
+            "yes",
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert applied.deterministic is True
+    assert provider.complete.call_count == 0
+    assert "Applied" in applied.reply, applied.reply
+    assert compute_joint_rent_for_due_date(
+        aishwarya_lease, date(2026, 8, 1)
+    ) == Decimal("400.00")
+    assert compute_joint_rent_for_due_date(
+        aishwarya_lease, date(2026, 9, 1)
+    ) == Decimal("2000.00")
+    assert compute_joint_rent_for_due_date(
+        gurpreet_lease, date(2026, 8, 4)
+    ) == Decimal("1900.00")
+
+
+def test_singular_gurpreet_august_target_prices_posted_proration_and_followup(
+    landlord,
+):
+    import uuid
+    from datetime import date
+
+    from rentium.leases.models import RentAdjustment
+    from rentium.ledger.billing import ensure_joint_rent_charge
+    from rentium.ledger.models import EntryType
+    from rentium.ledger.models import LedgerEntry
+    from rentium.rama.plan_runner import clear_plan
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    garden = _room(landlord, "Garden Suite", "950 McKenzie Ave")
+    lease = Lease.objects.create(
+        landlord=landlord,
+        property=garden,
+        lease_number="RMT698948-2EA3",
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.ACTIVE,
+        start_date=date(2026, 8, 4),
+        move_in_date=date(2026, 8, 4),
+        end_date=date(2026, 8, 31),
+        total_rent=Decimal("1900.00"),
+    )
+    gurpreet = LeaseTenant.objects.create(
+        lease=lease,
+        invited_name="Gurpreet Singh",
+        invited_email="gurpreet@example.com",
+        rent_amount=Decimal("1900.00"),
+        is_primary_tenant=True,
+        has_signed=True,
+    )
+    RentAdjustment.create_proration(
+        gurpreet,
+        date(2026, 8, 4),
+        date(2026, 8, 31),
+        landlord,
+    )
+    charge, created = ensure_joint_rent_charge(lease, date(2026, 8, 4))
+    assert created is True
+    assert charge.amount == Decimal("1716.13")
+
+    conversation_id = uuid.uuid4()
+    provider = mock.Mock()
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(
+            landlord,
+            "hey lso make aug rent $1900 for gurpreet singh",
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert preview.deterministic is True
+    assert provider.complete.call_count == 0
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    step = plan.steps.get()
+    assert step.arguments["lease_number"] == lease.lease_number
+    assert step.arguments["effective_date"] == "2026-08-04"
+    assert step.arguments["expected_current_total"] == "1716.13"
+    assert step.arguments["target_lease_total"] == "1900.00"
+
+    # Reproduce the terse correction after a prior attempt returned no plan.
+    clear_plan(landlord, conversation_id)
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        followup = run_turn(
+            landlord,
+            "yes but the ledger has prorated rate, make it 1900 man",
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert followup.deterministic is True
+    assert provider.complete.call_count == 0
+    followup_step = RamaPendingPlan.objects.get(
+        conversation_id=conversation_id,
+    ).steps.get()
+    assert followup_step.arguments["effective_date"] == "2026-08-04"
+    assert followup_step.arguments["expected_current_total"] == "1716.13"
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        applied = run_turn(
+            landlord,
+            "yes",
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert applied.deterministic is True
+    live_charge = LedgerEntry.objects.not_voided().get(
+        lease=lease,
+        entry_type=EntryType.RENT_CHARGE,
+        due_date=date(2026, 8, 4),
+    )
+    assert live_charge.amount == Decimal("1900.00")
+
+
+def test_explicit_august_target_adds_pre_move_in_charge_period(landlord):
+    from datetime import date
+
+    from rentium.leases.models import RentAdjustment
+    from rentium.ledger.billing import _lease_rent_due_dates
+    from rentium.ledger.billing import ensure_joint_rent_charge
+
+    garden = _room(landlord, "Garden Suite", "950 McKenzie Ave")
+    lease = Lease.objects.create(
+        landlord=landlord,
+        property=garden,
+        lease_number="RMT652523-C281",
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.ACTIVE,
+        start_date=date(2026, 8, 1),
+        move_in_date=date(2026, 9, 1),
+        end_date=date(2027, 5, 31),
+        total_rent=Decimal("2000.00"),
+    )
+    slot = LeaseTenant.objects.create(
+        lease=lease,
+        invited_name="Naveen Prasanth Singaravel",
+        invited_email="naveen@example.com",
+        rent_amount=Decimal("2000.00"),
+        is_primary_tenant=True,
+        has_signed=True,
+    )
+    RentAdjustment.objects.create(
+        lease_tenant=slot,
+        adjustment_type=RentAdjustment.AdjustmentType.DISCOUNT,
+        calculation_method=RentAdjustment.CalculationMethod.FLAT_AMOUNT,
+        amount=Decimal("1600.00"),
+        target_amount=Decimal("400.00"),
+        reason="Explicit August household rent target",
+        effective_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 31),
+        is_recurring=False,
+        created_by=landlord,
+    )
+
+    due_dates = list(_lease_rent_due_dates(lease, date(2026, 9, 30)))
+    assert due_dates == [date(2026, 8, 1), date(2026, 9, 1)]
+    august, _ = ensure_joint_rent_charge(lease, due_dates[0])
+    september, _ = ensure_joint_rent_charge(lease, due_dates[1])
+    assert august.amount == Decimal("400.00")
+    assert september.amount == Decimal("2000.00")
+
+
+def test_august_rent_can_be_target_bypasses_unavailable_provider(landlord):
+    import uuid
+    from datetime import date
+
+    from rentium.rama.service import run_turn
+
+    _enable_rama(landlord)
+    garden = _room(landlord, "Garden Suite", "950 McKenzie Ave")
+    lease = Lease.objects.create(
+        landlord=landlord,
+        property=garden,
+        lease_number="RMT652523-C281",
+        lease_type=Lease.LeaseType.GENERIC_ROOMMATE,
+        status=Lease.LeaseStatus.PENDING_SIGNATURES,
+        start_date=date(2026, 8, 1),
+        move_in_date=date(2026, 9, 1),
+        end_date=date(2027, 5, 31),
+        total_rent=Decimal("2000.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=lease,
+        invited_name="Aishwarya Chenthamara",
+        invited_email="aishwarya@example.com",
+        rent_amount=Decimal("0.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=lease,
+        invited_name="Naveen Prasanth Singaravel",
+        invited_email="naveen@example.com",
+        rent_amount=Decimal("2000.00"),
+        is_primary_tenant=True,
+    )
+    provider = mock.Mock()
+    provider.complete.side_effect = RuntimeError("OpenAI unavailable")
+    conversation_id = uuid.uuid4()
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        preview = run_turn(
+            landlord,
+            "ok and aug rent for aishwarya and naveen can be $400 ?",
+            conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert preview.deterministic is True
+    assert provider.complete.call_count == 0
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    step = plan.steps.get()
+    assert step.arguments["lease_number"] == lease.lease_number
+    assert step.arguments["effective_date"] == "2026-08-01"
+    assert step.arguments["expected_current_total"] == "2000.00"
+    assert step.arguments["target_lease_total"] == "400.00"
+
+
+def test_overlapping_followup_gets_an_immediate_deterministic_reply(landlord):
+    import uuid
+    from contextlib import contextmanager
+
+    from rentium.rama.service import run_turn
+
+    @contextmanager
+    def busy_guard(*_args, **_kwargs):
+        yield False
+
+    with mock.patch(
+        "rentium.rama.turn_guard.conversation_turn_guard",
+        busy_guard,
+    ):
+        result = run_turn(landlord, "?", uuid.uuid4(), role="general")
+
+    assert result.deterministic is True
+    assert result.model == "turn-guard"
+    assert "still finishing your previous message" in result.reply
+
+
 def test_room_d_lease_is_drafted_before_siya_is_invited(landlord):
     room = _room(landlord, "McKenzie Room D", "950 McKenzie Ave")
     terms = (

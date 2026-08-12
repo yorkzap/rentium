@@ -120,18 +120,76 @@ def search_capabilities(landlord, query: str = "") -> dict:
     }
 
 
+@_params(
+    entity="What to query: lease, property, lease_tenant, work_order, inquiry, "
+           "appointment, ledger_entry, inspection, inventory, conversation, "
+           "property_group, business_document, lease_form. "
+           "Call data_catalogue to see each one's fields.",
+    filters="Comma list of 'field OP value'. OP is one of = > < >= <= ~ (contains) "
+            "!= . Also 'field is empty' / 'field is set'. "
+            "Example: 'status=active, total_rent>800, parking_included=true'.",
+    fields="Optional comma list of fields to return. Default: all of them.",
+    limit="Max rows to return, 1-100 (default 20). Does NOT limit totals.",
+    aggregate="Comma list of 'count' or 'FUNC:field' with FUNC in "
+              "sum/avg/min/max/count. Example: 'count, sum:amount'. "
+              "Computed over EVERY matching row, not just the returned page.",
+    group_by="Up to two keys: a groupable field, or month:<date field> / "
+             "year:<date field>. Example: 'charge_state' or 'month:due_date'.",
+    order_by="One field, '-' for descending. May also name an aggregate you "
+             "asked for, e.g. '-sum_amount'.",
+    month="'YYYY-MM', or 'this' / 'last'. Narrows to that month on the entity's "
+          "date field. Prefer this over writing two date filters by hand.",
+    year="'YYYY'. Same idea as month, for a whole year.",
+    between="'YYYY-MM-DD..YYYY-MM-DD' inclusive, on the entity's date field.",
+)
 def read(landlord, entity: str = "", filters: str = "", fields: str = "",
-         limit: str = "20") -> dict:
-    """Query ANY catalogued entity directly — use for specific/composed questions
-    a fixed list_* tool doesn't answer. entity = lease, property, lease_tenant,
-    work_order, inquiry, appointment, ledger_entry, inspection, inventory,
-    conversation, or property_group (call data_catalogue to see fields). filters =
-    comma list of 'field OP value', OP in = > < >= <= ~ (contains) != , e.g.
-    'status=active, total_rent>800, parking_included=true'. fields = optional
-    comma list to return (default: all). Always scoped to your portfolio;
-    read-only. Example: entity='work_order', filters='status=open, priority=urgent'."""
+         limit: str = "20", aggregate: str = "", group_by: str = "",
+         order_by: str = "", month: str = "", year: str = "",
+         between: str = "") -> dict:
+    """Query or TOTAL any catalogued entity — the general way to answer a
+    specific question, including "how many / how much / which are still owed".
+    Prefer this over guessing; it is always available and always scoped to your
+    own portfolio, read-only.
+
+    COUNTING AND TOTALLING: pass `aggregate` and/or `group_by` and you get
+    `totals` (and `groups`) computed across EVERY matching row — not just the
+    page `limit` returns. Use it instead of listing rows and counting them.
+
+    Rents received vs still owed in August:
+      entity='ledger_entry', filters='entry_type=RENT_CHARGE', month='2026-08',
+      group_by='charge_state', aggregate='count, sum:amount, sum:outstanding'
+    Arrears, worst first:
+      entity='ledger_entry', filters='charge_state=OVERDUE',
+      order_by='due_date', aggregate='count, sum:outstanding'
+    Spending by category this year:
+      entity='ledger_entry', filters='entry_type=EXPENSE', year='2026',
+      group_by='category', aggregate='sum:amount'
+    Open urgent work:
+      entity='work_order', filters='status=open, priority=urgent'
+
+    MONEY, READ THIS BEFORE QUOTING A FIGURE:
+    - Whether a charge is paid is `charge_state`
+      (PAID / PARTIALLY_PAID / OVERDUE / DUE / SCHEDULED), NOT `paid_on`.
+      `paid_on` is a bank-clearing date that only expenses ever carry, so a
+      rent charge's is always empty — grouping rents by it reports every rent
+      as unpaid.
+    - "Collected this month" is NOT sum:amount over charges due this month.
+      Money received in August against a July charge counts as August. Use
+      `month_money` for collected/expected/net; this tool totals CHARGES.
+    - Deposits are refundable liabilities, not income. Filter
+      `entry_type=RENT_CHARGE`, or group by entry_type, rather than summing
+      every charge together.
+    - A FEE_CHARGE with `is_damage_claim=true` is contested damage recovery,
+      not expected income — exclude it with `is_damage_claim!=true` when
+      reporting what you expect to collect.
+    - Voided/reversed entries are already excluded; the reply says so.
+    """
     from .domain_read import read as _fn
-    return _fn(landlord, entity=entity, filters=filters, fields=fields, limit=limit)
+    return _fn(
+        landlord, entity=entity, filters=filters, fields=fields, limit=limit,
+        aggregate=aggregate, group_by=group_by, order_by=order_by,
+        month=month, year=year, between=between,
+    )
 
 
 def link(landlord, entity: str = "", query: str = "") -> dict:
@@ -2539,6 +2597,11 @@ def complete_inspection_package(
 @_params(
     adjustment_type="DISCOUNT | INCREASE | PRORATION | OTHER.",
     amount="Dollars for FLAT_AMOUNT, or percent for PERCENTAGE.",
+    target_lease_total=(
+        "Optional exact household rent total for the effective period. The "
+        "backend derives and allocates the required discount/increase; do not "
+        "calculate the difference yourself."
+    ),
     calculation_method="FLAT_AMOUNT (default) | PERCENTAGE | EXACT_NIGHTLY.",
     effective_date="When the adjustment starts (YYYY-MM-DD, default today).",
 )
@@ -2549,6 +2612,8 @@ def apply_rent_adjustment(
     tenant_email: str = "",
     adjustment_type: str = "DISCOUNT",
     amount: str = "",
+    target_lease_total: str = "",
+    expected_current_total: str = "",
     calculation_method: str = "FLAT_AMOUNT",
     reason: str = "",
     effective_date: str = "",
@@ -2567,6 +2632,8 @@ def apply_rent_adjustment(
         tenant_email=tenant_email,
         adjustment_type=adjustment_type,
         amount=amount,
+        target_lease_total=target_lease_total,
+        expected_current_total=expected_current_total,
         calculation_method=calculation_method,
         reason=reason,
         effective_date=effective_date,

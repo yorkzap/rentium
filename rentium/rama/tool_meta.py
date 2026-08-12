@@ -190,6 +190,14 @@ DEFAULT_META = ToolMeta(risk="high", own_confirm=True, autonomy=Autonomy.NEVER)
 AUTO_CATEGORIES = frozenset({"admin", "inventory", "memory"})
 
 TOOL_META: dict[str, ToolMeta] = {
+    # These compile other already-vetted operations into a persisted preview;
+    # they never execute their own prose and are always explicitly confirmed.
+    "plan_operation": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
+    "plan_move_tenant": ToolMeta(
+        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
     # ------------------------------------------------------- maintenance
     "create_work_order": ToolMeta(risk="low"),
     "transition_work_order": ToolMeta(risk="low"),
@@ -330,9 +338,11 @@ TOOL_META: dict[str, ToolMeta] = {
     # Ends a tenancy / settles deposit with legal evidence — own confirm.
     "settle_moveout": ToolMeta(risk="legal", own_confirm=True),
     "complete_inspection_package": ToolMeta(risk="medium", own_confirm=True),
-    # Money: rent adjustments reconcile ledger charges.
+    # Money: rent adjustments reconcile ledger charges and can never auto-run.
+    # The persisted preview itself is the explicit confirmation boundary; do
+    # not ask once per row again inside a landlord-approved batch.
     "apply_rent_adjustment": ToolMeta(
-        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
+        risk="high", own_confirm=False, autonomy=Autonomy.NEVER,
     ),
     "record_utility_bill": ToolMeta(
         risk="high", independent_writes=True, autonomy=Autonomy.NEVER

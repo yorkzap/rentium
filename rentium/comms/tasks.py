@@ -172,6 +172,8 @@ def handle_telegram_message(
     document_file_id: str = "",
     document_name: str = "",
     document_mime: str = "",
+    external_message_id: str = "",
+    reply_to_external_id: str = "",
 ) -> None:
     from rentium.rama.service import run_turn
     from rentium.users.models import LandlordProfile
@@ -243,6 +245,9 @@ def handle_telegram_message(
         conversation_id,
         role="general",
         channel="telegram",
+        external_key=chat_id,
+        external_message_id=external_message_id,
+        reply_to_external_id=reply_to_external_id,
     )
     if result.error is not None:
         transport.send_message(

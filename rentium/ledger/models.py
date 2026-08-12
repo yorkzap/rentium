@@ -39,12 +39,16 @@ from decimal import Decimal
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models import BooleanField
 from django.db.models import Case
+from django.db.models import CharField
 from django.db.models import DecimalField
 from django.db.models import Exists
+from django.db.models import ExpressionWrapper
 from django.db.models import F
 from django.db.models import OuterRef
 from django.db.models import Q
+from django.db.models import Subquery
 from django.db.models import Sum
 from django.db.models import Value
 from django.db.models import When
@@ -207,17 +211,35 @@ class LedgerEntryQuerySet(models.QuerySet):
         null otherwise" — is now true of the queryset that feeds it.
         """
         money = DecimalField(max_digits=12, decimal_places=2)
+        # A Subquery, not Sum() over a join. Two reasons, both structural:
+        #
+        # 1. `Sum("settlements__amount")` makes `_settled` an AGGREGATE, so
+        #    `outstanding` (which is built from it) is one too — and Django
+        #    refuses to aggregate an aggregate. That made "what is still owed
+        #    across August?" inexpressible: the number could be shown per row
+        #    and never totalled. It is the single most-asked money question.
+        # 2. Joining settlements fans out the parent row, so any OTHER
+        #    aggregate in the same query silently multiplies. A subquery keeps
+        #    one row per entry no matter how many payments it has.
+        #
+        # The annotated value is unchanged; only how it is computed is.
         active_settlements = Coalesce(
-            Sum(
-                "settlements__amount",
-                filter=Q(settlements__entry_type__in=SETTLEMENT_TYPES)
-                & Q(settlements__reversed_by__isnull=True),
+            Subquery(
+                LedgerEntry.objects.filter(
+                    settles=OuterRef("pk"),
+                    entry_type__in=SETTLEMENT_TYPES,
+                    reversed_by__isnull=True,
+                )
+                .values("settles")
+                .annotate(total=Sum("amount"))
+                .values("total"),
+                output_field=money,
             ),
             Value(Decimal("0.00")),
             output_field=money,
         )
-        # Two passes: a Case cannot reference an aggregate declared in the same
-        # annotate() call, so the Sum lands first and the Cases read it by F().
+        # Two passes: a Case cannot reference an annotation declared in the same
+        # annotate() call, so the subquery lands first and the Cases read it.
         return self.annotate(_settled=active_settlements).annotate(
             settled_amount=Case(
                 When(entry_type__in=CHARGE_TYPES, then=F("_settled")),
@@ -233,6 +255,52 @@ class LedgerEntryQuerySet(models.QuerySet):
                 output_field=money,
             ),
             is_voided=Exists(LedgerEntry.objects.filter(reverses=OuterRef("pk"))),
+        )
+
+    def with_charge_state(self, today=None):
+        """Annotate `charge_state` — the DB-side mirror of charge_status().
+
+        Includes with_settlement(), so callers need only this one.
+
+        A charge's paid state is NOT a stored column and cannot be derived from
+        `paid_on`: clean() rejects `paid_on` on anything but an EXPENSE, so a
+        rent charge's is always NULL. Asking "which rents are unpaid?" by
+        testing that field returns every rent, always, with total confidence.
+        The truth lives in the `settlements` reverse FK, which means grouping by
+        it needs SQL rather than a Python pass — a Python pass can only see the
+        rows already fetched, so any total computed that way silently becomes a
+        total over the first page.
+
+        `charge_status()` on the model stays the source of truth for one object;
+        this must agree with it on every row, which is asserted directly by
+        test_charge_state_agreement rather than left to review.
+        """
+        from datetime import date as date_cls
+
+        today = today or date_cls.today()
+        label = CharField()
+        return self.with_settlement().annotate(
+            charge_state=Case(
+                # Not a receivable at all → no state, matching the NULL that
+                # with_settlement() gives non-charges for the money fields.
+                When(~Q(entry_type__in=CHARGE_TYPES), then=Value(None, output_field=label)),
+                # Order mirrors charge_status() exactly: voided outranks paid,
+                # because a reversed charge is not a collected one.
+                When(reversed_by__isnull=False, then=Value(ChargeStatus.VOIDED)),
+                When(_settled__gte=F("amount"), then=Value(ChargeStatus.PAID)),
+                When(_settled__gt=Decimal("0.00"), then=Value(ChargeStatus.PARTIALLY_PAID)),
+                When(due_date__lt=today, then=Value(ChargeStatus.OVERDUE)),
+                When(due_date=today, then=Value(ChargeStatus.DUE)),
+                default=Value(ChargeStatus.SCHEDULED),
+                output_field=label,
+            ),
+            # Mirrors damage_claims(): a FEE_CHARGE with a work order is damage
+            # recovery, not income. Declared as a field so it can be excluded
+            # explicitly — a rule the caller cannot see is a rule they break.
+            is_damage_claim=ExpressionWrapper(
+                Q(entry_type=EntryType.FEE_CHARGE) & Q(work_order__isnull=False),
+                output_field=BooleanField(),
+            ),
         )
 
 

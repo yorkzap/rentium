@@ -34,6 +34,7 @@ from rentium.rama.models import RamaAudit, RamaPreferences
 from rentium.rama.providers import Turn
 from rentium.rama.service import promises_without_delivering as promises
 from rentium.rama.service import run_turn
+from rentium.rama.providers.testing import assert_translatable
 
 pytestmark = pytest.mark.django_db
 
@@ -49,7 +50,10 @@ class ScriptedProvider:
         self.requests = []
 
     def complete(self, *, model, system, messages, tools, api_key: str = ""):
-        self.requests.append({"system": system, "messages": list(messages)})
+        assert_translatable(messages)
+        self.requests.append(
+            {"system": system, "messages": list(messages), "tools": tools},
+        )
         if not self.turns:
             return Turn(text="")
         return self.turns.pop(0)
@@ -142,7 +146,10 @@ def test_the_continuation_tells_the_model_what_to_do(landlord):
     )
     _turn(landlord, "anything owing?", provider)
 
-    nudge = provider.requests[1]["messages"][-1]["text"]
+    # "content", not "text": a user message carries its prose under "content"
+    # (see providers.base). This assertion used to read "text", which is how the
+    # nudge shipped for months in a shape no adapter could translate.
+    nudge = provider.requests[1]["messages"][-1]["content"]
     assert "NOW in this turn" in nudge
     assert "what it means for them" in nudge
 
@@ -191,6 +198,169 @@ def test_a_preview_is_never_treated_as_a_stall(landlord):
     """"I'll record the payment once you confirm" is the confirm contract
     working, not a stall. Catching it would break every write flow."""
     assert promises("I'll record the $100 payment. Confirm?", []) is False
+
+
+def test_confirmation_prose_is_compiled_into_a_real_generic_write_plan(landlord):
+    """A capable model may understand the request but forget the tool call.
+
+    The engine gives it one strict compile pass, validates the resulting tool
+    preview, and persists that preview instead of shipping orphan prose.
+    """
+    from rentium.properties.models import Property
+    from rentium.rama.models import RamaPendingPlan
+    from rentium.rama.providers import ToolCall
+
+    _enable(landlord)
+    listing = Property.objects.create(
+        landlord=landlord,
+        name="Old Room Name",
+        address="950 McKenzie Ave",
+        city="Victoria",
+        province="bc",
+        property_category=Property.PropertyCategory.ROOM,
+        room_type=Property.RoomType.PRIVATE,
+    )
+    provider = ScriptedProvider(
+        [
+            Turn(
+                text=(
+                    "I'll rename Old Room Name to Cedar Room. "
+                    "Reply CONFIRM to apply it."
+                ),
+            ),
+            Turn(
+                tool_calls=[
+                    ToolCall(
+                        id="compile-rename",
+                        name="update_property",
+                        arguments={
+                            "property_query": str(listing.pk),
+                            "name": "Cedar Room",
+                        },
+                    ),
+                ],
+            ),
+            Turn(text="The validated preview is ready."),
+        ],
+    )
+
+    result = _turn(landlord, "the first one", provider)
+
+    assert len(provider.requests) == 3
+    assert "VERSIONED EXECUTION POLICY" in provider.requests[0]["system"]
+    assert any(
+        tool["name"] == "update_property"
+        for tool in provider.requests[1].get("tools", [])
+    )
+    compile_message = provider.requests[1]["messages"][-1]
+    assert "Compile the action" in compile_message["content"]
+    plan = RamaPendingPlan.objects.get(conversation_id=result.conversation_id)
+    step = plan.steps.get()
+    assert step.tool == "update_property"
+    assert step.arguments["property_query"] == str(listing.pk)
+    assert step.arguments["name"] == "Cedar Room"
+    assert result.pending_plan is not None
+    listing.refresh_from_db()
+    assert listing.name == "Old Room Name"
+
+
+def test_yes_recompiles_an_orphaned_lease_proposal_without_repeating_request(
+    landlord,
+    bc_lease,
+):
+    """A Yes to old prose becomes a real preview, never immediate execution."""
+    from calendar import monthrange
+    from decimal import Decimal
+
+    from rentium.leases.models import RentAdjustment
+    from rentium.leases.models import LeaseTenant
+    from rentium.rama.conversations import record_visible_message
+    from rentium.rama.models import RamaMessage
+    from rentium.rama.models import RamaPendingPlan
+    from rentium.rama.providers import ToolCall
+
+    _enable(landlord)
+    LeaseTenant.objects.create(
+        lease=bc_lease,
+        invited_name="Test Tenant",
+        invited_email="tenant@example.com",
+        rent_amount=Decimal("850.00"),
+        is_primary_tenant=True,
+        has_signed=True,
+    )
+    conversation_id = uuid.uuid4()
+    record_visible_message(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        direction=RamaMessage.Direction.INBOUND,
+        text=(
+            "Make the household first-month rent total $400 for lease "
+            f"{bc_lease.lease_number}."
+        ),
+    )
+    record_visible_message(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        direction=RamaMessage.Direction.OUTBOUND,
+        text=(
+            f"Ready to make lease {bc_lease.lease_number}'s household first "
+            "month total $400. Reply CONFIRM to apply it."
+        ),
+    )
+    provider = ScriptedProvider(
+        [
+            Turn(
+                tool_calls=[
+                    ToolCall(
+                        id="compile-rent",
+                        name="apply_rent_adjustment",
+                        arguments={
+                            "lease_number": bc_lease.lease_number,
+                            "target_lease_total": "400",
+                            "effective_date": str(bc_lease.start_date),
+                            "is_recurring": "0",
+                            "reason": "One-time first-month rent adjustment",
+                        },
+                    ),
+                ],
+            ),
+            Turn(text="The real preview is ready."),
+        ],
+    )
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        recovered = run_turn(landlord, "yes", conversation_id)
+
+    assert recovered.pending_plan is not None
+    assert not RentAdjustment.objects.filter(
+        lease_tenant__lease=bc_lease,
+    ).exists()
+    plan = RamaPendingPlan.objects.get(conversation_id=conversation_id)
+    step = plan.steps.get()
+    assert step.tool == "apply_rent_adjustment"
+    assert step.arguments["lease_number"] == bc_lease.lease_number
+    assert step.arguments["target_lease_total"] == "400.00"
+    expected_total = sum(
+        bc_lease.lease_tenants.filter(declined=False).values_list(
+            "rent_amount", flat=True,
+        ),
+        Decimal("0.00"),
+    )
+    assert step.arguments["expected_current_total"] == str(expected_total)
+    assert "not backed by an executable plan" not in recovered.reply
+
+    with mock.patch(
+        "rentium.rama.service.get_provider",
+        return_value=ScriptedProvider([]),
+    ):
+        applied = run_turn(landlord, "yes", conversation_id)
+
+    adjustment = RentAdjustment.objects.get(lease_tenant__lease=bc_lease)
+    assert adjustment.amount == (bc_lease.total_rent - Decimal("400.00"))
+    assert adjustment.end_date.day == monthrange(
+        adjustment.end_date.year, adjustment.end_date.month,
+    )[1]
+    assert bc_lease.lease_number in applied.reply
 
 
 # ------------------------------------------ a warning is not the model's to drop

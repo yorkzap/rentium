@@ -18,12 +18,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import date
 from datetime import datetime
 from datetime import timedelta
-
+from decimal import Decimal
 from django.conf import settings
 from django.utils import timezone
 
@@ -31,7 +33,11 @@ from . import autonomy as autonomy_policy
 from . import memory
 from .capabilities import select_tool_schemas
 from .capabilities import supported_tool_for_request
+from .intent_contract import contract_for_effects
+from .intent_contract import contract_from_messages
+from .intent_contract import validate_step as validate_intent_step
 from .models import RamaAudit
+from .models import RamaMessage
 from .models import RamaPendingPlan
 from .plan_runner import PENDING_PLAN_TTL_SECONDS
 from .plan_runner import clear_plan
@@ -54,12 +60,14 @@ from .roles import role_allows_tool
 from .roles import role_context
 from .roles import role_tool_schemas
 from .runtime import get_role_config
+from .runtime import is_model_certified
 from .tool_meta import already_done_for
 
 logger = logging.getLogger(__name__)
 from .union import live_context
 
-MAX_TOOL_ROUNDS = 20  # multi-step room/lease/invite needs headroom
+MAX_TOOL_ROUNDS = 8
+TURN_BUDGET_SECONDS = 45
 HISTORY_TURNS = 12
 MAX_MESSAGE_CHARS = 6000
 # A previewed plan is honored as "the thing the landlord just said yes to" only
@@ -125,6 +133,75 @@ _UNDO_EXACT = {
     "put it back", "put that back", "unde that", "roll that back", "roll back",
     "take that back", "reverse that", "undo the last one", "undo last",
 }
+
+_VISIBLE_REFERENCE_QUESTION = re.compile(
+    r"^\s*(?:which one|what (?:do you mean|are you (?:saying|talking about)|is that)|"
+    r"read what|what lease|which lease|huh|bro (?:you|u) (?:are )?bugg(?:ing|in))\b",
+    re.IGNORECASE,
+)
+
+
+def _visible_reference_answer(landlord, message: str, reference: dict) -> str | None:
+    """Answer short follow-ups from the last thing the user could see.
+
+    This deliberately runs before document/ledger routers.  A classifier may
+    describe "which one" as an answer, but it cannot replace its visible
+    referent with an unrelated attachment from days earlier.
+    """
+    if not _VISIBLE_REFERENCE_QUESTION.search(message or ""):
+        return None
+    context = reference or {}
+    payload = context.get("semantic_payload") or {}
+    # Assistant replies propagate the context they answered so a second short
+    # follow-up still reaches the original event without scanning old prose.
+    for _ in range(3):
+        nested = payload.get("reference_context")
+        if not isinstance(nested, dict):
+            break
+        context = nested
+        payload = context.get("semantic_payload") or {}
+    event_type = payload.get("source_event")
+    event_id = payload.get("event_id")
+    if event_type == "lease.activated":
+        from rentium.leases.models import Lease
+
+        lease_id = None
+        for ref in context.get("entity_refs") or []:
+            if ref.get("type") == "lease":
+                lease_id = ref.get("id")
+                break
+        if not lease_id and event_id:
+            from rentium.events.models import DomainEvent
+
+            event = DomainEvent.objects.filter(pk=event_id).first()
+            lease_id = event.lease_id if event else None
+        lease = Lease.objects.filter(pk=lease_id, landlord=landlord).select_related(
+            "property", "group"
+        ).first() if lease_id else None
+        if lease:
+            number = lease.lease_number or f"Draft-{lease.pk.hex[:6]}"
+            subject = (
+                lease.property.name
+                if lease.property_id
+                else lease.group.name
+                if lease.group_id
+                else "the rental"
+            )
+            return (
+                f"The activation notice was for lease {number}, for {subject}. "
+                f"Open /dashboard/leases/{lease.pk}"
+            )
+        return "The notice was about a lease activation, but I can't resolve that lease now."
+    # If the last visible answer asserted an attachment that this episode does
+    # not contain, recover plainly instead of doubling down on invented context.
+    previous_text = str(context.get("text") or "")
+    if re.search(r"\b(invoice|receipt|document|file you sent|i read this as)\b", previous_text, re.I):
+        return (
+            "You're right — that reply pulled in stale document context you did "
+            "not send in this conversation. I cleared that focus. What do you "
+            "want to work on?"
+        )
+    return None
 
 
 def _is_undo_request(text: str) -> bool:
@@ -2350,6 +2427,21 @@ def _batch_preview_reply(
                 detail = f"Put {target} in {args.get('group_name')}"
         elif step.tool == "create_property_group":
             detail = f"Create property group {args.get('name') or target}"
+        elif step.tool == "apply_rent_adjustment":
+            if args.get("target_lease_total"):
+                detail = (
+                    f"Set household rent for the period beginning "
+                    f"{args.get('effective_date') or 'the selected date'} on "
+                    f"{args.get('lease_number') or target} to "
+                    f"${args['target_lease_total']}; the ledger service will "
+                    "calculate the adjustment from the frozen live rent total"
+                )
+            else:
+                detail = (
+                    f"Apply a one-time {str(args.get('adjustment_type') or '').lower()} "
+                    f"of ${args.get('amount')} to "
+                    f"{args.get('lease_number') or target}"
+                )
         else:
             detail = (
                 f"{step.tool.replace('_', ' ').capitalize()}: {target}"
@@ -2612,18 +2704,25 @@ _DID = (
 )
 # "recorded AS $425" describes the books; "recorded THE payment" claims a write.
 _NOT_AN_ACTION = r"(?!\s+(?:as|in|under|on the ledger\b))"
-_CLAIMED_WRITE = re.compile(
-    # "...— I updated the rent": first person, anywhere in the sentence.
-    r"\bi(?:'ve|’ve| have| just)?\s+" + _DID + r"\b" + _NOT_AN_ACTION
-    # "Recorded the $100 payment...": bare past tense opening a sentence.
-    #
-    # No _NOT_AN_ACTION here, deliberately. The exclusion exists for the
-    # DESCRIPTIVE form — "The deposit is recorded as $425" — which is always
-    # mid-sentence, behind its linking verb, and so cannot reach this branch
-    # anyway. Applying it here excused "Recorded as etransfer." instead: the
-    # same words with the opposite meaning, and a fabricated write that reached
-    # a landlord in August 2026 because of it.
-    + r"|(?:^|[.!?]\s+|\n\s*|—\s*)" + _DID + r"\b",
+# "...— I updated the rent": first person, anywhere in the sentence. No shape of
+# report looks like this, so it is checked unconditionally.
+_FIRST_PERSON_WRITE = re.compile(
+    r"\bi(?:'ve|’ve| have| just)?\s+" + _DID + r"\b" + _NOT_AN_ACTION,
+    re.IGNORECASE,
+)
+# "Recorded the $100 payment...": bare past tense opening a sentence.
+#
+# No _NOT_AN_ACTION here, deliberately. The exclusion exists for the
+# DESCRIPTIVE form — "The deposit is recorded as $425" — which is always
+# mid-sentence, behind its linking verb, and so cannot reach this branch
+# anyway. Applying it here excused "Recorded as etransfer." instead: the
+# same words with the opposite meaning, and a fabricated write that reached
+# a landlord in August 2026 because of it.
+#
+# Having no subject, this branch cannot tell a claim from a table row on its
+# own — claims_completed_write filters those out before consulting it.
+_BARE_PAST_WRITE = re.compile(
+    r"(?:^|[.!?]\s+|\n\s*|—\s*)" + _DID + r"\b",
     re.IGNORECASE,
 )
 _NOT_A_CLAIM = re.compile(
@@ -2639,7 +2738,9 @@ _NOT_A_CLAIM = re.compile(
 _SOLICITS_CONFIRM = re.compile(
     r"(?:^|\n|\s)(?:confirm\?|confirm this|please confirm|shall i proceed"
     r"|should i proceed|do you want me to proceed|reply (?:with )?yes"
-    r"|say yes|approve this|ok to (?:post|proceed|apply|record))",
+    r"|reply (?:with )?confirm|confirm (?:you want|to (?:post|apply|record|proceed))"
+    r"|say yes|approve this|ok to (?:post|proceed|apply|record)"
+    r"|reply (?:yes|confirm) to (?:post|apply|record|proceed))",
     re.IGNORECASE,
 )
 
@@ -2653,19 +2754,90 @@ def _sentences(text: str) -> list[str]:
     return [part for part in re.split(r"(?<=[.!?])\s+|\n+", text or "") if part.strip()]
 
 
+# ---------------------------------------------------------------------------
+# Telling a REPORT apart from a CLAIM
+#
+# The bare-past-tense branch above has no subject, and _sentences splits on
+# newlines, so every row of a rendered table arrives here as its own "sentence".
+# That matters because this guard fires ONLY when the turn wrote nothing — i.e.
+# exclusively on read-only answers, which is exactly the output a table is. The
+# vocabulary is shared: charge_schedule's own status words are scheduled /
+# unpaid / paid, and "Scheduled viewings for August:" was being condemned as a
+# fabricated write and replaced with "I said that as though it were done — it
+# isn't." Seven of nine realistic read answers were destroyed this way.
+#
+# Three structural discriminators, none of which need new vocabulary:
+
+#: A rendered row: bullet, numbered item, pipe table, or "Label: value".
+_ROW_LINE = re.compile(
+    r"^\s*(?:[-*•·|>]|\d+[.)]\s)"
+    r"|^\s*\w[\w /()'’-]{0,40}:\s"
+    r"|\|",
+)
+#: Bare numeric / money / ISO-date columns: "Scheduled 2026-09-01 850.00".
+#: Counting these alone is not enough — a fabricated claim can carry three
+#: figures of its own ("Recorded the $100 payment … $425.00 … $325.00 still
+#: outstanding") and dropping that line as a table let the lie straight
+#: through. A row is numbers with few words; prose is words with some numbers.
+_NUMERIC_COLUMN = re.compile(
+    r"(?:^|\s)(?:\$?\d[\d,]*(?:\.\d+)?|\d{4}-\d{2}-\d{2})(?=\s|$)"
+)
+_ALPHA_WORD = re.compile(r"[A-Za-z]{2,}")
+_MAX_WORDS_IN_A_ROW = 6
+#: Verb + BARE PLURAL noun = a report headline ("Posted charges for August",
+#: "Updated leases in the last 30 days"). A real claim names a definite object
+#: instead — "Recorded THE payment", "Created A lease" — so the determiners are
+#: excluded. The {3,} length requirement keeps "Recorded as etransfer." out of
+#: this exemption: "as" also ends in an s, and letting it through would excuse
+#: the exact August 2026 fabrication the branch below exists to catch.
+_REPORT_HEADLINE = re.compile(
+    r"(?:^|[.!?]\s+|\n\s*|—\s*)" + _DID + r"\s+(?!the\b|a\b|an\b|this\b|that\b"
+    r"|your\b|his\b|her\b|their\b|its\b|my\b)[a-z]{3,}s\b",
+    re.IGNORECASE,
+)
+#: "Sent: 3 invites", "Marked paid: 2 of 5 August charges" — a colon close
+#: behind the verb makes it a label, not an assertion.
+_LABEL_COLON = re.compile(
+    r"(?:^|[.!?]\s+|\n\s*|—\s*)" + _DID + r"\b[^:.!?\n]{0,30}:",
+    re.IGNORECASE,
+)
+
+
+def _prose_only(text: str) -> str:
+    """Drop rendered rows so only the model's own sentences are judged."""
+    kept = []
+    for line in (text or "").splitlines():
+        if _ROW_LINE.search(line):
+            continue
+        numeric = len(_NUMERIC_COLUMN.findall(line))
+        words = len(_ALPHA_WORD.findall(line))
+        if numeric >= 2 and words <= _MAX_WORDS_IN_A_ROW:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def claims_completed_write(text: str) -> bool:
     """True when the model says, in its own voice, that it already wrote.
 
     Checked per SENTENCE so a negation elsewhere in a long reply cannot excuse
     a claim, and a claim elsewhere cannot condemn an honest "I haven't recorded
     that yet".
+
+    The first-person branch is unconditional — it carries all the safety value
+    and has no false-positive shape. The subject-less branch is skipped for
+    rendered rows and report headlines; see the discriminators above.
     """
-    for sentence in _sentences(text):
+    for sentence in _sentences(_prose_only(text)):
         if _NOT_A_CLAIM.search(sentence):
             continue
         if "?" in sentence:  # "Shall I record it?" is an offer, not a claim
             continue
-        if _CLAIMED_WRITE.search(sentence):
+        if _FIRST_PERSON_WRITE.search(sentence):
+            return True
+        if _REPORT_HEADLINE.search(sentence) or _LABEL_COLON.search(sentence):
+            continue
+        if _BARE_PAST_WRITE.search(sentence):
             return True
     return False
 
@@ -2732,6 +2904,15 @@ _DELIVER_NOW = (
     "look it up and report it. If you cannot, say plainly what is blocking you."
 )
 
+_COMPILE_PROPOSAL_NOW = (
+    "You just asked the landlord to confirm an action without creating an "
+    "executable preview. Compile the action you already understood into real "
+    "tool calls NOW. Call each required write tool once with confirm empty; "
+    "use read tools first if live facts are needed. Do not repeat the prose "
+    "plan and do not ask for confirmation yourself. If a genuine business "
+    "choice is still missing, ask only that one clarification instead."
+)
+
 
 # ------------------------------------------------- asking for its own data
 #
@@ -2778,12 +2959,37 @@ _ONLY_THE_LANDLORD_KNOWS = re.compile(
     r"\b(e-?transfer|cash|cheque|check|payment method|how did|how was|"
     r"when did|what day|which day|did (?:you|they|she|he)|has (?:it|she|he|"
     r"they)|do you want|would you like|should i|shall i|is that right|"
+    # An OFFER of more work is not a demand for data. "Want me to pull the
+    # ledger lines so you can see which charges remain unpaid?" ends a perfectly
+    # good answer, and condemning it cost a landlord the whole reply in August
+    # 2026 — the retry it triggered was the turn that crashed.
+    r"want me to|can i pull|shall i pull|i can pull|i can show|"
     r"correct\?|instead|approve|go ahead)\b",
     re.IGNORECASE,
 )
+_WORD = re.compile(r"[a-z0-9]+")
+#: Below this, a sentence is not meaningfully "the landlord's own question".
+_RESTATEMENT_MIN_WORDS = 3
+_RESTATEMENT_CONTAINMENT = 0.8
 
 
-def asks_for_what_the_books_hold(text: str) -> bool:
+def _restates_the_question(sentence: str, landlord_message: str) -> bool:
+    """True when the sentence is essentially the landlord's own words back.
+
+    RAMA restating what it was asked as a heading — "How much rent is still
+    due?" above the figures — is normal, good answer shape, and the guard has
+    no way to tell it from a demand because it never looks at who is asking.
+    """
+    asked = set(_WORD.findall((landlord_message or "").casefold()))
+    if not asked:
+        return False
+    words = set(_WORD.findall(sentence.casefold()))
+    if len(words) < _RESTATEMENT_MIN_WORDS:
+        return False
+    return len(words & asked) / len(words) >= _RESTATEMENT_CONTAINMENT
+
+
+def asks_for_what_the_books_hold(text: str, *, landlord_message: str = "") -> bool:
     """True when the reply asks the landlord for a figure RAMA can look up.
 
     Per SENTENCE, like the other two reply guards, so one legitimate question
@@ -2791,11 +2997,16 @@ def asks_for_what_the_books_hold(text: str) -> bool:
     stored-figure NOUN appearing in an otherwise fine sentence does not condemn
     it. Deliberately conservative in both directions: it needs an asking shape
     AND a stored figure AND no sign that the answer lives outside the database.
+
+    `landlord_message` is what they actually asked. Without it the guard cannot
+    tell a demand from an echo of the question it is about to answer.
     """
     for sentence in _sentences(text):
         if "?" not in sentence and not _ASKS_LANDLORD_TO_LOOK_UP.search(sentence):
             continue
         if _ONLY_THE_LANDLORD_KNOWS.search(sentence):
+            continue
+        if _restates_the_question(sentence, landlord_message):
             continue
         if _STORED_FIGURE.search(sentence) or (
             _ASKS_LANDLORD_TO_LOOK_UP.search(sentence)
@@ -3045,6 +3256,7 @@ def _persist_pending(
     landlord,
     conversation_id,
     pending_specs: list[dict] | None,
+    intent_contract: dict | None = None,
 ) -> None:
     """End-of-turn invariant: a plan row exists IFF something is outstanding.
 
@@ -3056,7 +3268,30 @@ def _persist_pending(
     """
     if not pending_specs:
         return
-    save_batch(landlord, conversation_id, pending_specs)
+    save_batch(
+        landlord, conversation_id, pending_specs,
+        intent_contract=intent_contract,
+    )
+
+
+def _intent_contract_for_turn(landlord, conversation_id, message: str) -> dict:
+    """Recover the active request across terse clarification/preview turns."""
+    from .models import RamaConversation
+
+    texts = [message]
+    conversation = RamaConversation.objects.filter(
+        pk=conversation_id, landlord=landlord,
+    ).select_related("active_episode").first()
+    if conversation and conversation.active_episode_id:
+        prior = RamaMessage.objects.filter(
+            conversation=conversation,
+            episode=conversation.active_episode,
+            direction=RamaMessage.Direction.INBOUND,
+        ).order_by("-created_at").values_list("text", flat=True)[:16]
+        for text in prior:
+            if str(text or "").strip() != str(message or "").strip():
+                texts.append(str(text or ""))
+    return contract_from_messages(texts)
 
 
 def _tool_facts_note(
@@ -3168,6 +3403,91 @@ _REFERENT_WORDS = {
 }
 
 
+def _recent_lease_reference(landlord, conversation_id, message: str = ""):
+    """Resolve the exact lease the landlord named in this visible episode.
+
+    Only landlord-authored lease numbers and tool calls that themselves passed
+    an exact lease_number are eligible. A fuzzy property lookup result is not:
+    two concurrent leases can legitimately share the same listing name.
+    """
+    from rentium.leases.models import Lease
+
+    from .models import RamaConversation
+
+    leases = list(
+        Lease.objects.filter(landlord=landlord)
+        .exclude(lease_number="")
+        .select_related("property", "group")
+    )
+    by_number = {
+        str(row.lease_number).casefold(): row for row in leases if row.lease_number
+    }
+
+    def named_in(text: str):
+        lowered = str(text or "").casefold()
+        matches = [
+            (number, row) for number, row in by_number.items() if number in lowered
+        ]
+        return max(matches, key=lambda item: len(item[0]))[1] if matches else None
+
+    explicit = named_in(_landlord_words(message or ""))
+    if explicit is not None:
+        return explicit
+
+    # A tenant is a first-class lease identifier for ordinary landlord speech.
+    # Resolve it from landlord-owned lease participants instead of asking the
+    # landlord to copy a lease number RAMA can read.  Only one unique matching
+    # lease is accepted; genuinely duplicated names remain ambiguous.
+    lowered_message = _landlord_words(message or "").casefold()
+    participant_matches = []
+    for lease in leases:
+        for slot in lease.lease_tenants.filter(declined=False):
+            display = str(slot.display_name or "").strip().casefold()
+            email = str(slot.invited_email or "").strip().casefold()
+            first_name = display.split()[0] if display else ""
+            if (
+                (display and display in lowered_message)
+                or (email and email in lowered_message)
+                or (len(first_name) >= 3 and re.search(
+                    rf"\b{re.escape(first_name)}\b", lowered_message,
+                ))
+            ):
+                participant_matches.append(lease)
+                break
+    unique_participant_matches = {lease.pk: lease for lease in participant_matches}
+    if len(unique_participant_matches) == 1:
+        return next(iter(unique_participant_matches.values()))
+
+    conversation = RamaConversation.objects.filter(
+        pk=conversation_id, landlord=landlord,
+    ).select_related("active_episode").first()
+    if not conversation or not conversation.active_episode_id:
+        return None
+
+    inbound = RamaMessage.objects.filter(
+        conversation=conversation,
+        episode=conversation.active_episode,
+        direction=RamaMessage.Direction.INBOUND,
+    ).order_by("-created_at")[:24]
+    for row in inbound:
+        found = named_in(row.text)
+        if found is not None:
+            return found
+
+    audits = RamaAudit.objects.filter(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        kind=RamaAudit.Kind.TOOL_CALL,
+        created_at__gte=conversation.active_episode.started_at,
+    ).order_by("-created_at")[:30]
+    for row in audits:
+        args = (row.content or {}).get("arguments") or {}
+        exact = str(args.get("lease_number") or "").strip().casefold()
+        if exact in by_number:
+            return by_number[exact]
+    return None
+
+
 def _conversation_focus(
     landlord,
     conversation_id,
@@ -3197,12 +3517,17 @@ def _conversation_focus(
             return None
         return max(matches, key=lambda item: len(item[0]))[1]
 
+    lease = _recent_lease_reference(landlord, conversation_id, message)
     row = named_in(message)
     source = "current message" if row else ""
     recent = RamaAudit.objects.filter(
         landlord=landlord,
         conversation_id=conversation_id,
     ).order_by("-created_at")[:24]
+    if row is None and lease is not None and lease.property_id:
+        row = by_name.get(str(lease.property.name).casefold())
+        if row:
+            source = "exact lease reference"
     if row is None:
         for audit_row in recent:
             content = audit_row.content or {}
@@ -3231,23 +3556,36 @@ def _conversation_focus(
                     source = "recent user message"
             if row:
                 break
-    if row is None:
+    if row is None and lease is None:
         return {}
-    return {
-        "property": {
+    result = {
+        "property": ({
             "name": row.get("name"),
             "category": row.get("category"),
             "primary_type": row.get("primary_type"),
             "group": row.get("group"),
             "lease_number": row.get("lease_number"),
-        },
+        } if row else {}),
         "source": source,
         "instruction": (
             "Resolve it/this/that/the property/the unit/the suite to this property "
-            "unless the landlord explicitly names another entity. Follow-up questions "
-            "inherit the topic but remain read-only."
+            "unless the landlord explicitly names another entity. If lease is "
+            "present below, use that exact lease_number; a property name is not "
+            "enough to replace it because one listing may have several leases. "
+            "Follow-up questions inherit the topic but remain read-only."
         ),
     }
+    if lease is not None:
+        result["lease"] = {
+            "id": str(lease.pk),
+            "lease_number": lease.lease_number,
+            "property": lease.property.name if lease.property_id else "",
+            "status": lease.status,
+            "start_date": str(lease.start_date),
+            "end_date": str(lease.end_date) if lease.end_date else None,
+            "total_rent": str(lease.total_rent),
+        }
+    return result
 
 
 def _contextualize_tool_arguments(
@@ -3256,6 +3594,24 @@ def _contextualize_tool_arguments(
     """Replace pronoun placeholders with the grounded conversation target."""
     args = dict(arguments or {})
     prop_name = ((focus.get("property") or {}).get("name") or "").strip()
+    exact_lease = ((focus.get("lease") or {}).get("lease_number") or "").strip()
+    registered = REGISTRY.get(tool_name)
+    fields = (
+        (registered.parameters or {}).get("properties", {})
+        if registered is not None
+        else {}
+    )
+    if exact_lease and "lease_number" in fields and not str(
+        args.get("lease_number") or ""
+    ).strip():
+        property_query = str(args.get("property_query") or "").strip()
+        lease_property = str((focus.get("lease") or {}).get("property") or "").strip()
+        if (
+            not property_query
+            or property_query.casefold() in _REFERENT_WORDS
+            or property_query.casefold() == lease_property.casefold()
+        ):
+            args["lease_number"] = exact_lease
     if not prop_name:
         return args
 
@@ -3287,6 +3643,434 @@ def _landlord_words(text: str) -> str:
     return _ATTACHMENT_MARKER.split(text or "", maxsplit=1)[0]
 
 
+def _first_month_rent_adjustment_intent(
+    landlord, conversation_id, message: str,
+) -> dict | None:
+    """Parse a high-confidence one-time first-month rent instruction.
+
+    "Discount the first month TO $400" means a $400 household total; "BY
+    $400" means $400 off. The backend prices both from the exact referenced
+    lease and never lets the model perform the subtraction or choose among
+    same-name leases.
+    """
+    text = _landlord_words(message or "").strip()
+    low = text.casefold().replace("’", "'")
+    scope_answer = ""
+    if re.fullmatch(
+        r"\s*(?:household|shared|both|the first one|first one|option one|1)\s*[.!]?\s*",
+        low,
+    ) or re.search(r"\b(?:entire|whole) household\b", low):
+        scope_answer = "household"
+    elif re.fullmatch(
+        r"\s*(?:aishwarya|individual|her|aishwarya only|the second one|"
+        r"second one|option two|2)\s*[.!]?\s*",
+        low,
+    ):
+        scope_answer = "individual"
+    has_actionable_rent_request = bool(
+        "rent" in low
+        and re.search(r"\b(?:discount|reduce|lower|set|make|change|adjust)\b", low)
+    )
+    if scope_answer and not has_actionable_rent_request:
+        from .models import RamaConversation
+
+        conversation = RamaConversation.objects.filter(
+            pk=conversation_id, landlord=landlord,
+        ).select_related("active_episode").first()
+        if conversation and conversation.active_episode_id:
+            earlier = RamaMessage.objects.filter(
+                conversation=conversation,
+                episode=conversation.active_episode,
+                direction=RamaMessage.Direction.INBOUND,
+            ).order_by("-created_at").values_list("text", flat=True)[:16]
+            source = next(
+                (
+                    _landlord_words(row).strip()
+                    for row in earlier
+                    if re.search(
+                        r"\b(?:first|1st)\s+month", _landlord_words(row), re.I,
+                    )
+                    and "rent" in _landlord_words(row).casefold()
+                ),
+                "",
+            )
+            if source:
+                text = f"{source} {scope_answer}"
+                low = text.casefold().replace("’", "'")
+    if not (
+        re.search(r"\b(?:first|1st)\s+month(?:'s)?\b", low)
+        or re.search(r"\bprorat(?:ed|ion)\s+rent\b", low)
+    ):
+        return None
+    if "rent" not in low or not re.search(
+        r"\b(?:discount|reduce|lower|set|make|change|adjust)\b", low,
+    ):
+        return None
+    amount = _amount_from_message(text)
+    if not amount:
+        return None
+
+    lease = _recent_lease_reference(landlord, conversation_id, text)
+    if lease is None:
+        return {
+            "error": (
+                "Which exact lease should get the first-month adjustment? "
+                "Send its lease number; a listing name can have more than one lease."
+            )
+        }
+
+    says_by = bool(re.search(r"\b(?:by|off)\s*\$?\s*\d", low))
+    says_target = bool(
+        re.search(r"\b(?:to(?:\s+be)?|at|only)\s*\$?\s*\d", low)
+        or re.search(r"\btotal(?:\s+(?:to|of|is|be))?\s*\$?\s*\d", low)
+        or re.search(
+            r"\b(?:set|make|change|adjust)\b[^.!?]{0,80}"
+            r"\b(?:first|1st)\s+month(?:'s)?\s+rent\s*"
+            r"(?:to(?:\s+be)?|at|be)?\s*\$?\s*\d",
+            low,
+        )
+    )
+    if says_target:
+        amounts = re.findall(r"\$\s*(\d+(?:\.\d{1,2})?)", text)
+        if amounts:
+            amount = amounts[-1]
+    if not says_by and not says_target:
+        return None
+
+    # “Make Aishwarya's first month $400” names an individual allocation,
+    # while “make their/the household first month $400” names the household
+    # total. Do not let this high-confidence shortcut erase that distinction;
+    # participant-scoped targets go through the model/tool clarification path.
+    if says_target:
+        mentioned_tenants = []
+        for lease_tenant in lease.lease_tenants.filter(declined=False):
+            display = str(lease_tenant.display_name or "").strip().casefold()
+            email = str(lease_tenant.invited_email or "").strip().casefold()
+            first_name = display.split()[0] if display else ""
+            if (
+                (display and display in low)
+                or (email and email in low)
+                or (len(first_name) >= 3 and first_name in low)
+            ):
+                mentioned_tenants.append(lease_tenant)
+        household_scope = bool(
+            re.search(
+                r"\b(?:household|combined|together|between (?:the )?tenants|their)\b",
+                low,
+            )
+        )
+        if mentioned_tenants and not household_scope and len(lts := list(
+            lease.lease_tenants.filter(declined=False)
+        )) > 1 and scope_answer != "individual":
+            named = mentioned_tenants[0]
+            current = str(named.rent_amount or "0.00")
+            return {
+                "error": (
+                    f"I found {named.display_name} on lease {lease.lease_number}. "
+                    f"The lease household rent is ${lease.total_rent}, while "
+                    f"{named.display_name}'s current allocation is ${current}. "
+                    "Should the entire household's first month total $"
+                    f"{amount}, or should only {named.display_name}'s share total "
+                    f"${amount}? Reply “household” or “{named.display_name.split()[0]} only”."
+                )
+            }
+
+    arguments = {
+        "lease_number": lease.lease_number,
+        # Explicit first-period terms belong to the legal lease period.
+        # Possession controls default billing, but must not silently move an
+        # agreed August amount into September.
+        "effective_date": str(lease.start_date),
+        "is_recurring": "0",
+        "reason": "One-time first-month rent adjustment",
+    }
+    if says_target and scope_answer != "individual":
+        arguments["target_lease_total"] = amount
+    elif says_target and mentioned_tenants:
+        named = mentioned_tenants[0]
+        current = Decimal(named.rent_amount or 0)
+        target = Decimal(amount)
+        arguments.update(
+            {
+                "tenant_email": named.invited_email or "",
+                "adjustment_type": (
+                    "DISCOUNT" if target < current else "INCREASE"
+                ),
+                "amount": str(abs(current - target).quantize(Decimal("0.01"))),
+                "calculation_method": "FLAT_AMOUNT",
+                "reason": (
+                    f"Set {named.display_name}'s first-month allocation to ${amount}"
+                ),
+            }
+        )
+    else:
+        arguments.update(
+            {
+                "adjustment_type": "DISCOUNT",
+                "amount": amount,
+                "calculation_method": "FLAT_AMOUNT",
+            }
+        )
+    return {"tool": "apply_rent_adjustment", "arguments": arguments}
+
+
+def _rent_adjustment_preview_reply(result: dict) -> str:
+    preview = result.get("preview") or {}
+    lease_number = preview.get("lease_number") or "the lease"
+    lines = [
+        "Ready to apply this one-time rent adjustment:",
+        f"• Lease: {lease_number} — {preview.get('property') or 'rental'}",
+    ]
+    if preview.get("target_lease_total") is not None:
+        lines.extend(
+            [
+                f"• Current household charge for that period: "
+                f"${preview.get('current_lease_total')}",
+                f"• Requested household total: "
+                f"${preview.get('target_lease_total')}",
+                f"• One-time {str(preview.get('adjustment_type') or '').lower()}: "
+                f"${preview.get('amount')}",
+            ]
+        )
+    else:
+        lines.append(
+            f"• One-time {str(preview.get('adjustment_type') or '').lower()}: "
+            f"${preview.get('amount')}"
+        )
+    lines.append(
+        f"• Applies only {preview.get('effective_date')} through "
+        f"{preview.get('end_date')}"
+    )
+    lines.append("Reply yes to apply it, or no to cancel.")
+    return "\n".join(lines)
+
+
+_MONTH_NUMBERS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+_MONTH_TOKEN = re.compile(
+    r"\b(" + "|".join(sorted(_MONTH_NUMBERS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+_PARALLEL_RENT_SPLIT = re.compile(
+    r"\s+(?:and\s+also|also|and)\s+"
+    r"(?=(?:please\s+)?(?:make|set|change|adjust|reduce|raise|lower)\b)",
+    re.IGNORECASE,
+)
+
+_RENT_TARGET_ACTION = re.compile(
+    r"\b(?:make|set|change|adjust|reduce|raise|lower)\b"
+    r"|\b(?:can|could|should|must|needs?\s+to)\s+be\b"
+    r"|\b(?:want|need|would\s+like)\b[^.!?]{0,80}\b(?:rent|charge|total)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_rent_target_action(text: str) -> bool:
+    """Whether ordinary speech requests a final rent-period state."""
+    return bool(_RENT_TARGET_ACTION.search(str(text or "")))
+
+
+def _billing_period_from_words(lease, text: str) -> tuple[date | None, str]:
+    """Resolve a landlord-named month inside the legal lease term.
+
+    ``move_in_date`` controls the default billing schedule, but it is not a
+    validity boundary for an explicit landlord override.
+    """
+    low = str(text or "").casefold()
+    legal_start = lease.start_date
+    month_match = _MONTH_TOKEN.search(low)
+    if month_match is None:
+        if re.search(r"\b(?:first|1st)\s+month\b", low) or re.search(
+            r"\bprorat(?:ed|ion)\s+(?:rent|rate|charge)\b", low,
+        ):
+            return legal_start, ""
+        return None, "Name the rent month (for example Aug 2026)."
+    month = _MONTH_NUMBERS[month_match.group(1).casefold()]
+    year_match = re.search(r"\b(20\d{2})\b", low)
+    if year_match:
+        years = [int(year_match.group(1))]
+    else:
+        last_year = lease.end_date.year if lease.end_date else legal_start.year + 2
+        years = list(range(legal_start.year, last_year + 1))
+        years.sort(key=lambda value: (value != timezone.now().date().year, value))
+
+    for year in years:
+        month_start = date(year, month, 1)
+        next_month = (
+            date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        )
+        month_end = next_month - timedelta(days=1)
+        if month_end < legal_start:
+            continue
+        if lease.end_date and month_start > lease.end_date:
+            continue
+        return (
+            legal_start
+            if (legal_start.year, legal_start.month) == (year, month)
+            else month_start,
+            "",
+        )
+
+    label = month_match.group(1).title()
+    return None, (
+        f"Lease {lease.lease_number} has no {label} period inside its legal "
+        f"term beginning {legal_start}."
+    )
+
+
+def _rent_target_amount(clause: str) -> Decimal | None:
+    """Read one target total from a high-confidence rent clause."""
+    # Bare amounts are accepted only after the compiler has proved this is a
+    # rent-target instruction. The last number wins so both "Aug 2026 rent
+    # 1900" and "the old charge is 1716.13; make it 1900" select the target.
+    candidates = re.findall(
+        r"(?<![\w.])([0-9][0-9,]*(?:\.\d{1,2})?)(?![\w.])", clause,
+    )
+    if not candidates:
+        return None
+    try:
+        amount = Decimal(candidates[-1].replace(",", "")).quantize(
+            Decimal("0.01"),
+        )
+    except Exception:
+        return None
+    return amount if amount >= 0 else None
+
+
+def _recent_rent_period_source(landlord, conversation_id, current: str) -> str:
+    """Recover the nearest active-episode rent subject for a terse correction."""
+    from .models import RamaConversation
+
+    conversation = RamaConversation.objects.filter(
+        pk=conversation_id, landlord=landlord,
+    ).select_related("active_episode").first()
+    if not conversation or not conversation.active_episode_id:
+        return ""
+    rows = RamaMessage.objects.filter(
+        conversation=conversation,
+        episode=conversation.active_episode,
+        direction=RamaMessage.Direction.INBOUND,
+    ).order_by("-created_at").values_list("text", flat=True)[:20]
+    current_words = _landlord_words(current).strip()
+    skipped_current = False
+    for row in rows:
+        source = _landlord_words(row).strip()
+        if not skipped_current and source == current_words:
+            skipped_current = True
+            continue
+        low = source.casefold()
+        if (
+            "rent" in low
+            and _MONTH_TOKEN.search(low)
+            and _has_rent_target_action(low)
+            and _recent_lease_reference(landlord, conversation_id, source) is not None
+        ):
+            return source
+    return ""
+
+
+def _rent_period_adjustment_intent(
+    landlord, conversation_id, message: str,
+) -> dict | None:
+    """Compile one or several explicit rent targets into one guarded batch.
+
+    This is deliberately an effect compiler, not a catalogue of transcript
+    phrases: each clause must contain an action, a rent period, one target
+    amount, and a tenant/lease that resolves uniquely in the live portfolio.
+    """
+    text = _landlord_words(message or "").strip()
+    clauses = [part.strip(" ,.;") for part in _PARALLEL_RENT_SPLIT.split(text)]
+    if len(clauses) == 1:
+        low = text.casefold()
+        explicit_period = bool(
+            _MONTH_TOKEN.search(low)
+            or re.search(r"\bprorat(?:ed|ion)\s+(?:rent|rate|charge)\b", low)
+        )
+        has_rent_action = bool(
+            "rent" in low
+            and _has_rent_target_action(low)
+        )
+        correction = bool(
+            re.search(r"\b(?:ledger|prorat(?:ed|ion))\b", low)
+            and re.search(r"\b(?:make|set|change|adjust)\b", low)
+        )
+        if not (has_rent_action and explicit_period) and correction:
+            source = _recent_rent_period_source(landlord, conversation_id, text)
+            if source:
+                clauses = [f"{source}; {text}"]
+                has_rent_action = True
+                explicit_period = True
+        if not (has_rent_action and explicit_period):
+            return None
+
+    items: list[dict] = []
+    problems: list[dict] = []
+    for clause in clauses:
+        low = clause.casefold()
+        if "rent" not in low or not _has_rent_target_action(low):
+            return None
+        target = _rent_target_amount(clause)
+        if target is None:
+            return None
+        lease = _recent_lease_reference(landlord, conversation_id, clause)
+        if lease is None:
+            problems.append(
+                {
+                    "target": clause[:100],
+                    "error": "I could not resolve one exact landlord-owned lease.",
+                    "fatal": True,
+                }
+            )
+            continue
+        effective, date_error = _billing_period_from_words(lease, clause)
+        if effective is None:
+            problems.append(
+                {
+                    "target": lease.lease_number,
+                    "error": date_error,
+                    "fatal": True,
+                }
+            )
+            continue
+        items.append(
+            {
+                "lease": lease,
+                "arguments": {
+                    "lease_number": lease.lease_number,
+                    "effective_date": str(effective),
+                    "is_recurring": "0",
+                    "reason": "One-time rent-period target requested by landlord",
+                    "target_lease_total": str(target),
+                },
+            }
+        )
+    return {"items": items, "problems": problems}
+
+
 # "these are NOT business documents" / "it isn't a receipt". Without this the
 # keyword scan below matched the very noun the landlord was ruling out.
 _DENIES_BUSINESS_RECORD = re.compile(
@@ -3314,10 +4098,36 @@ _CLAIMS_LISTING_PHOTO = re.compile(
 
 def _conversation_attachment_focus(landlord, conversation_id) -> dict:
     """Keep an unresolved attachment visible after its original upload turn."""
+    # Attachments are conversational focus only inside the current visible
+    # episode.  The old implementation sampled twelve audit messages with no
+    # age boundary, which let a 70-hour-old invoice hijack "which one?" after a
+    # lease notification.
+    from .models import RamaConversation
+
+    conversation = RamaConversation.objects.filter(
+        pk=conversation_id, landlord=landlord
+    ).select_related("active_episode").first()
+    if conversation and conversation.active_episode_id:
+        visible_batches = list(
+            RamaMessage.objects.filter(
+                conversation=conversation,
+                episode=conversation.active_episode,
+                direction=RamaMessage.Direction.INBOUND,
+                attachment_batch__isnull=False,
+            )
+            .order_by("-created_at")
+            .values_list("attachment_batch_id", flat=True)[:12]
+        )
+    else:
+        visible_batches = []
+    audit_floor = timezone.now() - timedelta(minutes=30)
+    if conversation and conversation.active_episode_id:
+        audit_floor = max(audit_floor, conversation.active_episode.started_at)
     rows = RamaAudit.objects.filter(
         landlord=landlord,
         conversation_id=conversation_id,
         kind=RamaAudit.Kind.USER_MESSAGE,
+        created_at__gte=audit_floor,
     ).order_by("-created_at")[:12]
     raw_texts = [str((row.content or {}).get("text") or "") for row in rows]
     # IDs are extracted from explicit message markers only. Never scan the
@@ -3333,6 +4143,7 @@ def _conversation_attachment_focus(landlord, conversation_id) -> dict:
         r"RAMA attachment batch ([0-9a-fA-F-]{32,36})",
         joined_raw,
     )
+    batch_ids = [str(pk) for pk in visible_batches if pk] + batch_ids
     texts = [_landlord_words(t) for t in raw_texts]
     combined = "\n".join(texts)
     from .models import RamaAttachment
@@ -3586,6 +4397,106 @@ def _message_has_new_file(message: str) -> bool:
     )
 
 
+# ------------------------------------------------------- what this turn IS
+#
+# The deterministic money/document routers each decide for themselves whether
+# this turn is theirs, from their own regexes. That works right up until two of
+# them are plausible, and then the pile has no way to arbitrate — it just runs
+# whichever is checked first.
+#
+# The failure that made this unavoidable: `_amount_from_message` returns any
+# dollar figure in any sentence, and `can_catalog` accepted a bare amount as
+# evidence that the landlord was correcting a receipt. So
+#
+#     "Okay I received amanats deposit. It's one $400 payment that covers
+#      her both deposits"
+#
+# found "$400", found an unfiled document still sitting in the conversation
+# from earlier, and answered with a filing preview for a rat-trap receipt. The
+# landlord said "No wtf", which is the correct review.
+#
+# Adding "…unless the sentence says received" would have been the fifth patch
+# of that shape. What the routers actually need is the thing a regex cannot
+# give them: what the sentence is ABOUT. The model answers that, from a closed
+# set, and Python keeps deciding what to DO about it — see interpret.py for why
+# that is safe.
+TURN_SUBJECTS = (
+    "filing_a_document",
+    "money_received",
+    "money_spent",
+    "lease_admin",
+    "answering_a_question",
+    "something_else",
+)
+
+# Which subject each pending write belongs to, so a plan left over from one
+# subject cannot absorb a confirmation given for another.
+_PLAN_SUBJECTS = {
+    "catalog_business_document": "filing_a_document",
+    "file_business_document": "filing_a_document",
+    "rename_business_document": "filing_a_document",
+    "record_payment": "money_received",
+    "record_payment_allocation": "money_received",
+    "create_expense": "money_spent",
+    "record_utility_bill": "money_spent",
+    "apply_rent_adjustment": "lease_admin",
+}
+
+
+def _turn_subject(landlord, conversation_id, message: str) -> str | None:
+    """What the landlord's message is about, or None when it can't be asked."""
+    landlord_text = _landlord_words(message or "")
+    # An explicit lease operation cannot become a receipt merely because an
+    # old OCR document is still unfinished elsewhere in the account.
+    if not _message_has_new_file(message) and re.search(
+        r"\b(?:lease|tenancy|roommate agreement|pending signatures?|"
+        r"signed|invite|first[- ]month rent|rent adjustment|rent discount|"
+        r"RMT\d{4,}-[A-Z0-9]+)\b",
+        landlord_text,
+        re.IGNORECASE,
+    ):
+        return "lease_admin"
+
+    from .interpret import classify
+
+    return classify(
+        landlord,
+        question="What is this message from the landlord about?",
+        message=message,
+        options=TURN_SUBJECTS,
+        conversation_id=conversation_id,
+        context=(
+            "filing_a_document: they are attaching, filing, naming or "
+            "correcting a receipt, invoice or other paperwork.\n"
+            "money_received: money came IN — rent, a deposit, a tenant paid "
+            "them.\n"
+            "money_spent: they bought something or paid a bill.\n"
+            "lease_admin: a lease, tenant roster, signature/invite, tenancy "
+            "date, or rent adjustment/discount.\n"
+            "answering_a_question: a short reply to something just asked of "
+            "them (a yes/no, a date, an amount, an address).\n"
+            "something_else: anything else — a question, lease admin, "
+            "scheduling, chat.\n\n"
+            "Judge the SENTENCE, not the numbers in it. A dollar figure "
+            "appears in all of these and tells you nothing on its own: "
+            "'I received her $400 deposit' is money_received, not a receipt "
+            "correction."
+        ),
+    )
+
+
+def _plan_subject(plan) -> str | None:
+    """The subject an outstanding plan belongs to, or None if it spans several."""
+    if plan is None:
+        return None
+    subjects = {
+        _PLAN_SUBJECTS.get(step.tool)
+        for step in plan.steps.all()
+        if _PLAN_SUBJECTS.get(step.tool)
+    }
+    return subjects.pop() if len(subjects) == 1 else None
+
+
 def _void_expense_intent(landlord, message: str) -> dict | None:
     """Parse 'void the $125 window screens expense' → void_ledger_entry."""
     if _message_has_new_file(message):
@@ -3717,13 +4628,21 @@ def _receipt_title_from_caption(caption: str, amount: str = "") -> str:
 
 def _pending_unscoped_document_id(landlord, conversation_id) -> str:
     """Newest prepared document from this chat that still needs holding/filing."""
+    from .models import RamaConversation
     from .models import RamaDocument
+
+    conversation = RamaConversation.objects.filter(
+        pk=conversation_id, landlord=landlord,
+    ).select_related("active_episode").first()
+    if not conversation or not conversation.active_episode_id:
+        return ""
 
     # Prefer document_ids returned by recent tool calls in this conversation.
     rows = RamaAudit.objects.filter(
         landlord=landlord,
         conversation_id=conversation_id,
         kind=RamaAudit.Kind.TOOL_CALL,
+        created_at__gte=conversation.active_episode.started_at,
     ).order_by("-created_at")[:30]
     seen: list[str] = []
     for row in rows:
@@ -3739,17 +4658,10 @@ def _pending_unscoped_document_id(landlord, conversation_id) -> str:
         ):
             if candidate and str(candidate) not in seen:
                 seen.append(str(candidate))
+    # Never fall back to the landlord's global inbox. A document becomes chat
+    # context only when this active episode actually referenced it.
     if not seen:
-        # Fallback: newest unscoped doc for landlord (same as catalog tool bare path).
-        pending = (
-            RamaDocument.objects.filter(
-                landlord=landlord, holding__isnull=True, deleted_at__isnull=True
-            )
-            .exclude(status=RamaDocument.Status.FILED)
-            .order_by("-created_at")
-            .first()
-        )
-        return str(pending.pk) if pending else ""
+        return ""
 
     for doc_id in seen:
         doc = (
@@ -3774,12 +4686,20 @@ def _awaiting_expense_decision(landlord, conversation_id):
     is already stamped on the tool result that asked, so the state is on the
     record that produced it and cannot drift from it.
     """
+    from .models import RamaConversation
     from .models import RamaDocument
+
+    conversation = RamaConversation.objects.filter(
+        pk=conversation_id, landlord=landlord,
+    ).select_related("active_episode").first()
+    if not conversation or not conversation.active_episode_id:
+        return None
 
     rows = RamaAudit.objects.filter(
         landlord=landlord,
         conversation_id=conversation_id,
         kind=RamaAudit.Kind.TOOL_CALL,
+        created_at__gte=conversation.active_episode.started_at,
     ).order_by("-created_at")[:12]
     for row in rows:
         result = (row.content or {}).get("result") or {}
@@ -4184,10 +5104,18 @@ def _recent_document_id(landlord, conversation_id, message: str) -> str:
     )
     if explicit:
         return explicit.group(0)
+    from .models import RamaConversation
+
+    conversation = RamaConversation.objects.filter(
+        pk=conversation_id, landlord=landlord,
+    ).select_related("active_episode").first()
+    if not conversation or not conversation.active_episode_id:
+        return ""
     rows = RamaAudit.objects.filter(
         landlord=landlord,
         conversation_id=conversation_id,
         kind=RamaAudit.Kind.TOOL_CALL,
+        created_at__gte=conversation.active_episode.started_at,
     ).order_by("-created_at")[:20]
     for row in rows:
         content = row.content or {}
@@ -4277,6 +5205,8 @@ def _delegate(landlord, tool_name: str, arguments: dict) -> dict:
 @dataclass
 class TurnResult:
     conversation_id: uuid.UUID
+    episode_id: uuid.UUID | None = None
+    message_id: uuid.UUID | None = None
     reply: str = ""
     provider: str = ""
     model: str = ""
@@ -4295,7 +5225,168 @@ class TurnResult:
     error: dict | None = None
 
 
+#: Shown when a turn dies of something nobody anticipated. It says only what is
+#: certainly true — nothing was changed, the message is kept — because the one
+#: thing a crashed turn cannot do is describe what it was in the middle of.
+_TURN_CRASHED = (
+    "Something broke while I was working on that, so I stopped. Nothing was "
+    "changed. Your message is saved — try asking again, and if it keeps "
+    "failing, rephrase it or ask me for a smaller piece of it."
+)
+
+
+def record_recovery_outbound(
+    landlord,
+    conversation_id,
+    text: str,
+    *,
+    channel: str = "web",
+    role: str = "corporal",
+    external_key: str = "",
+) -> None:
+    """Persist a visible reply from outside the turn's own machinery.
+
+    The normal path records outbound messages through a closure inside
+    `_run_turn_unlocked`, which is exactly the scope an exception destroys. A
+    turn that crashes after its inbound row is written leaves the landlord
+    looking at their own question with nothing under it — no error, no reply,
+    no indication anything happened. Never raises: a failure to record the
+    failure must not replace one silent turn with another.
+    """
+    try:
+        from .conversations import record_visible_message
+
+        record_visible_message(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            direction=RamaMessage.Direction.OUTBOUND,
+            text=text,
+            channel=channel,
+            role=role,
+            kind=RamaMessage.Kind.RECOVERY,
+            external_key=external_key,
+            semantic_payload={"recovery": "turn_crashed"},
+        )
+    except Exception:  # noqa: BLE001 - last resort; see docstring
+        logger.exception(
+            "rama: could not record recovery message for conversation %s",
+            conversation_id,
+        )
+
+
 def run_turn(
+    landlord,
+    message: str,
+    conversation_id: uuid.UUID | None = None,
+    **kwargs,
+) -> TurnResult:
+    """Serialize visible turns for one conversation without making callers wait."""
+    conversation_id = conversation_id or uuid.uuid4()
+    if int(kwargs.get("depth") or 0) > 0:
+        # Sub-turns keep raising/returning `error=`. The delegating turn needs to
+        # know its helper failed so it can say so, rather than receive an
+        # apology it would then relay as if it were an answer.
+        return _run_turn_unlocked(
+            landlord, message, conversation_id, **kwargs,
+        )
+
+    from .turn_guard import conversation_turn_guard
+
+    with conversation_turn_guard(landlord.pk, conversation_id) as acquired:
+        if not acquired:
+            return TurnResult(
+                conversation_id=conversation_id,
+                reply=(
+                    "I’m still finishing your previous message. I won’t start "
+                    "a second overlapping turn; the result will arrive in this "
+                    "chat as soon as that turn finishes."
+                ),
+                provider="deterministic",
+                model="turn-guard",
+                deterministic=True,
+            )
+        try:
+            return _run_turn_unlocked(
+                landlord, message, conversation_id, **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - a visible turn may never 500
+            return _crashed_turn(landlord, conversation_id, exc, kwargs)
+
+
+def _crashed_turn(landlord, conversation_id, exc, kwargs) -> TurnResult:
+    """Turn an unhandled exception into a visible, harmless reply.
+
+    Three things have to happen, in this order, and each is independently
+    wrapped so a failure in one still lets the others run:
+
+    1. Audit the traceback — otherwise the only trace of the crash is a 500 in
+       a log nobody correlates back to a conversation.
+    2. Discard any plan the landlord was never shown. A deterministic router
+       persists its plan mid-turn, before the reply is composed, so a crash in
+       between leaves a plan with no preview attached to it — and the next "yes"
+       would execute something nobody ever saw. A plan that DID reach them has
+       `prompt_message` bound (see conversations.bind_plan_prompt) and is left
+       alone: a crashed side question must not destroy confirmed intent, which
+       is the same invariant _persist_pending protects.
+    3. Persist an outbound so the thread is not silent.
+
+    Returns `reply=`, not `error=`. `_chat_response` renders `error` as a bare
+    HTTP status with no message body, which from the landlord's side is
+    indistinguishable from the silence this exists to prevent.
+    """
+    import traceback
+
+    channel = str(kwargs.get("channel") or "web")
+    role = str(kwargs.get("role") or "corporal")
+    external_key = str(kwargs.get("external_key") or "")
+
+    logger.exception("rama: turn crashed for conversation %s", conversation_id)
+    try:
+        RamaAudit.objects.create(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            kind=RamaAudit.Kind.ERROR,
+            provider="deterministic",
+            model="turn-crash",
+            content={
+                "error": "turn_crashed",
+                "guard": "turn_crashed",
+                "exception": f"{type(exc).__name__}: {exc}"[:500],
+                "traceback": traceback.format_exc()[-4000:],
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("rama: could not audit the crash either")
+
+    try:
+        unseen = RamaPendingPlan.objects.filter(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            prompt_message__isnull=True,
+        )
+        for plan in unseen:
+            plan.delete()
+    except Exception:  # noqa: BLE001
+        logger.exception("rama: could not discard the unseen plan after a crash")
+
+    record_recovery_outbound(
+        landlord,
+        conversation_id,
+        _TURN_CRASHED,
+        channel=channel,
+        role=role,
+        external_key=external_key,
+    )
+    return TurnResult(
+        conversation_id=conversation_id,
+        reply=_TURN_CRASHED,
+        provider="deterministic",
+        model="turn-crash",
+        deterministic=True,
+    )
+
+
+def _run_turn_unlocked(
     landlord,
     message: str,
     conversation_id: uuid.UUID | None = None,
@@ -4304,12 +5395,52 @@ def run_turn(
     channel: str = "web",
     depth: int = 0,
     extra_system: str = "",
+    message_id: uuid.UUID | str | None = None,
+    reply_to_message_id: uuid.UUID | str | None = None,
+    external_key: str = "",
+    external_message_id: str = "",
+    reply_to_external_id: str = "",
+    client_context: dict | None = None,
+    attachment_batch_id: uuid.UUID | str | None = None,
+    visible_text: str | None = None,
 ) -> TurnResult:
     """Run one agent turn for `landlord`. Callers validate enablement/input;
     this function assumes a non-empty message and a resolvable provider."""
     conversation_id = conversation_id or uuid.uuid4()
     cfg = get_role_config(landlord, role)
     provider_name, model, api_key = cfg.provider, cfg.model, cfg.api_key
+
+    visible_input = None
+    visible_reference: dict = {"source": "none"}
+    if depth == 0:
+        from .conversations import record_visible_message
+        from .conversations import reference_context
+
+        attachment_batch = None
+        if attachment_batch_id:
+            from .models import RamaAttachmentBatch
+
+            attachment_batch = RamaAttachmentBatch.objects.filter(
+                pk=attachment_batch_id,
+                landlord=landlord,
+                conversation_id=conversation_id,
+            ).first()
+        visible_input = record_visible_message(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            direction=RamaMessage.Direction.INBOUND,
+            text=visible_text if visible_text is not None else message,
+            channel=channel,
+            role=role,
+            message_id=message_id,
+            external_key=external_key,
+            external_message_id=external_message_id,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_external_id=reply_to_external_id,
+            attachment_batch=attachment_batch,
+            semantic_payload={"client_context": client_context or {}},
+        )
+        visible_reference = reference_context(visible_input)
 
     meta = {}
     if role != "corporal":
@@ -4327,31 +5458,81 @@ def run_turn(
             content={**content, **meta} if meta else content,
         )
 
+    def record_outbound(text: str, *, plan=None, recovery: bool = False):
+        if depth != 0:
+            return None
+        from .conversations import bind_plan_prompt
+        from .conversations import record_visible_message
+
+        payload = {"reference_context": visible_reference}
+        if plan is not None:
+            payload["plan_id"] = str(plan.plan_id)
+            payload["task_id"] = str(plan.task_id) if plan.task_id else ""
+        row = record_visible_message(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            direction=RamaMessage.Direction.OUTBOUND,
+            text=text,
+            channel=channel,
+            role=role,
+            kind=(
+                RamaMessage.Kind.PLAN_PROMPT
+                if plan is not None
+                else RamaMessage.Kind.RECOVERY
+                if recovery
+                else RamaMessage.Kind.CHAT
+            ),
+            external_key=external_key,
+            semantic_payload=payload,
+        )
+        if plan is not None:
+            bind_plan_prompt(plan, row)
+        return row
+
     try:
         provider = get_provider(provider_name)
     except ProviderError as exc:
+        # Populate `reply` as well as `error`. The API needs the status code,
+        # but `_chat_response` renders `error` alone as a bare HTTP failure with
+        # nothing in the thread — and a misconfigured key is precisely the case
+        # where the landlord needs to be told what to fix, in the chat, rather
+        # than watch their message vanish.
+        record_outbound(str(exc), recovery=True)
         return TurnResult(
             conversation_id=conversation_id,
             provider=provider_name,
             model=model,
+            reply=str(exc),
             error={"detail": str(exc), "code": "PROVIDER_ERROR", "status_hint": 400},
         )
 
-    prior = RamaAudit.objects.filter(
-        landlord=landlord,
-        conversation_id=conversation_id,
-        kind__in=[RamaAudit.Kind.USER_MESSAGE, RamaAudit.Kind.ASSISTANT_MESSAGE],
-    ).order_by("created_at")
     messages = []
-    for row in list(prior)[-HISTORY_TURNS:]:
-        text = row.content.get("text", "")
-        if not text:
-            continue
-        if row.kind == RamaAudit.Kind.USER_MESSAGE:
-            messages.append({"role": "user", "content": text})
-        else:
-            messages.append({"role": "assistant", "text": text})
-    messages.append({"role": "user", "content": message})
+    if depth == 0:
+        from .conversations import visible_history
+
+        for row in visible_history(
+            landlord=landlord, conversation_id=conversation_id, limit=HISTORY_TURNS
+        ):
+            if row["role"] == "user":
+                content = message if row["id"] == str(visible_input.pk) else row["text"]
+                messages.append({"role": "user", "content": content})
+            else:
+                messages.append({"role": "assistant", "text": row["text"]})
+    else:
+        prior = RamaAudit.objects.filter(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            kind__in=[RamaAudit.Kind.USER_MESSAGE, RamaAudit.Kind.ASSISTANT_MESSAGE],
+        ).order_by("created_at")
+        for row in list(prior)[-HISTORY_TURNS:]:
+            text = row.content.get("text", "")
+            if not text:
+                continue
+            if row.kind == RamaAudit.Kind.USER_MESSAGE:
+                messages.append({"role": "user", "content": text})
+            else:
+                messages.append({"role": "assistant", "text": text})
+        messages.append({"role": "user", "content": message})
 
     audit(RamaAudit.Kind.USER_MESSAGE, {"text": message})
 
@@ -4371,12 +5552,22 @@ def run_turn(
     # does, and the prompt never needs a new hand-written line per capability.
     if role in ("corporal", "general"):
         from .manifest import capability_digest
+        from .runtime_policy import execution_policy
 
         system += "\n\n" + capability_digest()
+        policy = execution_policy()
+        if policy:
+            system += "\n\n## VERSIONED EXECUTION POLICY\n" + policy
     system += (
         "\n\n## LIVE PORTFOLIO (authoritative — overrides chat history)\n"
         + json.dumps(safe_context, indent=None, separators=(",", ":"))
     )
+    if visible_reference.get("source") != "none":
+        system += (
+            "\n\n## VISIBLE REPLY CONTEXT (authoritative for words like "
+            "this/that/which one)\n"
+            + json.dumps(visible_reference, default=str, separators=(",", ":"))
+        )
     focus = _conversation_focus(
         landlord, conversation_id, message, safe_context,
     )
@@ -4441,13 +5632,50 @@ def run_turn(
         },
     )
 
+    intent_contract = _intent_contract_for_turn(
+        landlord, conversation_id, message,
+    )
+    if intent_contract:
+        system += (
+            "\n\n## EXECUTABLE INTENT CONTRACT (server-enforced)\n"
+            + json.dumps(intent_contract, separators=(",", ":"))
+            + "\nAny write preview must use the required capability and preserve "
+            "all constraints. The server will reject a semantically different "
+            "tool even when its schema is valid."
+        )
+
     schemas = role_tool_schemas(role, depth)
+    if not is_model_certified(provider_name, model):
+        schemas = [
+            schema
+            for schema in schemas
+            if "confirm" not in (schema.get("parameters") or {}).get("properties", {})
+        ]
+        system += (
+            "\n\nThis custom model is not certified for model-authored writes. "
+            "You may read and explain. For a change, state the requested operation "
+            "plainly so the server's deterministic certified route can preview it."
+        )
+    eligible_schemas = list(schemas)
     if getattr(settings, "RAMA_COMMAND_ENGINE_V2", True):
         schemas = select_tool_schemas(
             message,
             schemas,
             limit=max(6, int(getattr(settings, "RAMA_TOOL_RETRIEVAL_LIMIT", 12))),
         )
+        required_capability = str(
+            intent_contract.get("required_capability") or "",
+        )
+        required_schema = next(
+            (
+                schema
+                for schema in eligible_schemas
+                if schema.get("name") == required_capability
+            ),
+            None,
+        )
+        if required_schema is not None and required_schema not in schemas:
+            schemas = [*schemas[:-1], required_schema]
     max_rounds = SUB_TURN_MAX_ROUNDS if depth >= 1 else MAX_TOOL_ROUNDS
     tools_used: list[str] = ["_live_context"]
     # Tools whose RESULT said a change landed. Distinct from tools_used: a
@@ -4547,9 +5775,59 @@ def run_turn(
     # loop). Lease terminations and similar own-confirm steps pause execution
     # for their own explicit "yes" (tiered confirm).
     plan_progress: dict | None = None
-    deterministic_reply: str | None = None
+    deterministic_reply: str | None = _visible_reference_answer(
+        landlord, visible_text if visible_text is not None else message, visible_reference
+    )
     forced_expense_intent: dict | None = None
+    orphaned_confirmation_proposal = ""
     pending_plan = load_fresh_plan(landlord, conversation_id)
+
+    # A plan survives 30 minutes, so one left over from an earlier subject is
+    # still sitting there when the conversation has moved on — and a "yes"
+    # lands on whatever is persisted, not on what the reply described.
+    #
+    # That is what happened here. RAMA offered, in prose, to post two deposit
+    # charges; the landlord said Yes; the stale document-filing plan underneath
+    # executed instead, and the answer came back "Stored at the
+    # physical-property level." The confirmation guard did not catch it because
+    # it only asks whether SOME plan exists, and one did — the wrong one.
+    #
+    # So a plan is discarded once this turn is plainly about something else.
+    # Not on "yes"/"no" (that is the landlord answering THIS plan) and not on a
+    # subject we could not read — only on a different, concrete subject.
+    if (
+        pending_plan is not None
+        and not _is_affirmative(message)
+        and not _is_negative(message)
+    ):
+        _plan_is_about = _plan_subject(pending_plan)
+        if _plan_is_about is not None:
+            _turn_is_about = _turn_subject(landlord, conversation_id, message)
+            if (
+                _turn_is_about in set(_PLAN_SUBJECTS.values())
+                and _turn_is_about != _plan_is_about
+            ):
+                audit(
+                    RamaAudit.Kind.TOOL_CALL,
+                    {
+                        "tool": "_stale_plan_discarded",
+                        "arguments": {
+                            "plan_was_about": _plan_is_about,
+                            "turn_is_about": _turn_is_about,
+                        },
+                        "result": {
+                            "discarded": plan_to_payload(pending_plan),
+                            "reason": (
+                                "a yes here would have confirmed something the "
+                                "landlord had stopped talking about"
+                            ),
+                        },
+                        "deterministic_routing": True,
+                    },
+                )
+                clear_plan(landlord, conversation_id)
+                pending_plan = None
+
     rejects_document = bool(_NO_RECEIPT_RE.search(message or "")) and bool(
         re.search(r"\b(expense|ledger|log|record|post)\b", message or "", re.I)
     )
@@ -4734,6 +6012,154 @@ def run_turn(
             + json.dumps(plan_brief(pending_plan), default=str)
         )
 
+    # Several explicit rent-period targets are compiled together before the
+    # model loop. This is the common "make Aug $X for A and $Y for B" case: one
+    # instruction, live resolution of both leases, one persisted batch, one
+    # confirmation. A model is not allowed to serially rediscover the entities
+    # for twenty rounds or silently drop one half of the request.
+    if deterministic_reply is None and pending_plan is None:
+        parallel_rent = _rent_period_adjustment_intent(
+            landlord, conversation_id, message,
+        )
+        if parallel_rent is not None:
+            fatal = [row for row in parallel_rent["problems"] if row["fatal"]]
+            specs: list[dict] = []
+            effects: list[dict] = []
+            excluded = [
+                {"target": row["target"], "error": row["error"]}
+                for row in parallel_rent["problems"]
+                if not row["fatal"]
+            ]
+            preview_errors: list[dict] = []
+            if not fatal:
+                for item in parallel_rent["items"]:
+                    result = _run_deterministic_tool(
+                        "apply_rent_adjustment", item["arguments"],
+                    )
+                    if result.get("needs_confirm"):
+                        stable = dict(
+                            result.get("resolved_arguments")
+                            or item["arguments"]
+                        )
+                        specs.append(
+                            {
+                                "kind": "single",
+                                "tool": "apply_rent_adjustment",
+                                "arguments": stable,
+                                "target": stable["lease_number"],
+                            }
+                        )
+                        effects.append(
+                            {
+                                "capability": "apply_rent_adjustment",
+                                "constraints": {
+                                    "lease_number": stable["lease_number"],
+                                    "effective_date": stable["effective_date"],
+                                    "target_lease_total": stable[
+                                        "target_lease_total"
+                                    ],
+                                },
+                            }
+                        )
+                    elif result.get("unchanged") or result.get("idempotent"):
+                        excluded.append(
+                            {
+                                "target": item["lease"].lease_number,
+                                "error": str(
+                                    result.get("message") or "No change is needed."
+                                ),
+                            }
+                        )
+                    else:
+                        preview_errors.append(
+                            {
+                                "target": item["lease"].lease_number,
+                                "error": str(
+                                    result.get("error")
+                                    or result.get("question_for_user")
+                                    or result
+                                ),
+                            }
+                        )
+            if fatal or preview_errors:
+                clear_plan(landlord, conversation_id)
+                rows = [
+                    *[
+                        {"target": row["target"], "error": row["error"]}
+                        for row in fatal
+                    ],
+                    *preview_errors,
+                ]
+                deterministic_reply = (
+                    "I resolved the rent changes, but I could not safely prepare "
+                    "the complete batch:\n"
+                    + "\n".join(
+                        f"• {row['target']}: {row['error']}" for row in rows
+                    )
+                    + "\n\nNothing is waiting for confirmation."
+                )
+            elif specs:
+                batch_contract = contract_for_effects(message, effects)
+                plan = save_batch(
+                    landlord,
+                    conversation_id,
+                    specs,
+                    intent_contract=batch_contract,
+                )
+                deterministic_reply = _batch_preview_reply(plan, excluded)
+            elif excluded:
+                deterministic_reply = "No rent change is needed:\n" + "\n".join(
+                    f"• {row['target']}: {row['error']}" for row in excluded
+                )
+
+    # A first-month target is ledger arithmetic over one exact lease, not a
+    # prose task for the model. Resolve the lease from the landlord-authored
+    # conversation subject, let the domain tool calculate the adjustment, and
+    # persist the exact preview that the next Yes can execute.
+    if deterministic_reply is None and pending_plan is None:
+        rent_intent = _first_month_rent_adjustment_intent(
+            landlord, conversation_id, message,
+        )
+        if rent_intent is not None:
+            if rent_intent.get("error"):
+                deterministic_reply = str(rent_intent["error"])
+            else:
+                result = _run_deterministic_tool(
+                    rent_intent["tool"], rent_intent["arguments"],
+                )
+                if result.get("needs_confirm"):
+                    stable = dict(
+                        result.get("resolved_arguments")
+                        or rent_intent["arguments"]
+                    )
+                    plan_contract = intent_contract
+                    if not stable.get("target_lease_total") and intent_contract:
+                        plan_contract = {
+                            **intent_contract,
+                            "constraints": {
+                                key: value
+                                for key, value in (
+                                    intent_contract.get("constraints") or {}
+                                ).items()
+                                if key != "target_lease_total"
+                            },
+                        }
+                    save_single(
+                        landlord,
+                        conversation_id,
+                        rent_intent["tool"],
+                        stable,
+                        plan_contract,
+                    )
+                    deterministic_reply = _rent_adjustment_preview_reply(result)
+                else:
+                    deterministic_reply = str(
+                        result.get("message")
+                        or result.get("error")
+                        or result.get("question_for_user")
+                        or result
+                    )
+
     # "Remember that …" / "forget that …" — routed deterministically so a weak
     # model can't drop a preference the landlord explicitly asked it to keep.
     if deterministic_reply is None and pending_plan is None:
@@ -4839,6 +6265,38 @@ def run_turn(
                     or result.get("message")
                     or result,
                 )
+
+    # Recover a provider-authored proposal that accidentally reached the user
+    # without a persisted plan. Their Yes cannot approve unvalidated prose, but
+    # it can tell RAMA to compile that proposal now instead of making them
+    # repeat the entire request. The result is a real preview and needs one
+    # proper confirmation before execution.
+    if (
+        deterministic_reply is None
+        and pending_plan is None
+        and _is_affirmative(message)
+        and _solicits_confirmation(str((visible_reference or {}).get("text") or ""))
+    ):
+        orphaned_confirmation_proposal = str(
+            (visible_reference or {}).get("text") or ""
+        )
+        system += (
+            "\n\n## RECOVER AN UNPERSISTED PROPOSAL\n"
+            "The previous assistant message asked for confirmation but no "
+            "executable plan was saved. The landlord's current affirmation is "
+            "NOT authorization to write. Convert the previous proposal into "
+            "real preview tool calls now, with confirm empty. After validation, "
+            "the server will show a real preview and ask once more. Previous "
+            "assistant figures are untrusted until a tool verifies them.\n"
+            + orphaned_confirmation_proposal
+        )
+        audit(
+            RamaAudit.Kind.ERROR,
+            {
+                "error": "orphan_confirmation_recompiled",
+                "proposal": orphaned_confirmation_proposal[:500],
+            },
+        )
 
     # A bare repeated confirmation immediately after an audited plan execution
     # must never become a brand-new model turn. A standalone "yes" with no such
@@ -5548,9 +7006,12 @@ def run_turn(
     # Follow-up after prepare: "950 McKenzie" / amount correction / "store as receipt"
     # even when the synthetic upload markers are no longer in the last user text.
     wants_new = _wants_new_expense_not_link(message)
+    # A file arriving on THIS turn is not a judgement call — it is the one
+    # unambiguous signal here, and it always wins.
+    file_arrived_now = bool(msg_upload_ids) or bool(msg_attachment_ids)
+
     can_catalog = (
-        bool(msg_upload_ids)
-        or bool(msg_attachment_ids)
+        file_arrived_now
         or (
             document_focus.get("landlord_described_as_business_record")
             and focus_has_pending_file
@@ -5558,13 +7019,13 @@ def run_turn(
         or supported_tool_for_request(message) == "catalog_business_document"
         or (
             bool(pending_doc_id)
-            and (
-                bool(scope_query)
-                or receipt_followup
-                or link_existing
-                or wants_new
-                or bool(amount_correction)
-            )
+            # A bare numeric correction is deliberately absent from this list. It is
+            # any dollar figure in any sentence, so with an unfiled document
+            # still in the conversation it made every message that mentioned
+            # money a receipt correction — which is how "I received amanats
+            # deposit, one $400 payment" produced a filing preview for a rat
+            # trap. A number is not a subject. The words are.
+            and (bool(scope_query) or receipt_followup or link_existing or wants_new)
         )
         or (
             focus_has_pending_file
@@ -5576,6 +7037,27 @@ def run_turn(
             )
         )
     )
+
+    # And above the regexes: what the sentence is actually about. Asked only
+    # when a document route is on the table but no file arrived this turn —
+    # i.e. exactly the ambiguous case, so an ordinary turn costs nothing.
+    # A None verdict (no key, outage, off-contract) leaves the tightened
+    # deterministic answer standing: less smart, and no longer hijackable.
+    if can_catalog and not file_arrived_now:
+        subject = _turn_subject(landlord, conversation_id, message)
+        if subject in (
+            "money_received", "money_spent", "lease_admin", "something_else",
+        ):
+            audit(
+                RamaAudit.Kind.TOOL_CALL,
+                {
+                    "tool": "_document_route_declined",
+                    "arguments": {"subject": subject},
+                    "result": {"reason": "this turn is not about the paperwork"},
+                    "deterministic_routing": True,
+                },
+            )
+            can_catalog = False
     if (
         deterministic_reply is None
         and pending_plan is None
@@ -6248,8 +7730,15 @@ def run_turn(
                 ),
             },
         )
+        outbound = record_outbound(
+            deterministic_reply,
+            plan=outstanding,
+            recovery="stale document context" in deterministic_reply,
+        )
         return TurnResult(
             conversation_id=conversation_id,
+            episode_id=outbound.episode_id if outbound else None,
+            message_id=outbound.pk if outbound else None,
             reply=deterministic_reply,
             provider=provider_name,
             model=model,
@@ -6268,8 +7757,43 @@ def run_turn(
     unresolved_write_inputs: list[str] = []
     planned_property_aliases: dict[str, str] = {}
     turn_tools = schemas
+    proposal_compile_attempted = False
+    if orphaned_confirmation_proposal and getattr(
+        settings, "RAMA_COMMAND_ENGINE_V2", True,
+    ):
+        turn_tools = select_tool_schemas(
+            message + "\n" + orphaned_confirmation_proposal,
+            eligible_schemas,
+            limit=max(
+                12,
+                int(getattr(settings, "RAMA_TOOL_RETRIEVAL_LIMIT", 12)),
+            ),
+        )
     try:
-        for _ in range(max_rounds):
+        # A compile recovery earns exactly one extra model round. Ordinary and
+        # endlessly tool-calling turns keep the existing hard round limit.
+        round_budget = max_rounds
+        round_number = 0
+        model_loop_started = time.monotonic()
+        while round_number < round_budget:
+            if time.monotonic() - model_loop_started >= TURN_BUDGET_SECONDS:
+                audit(
+                    RamaAudit.Kind.ERROR,
+                    {
+                        "error": "turn_time_budget_exhausted",
+                        "rounds": round_number,
+                    },
+                )
+                turn = Turn(
+                    text=(
+                        "I stopped this turn because the model kept looking "
+                        "without producing an executable answer. Nothing was "
+                        "changed. Please retry; RAMA will not keep a request "
+                        "open indefinitely."
+                    )
+                )
+                break
+            round_number += 1
             turn = provider.complete(
                 model=model,
                 system=system,
@@ -6278,6 +7802,41 @@ def run_turn(
                 api_key=api_key,
             )
             if not turn.tool_calls:
+                if (
+                    not pending_specs
+                    and not proposal_compile_attempted
+                    and is_model_certified(provider_name, model)
+                    and _solicits_confirmation(turn.text or "")
+                ):
+                    proposal_compile_attempted = True
+                    round_budget += 1
+                    audit(
+                        RamaAudit.Kind.ERROR,
+                        {
+                            "error": "confirmation_prose_sent_to_plan_compiler",
+                            "proposal": (turn.text or "")[:500],
+                        },
+                    )
+                    messages.append({"role": "assistant", "text": turn.text})
+                    messages.append(
+                        {"role": "user", "content": _COMPILE_PROPOSAL_NOW},
+                    )
+                    if getattr(settings, "RAMA_COMMAND_ENGINE_V2", True):
+                        turn_tools = select_tool_schemas(
+                            message + "\n" + (turn.text or ""),
+                            eligible_schemas,
+                            limit=max(
+                                12,
+                                int(
+                                    getattr(
+                                        settings,
+                                        "RAMA_TOOL_RETRIEVAL_LIMIT",
+                                        12,
+                                    )
+                                ),
+                            ),
+                        )
+                    continue
                 break
             messages.append(
                 {
@@ -6382,6 +7941,11 @@ def run_turn(
                     else:
                         stable_arguments = dict(effective_arguments)
                         preview = result.get("preview") or {}
+                        if isinstance(result.get("resolved_arguments"), dict):
+                            # Domain composites may bind a fuzzy lookup to an
+                            # exact entity and freeze live arithmetic for the
+                            # confirmation step (notably rent adjustments).
+                            stable_arguments = dict(result["resolved_arguments"])
                         if (
                             call.name == "rename_business_document"
                             and isinstance(result.get("resolved_arguments"), dict)
@@ -6418,12 +7982,44 @@ def run_turn(
                             "arguments": stable_arguments,
                             "target": target,
                         }
-                    _append_pending_spec(pending_specs, spec)
+                    if spec.get("kind") == "plan":
+                        semantic_errors = [
+                            error
+                            for step in (spec.get("payload") or {}).get("steps", [])
+                            for error in validate_intent_step(
+                                intent_contract,
+                                str(step.get("tool") or ""),
+                                step.get("arguments") or {},
+                            )
+                        ]
+                    else:
+                        semantic_errors = validate_intent_step(
+                            intent_contract,
+                            str(spec.get("tool") or ""),
+                            spec.get("arguments") or {},
+                        )
+                    if semantic_errors:
+                        result = {
+                            "error": " ".join(semantic_errors),
+                            "code": "INTENT_MISMATCH",
+                            "required_contract": intent_contract,
+                        }
+                        safe_result = json.loads(json.dumps(result, default=str))
+                        audit(
+                            RamaAudit.Kind.ERROR,
+                            {
+                                "error": "preview_intent_mismatch",
+                                "tool": call.name,
+                                "detail": semantic_errors,
+                            },
+                        )
+                    else:
+                        _append_pending_spec(pending_specs, spec)
 
                     # Make the future name addressable by later calls in this
                     # same model turn. The pending step itself already uses the
                     # stable id, so execution remains correct after the rename.
-                    if call.name == "update_property":
+                    if not semantic_errors and call.name == "update_property":
                         preview = result.get("preview") or {}
                         future_name = str(
                             effective_arguments.get("name") or "",
@@ -6497,15 +8093,20 @@ def run_turn(
         # If a confirmed plan already ran, don't surface an error for work
         # that actually succeeded — report it deterministically instead.
         if plan_progress is not None:
-            _persist_pending(landlord, conversation_id, pending_specs)
+            _persist_pending(
+                landlord, conversation_id, pending_specs, intent_contract,
+            )
             outstanding = load_fresh_plan(landlord, conversation_id)
             reply = _plan_fallback_reply(plan_progress)
             audit(
                 RamaAudit.Kind.ASSISTANT_MESSAGE,
                 {"text": reply, "tools_used": tools_used, "degraded": True},
             )
+            outbound = record_outbound(reply, plan=outstanding)
             return TurnResult(
                 conversation_id=conversation_id,
+                episode_id=outbound.episode_id if outbound else None,
+                message_id=outbound.pk if outbound else None,
                 reply=reply,
                 provider=provider_name,
                 model=model,
@@ -6517,11 +8118,16 @@ def run_turn(
         # Keep codes in a sensible HTTP range.
         if status_code not in (400, 401, 403, 429, 502, 503):
             status_code = 502
+        # Same reasoning as the get_provider failure above: keep the status for
+        # the API, but leave something readable in the conversation. An upstream
+        # outage that shows the landlord nothing looks identical to being ignored.
+        record_outbound(str(exc), recovery=True)
         return TurnResult(
             conversation_id=conversation_id,
             provider=provider_name,
             model=model,
             tools_used=tools_used,
+            reply=str(exc),
             error={
                 "detail": str(exc),
                 "code": "PROVIDER_ERROR",
@@ -6543,13 +8149,20 @@ def run_turn(
         had_pending_plan=pending_plan is not None or plan_progress is not None,
     )
     if auto.approved:
-        auto_plan = save_batch(landlord, conversation_id, pending_specs)
+        auto_plan = save_batch(
+            landlord, conversation_id, pending_specs,
+            intent_contract=intent_contract,
+        )
 
         def _auto_audit(content):
             tools_used.append(content.get("tool", ""))
             audit(RamaAudit.Kind.TOOL_CALL, {**content, "autonomous": True})
 
-        errors = validate_plan(plan_to_payload(auto_plan)["steps"], landlord)
+        auto_payload = plan_to_payload(auto_plan)
+        errors = validate_plan(
+            auto_payload["steps"], landlord,
+            auto_payload.get("intent_contract"),
+        )
         if errors:
             # A blocker appeared between preview and now. Fall back to asking
             # rather than executing something that no longer validates.
@@ -6574,8 +8187,11 @@ def run_turn(
                 },
             )
             outstanding = load_fresh_plan(landlord, conversation_id)
+            outbound = record_outbound(reply, plan=outstanding)
             return TurnResult(
                 conversation_id=conversation_id,
+                episode_id=outbound.episode_id if outbound else None,
+                message_id=outbound.pk if outbound else None,
                 reply=reply,
                 provider=provider_name,
                 model=model,
@@ -6607,9 +8223,12 @@ def run_turn(
         not pending_specs
         and turn.text
         and not _stalled
-        and asks_for_what_the_books_hold(turn.text)
+        and asks_for_what_the_books_hold(turn.text, landlord_message=message)
     )
-    if _stalled or _asked_for_own_data:
+    if (
+        (_stalled or _asked_for_own_data)
+        and time.monotonic() - model_loop_started < TURN_BUDGET_SECONDS
+    ):
         audit(
             RamaAudit.Kind.ERROR,
             {
@@ -6618,12 +8237,22 @@ def run_turn(
                     if _stalled
                     else "asked_landlord_for_stored_data"
                 ),
+                "guard": (
+                    "promises_without_delivering"
+                    if _stalled
+                    else "asks_for_what_the_books_hold"
+                ),
                 "text": turn.text[:500],
             },
         )
         messages.append({"role": "assistant", "text": turn.text})
         messages.append(
-            {"role": "user", "text": _DELIVER_NOW if _stalled else _LOOK_IT_UP},
+            # "content", not "text" — a user message that carries its text under
+            # the wrong key raised KeyError inside the adapter, which nothing
+            # catches, so this recovery round returned an HTTP 500 and the
+            # landlord got no reply at all. providers.base.validate_wire now
+            # rejects the shape with a catchable ProviderError.
+            {"role": "user", "content": _DELIVER_NOW if _stalled else _LOOK_IT_UP},
         )
         try:
             follow_up = provider.complete(
@@ -6693,9 +8322,11 @@ def run_turn(
             except ProviderError:
                 pass
 
-    _persist_pending(landlord, conversation_id, pending_specs)
+    _persist_pending(
+        landlord, conversation_id, pending_specs, intent_contract,
+    )
     outstanding = load_fresh_plan(landlord, conversation_id)
-    if outstanding is not None and outstanding.operation == "preview_batch":
+    if outstanding is not None:
         reply = _batch_preview_reply(outstanding, excluded_preview_errors)
     else:
         reply = (
@@ -6708,7 +8339,8 @@ def run_turn(
     # tools actually found, or admit the stall — either beats making the
     # landlord prompt for an answer a third time.
     if promises_without_delivering(reply, tools_used):
-        audit(RamaAudit.Kind.ERROR, {"error": "promised_twice", "text": reply[:500]})
+        audit(RamaAudit.Kind.ERROR, {"error": "promised_twice", "guard": "promises_without_delivering",
+             "text": reply[:500]})
         facts = _tool_facts_note(landlord, conversation_id)
         response_deterministic = True
         reply = (
@@ -6726,10 +8358,13 @@ def run_turn(
     # record may genuinely be missing the figure. But it goes on the capability
     # backlog either way, because a landlord being asked to read out their own
     # books twice in one turn is a gap in RAMA, not in their memory.
-    if _asked_for_own_data and asks_for_what_the_books_hold(reply):
+    if _asked_for_own_data and asks_for_what_the_books_hold(
+        reply, landlord_message=message,
+    ):
         audit(
             RamaAudit.Kind.ERROR,
-            {"error": "asked_landlord_for_stored_data_twice", "text": reply[:500]},
+            {"error": "asked_landlord_for_stored_data_twice",
+             "guard": "asks_for_what_the_books_hold", "text": reply[:500]},
         )
         try:
             execute(
@@ -6746,7 +8381,9 @@ def run_turn(
         except Exception:
             logger.exception("capability gap logging failed")
 
-    if outstanding is None and _looks_like_confirmation_request(reply):
+    if outstanding is None and (
+        _looks_like_confirmation_request(reply) or proposal_compile_attempted
+    ):
         # A model cannot create a confirmation contract with prose. If no
         # persisted plan backs its "reply yes", replace that claim with the
         # real blocker collected from the write tools (or an honest failure).
@@ -6762,9 +8399,10 @@ def run_turn(
             )
         else:
             reply = (
-                "I couldn't prepare an executable plan, so nothing is waiting "
-                "for confirmation. Please resend the changes; I will only ask "
-                "for Yes after the complete plan is saved."
+                "I couldn't prepare an executable plan. There is no pending "
+                "action and nothing is waiting for confirmation. Please resend "
+                "the changes; I will only ask for Yes after the complete plan "
+                "is saved."
             )
 
     # A model cannot create a completed write with prose either. The General,
@@ -6800,6 +8438,7 @@ def run_turn(
                 RamaAudit.Kind.ERROR,
                 {
                     "error": "write_claim_answered_from_record",
+                    "guard": "claims_completed_write",
                     "claim": reply[:500],
                     "writes": [w["tool"] for w in prior_writes],
                 },
@@ -6808,7 +8447,8 @@ def run_turn(
         else:
             audit(
                 RamaAudit.Kind.ERROR,
-                {"error": "claimed_write_without_writing", "claim": reply[:500]},
+                {"error": "claimed_write_without_writing",
+             "guard": "claims_completed_write", "claim": reply[:500]},
             )
             gap = _capability_gap_hint(landlord, message, conversation_id)
             reply = (
@@ -6836,7 +8476,8 @@ def run_turn(
         response_deterministic = True
         audit(
             RamaAudit.Kind.ERROR,
-            {"error": "confirmation_offered_without_a_plan", "claim": reply[:500]},
+            {"error": "confirmation_offered_without_a_plan",
+             "guard": "_solicits_confirmation", "claim": reply[:500]},
         )
         reply = (
             "I asked you to confirm something I hadn't actually worked out — "
@@ -6863,8 +8504,12 @@ def run_turn(
         },
     )
 
+    outbound = record_outbound(reply, plan=outstanding)
+
     return TurnResult(
         conversation_id=conversation_id,
+        episode_id=outbound.episode_id if outbound else None,
+        message_id=outbound.pk if outbound else None,
         reply=reply,
         provider=provider_name,
         model=model,

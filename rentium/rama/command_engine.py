@@ -67,6 +67,9 @@ def create_task(
     capability_key: str,
     inputs: dict | None = None,
     context: dict | None = None,
+    episode=None,
+    source_message=None,
+    expires_at=None,
 ) -> RamaTask:
     return RamaTask.objects.create(
         landlord=landlord,
@@ -74,6 +77,9 @@ def create_task(
         capability_key=capability_key,
         input=inputs or {},
         context=context or {},
+        episode=episode,
+        source_message=source_message,
+        expires_at=expires_at,
     )
 
 

@@ -26,6 +26,7 @@ from rentium.rama.roles import (
 )
 from rentium.rama.runtime import get_role_config
 from rentium.rama.service import run_turn
+from rentium.rama.providers.testing import assert_translatable
 
 pytestmark = pytest.mark.django_db
 
@@ -39,6 +40,7 @@ class ScriptedProvider:
         self.requests = []
 
     def complete(self, *, model, system, messages, tools, api_key=""):
+        assert_translatable(messages)
         self.requests.append({"system": system, "tools": tools, "model": model})
         return self.turns.pop(0) if self.turns else Turn(text="")
 

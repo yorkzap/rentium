@@ -35,6 +35,29 @@ class FieldSpec:
     # DEFAULT-DENY — a field is never writable unless this is explicitly True and
     # the entity's edit_guard (below) allows editing in the instance's state.
     editable: bool = False
+    # Phase 5 — aggregation. All default-deny, for the same reason `editable`
+    # is: a field reachable by accident is a field reported by accident.
+    #
+    # sum/avg/min/max. Only meaningful on a quantity.
+    aggregatable: bool = False
+    # A legal group_by key. Restricted to bounded-cardinality types, because
+    # grouping by a free-text field produces one group per row and reads like
+    # a table that means something.
+    groupable: bool = False
+    # Name of a queryset ANNOTATION rather than a model field. `charge_state`
+    # and `outstanding` do not exist in the database; they are computed by the
+    # entity's `annotate` methods. Declared here so filtering and grouping
+    # reach them by the name a landlord would use.
+    source: str = ""
+    # Whether "is empty" / "is set" are legal on this field. Most fields in
+    # this codebase are `blank=True, default=""` rather than nullable, so
+    # isnull would silently match nothing; the read layer checks both.
+    nullable: bool = False
+
+    @property
+    def lookup_path(self) -> str:
+        """What the ORM should be handed for this field."""
+        return self.source or self.name
 
 
 @dataclass(frozen=True)
@@ -72,9 +95,52 @@ class EntitySpec:
     # editable-by-name.
     lookup: tuple[str, ...] = ()
     label_field: str = ""
+    # Zero-argument QuerySet methods applied to EVERY read of this entity,
+    # before any user filter — the entity's definition of "the rows that
+    # count". `read` was the only ledger reader in the codebase that did not
+    # start from .not_voided(), so it reported reversed charges as live and
+    # would have summed them once aggregation arrived. Structural, because a
+    # rule the model has to remember to pass is a rule it will eventually
+    # forget.
+    base_queryset: tuple[str, ...] = ()
+    # Human-readable note appended to results, explaining what base_queryset
+    # removed. A total the model cannot explain is a total it will misreport.
+    scope_note: str = ""
+    # Zero-argument QuerySet methods producing the fields declared with a
+    # `source`. Applied only when such a field is actually referenced, so an
+    # ordinary read does not pay for the join.
+    annotate: tuple[str, ...] = ()
+    # The date field that `month=` / `year=` / `between=` narrow. Without one,
+    # every time question has to be spelled as two explicit bounds.
+    date_field: str = ""
 
     def field_map(self) -> dict[str, FieldSpec]:
         return {f.name: f for f in self.fields}
+
+    def aggregatable_map(self) -> dict[str, FieldSpec]:
+        return {f.name: f for f in self.fields if f.aggregatable}
+
+    def groupable_map(self) -> dict[str, FieldSpec]:
+        return {f.name: f for f in self.fields if f.groupable}
+
+    def _apply(self, queryset, names, kind):
+        for name in names:
+            method = getattr(queryset, name, None)
+            if method is None or not callable(method):
+                raise AttributeError(
+                    f"{self.key}.{kind} names {name!r}, which is not a "
+                    f"method on {type(queryset).__name__}.",
+                )
+            queryset = method()
+        return queryset
+
+    def base_queryset_for(self, manager):
+        """Apply the entity's standing filters, failing loudly on a typo."""
+        return self._apply(manager, self.base_queryset, "base_queryset")
+
+    def annotate_for(self, queryset):
+        """Add the derived fields. Only called when one is referenced."""
+        return self._apply(queryset, self.annotate, "annotate")
 
     def editable_map(self) -> dict[str, FieldSpec]:
         return {f.name: f for f in self.fields if f.editable}
@@ -295,6 +361,15 @@ LEDGER_ENTRY = EntitySpec(
     model="ledger.LedgerEntry",
     label="Ledger entry (charge / payment / expense)",
     scope_path="landlord",  # idempotency_key / metadata are internal → not declared
+    # A voided entry is a reversal, not money owed. Every other ledger reader
+    # (union.month_money, domain_reads.charge_schedule) starts from
+    # .not_voided(); the generic read did not, so it counted reversed charges
+    # as live.
+    base_queryset=("not_voided",),
+    scope_note="voided/reversed entries excluded",
+    annotate=("with_charge_state",),
+    date_field="due_date",
+    default_order="due_date",
     fields=[
         # Without a way to narrow to ONE tenancy, every read of this entity was
         # portfolio-wide. Asked why a Room C balance looked wrong, RAMA read
@@ -304,14 +379,53 @@ LEDGER_ENTRY = EntitySpec(
         # which.
         FieldSpec("lease__lease_number", "Lease number"),
         FieldSpec("property__name", "Property / listing"),
-        FieldSpec("entry_type", "Type", "enum", display="get_entry_type_display"),
-        FieldSpec("amount", "Amount", "money"),
+        FieldSpec(
+            "entry_type", "Type", "enum",
+            display="get_entry_type_display", groupable=True,
+        ),
+        FieldSpec("amount", "Amount", "money", aggregatable=True),
         FieldSpec("due_date", "Due date", "date"),
         FieldSpec("effective_date", "Effective date", "date"),
-        FieldSpec("paid_on", "Paid on", "date"),
-        FieldSpec("payment_method", "Method"),
+        # ---- derived (queryset annotations, not columns) -------------------
+        # Whether a charge has been paid is NOT stored and is NOT `paid_on`:
+        # clean() rejects paid_on on anything but an EXPENSE, so a rent
+        # charge's is always empty. Grouping rents by paid_on reports every
+        # rent as unpaid, confidently. The truth is the settlements FK, which
+        # `with_charge_state` reduces to one enum.
+        FieldSpec(
+            "charge_state", "Charge state", "enum",
+            source="charge_state", groupable=True,
+        ),
+        FieldSpec(
+            "settled_amount", "Paid so far", "money",
+            source="settled_amount", aggregatable=True,
+        ),
+        FieldSpec(
+            "outstanding", "Still owed", "money",
+            source="outstanding", aggregatable=True,
+        ),
+        # A FEE_CHARGE is a late fee (income) or damage recovery (not income),
+        # told apart only by a work order. Declared so it can be excluded on
+        # purpose rather than silently — see ledger/models.py damage_claims().
+        FieldSpec(
+            "is_damage_claim", "Damage-recovery claim", "bool",
+            source="is_damage_claim", groupable=True,
+        ),
+        # Genuinely nullable, and the one place "is empty" means something:
+        # an expense that has not yet cleared the bank.
+        FieldSpec("paid_on", "Bank-cleared on (expenses only)", "date",
+                  nullable=True),
+        FieldSpec(
+            "payment_method", "Method", "enum",
+            display="get_payment_method_display", groupable=True,
+        ),
         FieldSpec("reference_number", "Reference"),
-        FieldSpec("category", "Category"),
+        # A real choices field (ExpenseCategory), so "what did I spend on
+        # maintenance this year?" is one grouped read rather than a tool.
+        FieldSpec(
+            "category", "Expense category", "enum",
+            display="get_category_display", groupable=True,
+        ),
         FieldSpec("vendor", "Vendor"),
         FieldSpec("description", "Description", filterable=False),
     ],
@@ -458,15 +572,46 @@ def capability_digest() -> str:
             linkable.append(key)
     from .links import DASHBOARD_COLLECTIONS
 
-    return (
+    # Counting/totalling is advertised the same way everything else here is:
+    # generated from the manifest, so declaring a field aggregatable makes it
+    # discoverable the same day, with no persona prose to update.
+    totalling = []
+    for key, spec in MANIFEST.items():
+        sums = ", ".join(spec.aggregatable_map())
+        groups = ", ".join(spec.groupable_map())
+        if not (sums or groups):
+            continue
+        bits = []
+        if sums:
+            bits.append(f"total {sums}")
+        if groups:
+            bits.append(f"group by {groups}")
+        if spec.date_field:
+            bits.append(f"month=/year=/between= on {spec.date_field}")
+        totalling.append(f"{key} ({'; '.join(bits)})")
+
+    lines = [
         "## DATA SURFACE (manifest-derived — reach it generically; don't say "
-        "'not supported' or log a gap for these)\n"
-        f"- READ/FILTER any of: {readable}. Field names come from data_catalogue; "
-        "use the `read` tool for specific/combined questions.\n"
-        f"- EDIT via `update` (previews, then confirm): {'; '.join(editable_bits)}.\n"
-        f"- DEEP-LINK / attachments via `link`: {', '.join(linkable)}. "
-        f"Dashboard collections: {', '.join(DASHBOARD_COLLECTIONS)}."
+        "'not supported' or log a gap for these)",
+        f"- READ/FILTER any of: {readable}. Field names come from "
+        "data_catalogue; use the `read` tool for specific/combined questions.",
+    ]
+    if totalling:
+        lines.append(
+            "- COUNT/TOTAL with `read`'s aggregate= and group_by= — computed "
+            "over every matching row, not just the page. Do this instead of "
+            "listing rows and counting them yourself: "
+            + "; ".join(totalling)
+            + ".",
+        )
+    lines.append(
+        f"- EDIT via `update` (previews, then confirm): {'; '.join(editable_bits)}.",
     )
+    lines.append(
+        f"- DEEP-LINK / attachments via `link`: {', '.join(linkable)}. "
+        f"Dashboard collections: {', '.join(DASHBOARD_COLLECTIONS)}.",
+    )
+    return "\n".join(lines)
 
 
 def entity_catalogue() -> list[dict]:

@@ -73,6 +73,7 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
     )
 
     tenant_name = serializers.SerializerMethodField()
+    tenant_names = serializers.SerializerMethodField()
 
     # True for household charges on joint (roommate) leases — everyone on
     # the lease owes it together, and any tenant's payment settles it.
@@ -128,6 +129,7 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
             "lease_number",
             "tenant",
             "tenant_name",
+            "tenant_names",
             "is_joint",
             "settles",
             "reverses",
@@ -161,6 +163,28 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
             return obj.tenant.user.name if obj.tenant else None
         except AttributeError:
             return str(obj.tenant) if obj.tenant else None
+
+    def get_tenant_names(self, obj):
+        """Every non-declined participant on the entry's lease.
+
+        Joint household charges correctly have ``tenant=NULL``; that describes
+        liability, not an absence of people.  Expose the lease participants
+        separately so clients can show who the household charge concerns
+        without pretending it was assigned to one tenant.
+        """
+        if not obj.lease_id:
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        for slot in obj.lease.lease_tenants.all():
+            if slot.declined:
+                continue
+            name = str(slot.display_name or "").strip()
+            key = name.casefold()
+            if name and key not in seen:
+                seen.add(key)
+                names.append(name)
+        return names
 
     def get_is_joint(self, obj):
         return (
@@ -308,7 +332,10 @@ class LedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
             LedgerEntry.objects.select_related(
                 "property", "tenant", "lease", "holding", "reversed_by", "reverses"
             )
-            .prefetch_related("attachments")
+            .prefetch_related(
+                "attachments",
+                "lease__lease_tenants__tenant__user",
+            )
             .with_settlement()
         )
 

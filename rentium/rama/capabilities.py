@@ -643,7 +643,7 @@ def supported_tool_for_request(request: str) -> str | None:
         return "complete_inspection_package"
     if re.search(
         r"\b(rent )?(discount|increase|proration|adjustment)\b"
-        r"|\b(reduce|raise|lower|increase)\b.+\brent\b"
+        r"|\b(reduce|raise|lower|increase|adjust|set|make|change)\b.+\brent\b"
         r"|\bapply_rent_adjustment\b",
         text,
     ):

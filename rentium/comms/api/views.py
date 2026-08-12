@@ -148,6 +148,10 @@ def telegram_webhook(request):
     # the bot acks the webhook, stages nothing, and the model falsely claims it
     # cannot see files.
     document = message.get("document") or {}
+    external_message_id = str(message.get("message_id") or "").strip()
+    reply_to_external_id = str(
+        (message.get("reply_to_message") or {}).get("message_id") or ""
+    ).strip()
     document_file_id = str(document.get("file_id") or "").strip()
     document_name = str(document.get("file_name") or "").strip()
     document_mime = str(document.get("mime_type") or "").strip()
@@ -204,14 +208,20 @@ def telegram_webhook(request):
 
     from ..tasks import handle_telegram_message
 
+    task_kwargs = {
+        "photo_file_id": photo_file_id,
+        "document_file_id": document_file_id,
+        "document_name": document_name,
+        "document_mime": document_mime,
+    }
+    # Preserve the long-standing Celery call shape for old clients/tests while
+    # carrying Telegram reply identity whenever Telegram actually supplied it.
+    if external_message_id:
+        task_kwargs["external_message_id"] = external_message_id
+    if reply_to_external_id:
+        task_kwargs["reply_to_external_id"] = reply_to_external_id
     handle_telegram_message.delay(
-        str(account.landlord_id),
-        chat_id,
-        text,
-        photo_file_id=photo_file_id,
-        document_file_id=document_file_id,
-        document_name=document_name,
-        document_mime=document_mime,
+        str(account.landlord_id), chat_id, text, **task_kwargs
     )
     return Response({"ok": True})
 

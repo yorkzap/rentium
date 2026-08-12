@@ -17,7 +17,7 @@ DEFAULT_MODELS = {
     "gemini": "gemini-flash-latest",
     "mistral": "mistral-small-latest",
     "anthropic": "claude-haiku-4-5",
-    "openai": "gpt-5.6-luna",
+    "openai": "gpt-5-mini",
 }
 
 # Curated per vendor: one fast/cheap option (the recommended default — RAMA is
@@ -52,7 +52,8 @@ MODEL_CATALOG: dict[str, list[dict[str, str]]] = {
         {"id": "claude-fable-5", "label": "Claude Fable 5 (most capable, premium)"},
     ],
     "openai": [
-        {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna (fast, recommended)"},
+        {"id": "gpt-5-mini", "label": "GPT-5 mini (cheap, recommended)"},
+        {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna (fast)"},
         {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra (balanced)"},
         {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol (frontier)"},
     ],
@@ -91,6 +92,19 @@ def resolve_model(provider: str, model: str | None) -> str:
         return chosen
     return DEFAULT_MODELS.get(
         provider, getattr(settings, "RAMA_MODEL", "grok-4.3")
+    )
+
+
+def is_model_certified(provider: str, model: str) -> bool:
+    """Whether this model id passed the curated RAMA tool-planning contract.
+
+    Landlords may still use an arbitrary provider model for chat and reads.
+    Unknown ids do not receive model-authored write tools until certified;
+    deterministic server routes and explicit plan execution remain available.
+    """
+    return any(
+        row["id"] == (model or "").strip()
+        for row in MODEL_CATALOG.get((provider or "").strip().lower(), [])
     )
 
 

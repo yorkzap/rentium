@@ -33,6 +33,9 @@ from django.utils import timezone
 
 from .command_engine import create_task
 from .command_engine import record_receipt
+from .intent_contract import attach_contract
+from .intent_contract import validate_effect_set
+from .intent_contract import validate_step as validate_intent_step
 from .models import RamaPendingPlan
 from .models import RamaPlanStep
 from .models import RamaTask
@@ -108,11 +111,14 @@ def _resolve_argument_refs(value, results_by_step: dict[str, dict]):
 
 
 # ------------------------------------------------------------- validation
-def validate_plan(steps: list[dict], landlord) -> list[str]:
+def validate_plan(
+    steps: list[dict], landlord, intent_contract: dict | None = None,
+) -> list[str]:
     """Errors preventing this step list from being persisted ([] = valid)."""
     errors: list[str] = []
     if not steps:
         errors.append("Plan has no steps.")
+    errors.extend(validate_effect_set(intent_contract, steps))
     seen_step_ids: set[str] = set()
     for i, step in enumerate(steps, start=1):
         step_id = str(step.get("step_id") or f"step-{i}")
@@ -137,6 +143,10 @@ def validate_plan(steps: list[dict], landlord) -> list[str]:
         if tool is None:
             errors.append(f"Step {i}: unknown tool {tool_name!r}.")
             continue
+        for semantic_error in validate_intent_step(
+            intent_contract, tool_name, step.get("arguments") or {},
+        ):
+            errors.append(f"Step {i} ({tool_name}): {semantic_error}")
         allowed = set(tool.parameters["properties"])
         args = step.get("arguments") or {}
         unknown = [k for k in args if k not in allowed]
@@ -179,15 +189,40 @@ def validate_plan(steps: list[dict], landlord) -> list[str]:
 # ------------------------------------------------------------ persistence
 def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
     """Persist a playbook plan payload (latest plan per conversation wins)."""
-    errors = validate_plan(plan_payload.get("steps") or [], landlord)
+    intent_contract = plan_payload.get("intent_contract") or {}
+    errors = validate_plan(
+        plan_payload.get("steps") or [], landlord, intent_contract,
+    )
     if errors:
         raise ValueError("Invalid RAMA plan: " + " ".join(errors))
     clear_plan(landlord, conversation_id)
+    from .conversations import CONFIRMATION_TTL
+    from .models import RamaConversation
+    from .models import RamaMessage
+
+    conversation = RamaConversation.objects.filter(
+        pk=conversation_id, landlord=landlord
+    ).select_related("active_episode").first()
+    source_message = None
+    if conversation and conversation.active_episode_id:
+        source_message = (
+            RamaMessage.objects.filter(
+                conversation=conversation,
+                episode=conversation.active_episode,
+                direction=RamaMessage.Direction.INBOUND,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+    expires_at = timezone.now() + CONFIRMATION_TTL
     task = create_task(
         landlord=landlord,
         conversation_id=conversation_id,
         capability_key=plan_payload.get("operation") or "plan",
         inputs=plan_payload,
+        episode=conversation.active_episode if conversation else None,
+        source_message=source_message,
+        expires_at=expires_at,
     )
     task.transition_to(
         RamaTask.Status.AWAITING_CONFIRMATION,
@@ -201,6 +236,8 @@ def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
         conversation_id=conversation_id,
         landlord=landlord,
         task=task,
+        episode=conversation.active_episode if conversation else None,
+        expires_at=expires_at,
         operation=plan_payload.get("operation") or "plan",
         summary=plan_payload.get("summary") or "",
         blocked=plan_payload.get("blocked") or [],
@@ -225,6 +262,7 @@ def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
 
 def save_single(
     landlord, conversation_id, tool: str, arguments: dict,
+    intent_contract: dict | None = None,
 ) -> RamaPendingPlan:
     """Wrap a single previewed write tool as a one-step plan — one code path
     for every confirmation."""
@@ -236,7 +274,7 @@ def save_single(
     return save_plan(
         landlord,
         conversation_id,
-        {
+        attach_contract({
             "operation": "single",
             "summary": f"{tool} {label}".strip(),
             "steps": [
@@ -250,7 +288,7 @@ def save_single(
                     "requires_own_confirm": meta_for(tool).own_confirm,
                 },
             ],
-        },
+        }, intent_contract),
     )
 
 
@@ -258,6 +296,7 @@ def save_batch(
     landlord,
     conversation_id,
     pending_specs: list[dict],
+    intent_contract: dict | None = None,
 ) -> RamaPendingPlan:
     """Persist every preview a model produced in one turn as one plan.
 
@@ -270,12 +309,16 @@ def save_batch(
     if len(pending_specs) == 1:
         spec = pending_specs[0]
         if spec["kind"] == "plan":
-            return save_plan(landlord, conversation_id, spec["payload"])
+            return save_plan(
+                landlord,
+                conversation_id,
+                attach_contract(spec["payload"], intent_contract),
+            )
         if spec.get("target"):
             return save_plan(
                 landlord,
                 conversation_id,
-                {
+                attach_contract({
                     "operation": "single",
                     "summary": (
                         f"{spec['tool']} {str(spec['target']).strip()}".strip()
@@ -295,13 +338,14 @@ def save_batch(
                             ).own_confirm,
                         },
                     ],
-                },
+                }, intent_contract),
             )
         return save_single(
             landlord,
             conversation_id,
             spec["tool"],
             spec["arguments"],
+            intent_contract,
         )
 
     steps: list[dict] = []
@@ -367,12 +411,12 @@ def save_batch(
     return save_plan(
         landlord,
         conversation_id,
-        {
+        attach_contract({
             "operation": "preview_batch",
             "summary": (f"{len(steps)} previewed changes collected from one request."),
             "steps": steps,
             "blocked": blocked,
-        },
+        }, intent_contract),
     )
 
 
@@ -382,19 +426,46 @@ def load_fresh_plan(landlord, conversation_id) -> RamaPendingPlan | None:
         RamaPendingPlan.objects.filter(
             conversation_id=conversation_id, landlord=landlord,
         )
-        .select_related("task")
+        .select_related("task", "episode", "prompt_message__conversation")
         .prefetch_related("steps")
         .first()
     )
     if plan is None:
         return None
-    if (timezone.now() - plan.updated_at).total_seconds() > PENDING_PLAN_TTL_SECONDS:
+    expired = (
+        plan.expires_at is not None and timezone.now() >= plan.expires_at
+    ) or (timezone.now() - plan.updated_at).total_seconds() > PENDING_PLAN_TTL_SECONDS
+    wrong_episode = bool(
+        plan.episode_id
+        and plan.prompt_message_id
+        and plan.prompt_message.conversation.active_episode_id != plan.episode_id
+    )
+    superseded_prompt = False
+    if plan.prompt_message_id:
+        from .models import RamaMessage
+
+        latest_outbound = (
+            RamaMessage.objects.filter(
+                conversation_id=conversation_id,
+                episode_id=plan.episode_id,
+                direction=RamaMessage.Direction.OUTBOUND,
+            )
+            .order_by("-created_at")
+            .values_list("pk", flat=True)
+            .first()
+        )
+        superseded_prompt = latest_outbound != plan.prompt_message_id
+    if expired or wrong_episode or superseded_prompt:
         if plan.task_id and plan.task.status not in RamaTask.TERMINAL_STATUSES:
             plan.task.transition_to(
-                RamaTask.Status.CANCELLED,
+                RamaTask.Status.EXPIRED,
                 outcome=CommandOutcome(
                     OutcomeKind.NOOP,
-                    "The confirmation window expired; nothing was executed.",
+                    (
+                        "The confirmation window expired; nothing was executed."
+                        if expired
+                        else "The confirmation is no longer the active visible prompt; nothing was executed."
+                    ),
                 ).as_dict(),
             )
         plan.delete()
@@ -422,7 +493,7 @@ def plan_to_payload(plan: RamaPendingPlan) -> dict:
     """The save_plan() input that reproduces this plan — used to re-home a
     delegated sub-turn's pending plan onto the delegating conversation so the
     landlord's next "yes" runs it there."""
-    return {
+    payload = {
         "operation": plan.operation,
         "summary": plan.summary,
         "blocked": plan.blocked,
@@ -439,12 +510,25 @@ def plan_to_payload(plan: RamaPendingPlan) -> dict:
             for s in plan.steps.order_by("order")
         ],
     }
+    intent_contract = (
+        (plan.task.input or {}).get("intent_contract")
+        if plan.task_id and isinstance(plan.task.input, dict)
+        else None
+    )
+    return attach_contract(payload, intent_contract)
 
 
 def plan_brief(plan: RamaPendingPlan) -> dict:
     """JSON-safe description of an outstanding plan (for the UI + prompt)."""
     steps = list(plan.steps.all())
     return {
+        "id": str(plan.plan_id),
+        "plan_id": str(plan.plan_id),
+        "episode_id": str(plan.episode_id) if plan.episode_id else None,
+        "prompt_message_id": (
+            str(plan.prompt_message_id) if plan.prompt_message_id else None
+        ),
+        "expires_at": plan.expires_at.isoformat() if plan.expires_at else None,
         "task": {
             "id": str(plan.task_id) if plan.task_id else None,
             "status": plan.task.status if plan.task_id else None,
@@ -501,6 +585,45 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
     """
     steps = list(plan.steps.order_by("order"))
     task = plan.task
+    intent_contract = (
+        (task.input or {}).get("intent_contract")
+        if task is not None and isinstance(task.input, dict)
+        else None
+    )
+    step_payloads = [
+        {"tool": step.tool, "arguments": step.arguments or {}}
+        for step in steps
+    ]
+    semantic_errors = validate_effect_set(intent_contract, step_payloads)
+    semantic_errors.extend(
+        [
+            error
+            for step in steps
+            for error in validate_intent_step(
+                intent_contract, step.tool, step.arguments or {},
+            )
+        ],
+    )
+    if semantic_errors:
+        summary = (
+            "Confirmation refused because the saved plan no longer matches "
+            "the landlord's requested outcome: " + " ".join(semantic_errors)
+        )
+        if task is not None and task.status not in RamaTask.TERMINAL_STATUSES:
+            task.transition_to(
+                RamaTask.Status.FAILED,
+                outcome=CommandOutcome(OutcomeKind.FAILED, summary).as_dict(),
+                error=summary,
+            )
+        plan.delete()
+        return {
+            "executed": [],
+            "failed": [{"error": summary, "code": "INTENT_MISMATCH"}],
+            "skipped": [],
+            "awaiting": None,
+            "status": "failed",
+            "summary": summary,
+        }
     if task is not None and task.status != RamaTask.Status.EXECUTING:
         task.transition_to(RamaTask.Status.EXECUTING)
     multi_step = len(steps) > 1

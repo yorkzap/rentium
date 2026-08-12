@@ -20,6 +20,7 @@ from rentium.rama.tool_meta import DEFAULT_META
 from rentium.rama.tool_meta import TOOL_META
 from rentium.rama.tool_meta import Autonomy
 from rentium.rama.tool_meta import meta_for
+from rentium.rama.providers.testing import assert_translatable
 
 OPT_IN = {n: m for n, m in TOOL_META.items() if m.autonomy == Autonomy.OPT_IN}
 
@@ -167,6 +168,7 @@ class ScriptedProvider:
         self.turns = list(turns)
 
     def complete(self, *, model, system, messages, tools, api_key=""):
+        assert_translatable(messages)
         return self.turns.pop(0) if self.turns else Turn(text="")
 
 

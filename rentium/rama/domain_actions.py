@@ -1609,7 +1609,7 @@ def _resolve_lease(landlord, *, property_query: str = "", lease_number: str = ""
     prop, err = _resolve_property(landlord, pq)
     if err:
         return None, err
-    lease = (
+    leases = (
         Lease.objects.filter(landlord=landlord, property=prop)
         .exclude(
             status__in=[
@@ -1619,8 +1619,18 @@ def _resolve_lease(landlord, *, property_query: str = "", lease_number: str = ""
         )
         .order_by("-created_at")
         .select_related("property", "group")
-        .first()
     )
+    candidates = list(leases[:8])
+    if len(candidates) > 1:
+        choices = ", ".join(
+            f"{row.lease_number} ({row.status}, {row.start_date})"
+            for row in candidates
+        )
+        return None, (
+            f"Multiple open leases exist on {prop.name}: {choices}. "
+            "Pass the exact lease_number; property name alone is unsafe."
+        )
+    lease = candidates[0] if candidates else None
     if not lease:
         return None, f"No open lease on {prop.name}."
     return lease, None

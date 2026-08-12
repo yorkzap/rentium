@@ -9,9 +9,9 @@ import json
 import requests
 from django.conf import settings
 
-from .base import Provider, ProviderError, ToolCall, Turn
+from .base import Provider, ProviderError, ToolCall, Turn, validate_wire
 
-TIMEOUT_SECONDS = 60
+TIMEOUT_SECONDS = 25
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.0  # RAMA routes and phrases; determinism beats flair
 
@@ -24,6 +24,7 @@ class OpenAIProvider(Provider):
     def complete(self, *, model, system, messages, tools, api_key: str = ""):
         from rentium.rama.runtime import platform_api_key
 
+        validate_wire(messages)
         key = (api_key or "").strip() or platform_api_key(self.name)
         if not key:
             raise ProviderError(
@@ -33,12 +34,6 @@ class OpenAIProvider(Provider):
         api_key = key
         payload = {
             "model": model,
-            "temperature": float(
-                getattr(settings, "RAMA_TEMPERATURE", DEFAULT_TEMPERATURE)
-            ),
-            "max_tokens": int(
-                getattr(settings, "RAMA_MAX_TOKENS", DEFAULT_MAX_TOKENS)
-            ),
             "messages": [
                 {"role": "system", "content": system},
                 *[self._to_wire(m) for m in messages],
@@ -55,6 +50,21 @@ class OpenAIProvider(Provider):
                 for t in tools
             ],
         }
+        max_tokens = int(
+            getattr(settings, "RAMA_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+        )
+        if self.name == "openai":
+            # Current OpenAI reasoning models (including gpt-5-mini) reject
+            # the legacy ``max_tokens`` field and non-default temperatures.
+            # Keep those compatibility choices scoped to OpenAI: xAI,
+            # Gemini and Mistral share this adapter but retain their existing
+            # OpenAI-compatible request contracts.
+            payload["max_completion_tokens"] = max_tokens
+        else:
+            payload["max_tokens"] = max_tokens
+            payload["temperature"] = float(
+                getattr(settings, "RAMA_TEMPERATURE", DEFAULT_TEMPERATURE)
+            )
         # Trailing slash on base_url must not produce //chat/completions —
         # Gemini's OpenAI-compat gateway 404s on the double slash.
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
@@ -63,7 +73,13 @@ class OpenAIProvider(Provider):
                 endpoint,
                 json=payload,
                 headers={"Authorization": f"Bearer {key}"},
-                timeout=TIMEOUT_SECONDS,
+                timeout=int(
+                    getattr(
+                        settings,
+                        "RAMA_PROVIDER_TIMEOUT_SECONDS",
+                        TIMEOUT_SECONDS,
+                    ),
+                ),
             )
         except requests.RequestException as exc:
             raise ProviderError(f"Could not reach the {self.name} API.") from exc

@@ -404,8 +404,10 @@ def test_receipt_followup_catalogs_and_links_existing_expense(landlord):
     from django.core.files.uploadedfile import SimpleUploadedFile
 
     from rentium.ledger.models import EntryType, ExpenseCategory, LedgerEntry
+    from rentium.rama.conversations import record_visible_message
     from rentium.rama.document_services import ingest_document
     from rentium.rama.models import RamaAudit, RamaDocument
+    from rentium.rama.models import RamaMessage
     from rentium.rama.service import _amount_from_message
     from rentium.rama.service import _looks_like_receipt_followup
     from rentium.rama.service import _pending_unscoped_document_id
@@ -437,6 +439,12 @@ def test_receipt_followup_catalogs_and_links_existing_expense(landlord):
     document.save()
 
     conversation = uuid.uuid4()
+    record_visible_message(
+        landlord=landlord,
+        conversation_id=conversation,
+        direction=RamaMessage.Direction.INBOUND,
+        text="Found the draino receipt",
+    )
     RamaAudit.objects.create(
         landlord=landlord,
         conversation_id=conversation,
@@ -526,8 +534,10 @@ def test_already_logged_alone_links_pending_receipt(landlord):
     from django.core.files.uploadedfile import SimpleUploadedFile
 
     from rentium.ledger.models import EntryType, ExpenseCategory, LedgerEntry
+    from rentium.rama.conversations import record_visible_message
     from rentium.rama.document_services import ingest_document
     from rentium.rama.models import RamaAudit, RamaDocument
+    from rentium.rama.models import RamaMessage
     from rentium.rama.service import _pending_unscoped_document_id
     from rentium.rama.service import _wants_link_existing_expense
     from rentium.rama import registry
@@ -561,6 +571,12 @@ def test_already_logged_alone_links_pending_receipt(landlord):
     }
     document.save()
     conversation = uuid.uuid4()
+    record_visible_message(
+        landlord=landlord,
+        conversation_id=conversation,
+        direction=RamaMessage.Direction.INBOUND,
+        text="Found the draino receipt",
+    )
     RamaAudit.objects.create(
         landlord=landlord,
         conversation_id=conversation,

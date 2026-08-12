@@ -81,6 +81,54 @@ def test_next_charge_none_when_nothing_upcoming(landlord):
     assert services.next_upcoming_charge(landlord) is None
 
 
+def test_joint_charge_serializes_every_non_declined_lease_tenant(
+    landlord, bc_lease,
+):
+    from rentium.leases.models import LeaseTenant
+    from rentium.ledger.api.views import LedgerEntrySerializer
+    from rentium.ledger.models import LedgerEntry
+
+    LeaseTenant.objects.create(
+        lease=bc_lease,
+        invited_name="Aishwarya Chenthamara",
+        invited_email="aishwarya@example.com",
+        rent_amount=Decimal("0.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=bc_lease,
+        invited_name="Naveen Prasanth Singaravel",
+        invited_email="naveen@example.com",
+        rent_amount=Decimal("850.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=bc_lease,
+        invited_name="Declined Person",
+        invited_email="declined@example.com",
+        rent_amount=Decimal("0.00"),
+        declined=True,
+    )
+    charge = LedgerEntry.objects.create(
+        landlord=landlord,
+        lease=bc_lease,
+        property=bc_lease.property,
+        tenant=None,
+        entry_type=EntryType.RENT_CHARGE,
+        amount=Decimal("400.00"),
+        due_date=date.today(),
+        effective_date=date.today(),
+        description="Monthly household rent",
+    )
+
+    data = LedgerEntrySerializer(charge).data
+
+    assert data["tenant_name"] is None
+    assert data["tenant_names"] == [
+        "Aishwarya Chenthamara",
+        "Naveen Prasanth Singaravel",
+    ]
+    assert data["is_joint"] is True
+
+
 # ------------------------------------------- damage claims vs expected income
 # A FEE_CHARGE means two unrelated things. A late fee is ordinary income and
 # must keep counting; a damage-recovery claim is contested and settles at

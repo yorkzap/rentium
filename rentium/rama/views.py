@@ -28,6 +28,7 @@ from .providers import PROVIDERS
 from .runtime import MODEL_CATALOG
 from .runtime import get_landlord_config
 from .runtime import get_role_config
+from .runtime import is_model_certified
 from .runtime import platform_api_key
 from .service import MAX_MESSAGE_CHARS
 from .service import PENDING_ACTION_TTL_SECONDS
@@ -179,7 +180,8 @@ def config_view(request):
             "has_api_key": cfg.has_own_key,
             "providers": sorted(PROVIDERS),
             "models": MODEL_CATALOG,
-            "can_override": False,
+            "can_override": True,
+            "write_planning_certified": is_model_certified(cfg.provider, cfg.model),
             "byok": True,
             "platform_ready": {
                 name: bool(platform_api_key(name)) for name in PROVIDERS
@@ -276,12 +278,20 @@ def _chat_response(result) -> Response:
                 "code": result.error.get("code", "PROVIDER_ERROR"),
                 "provider": result.provider,
                 "model": result.model,
+                # Carry the conversation and any reply the turn managed to
+                # produce. A failing turn now persists a visible RECOVERY
+                # message; echoing it here lets the client render it straight
+                # away instead of showing a bare status and needing a refetch.
+                "conversation_id": str(result.conversation_id),
+                "reply": result.reply,
             },
             status=status_code,
         )
     return Response(
         {
             "conversation_id": str(result.conversation_id),
+            "episode_id": str(result.episode_id) if result.episode_id else None,
+            "message_id": str(result.message_id) if result.message_id else None,
             "reply": result.reply,
             "provider": result.provider,
             "model": result.model,
@@ -291,6 +301,23 @@ def _chat_response(result) -> Response:
             "attachments": result.attachments,
         },
     )
+
+
+def _turn_kwargs(request, *, visible_text: str) -> dict:
+    """Typed client envelope shared by every chat role."""
+    kwargs = {"visible_text": visible_text}
+    for source, target in (
+        ("message_id", "message_id"),
+        ("reply_to_message_id", "reply_to_message_id"),
+        ("attachment_batch_id", "attachment_batch_id"),
+    ):
+        value = request.data.get(source)
+        if value:
+            kwargs[target] = uuid.UUID(str(value))
+    client_context = request.data.get("client_context")
+    if isinstance(client_context, dict):
+        kwargs["client_context"] = client_context
+    return kwargs
 
 
 @api_view(["POST"])
@@ -528,10 +555,189 @@ def chat_view(request):
         f"{_document_attachment_note(request, landlord)}"
     )
 
-    result = run_turn(
-        landlord, message, conversation_id, role="corporal", channel="web",
-    )
+    target = str(request.data.get("target_role") or "auto").strip().casefold()
+    from .orchestrator import TurnEnvelope
+    from .orchestrator import routing_decision
+    from .orchestrator import run_strategic_treasurer_turn
+
+    try:
+        decision = routing_decision(message, target)
+    except ValueError:
+        return Response(
+            {"detail": "target_role must be auto, ops, chief, or treasurer."},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    role = decision.role
+    try:
+        turn_kwargs = _turn_kwargs(request, visible_text=str(request.data.get("message") or "").strip())
+    except ValueError:
+        return Response(
+            {"detail": "message and reply identifiers must be UUIDs."},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    if decision.requires_deliberation:
+        result = run_strategic_treasurer_turn(
+            landlord=landlord,
+            envelope=TurnEnvelope(
+                message=str(request.data.get("message") or "").strip(),
+                conversation_id=conversation_id or uuid.uuid4(),
+                message_id=turn_kwargs.get("message_id") or uuid.uuid4(),
+                target_role=target,
+                reply_to_message_id=turn_kwargs.get("reply_to_message_id"),
+                attachment_batch_id=turn_kwargs.get("attachment_batch_id"),
+                client_context=turn_kwargs.get("client_context") or {},
+            ),
+        )
+    else:
+        result = run_turn(
+            landlord, message, conversation_id, role=role, channel="web", **turn_kwargs,
+        )
     return _chat_response(result)
+
+
+def _explicit_plan(request, plan_id):
+    from .models import RamaPendingPlan
+    from .plan_runner import load_fresh_plan
+
+    landlord = _landlord(request)
+    candidate = RamaPendingPlan.objects.filter(
+        plan_id=plan_id, landlord=landlord
+    ).first()
+    if candidate is None:
+        return landlord, None, Response(
+            {"detail": "That plan is no longer pending; nothing was executed."},
+            status=http_status.HTTP_409_CONFLICT,
+        )
+    plan = load_fresh_plan(landlord, candidate.conversation_id)
+    if plan is None or plan.plan_id != plan_id:
+        return landlord, None, Response(
+            {"detail": "That confirmation expired or is no longer the visible plan."},
+            status=http_status.HTTP_409_CONFLICT,
+        )
+    prompt_id = str(request.data.get("prompt_message_id") or "")
+    if not plan.prompt_message_id or prompt_id != str(plan.prompt_message_id):
+        return landlord, None, Response(
+            {"detail": "The confirmation does not match the active plan prompt."},
+            status=http_status.HTTP_409_CONFLICT,
+        )
+    return landlord, plan, None
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def plan_confirm_view(request, plan_id):
+    """Confirm one exact persisted plan; chat prose is not authorization."""
+    from .conversations import bind_plan_prompt
+    from .conversations import record_visible_message
+    from .models import RamaMessage
+    from .models import RamaPendingPlan
+    from .plan_runner import plan_brief
+    from .plan_runner import run_plan
+    from .service import _plan_fallback_reply
+
+    landlord, plan, err = _explicit_plan(request, plan_id)
+    if err is not None:
+        return err
+    try:
+        inbound_id = request.data.get("message_id") or uuid.uuid4()
+        inbound = record_visible_message(
+            landlord=landlord,
+            conversation_id=plan.conversation_id,
+            direction=RamaMessage.Direction.INBOUND,
+            text="Confirm plan",
+            channel="web",
+            role="corporal",
+            message_id=inbound_id,
+            reply_to_message_id=plan.prompt_message_id,
+        )
+    except ValueError:
+        return Response({"detail": "message_id must be a UUID."}, status=http_status.HTTP_400_BAD_REQUEST)
+    progress = run_plan(plan, landlord)
+    reply = _plan_fallback_reply(progress)
+    outstanding = RamaPendingPlan.objects.filter(plan_id=plan_id).first()
+    outbound = record_visible_message(
+        landlord=landlord,
+        conversation_id=inbound.conversation_id,
+        direction=RamaMessage.Direction.OUTBOUND,
+        text=reply,
+        channel="web",
+        role="corporal",
+        kind=RamaMessage.Kind.PLAN_PROMPT if outstanding else RamaMessage.Kind.CHAT,
+        semantic_payload={"confirmation_result": progress, "plan_id": str(plan_id)},
+    )
+    if outstanding:
+        bind_plan_prompt(outstanding, outbound)
+    return Response(
+        {
+            "conversation_id": str(inbound.conversation_id),
+            "episode_id": str(outbound.episode_id),
+            "message_id": str(outbound.pk),
+            "reply": reply,
+            "provider": "deterministic",
+            "model": "plan-runner",
+            "tools_used": [row["tool"] for row in progress.get("executed", [])],
+            "pending_plan": plan_brief(outstanding) if outstanding else None,
+            "attachments": [],
+            "auto_executed": [],
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def plan_cancel_view(request, plan_id):
+    """Cancel one exact plan and preserve the visible cancellation receipt."""
+    from .conversations import record_visible_message
+    from .models import RamaMessage
+    from .models import RamaTask
+    from .outcomes import CommandOutcome
+    from .outcomes import OutcomeKind
+
+    landlord, plan, err = _explicit_plan(request, plan_id)
+    if err is not None:
+        return err
+    conversation_id = plan.conversation_id
+    prompt_id = plan.prompt_message_id
+    if plan.task_id and plan.task.status not in RamaTask.TERMINAL_STATUSES:
+        plan.task.transition_to(
+            RamaTask.Status.CANCELLED,
+            outcome=CommandOutcome(OutcomeKind.NOOP, "Cancelled; nothing was executed.").as_dict(),
+        )
+    plan.delete()
+    inbound = record_visible_message(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        direction=RamaMessage.Direction.INBOUND,
+        text="Cancel plan",
+        channel="web",
+        role="corporal",
+        message_id=request.data.get("message_id") or uuid.uuid4(),
+        reply_to_message_id=prompt_id,
+    )
+    reply = "Cancelled. Nothing was executed."
+    outbound = record_visible_message(
+        landlord=landlord,
+        conversation_id=conversation_id,
+        direction=RamaMessage.Direction.OUTBOUND,
+        text=reply,
+        channel="web",
+        role="corporal",
+        semantic_payload={"cancelled_plan_id": str(plan_id)},
+    )
+    return Response(
+        {
+            "conversation_id": str(conversation_id),
+            "episode_id": str(outbound.episode_id),
+            "message_id": str(outbound.pk),
+            "reply": reply,
+            "provider": "deterministic",
+            "model": "plan-runner",
+            "tools_used": [],
+            "pending_plan": None,
+            "attachments": [],
+            "auto_executed": [],
+        }
+    )
 
 
 @api_view(["GET"])
@@ -1216,8 +1422,12 @@ def general_chat_view(request):
             )
         raise
 
+    try:
+        turn_kwargs = _turn_kwargs(request, visible_text=str(request.data.get("message") or "").strip())
+    except ValueError:
+        return Response({"detail": "message and reply identifiers must be UUIDs."}, status=http_status.HTTP_400_BAD_REQUEST)
     result = run_turn(
-        landlord, message, conversation_id, role="general", channel="web",
+        landlord, message, conversation_id, role="general", channel="web", **turn_kwargs,
     )
     return _chat_response(result)
 
@@ -1256,9 +1466,31 @@ def treasurer_chat_view(request):
     if err is not None:
         return err
 
-    result = run_turn(
-        landlord, message, conversation_id, role="treasurer", channel="web",
-    )
+    try:
+        turn_kwargs = _turn_kwargs(request, visible_text=message)
+    except ValueError:
+        return Response({"detail": "message and reply identifiers must be UUIDs."}, status=http_status.HTTP_400_BAD_REQUEST)
+    from .orchestrator import TurnEnvelope
+    from .orchestrator import routing_decision
+    from .orchestrator import run_strategic_treasurer_turn
+
+    decision = routing_decision(message, "treasurer")
+    if decision.requires_deliberation:
+        result = run_strategic_treasurer_turn(
+            landlord=landlord,
+            envelope=TurnEnvelope(
+                message=message,
+                conversation_id=conversation_id or uuid.uuid4(),
+                message_id=turn_kwargs.get("message_id") or uuid.uuid4(),
+                target_role="treasurer",
+                reply_to_message_id=turn_kwargs.get("reply_to_message_id"),
+                client_context=turn_kwargs.get("client_context") or {},
+            ),
+        )
+    else:
+        result = run_turn(
+            landlord, message, conversation_id, role="treasurer", channel="web", **turn_kwargs,
+        )
     return _chat_response(result)
 
 

@@ -35,7 +35,9 @@ def bridge_to_channels(event):
         user = _landlord_user(event)
         landlord = getattr(user, "landlord_profile", None) if user else None
         if landlord is not None:
-            send_to_landlord(landlord, text, category=category, url=url)
+            send_to_landlord(
+                landlord, text, category=category, url=url, event=event
+            )
 
     if audience in ("TENANT", "BOTH"):
         for user in _tenant_users(event):

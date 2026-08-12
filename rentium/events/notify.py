@@ -174,7 +174,22 @@ def _render(event):
             "/dashboard/financial",
         )
     if t == "lease.activated":
-        return "Lease activated", "Your lease is now active.", "/dashboard/leases"
+        lease = _lease(event)
+        if lease is not None:
+            label = lease.lease_number or f"Draft-{lease.pk.hex[:6]}"
+            subject = (
+                lease.property.name
+                if lease.property_id
+                else lease.group.name
+                if lease.group_id
+                else "the rental"
+            )
+            return (
+                "Lease activated",
+                f"Lease {label} for {subject} is now active.",
+                f"/dashboard/leases/{lease.pk}",
+            )
+        return "Lease activated", "A lease is now active.", "/dashboard/leases"
     if t == "lease.expired":
         return "Lease expired", "A lease has reached its end date.", "/dashboard/leases"
     if t == "lease.status_changed":

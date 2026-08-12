@@ -46,6 +46,7 @@ class RentAdjustmentSerializer(serializers.ModelSerializer):
             "adjustment_type",
             "calculation_method",
             "amount",
+            "target_amount",
             "nights_charged",
             "nights_in_period",
             "reason",
@@ -57,7 +58,13 @@ class RentAdjustmentSerializer(serializers.ModelSerializer):
             "updated_at",
             "adjusted_preview",
         ]
-        read_only_fields = ["id", "created_by", "created_at", "updated_at"]
+        read_only_fields = [
+            "id",
+            "target_amount",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]
 
     def get_adjusted_preview(self, obj):
         """Shows what the resulting rent would be, given the parent LeaseTenant's base rent."""

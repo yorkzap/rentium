@@ -833,6 +833,8 @@ def apply_rent_adjustment(
     tenant_email: str = "",
     adjustment_type: str = "DISCOUNT",
     amount: str = "",
+    target_lease_total: str = "",
+    expected_current_total: str = "",
     calculation_method: str = "FLAT_AMOUNT",
     reason: str = "",
     effective_date: str = "",
@@ -844,6 +846,7 @@ def apply_rent_adjustment(
     open rent charges (same as UI rent-adjustments)."""
     from rentium.leases.models import RentAdjustment
     from rentium.ledger.billing import apply_adjustment_to_ledger
+    from rentium.ledger.billing import compute_rent_for_due_date
 
     lease, err = _resolve_lease(
         landlord, property_query=property_query, lease_number=lease_number,
@@ -863,27 +866,6 @@ def apply_rent_adjustment(
         u = getattr(getattr(lt, "tenant", None), "user", None)
         return ((getattr(u, "email", None) or "") if u else "").strip().lower()
 
-    chosen = None
-    email_q = (tenant_email or "").strip().lower()
-    if email_q:
-        for lt in lts:
-            if email_q == _email(lt) or email_q in _email(lt):
-                chosen = lt
-                break
-        if not chosen:
-            return {"error": f"No tenant matching {tenant_email!r} on this lease."}
-    elif len(lts) == 1:
-        chosen = lts[0]
-    else:
-        chosen = next((lt for lt in lts if lt.is_primary_tenant), None)
-        if not chosen:
-            return {
-                "error": (
-                    "Multiple tenants — pass tenant_email to pick who gets "
-                    f"the adjustment. On lease: {[ _email(lt) or lt.display_name for lt in lts ]}."
-                ),
-            }
-
     adj_type = (adjustment_type or "DISCOUNT").strip().upper()
     if adj_type not in RentAdjustment.AdjustmentType.values:
         return {
@@ -900,14 +882,28 @@ def apply_rent_adjustment(
                 f"{list(RentAdjustment.CalculationMethod.values)}."
             ),
         }
-    if not (amount or "").strip() and method != RentAdjustment.CalculationMethod.EXACT_NIGHTLY:
+    target_mode = bool((target_lease_total or "").strip())
+    if (
+        not target_mode
+        and not (amount or "").strip()
+        and method != RentAdjustment.CalculationMethod.EXACT_NIGHTLY
+    ):
         return {"error": "amount is required (dollars for FLAT, percent for PERCENTAGE)."}
     try:
         amt = _money(amount or "0")
+        target_total = (
+            _money(target_lease_total).quantize(Decimal("0.01"))
+            if target_mode
+            else None
+        )
         eff = (
             _parse_date(effective_date, "effective_date")
             if (effective_date or "").strip()
-            else timezone.now().date()
+            else (
+                (lease.move_in_date or lease.start_date)
+                if target_mode
+                else timezone.now().date()
+            )
         )
         end = (
             _parse_date(end_date, "end_date")
@@ -918,13 +914,122 @@ def apply_rent_adjustment(
         return {"error": str(exc)}
 
     recurring = _truthy(is_recurring)
+    # A non-recurring adjustment is one billing period. Leaving end_date null
+    # makes the billing query apply it forever even though is_recurring=False.
+    # Close it at the end of its effective month unless the caller supplied a
+    # narrower/wider explicit period.
+    if not recurring and end is None:
+        end = (eff.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+
+    chosen = None
+    email_q = (tenant_email or "").strip().lower()
+    if not target_mode:
+        if email_q:
+            for lt in lts:
+                if email_q == _email(lt) or email_q in _email(lt):
+                    chosen = lt
+                    break
+            if not chosen:
+                return {"error": f"No tenant matching {tenant_email!r} on this lease."}
+        elif len(lts) == 1:
+            chosen = lts[0]
+        else:
+            chosen = next((lt for lt in lts if lt.is_primary_tenant), None)
+            if not chosen:
+                return {
+                    "error": (
+                        "Multiple tenants — pass tenant_email to pick who gets "
+                        f"the adjustment. On lease: "
+                        f"{[_email(lt) or lt.display_name for lt in lts]}."
+                    ),
+                }
+
+    allocations: list[dict] = []
+    period_amounts = [
+        (lt, compute_rent_for_due_date(lt, eff))
+        for lt in lts
+    ]
+    current_total = sum(
+        (period_amount for _, period_amount in period_amounts),
+        Decimal("0.00"),
+    )
+    if target_mode:
+        if method != RentAdjustment.CalculationMethod.FLAT_AMOUNT:
+            return {"error": "target_lease_total requires FLAT_AMOUNT."}
+        if target_total is None or target_total < 0:
+            return {"error": "target_lease_total must be zero or greater."}
+        if current_total <= 0:
+            return {
+                "error": (
+                    f"Lease {lease.lease_number} has no positive tenant rent "
+                    "allocations, so its household adjustment cannot be priced safely."
+                ),
+            }
+        if (expected_current_total or "").strip():
+            try:
+                expected = _money(expected_current_total)
+            except ValueError as exc:
+                return {"error": str(exc)}
+            if expected != current_total:
+                return {
+                    "error": (
+                        f"Lease {lease.lease_number} rent changed from "
+                        f"{expected} to {current_total} after the preview. "
+                        "Prepare a fresh preview before applying it."
+                    ),
+                }
+        if target_total == current_total:
+            return {
+                "unchanged": True,
+                "lease_number": lease.lease_number,
+                "message": (
+                    f"Lease {lease.lease_number} already totals {target_total} "
+                    f"for the period beginning {eff}."
+                ),
+            }
+
+        adj_type = (
+            RentAdjustment.AdjustmentType.DISCOUNT
+            if target_total < current_total
+            else RentAdjustment.AdjustmentType.INCREASE
+        )
+        positive = [
+            (lt, period_amount)
+            for lt, period_amount in period_amounts
+            if period_amount > 0
+        ]
+        remaining_target = target_total
+        for index, (lt, base) in enumerate(positive):
+            if index == len(positive) - 1:
+                adjusted = remaining_target
+            else:
+                adjusted = (target_total * base / current_total).quantize(Decimal("0.01"))
+                remaining_target -= adjusted
+            delta = abs(base - adjusted).quantize(Decimal("0.01"))
+            if delta:
+                allocations.append(
+                    {
+                        "lease_tenant": lt,
+                        "tenant": lt.display_name,
+                        "tenant_email": _email(lt) or None,
+                        "base_rent": base,
+                        "adjusted_rent": adjusted,
+                        "amount": delta,
+                    }
+                )
+        amt = abs(current_total - target_total).quantize(Decimal("0.01"))
+
     place = lease.property.name if lease.property_id else ""
     preview = {
         "lease_number": lease.lease_number,
         "property": place,
-        "tenant": chosen.display_name,
-        "tenant_email": _email(chosen) or None,
-        "base_rent": str(chosen.rent_amount or lease.total_rent),
+        "tenant": "Lease household" if target_mode else chosen.display_name,
+        "tenant_email": None if target_mode else (_email(chosen) or None),
+        "base_rent": str(
+            current_total
+            if target_mode
+            else (chosen.rent_amount or lease.total_rent)
+        ),
         "adjustment_type": adj_type,
         "calculation_method": method,
         "amount": str(amt),
@@ -937,52 +1042,132 @@ def apply_rent_adjustment(
             "Reconcile unpaid future rent charges on ACTIVE leases",
         ],
     }
+    if target_mode:
+        preview.update(
+            {
+                "current_lease_total": str(current_total),
+                "target_lease_total": str(target_total),
+                "allocation_adjustments": [
+                    {
+                        "tenant": row["tenant"],
+                        "tenant_email": row["tenant_email"],
+                        "base_rent": str(row["base_rent"]),
+                        "adjusted_rent": str(row["adjusted_rent"]),
+                        "adjustment": str(row["amount"]),
+                    }
+                    for row in allocations
+                ],
+            }
+        )
+    resolved_arguments = {
+        "lease_number": lease.lease_number,
+        "property_query": "",
+        "tenant_email": tenant_email,
+        "adjustment_type": adj_type,
+        "amount": str(amt) if not target_mode else "",
+        "target_lease_total": str(target_total) if target_mode else "",
+        "expected_current_total": str(current_total) if target_mode else "",
+        "calculation_method": method,
+        "reason": reason,
+        "effective_date": str(eff),
+        "end_date": str(end) if end else "",
+        "is_recurring": "1" if recurring else "0",
+    }
     if not _confirmed(confirm):
-        return _preview(
+        result = _preview(
             "apply_rent_adjustment",
             preview,
             "Records rent adjustment and reconciles ledger charges.",
         )
+        result["resolved_arguments"] = resolved_arguments
+        return result
 
+    created_adjustments = []
     try:
-        adjustment = RentAdjustment.objects.create(
-            lease_tenant=chosen,
-            adjustment_type=adj_type,
-            calculation_method=method,
-            amount=amt,
-            reason=(reason or "")[:2000],
-            effective_date=eff,
-            end_date=end,
-            is_recurring=recurring,
-            created_by=landlord,
-        )
+        if target_mode:
+            pending = [
+                RentAdjustment(
+                    lease_tenant=row["lease_tenant"],
+                    adjustment_type=adj_type,
+                    calculation_method=method,
+                    amount=row["amount"],
+                    target_amount=row["adjusted_rent"],
+                    reason=(reason or "")[:2000],
+                    effective_date=eff,
+                    end_date=end,
+                    is_recurring=recurring,
+                    created_by=landlord,
+                )
+                for row in allocations
+            ]
+            for adjustment in pending:
+                adjustment.full_clean()
+            with transaction.atomic():
+                created_adjustments = list(RentAdjustment.objects.bulk_create(pending))
+        else:
+            created_adjustments = [
+                RentAdjustment.objects.create(
+                    lease_tenant=chosen,
+                    adjustment_type=adj_type,
+                    calculation_method=method,
+                    amount=amt,
+                    reason=(reason or "")[:2000],
+                    effective_date=eff,
+                    end_date=end,
+                    is_recurring=recurring,
+                    created_by=landlord,
+                )
+            ]
     except ValidationError as exc:
         return _validation_error_payload(exc)
 
     ledger_result = {}
-    if lease.status == lease.LeaseStatus.ACTIVE:
+    if lease.status == lease.LeaseStatus.ACTIVE and created_adjustments:
         try:
-            ledger_result = apply_adjustment_to_ledger(chosen, adjustment)
+            # compute_* reads every adjustment; one reconciliation after the
+            # atomic bulk create reaches the final household amount directly.
+            ledger_result = apply_adjustment_to_ledger(
+                created_adjustments[0].lease_tenant,
+                created_adjustments[-1],
+            )
         except Exception as exc:  # noqa: BLE001
             ledger_result = {"warning": f"Ledger reconcile deferred: {exc}"}
 
+    first = created_adjustments[0]
     return {
         "applied": True,
         "adjustment": {
-            "id": str(adjustment.pk),
-            "type": adjustment.adjustment_type,
-            "amount": str(adjustment.amount),
-            "method": adjustment.calculation_method,
-            "effective_date": str(adjustment.effective_date),
-            "end_date": str(adjustment.end_date) if adjustment.end_date else None,
-            "is_recurring": adjustment.is_recurring,
+            "id": str(first.pk),
+            "type": first.adjustment_type,
+            "amount": str(amt),
+            "method": first.calculation_method,
+            "effective_date": str(first.effective_date),
+            "end_date": str(first.end_date) if first.end_date else None,
+            "is_recurring": first.is_recurring,
         },
+        "adjustments": [
+            {
+                "id": str(row.pk),
+                "tenant": row.lease_tenant.display_name,
+                "amount": str(row.amount),
+            }
+            for row in created_adjustments
+        ],
         "lease_number": lease.lease_number,
-        "tenant": chosen.display_name,
+        "property": place,
+        "tenant": "Lease household" if target_mode else chosen.display_name,
+        "previous_lease_total": str(current_total) if target_mode else None,
+        "target_lease_total": str(target_total) if target_mode else None,
         "ledger": ledger_result,
         "message": (
-            f"Applied {adj_type} of {amt} on lease {lease.lease_number} "
-            f"for {chosen.display_name} from {eff}."
+            f"Applied one-time {adj_type.lower()} of {amt} on lease "
+            f"{lease.lease_number}; rent for {eff} through {end} is "
+            f"{target_total}."
+            if target_mode
+            else (
+                f"Applied {adj_type} of {amt} on lease {lease.lease_number} "
+                f"for {chosen.display_name} from {eff} through {end}."
+            )
         ),
     }
 

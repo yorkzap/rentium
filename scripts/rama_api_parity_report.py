@@ -23,6 +23,7 @@ Flags:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -51,7 +52,7 @@ from rest_framework.viewsets import ViewSetMixin  # noqa: E402
 
 from rentium.rama.registry import REGISTRY  # noqa: E402
 from rentium.rama.roles import GENERAL_TOOLS  # noqa: E402
-from rentium.rama.tool_meta import meta_for  # noqa: E402
+from rentium.rama.tool_meta import TOOL_META, meta_for  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Curated map: high-value API operations → RAMA tool(s)
@@ -345,6 +346,8 @@ COVERAGE_MAP: dict[str, list[str] | None] = {
     "rama:chat_view": None,
     "rama:general_chat_view": None,
     "rama:treasurer_chat_view": None,
+    "rama:plan_confirm_view": None,  # control-plane confirmation, not a domain capability
+    "rama:plan_cancel_view": None,  # control-plane cancellation
     "rama:settings_view": None,
     "rama:config_view": None,
     "rama:upload_view": None,
@@ -594,7 +597,36 @@ def collect_rama_tools() -> list[dict]:
                 "risk": meta.risk,
                 "has_confirm": "confirm" in tool.parameters.get("properties", {}),
                 "autonomy": getattr(meta.autonomy, "value", str(meta.autonomy)),
+                # Behavioural certification: existence is not parity. A
+                # callable landlord adapter, typed schema, role exposure, and
+                # explicit policy for writes are the minimum contract.
+                "landlord_scoped": "landlord" in inspect.signature(tool.fn).parameters
+                and "landlord" not in tool.parameters.get("properties", {}),
+                "schema_valid": tool.parameters.get("type") == "object"
+                and isinstance(tool.parameters.get("properties"), dict),
+                "general_allowed": name in GENERAL_TOOLS,
+                "intentional_landlord_exclusion": name not in GENERAL_TOOLS,
+                "write_policy_classified": (
+                    "confirm" not in tool.parameters.get("properties", {})
+                    or name in TOOL_META
+                ),
+                "execution_evidence": (
+                    "read_result"
+                    if "confirm" not in tool.parameters.get("properties", {})
+                    else "task_receipt_after_verified_tool_result"
+                ),
             },
+        )
+        rows[-1]["certified"] = all(
+            rows[-1][field]
+            for field in (
+                "landlord_scoped",
+                "schema_valid",
+                "write_policy_classified",
+            )
+        ) and (
+            rows[-1]["general_allowed"]
+            or rows[-1]["intentional_landlord_exclusion"]
         )
     return rows
 
@@ -672,6 +704,18 @@ def render_markdown(
         f"| unmapped | {len(by_status['unmapped'])} |",
         f"| intentional | {len(by_status['intentional'])} |",
         "",
+        "## Behavioural capability contracts",
+        "",
+        "A mapping is not treated as proof by itself. Tools are certified only "
+        "when the adapter is landlord-scoped, its input schema is typed, the "
+        "General may call it, and every write has explicit server-side policy. "
+        "Confirmed writes produce immutable task/action receipts after the tool "
+        "result is verified.",
+        "",
+        f"Certified landlord-callable tools: **{sum(1 for tool in tools if tool['certified'] and tool['general_allowed'])}**",
+        f"Intentionally excluded destructive/admin tools: **{sum(1 for tool in tools if tool['intentional_landlord_exclusion'])}**",
+        f"Uncertified tools: **{sum(1 for tool in tools if not tool['certified'])}**",
+        "",
         "## High-priority gaps (mapped but unavailable to the General)",
         "",
     ]
@@ -747,6 +791,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--fail-on-gap", action="store_true")
+    parser.add_argument("--fail-on-uncertified", action="store_true")
     parser.add_argument("--out", type=str, default="")
     args = parser.parse_args(argv)
 
@@ -768,6 +813,9 @@ def main(argv: list[str] | None = None) -> int:
                 s: sum(1 for g in gaps if g.status == s)
                 for s in ("covered", "missing_tool", "unmapped", "intentional")
             },
+            "uncertified_tools": [
+                tool for tool in tools if not tool.get("certified")
+            ],
         }
         print(json.dumps(payload, indent=2, default=str))
     else:
@@ -787,6 +835,10 @@ def main(argv: list[str] | None = None) -> int:
     ]
     if args.fail_on_gap and (
         any(g.status == "missing_tool" for g in gaps) or unmapped_mutations
+    ):
+        return 1
+    if args.fail_on_uncertified and any(
+        not tool.get("certified") for tool in tools
     ):
         return 1
     return 0

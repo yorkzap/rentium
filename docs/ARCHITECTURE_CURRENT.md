@@ -124,14 +124,32 @@ is:
 
 ```text
 Web chat or linked landlord channel
-→ deterministic high-confidence intent routing
+→ `RamaConversation` visible timeline
+→ 30-minute `RamaEpisode` topic boundary and reply-to resolution
+→ hybrid AUTO routing (Ops / Chief / Treasurer)
 → capability retrieval over the role's allowlist
+→ executable intent contract for exact entities and requested final states
+→ model interpretation; prose-only action proposals are recompiled into tool calls
 → landlord-scoped resolution and application service
 → typed answer, clarification, no-op, failure, or complete mutation preview
-→ explicit confirmation
+→ explicit confirmation bound to plan ID + episode + visible prompt ID
 → service-layer transaction
 → immutable action receipt, verification, and concrete completion message
 ```
+
+`RamaAudit` is diagnostic evidence; it is no longer conversational truth.
+Every visible inbound chat message, assistant response, and successfully
+delivered landlord notification is a `RamaMessage`. Short references resolve in
+this order: transport reply-to, explicit entity, source event/client context,
+then the last visible outbound message in the active episode. An idle/reset
+episode boundary suspends clarifications and expires confirmations, so a file
+or question from days earlier cannot silently become the subject of a new turn.
+
+The web surface defaults to AUTO and keeps one conversation while the landlord
+switches between AUTO, Ops, and Treasurer. Strategic finance requests run the
+bounded Treasurer deliberation pipeline; ordinary finance lookups use the
+faster read-only Treasurer turn. Arbitrary model IDs are permitted for chat and
+reads, but only curated/certified model IDs receive model-authored write schemas.
 
 `rama/capabilities.py` indexes registered operations by business-language
 aliases, descriptions, risk, and schema. A turn sees a small relevant subset
@@ -151,6 +169,47 @@ when every existing group member agrees, asks once for a missing landlord-use
 classification, warns about exact and near-duplicate names, and rolls the
 whole operation back on failure.
 
+Lease mutations additionally carry an exact `lease_number` from preview through
+execution. A listing name is never enough when several DRAFT, PENDING, or ACTIVE
+leases share that listing; property-only resolution returns the candidates and
+asks for the lease number instead of selecting the newest row. First-month rent
+targets are priced by `apply_rent_adjustment` from live billable period amounts
+after existing proration and adjustments. The preview freezes both the exact
+lease and expected current household period total, execution rejects intervening
+rent changes, and a non-recurring adjustment is explicitly bounded to that first
+billing month. Target adjustments persist their final per-tenant amounts, so
+they override earlier proration instead of stacking an incorrect model-computed
+delta. A pre-activation possession-date edit rebases automatic proration only.
+An explicit target for a named legal lease period remains fixed to that period:
+if a lease begins August 1 and move-in becomes September 1, an agreed August
+target still creates an August bill. The model neither chooses the lease nor
+performs the ledger arithmetic.
+
+One instruction may name one or several rent-period targets. The deterministic
+effect compiler resolves each tenant/lease and month independently, previews
+every live billable total (including posted proration), and stores a version-2
+intent contract containing the exact effect set. Natural target-state language
+(`make`, `set`, `should be`, `can be`, `I want … rent`) shares this route. These
+certified requests never depend on a model-provider call, so a provider outage
+cannot turn a routine billing instruction into an API error. Plan validation
+and confirmation both require every effect exactly once;
+no item may be silently omitted, duplicated, or retargeted. These financial
+steps remain non-autonomous, but the one complete batch preview is their single
+confirmation boundary rather than a second confirmation per row. A named month
+is valid when it overlaps the legal lease term, even when it precedes the
+default move-in billing anchor. The charge scheduler includes such an explicit
+target period and then resumes ordinary monthly billing.
+
+`rama/intent_contract.py` preserves high-confidence entity and outcome
+constraints across short follow-ups such as “prepare preview”, “household”, and
+“the first one”. It validates model previews before persistence and is stored in
+`RamaTask.input`, so the confirmation runner validates the same contract again
+before executing. This is semantic validation in addition to schema validation:
+an `update_lease(special_terms=...)` call is structurally legal but is rejected
+when the requested effect is a rent adjustment, as is a guessed flat discount
+when the landlord requested a final rent total. Unconstrained composite requests
+remain free to compile into several validated tools.
+
 Whole-house descriptions use the atomic `create_house_layout` service rather
 than a model-authored sequence of unrelated calls. It can create one holding,
 empty or populated property groups, room listings, private areas such as an
@@ -166,7 +225,8 @@ backed by `RamaTask` and follows a validated FSM:
 
 ```text
 RECEIVED → NEEDS_INPUT / AWAITING_CONFIRMATION → EXECUTING
-         → VERIFIED / FAILED / CANCELLED
+         → VERIFIED / FAILED / CANCELLED / EXPIRED
+         ↘ SUSPENDED (episode ended while collecting clarification)
 ```
 
 Pending plans point at their task. Each completed plan step writes one immutable
@@ -175,6 +235,24 @@ references, verification evidence, and links. Repeated confirmations are
 recognized as already applied, and tool-specific `already_done` guards run both
 before preview and immediately before execution.
 
+Any assistant sentence asking for confirmation without a matching persisted
+plan is non-authoritative. Before such a sentence can reach the landlord, the
+engine gives a certified model one strict compilation pass: it retrieves tools
+again using the proposed action, requires actual tool calls with `confirm`
+blank, validates their previews, and persists the resulting batch. If an older
+orphan prompt already reached the landlord, their later “yes” triggers the same
+compilation rather than execution; RAMA then shows the real preview for one
+proper confirmation. If compilation fails, nothing runs. The executable plan
+is the confirmation contract, never the prose.
+
+`rama/policies/EXECUTION_CONTRACT.md` is versioned model guidance for this
+intent-to-tool discipline and is loaded into Corporal/General prompts through
+`rama/runtime_policy.py`. It is deliberately generic: it contains no portfolio
+facts and does not enumerate case-specific business workflows. Markdown cannot
+authorize or perform a write; role allowlists, capability schemas, domain
+validation, pending plans, the confirmation runner, and action receipts enforce
+the policy even when a model ignores the text.
+
 Plan steps also have a stable `step_id`, explicit `depends_on` edges, and typed
 result bindings such as
 `{"$step": "create-room", "path": "property.id"}`. The runner resolves a
@@ -182,6 +260,13 @@ binding only from an earlier verified result, then reruns blockers and duplicate
 checks against the resolved IDs immediately before execution. A failed step
 skips its dependants; RAMA never guesses a newly created row from its name or
 reconstructs a chain after confirmation.
+
+Only one visible turn may execute for a conversation at a time. A non-blocking
+PostgreSQL advisory lock spans web/Celery workers; an overlapping follow-up gets
+an immediate deterministic “still finishing” response. Provider loops are
+bounded separately by round, total-turn, and HTTP-request budgets, so a weak
+model repeatedly reading the catalogue cannot leave a saved inbound message
+without an eventual response.
 
 `rama/capability_contract.py` is the fail-closed landlord capability policy.
 The parity scanner compares landlord-facing mutating REST actions against the
@@ -209,6 +294,12 @@ composer sends that exact batch ID with the message; the server seals it, and
 media/document tools must target the batch or explicit attachment IDs. There is
 no fallback to “all unused uploads,” so a later set of 11 photos cannot absorb
 17 earlier photos or a mortgage document from another message.
+
+Document follow-ups are also episode-scoped. RAMA may recover an unfiled
+document only from a tool result in the current visible episode; it never falls
+back to the landlord's global unscoped document inbox. Explicit lease language
+is classified as lease administration before document routing, so an old OCR
+amount cannot hijack a lease edit.
 
 `properties.media_services` is the shared REST/RAMA boundary for attach,
 manifest, reorder, exact removal, and atomic removal of a selected set. Media
@@ -272,6 +363,10 @@ previously drifted:
 - `ledger.services.return_refundable_deposits` is the move-out return boundary.
   It derives what was actually received per deposit charge and posts separate,
   idempotent security, pet, and cleaning-deposit return rows.
+- Joint ledger charges retain `tenant=NULL` to represent household liability.
+  `LedgerEntrySerializer.tenant_names` separately projects every non-declined
+  lease participant so the Financial ledger can show who the charge concerns
+  beneath its property without falsely assigning it to one tenant.
 
 Lease invitations additionally have an append-only `LeaseInviteEvent` stream:
 `SENT`, `LINK_OPENED`, `ACCOUNT_LINKED`, `SIGNED`, `DECLINED`, and `RESENT`.

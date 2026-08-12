@@ -2,11 +2,12 @@
 
 from django.conf import settings
 
-from .base import Provider, ProviderError, ToolCall, Turn
+from .base import Provider, ProviderError, ToolCall, Turn, validate_wire
 
 # Plan previews and full set listings routinely exceed 1024 tokens; a cap that
 # truncates mid-plan reads as the model "going quiet". Overridable via settings.
 DEFAULT_MAX_TOKENS = 4096
+DEFAULT_TIMEOUT_SECONDS = 25
 
 
 def _max_tokens() -> int:
@@ -20,6 +21,7 @@ class AnthropicProvider(Provider):
     def complete(self, *, model, system, messages, tools, api_key: str = ""):
         from rentium.rama.runtime import platform_api_key
 
+        validate_wire(messages)
         key = (api_key or "").strip() or platform_api_key(self.name)
         if not key:
             raise ProviderError(
@@ -28,7 +30,16 @@ class AnthropicProvider(Provider):
             )
         import anthropic
 
-        client = anthropic.Anthropic(api_key=key)
+        client = anthropic.Anthropic(
+            api_key=key,
+            timeout=float(
+                getattr(
+                    settings,
+                    "RAMA_PROVIDER_TIMEOUT_SECONDS",
+                    DEFAULT_TIMEOUT_SECONDS,
+                ),
+            ),
+        )
         try:
             response = client.messages.create(
                 model=model,

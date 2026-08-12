@@ -85,6 +85,7 @@ def test_pending_lease_start_date_and_semi_furnished(pending_lease, landlord):
 
 
 def test_update_lease_alone_can_change_pending_start(pending_lease, landlord):
+    original_start = pending_lease.start_date
     out = registry.execute(
         "update_lease",
         {
@@ -95,6 +96,7 @@ def test_update_lease_alone_can_change_pending_start(pending_lease, landlord):
         landlord=landlord,
     )
     assert out.get("updated"), out
+    assert out["previous"]["start_date"] == str(original_start)
     pending_lease.refresh_from_db()
     assert pending_lease.start_date == date(2026, 9, 1)
 

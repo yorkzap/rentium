@@ -21,7 +21,8 @@ from decimal import Decimal
 import pytest
 from rest_framework.test import APIClient
 
-from rentium.leases.models import Lease, LeaseInviteEvent, LeaseTenant
+from rentium.leases.models import Lease, LeaseInviteEvent, LeaseTenant, RentAdjustment
+from rentium.leases.services import update_lease_record
 
 pytestmark = pytest.mark.django_db
 
@@ -83,6 +84,37 @@ def test_a_pending_lease_is_editable_even_with_a_signature_on_it(
     pending_lease.refresh_from_db()
     assert pending_lease.cleaning_deposit == Decimal("250.00")
     assert pending_lease.total_rent == Decimal("1900.00")
+
+
+def test_move_in_change_keeps_explicit_lease_period_target(pending_lease, landlord):
+    pending_lease.start_date = date(2026, 8, 1)
+    pending_lease.move_in_date = date(2026, 8, 1)
+    pending_lease.save(update_fields=["start_date", "move_in_date", "updated_at"])
+    slot = pending_lease.lease_tenants.get(is_primary_tenant=True)
+    adjustment = RentAdjustment.objects.create(
+        lease_tenant=slot,
+        adjustment_type=RentAdjustment.AdjustmentType.DISCOUNT,
+        calculation_method=RentAdjustment.CalculationMethod.FLAT_AMOUNT,
+        amount=Decimal("500.00"),
+        target_amount=Decimal("400.00"),
+        reason="First-month household rent target",
+        effective_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 31),
+        is_recurring=False,
+        created_by=landlord,
+    )
+
+    result = update_lease_record(
+        landlord=landlord,
+        lease=pending_lease,
+        values={"move_in_date": date(2026, 9, 1)},
+    )
+
+    adjustment.refresh_from_db()
+    assert result["rebased_adjustments"] == []
+    assert adjustment.effective_date == date(2026, 8, 1)
+    assert adjustment.end_date == date(2026, 8, 31)
+    assert adjustment.target_amount == Decimal("400.00")
 
 
 def test_amending_terms_records_it_against_whoever_already_signed(
