@@ -147,6 +147,32 @@ def _emptiness_clause(clause: str, fmap: dict[str, FieldSpec]):
     return True, blank_forms, {}, None
 
 
+def _did_you_mean(name: str, spec: EntitySpec) -> str:
+    """" — did you mean `area_type`?", or "".
+
+    Asked how many bedrooms the Garden Suite has, the model requested
+    `fields='type,type_display,count,name,unit,property,serves,description'`.
+    `area_type` was the one column that answered the question and it never
+    appeared in that list, so RAMA got twenty rows named "Bonus room J" and
+    "Room K" with no way to see they were bedrooms, and reported no bedrooms.
+    The full field list was in the reply; a list of twenty is something to scan,
+    a suggestion is something to act on.
+    """
+    from difflib import get_close_matches  # noqa: PLC0415
+
+    pool = list(spec.field_map()) + relation_paths(spec)
+    close = get_close_matches(name, pool, n=2, cutoff=0.6)
+    # Substring hits ("type" inside "area_type") that similarity alone can miss
+    # on longer names.
+    close += [
+        candidate for candidate in pool
+        if candidate not in close and len(name) >= 3 and name in candidate
+    ][:2]
+    if not close:
+        return ""
+    return " — did you mean " + " or ".join(f"`{c}`" for c in close[:2]) + "?"
+
+
 def _filterable_names(spec: EntitySpec) -> str:
     """What to offer when a filter name is rejected.
 
@@ -239,7 +265,7 @@ def _relation_clause(spec: EntitySpec, fname: str, suffix: str, raw: str):
         )
 
     if _pk_shaped(target, value):
-        return True, Q(**{f"{prefix}__pk": value}), None
+        return True, (Q(**{f"{prefix}__pk": value}), None), None
 
     paths = _identity_paths(prefix, target) or [
         p for p in [relation_label_path(spec, fname)] if p
@@ -252,7 +278,10 @@ def _relation_clause(spec: EntitySpec, fname: str, suffix: str, raw: str):
     cond = Q()
     for path in paths:
         cond |= Q(**{f"{path}__icontains": value})
-    return True, cond, None
+    # A name is not an identifier. Two units are called "Garden Suite"; a
+    # filter naming one of them silently spans both, and the answer reads as
+    # being about one place. The probe lets `read` count what it matched.
+    return True, (cond, (fname, prefix, value)), None
 
 
 _PERIOD_IN_FILTER = re.compile(
@@ -332,11 +361,12 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = 
         fs = fmap.get(fname)
         path = fs.lookup_path if (fs is not None and fs.filterable) else None
         if path is None:
-            handled, cond, err = _relation_clause(spec, fname, suffix, raw)
+            handled, matched, err = _relation_clause(spec, fname, suffix, raw)
             if handled:
                 if err:
                     return None, None, None, err
-                conditions.append(~cond if suffix == "!=" else cond)
+                cond, probe = matched
+                conditions.append((~cond if suffix == "!=" else cond, probe))
                 continue
             path, fs, err = resolve_path(spec, fname)
             if err:
@@ -349,8 +379,8 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = 
                 include[aliased] = raw.strip()
                 continue
             return None, None, None, (
-                f"Can't filter on {fname!r}. Filterable fields: "
-                f"{_filterable_names(spec)}."
+                f"Can't filter on {fname!r}{_did_you_mean(fname, spec)} "
+                f"Filterable fields: {_filterable_names(spec)}."
             )
 
         # A range on the field itself — `start_date=2026-08-01..2026-08-31`.
@@ -396,6 +426,19 @@ def _agg_key(func: str, fname: str) -> str:
     return "count" if func == "count" else f"{func}_{fname.replace('__', '_')}"
 
 
+def _count_alias(spec: EntitySpec) -> str:
+    """What to call the row count on THIS entity.
+
+    Normally "count". But PropertyArea declares a field literally called
+    `count` ("number of identical areas"), and annotating `count=Count('pk')`
+    alongside `sum_count=Sum('count')` makes Django resolve the Sum against its
+    own sibling annotation: "Cannot compute Sum('count'): 'count' is an
+    aggregate". Rename the row count rather than refuse to total the column —
+    the collision is with our alias, not with the landlord's question.
+    """
+    return "row_count" if "count" in spec.field_map() else "count"
+
+
 def _parse_aggregate(aggregate: str, spec: EntitySpec):
     """Returns (list of (key, django_aggregate), referenced_names, error)."""
     from django.db.models import Avg, Count, Max, Min, Sum
@@ -408,7 +451,7 @@ def _parse_aggregate(aggregate: str, spec: EntitySpec):
         if not token:
             continue
         if token == "count":
-            specs.append(("count", Count("pk")))
+            specs.append((_count_alias(spec), Count("pk")))
             continue
         if ":" not in token:
             return None, None, (
@@ -640,7 +683,10 @@ def _resolve_column(spec: EntitySpec, name: str):
     if err:
         return None, err
     if path is None or fs is None:
-        return None, f"not a field or a relation on {spec.key}"
+        return None, (
+            f"not a field or a relation on {spec.key}"
+            f"{_did_you_mean(name, spec)}"
+        )
     return _Column(name, tuple(path.split("__")[:-1]), fs), None
 
 
@@ -650,6 +696,39 @@ def _readable_names(spec: EntitySpec) -> str:
         f"{', '.join(spec.field_map())}, id — and through relations "
         f"(as `rel__field`, or `rel` alone for its name): {rels}"
     )
+
+
+def _ambiguous_name_matches(qs, conditions) -> dict[str, str]:
+    """Filters that named ONE thing and matched several.
+
+    Two units in this portfolio are called "Garden Suite" — one with nothing
+    recorded, one with two bedrooms. `filters='unit=Garden Suite'` spans both,
+    and the answer reads as being about one place. That is not a wrong query,
+    it is an under-specified one, and the only safe thing is to say so: the
+    number is real, the noun it is attached to is not.
+    """
+    out: dict[str, str] = {}
+    for _condition, probe in conditions:
+        if probe is None:
+            continue
+        fname, prefix, value = probe
+        try:
+            # `.order_by()` FIRST: Django adds ordering columns to the SELECT,
+            # so DISTINCT over (unit_id, kind) counts one unit twice and every
+            # filter looks ambiguous.
+            distinct = (
+                qs.order_by().values_list(f"{prefix}__pk", flat=True).distinct()
+            )
+            matched = [pk for pk in distinct if pk is not None]
+        except Exception:  # noqa: BLE001 - a countable answer is a nicety
+            continue
+        if len(matched) > 1:
+            out[fname] = (
+                f"{value!r} matched {len(matched)} different {fname}s, and the "
+                f"figures below cover ALL of them. Say so, or narrow by id "
+                f"({fname}=<id>) — do not report this as one {fname}."
+            )
+    return out
 
 
 def _select_fields(fields: str, spec: EntitySpec):
@@ -801,7 +880,7 @@ def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
     # Scope FIRST and unconditionally — never widened by user filters. The
     # entity's standing filters (e.g. "not voided") come next, for the same
     # reason and with the same guarantee: user filters can only narrow.
-    qs = spec.base_queryset_for(Model.objects).filter(**{spec.scope_path: landlord})
+    qs = spec.base_queryset_for(Model.objects).filter(spec.scope_q(landlord))
 
     # Derived fields are queryset annotations, so they have to exist before
     # anything filters, groups or sums on them. Applied only when one is
@@ -817,7 +896,7 @@ def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
 
     if include:
         qs = qs.filter(**include)
-    for condition in conditions:
+    for condition, _probe in conditions:
         qs = qs.filter(condition)
     if exclude:
         qs = qs.exclude(**exclude)
@@ -842,6 +921,11 @@ def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
         result["filters_applied"] = "; ".join(applied)
     if spec.scope_note:
         result["scope_note"] = spec.scope_note
+    # Before anything is summarised: a filter that named a thing may have
+    # matched more than one thing.
+    ambiguous = _ambiguous_name_matches(qs, conditions)
+    if ambiguous:
+        result["ambiguous_filters"] = ambiguous
 
     if agg_specs or group_keys:
         summary = _summarise(qs, spec, agg_specs, group_keys, ordering)
@@ -909,7 +993,7 @@ def _summarise(qs, spec: EntitySpec, agg_specs, group_keys, ordering) -> dict:
 
     # A group_by with no aggregate still means "how many in each" — that is
     # the only thing it could mean.
-    aggregates = dict(agg_specs) or {"count": Count("pk")}
+    aggregates = dict(agg_specs) or {_count_alias(spec): Count("pk")}
 
     totals = qs.aggregate(**aggregates)
     out = {
@@ -1001,7 +1085,7 @@ def link(landlord, *, entity: str = "", query: str = "") -> dict:
     ls = spec.links
     lookup = spec.resolve_lookup()
     label_field = spec.resolve_label()
-    qs = Model.objects.filter(**{spec.scope_path: landlord})
+    qs = Model.objects.filter(spec.scope_q(landlord))
     q = (query or "").strip()
     if q:
         cond = Q()

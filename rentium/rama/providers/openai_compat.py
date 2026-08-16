@@ -85,6 +85,14 @@ class OpenAIProvider(Provider):
                     ),
                 ),
             )
+        except requests.Timeout as exc:
+            # A timeout is not "unreachable" — the request went out and the
+            # answer did not come back in time, which is usually a payload big
+            # enough to be slow. Saying "could not reach" sends whoever reads
+            # the audit log looking at the network instead of at the prompt.
+            raise ProviderError(
+                f"The {self.name} API did not answer within the timeout."
+            ) from exc
         except requests.RequestException as exc:
             raise ProviderError(f"Could not reach the {self.name} API.") from exc
         if response.status_code >= 400:

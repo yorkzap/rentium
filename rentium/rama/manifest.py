@@ -82,6 +82,19 @@ class EntitySpec:
     # ORM path from the model to its owning LandlordProfile. Every query is
     # filtered by {scope_path: landlord}, so results never cross tenants.
     scope_path: str
+    # Additional paths to the SAME landlord, ORed with scope_path. Only for a
+    # model that genuinely hangs off one of several parents: PropertyArea has
+    # nullable `unit`, `group` and `property` FKs with a check constraint that
+    # one of them is set, so no single path reaches every row and picking one
+    # would silently hide the others — the exact "absence reads as zero" failure
+    # this manifest exists to prevent.
+    #
+    # This does NOT weaken scoping. Every disjunct must itself terminate at a
+    # LandlordProfile (test_manifest_coverage enforces that for these exactly as
+    # for scope_path), so a row is reachable only if some parent of it belongs
+    # to the acting landlord. All disjuncts are forward FKs, so no join fans a
+    # row out and no aggregate is multiplied.
+    alt_scope_paths: tuple[str, ...] = ()
     fields: list[FieldSpec] = field(default_factory=list)
     default_order: str = "-created_at"
     links: LinkSpec | None = None
@@ -113,6 +126,20 @@ class EntitySpec:
     # The date field that `month=` / `year=` / `between=` narrow. Without one,
     # every time question has to be spelled as two explicit bounds.
     date_field: str = ""
+
+    def scope_q(self, landlord):
+        """The landlord filter, as a Q. The ONLY way to scope a query.
+
+        Callers must use this rather than building `{scope_path: landlord}`
+        themselves, or an entity with several parents gets scoped by one of them
+        and the rest of its rows quietly vanish.
+        """
+        from django.db.models import Q  # noqa: PLC0415
+
+        condition = Q(**{self.scope_path: landlord})
+        for path in self.alt_scope_paths:
+            condition |= Q(**{path: landlord})
+        return condition
 
     def field_map(self) -> dict[str, FieldSpec]:
         return {f.name: f for f in self.fields}
@@ -536,6 +563,52 @@ PROPERTY_UNIT = EntitySpec(
     ],
 )
 
+# The biggest table on live data that RAMA could not see — 218 rows describing
+# what is physically inside every unit. "How many bedrooms does the Garden Suite
+# have?" and "which bathrooms are shared?" had no answer at all, and per the
+# denial guard's whole argument, no answer reads exactly like none.
+#
+# Scoped through THREE parents because that is how the model is built: a check
+# constraint requires one of unit / group / property, and each is nullable.
+# Picking any single one would hide the rest — see EntitySpec.alt_scope_paths.
+PROPERTY_AREA = EntitySpec(
+    key="property_area",
+    model="properties.PropertyArea",
+    label="Area inside a unit (bedroom, kitchen, bathroom…) — layout, not a listing",
+    scope_path="unit__landlord",
+    alt_scope_paths=("group__landlord", "property__landlord"),
+    lookup=("name",),
+    label_field="name",
+    default_order="kind",
+    scope_note=(
+        "A bedroom here is LAYOUT, not something let on its own — only a "
+        "BY_ROOM unit turns bedrooms into lettable listings (see property). "
+        "Rows with is_seeded_default=true are auto-created scaffolding, NOT a "
+        "layout the landlord recorded: never report them as known facts about "
+        "a unit. Filter is_seeded_default=false to see only recorded layout."
+    ),
+    fields=[
+        FieldSpec("name", "Name", nullable=True),
+        FieldSpec("area_type", "What it is", "enum",
+                  display="get_area_type_display", groupable=True),
+        # Orthogonal to area_type on purpose: a bathroom can be the master
+        # ensuite (PRIVATE), shared by the household (COMMON) or reserved to
+        # one room (EXCLUSIVE).
+        FieldSpec("kind", "Who may use it", "enum", display="get_kind_display",
+                  groupable=True),
+        FieldSpec("count", "How many", "number", aggregatable=True),
+        FieldSpec("description", "Details", filterable=False),
+        # Legally load-bearing: leases/tenancy_rules reads this to decide
+        # whether the provincial tenancy act applies at all.
+        FieldSpec("shared_with_landlord", "Landlord uses it too", "bool",
+                  groupable=True),
+        FieldSpec("is_group_common", "Common to the whole group", "bool",
+                  groupable=True),
+        FieldSpec("is_seeded_default", "Auto-created placeholder", "bool",
+                  groupable=True),
+    ],
+)
+
 OCCUPANCY = EntitySpec(
     key="occupancy",
     model="leases.Occupancy",
@@ -876,7 +949,8 @@ MANIFEST: dict[str, EntitySpec] = {
     for e in (
         PROPERTY, LEASE, LEASE_TENANT, WORK_ORDER, INQUIRY, APPOINTMENT,
         LEDGER_ENTRY, RENT_ADJUSTMENT, INSPECTION, INVENTORY, CONVERSATION,
-        PROPERTY_GROUP, PROPERTY_HOLDING, PROPERTY_UNIT, OCCUPANCY,
+        PROPERTY_GROUP, PROPERTY_HOLDING, PROPERTY_UNIT, PROPERTY_AREA,
+        OCCUPANCY,
         BUSINESS_DOCUMENT, LEASE_FORM,
     )
 }

@@ -911,6 +911,49 @@ def _portfolio_first_names(landlord) -> frozenset[str]:
     return frozenset(tokens)
 
 
+def portfolio_proper_nouns(landlord) -> frozenset[str]:
+    """Words that are the NAME of something in this landlord's books.
+
+    Not just people: units, holdings, properties and groups. The point is to
+    tell a name apart from a concept, because the two collide constantly and
+    the collision produces confident wrong answers.
+
+    Asked "how many bedrooms are there in the garden suite?", the denial guard
+    matched "suite" against property_unit — labelled "Unit within a holding
+    (floor / suite)" — decided the landlord was asking about suites, and sent
+    RAMA away from property_area, which held both bedrooms, to a table that
+    could not answer. "Garden Suite" is the name of a unit, not the word
+    "suite". The landlord's own data is what knows the difference.
+    """
+    from rentium.properties.models import (  # noqa: PLC0415
+        PropertyGroup,
+        PropertyHolding,
+        PropertyUnit,
+    )
+    from rentium.properties.models import Property  # noqa: PLC0415
+
+    tokens: set[str] = set()
+    sources = (
+        (PropertyUnit, {"landlord": landlord}, ("name",)),
+        (PropertyHolding, {"landlord": landlord}, ("name",)),
+        (Property, {"landlord": landlord}, ("name",)),
+        (PropertyGroup, {"landlord": landlord}, ("name",)),
+    )
+    for model, scope, fields in sources:
+        try:
+            rows = model.objects.filter(**scope).values_list(*fields)
+        except Exception:  # noqa: BLE001 - a model without that field is not fatal
+            logger.exception("portfolio noun scan failed for %s", model)
+            continue
+        for row in rows:
+            for value in row:
+                for part in (value or "").casefold().split():
+                    cleaned = "".join(c for c in part if c.isalpha())
+                    if len(cleaned) >= 3:
+                        tokens.add(cleaned)
+    return frozenset(tokens | _portfolio_first_names(landlord))
+
+
 def names_someone_in_the_portfolio(message: str, landlord) -> bool:
     if landlord is None or not (message or "").strip():
         return False

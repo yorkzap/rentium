@@ -179,3 +179,43 @@ def test_clamp_reads_the_task_attribute_when_no_per_call_limit(monkeypatch):
 
     monkeypatch.setattr("celery.current_task", _TaskLevelOnly())
     assert _turn_budget_seconds() == 30
+
+
+def test_a_provider_call_cannot_outlive_the_turn():
+    """The same drift as the Celery limit, one layer down.
+
+    The providers hardcoded a 25s timeout while a turn had 90. A call carrying
+    the 66KB portfolio snapshot took longer than 25s, so the landlord got
+    "Could not reach the openai API" with 65 seconds of budget unspent — and
+    the message pointed at the network rather than at the payload.
+    """
+    from django.conf import settings
+
+    provider = settings.RAMA_PROVIDER_TIMEOUT_SECONDS
+    budget = settings.RAMA_TURN_BUDGET_SECONDS
+    assert provider < budget, (
+        "a single provider call must not be able to consume the whole turn"
+    )
+    assert provider >= budget * 0.5, (
+        "and it must be allowed most of it, or slow-but-fine calls die early"
+    )
+
+
+def test_every_provider_reads_the_setting():
+    """A hardcoded default in one adapter is how the two drifted apart."""
+    import pathlib
+
+    providers = pathlib.Path(__file__).parent / "providers"
+    for name in ("openai_compat.py", "anthropic.py"):
+        source = (providers / name).read_text()
+        assert "RAMA_PROVIDER_TIMEOUT_SECONDS" in source, name
+
+
+def test_a_timeout_is_not_reported_as_unreachable():
+    """"Could not reach" sends whoever reads the audit log to the network."""
+    import pathlib
+
+    providers = pathlib.Path(__file__).parent / "providers"
+    for name in ("openai_compat.py", "anthropic.py"):
+        source = (providers / name).read_text()
+        assert "did not answer within the timeout" in source, name

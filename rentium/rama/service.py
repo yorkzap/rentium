@@ -35,6 +35,21 @@ from .capabilities import select_tool_schemas
 from .capabilities import supported_tool_for_request
 from .coverage import look_here_first
 from .coverage import unchecked_denials
+
+
+def _portfolio_nouns(landlord) -> frozenset[str]:
+    """Names of things in this landlord's books, for the denial guard.
+
+    Never let a name lookup break a turn: without it the guard is merely
+    more eager, which is its old behaviour, not a new failure.
+    """
+    from .capabilities import portfolio_proper_nouns
+
+    try:
+        return portfolio_proper_nouns(landlord)
+    except Exception:  # noqa: BLE001
+        logger.exception("portfolio noun lookup failed")
+        return frozenset()
 from .intent_contract import contract_for_effects
 from .intent_contract import contract_from_messages
 from .intent_contract import validate_step as validate_intent_step
@@ -8419,6 +8434,7 @@ def _run_turn_unlocked(
         if (pending_specs or not turn.text or _stalled or _asked_for_own_data)
         else unchecked_denials(
             turn.text, entities_read, landlord_message=message,
+            proper_nouns=_portfolio_nouns(landlord),
         )
     )
     if (

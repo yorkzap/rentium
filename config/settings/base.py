@@ -303,6 +303,13 @@ RAMA_TURN_TASK_TIME_LIMIT = RAMA_TURN_TASK_SOFT_TIME_LIMIT + 60
 # so the ceiling is generous.
 RAMA_TURN_BATCH_SOFT_TIME_LIMIT = 15 * 60
 RAMA_TURN_BATCH_TIME_LIMIT = RAMA_TURN_BATCH_SOFT_TIME_LIMIT + 5 * 60
+# The SAME drift, one layer down: the providers hardcoded 25s while a turn had
+# 90. Asked "what rooms have we actually recorded", RAMA fetched the portfolio
+# snapshot — 66KB, ~16k tokens — and the next call took longer than 25s, so the
+# landlord got "Could not reach the openai API" while 65 seconds of budget went
+# unused. A single call may take most of a turn, but never all of it: leaving
+# headroom is what lets the loop stop gracefully and answer with what it has.
+RAMA_PROVIDER_TIMEOUT_SECONDS = RAMA_TURN_BUDGET_SECONDS - 20
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 CELERY_WORKER_SEND_TASK_EVENTS = True
 CELERY_TASK_SEND_SENT_EVENT = True

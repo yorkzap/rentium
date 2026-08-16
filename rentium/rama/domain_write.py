@@ -167,7 +167,7 @@ def _resolve_one(landlord, spec: EntitySpec, query: str):
         return None, {"error": f"{spec.key} can't be targeted by name yet."}
     label = spec.resolve_label()
     Model = apps.get_model(*spec.model.split("."))
-    qs = Model.objects.filter(**{spec.scope_path: landlord})
+    qs = Model.objects.filter(spec.scope_q(landlord))
     q = (query or "").strip()
     if q:
         cond = Q()

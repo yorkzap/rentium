@@ -65,6 +65,14 @@ class AnthropicProvider(Provider):
             raise ProviderError(
                 f"Anthropic API error {exc.status_code}: {exc.message}"
             ) from exc
+        except anthropic.APITimeoutError as exc:
+            # A timeout is not "unreachable" — the request went out and the
+            # answer did not come back in time, which is usually a payload big
+            # enough to be slow. Saying "could not reach" sends whoever reads
+            # the audit log looking at the network instead of at the prompt.
+            raise ProviderError(
+                "The Anthropic API did not answer within the timeout."
+            ) from exc
         except anthropic.APIConnectionError as exc:
             raise ProviderError("Could not reach the Anthropic API.") from exc
 

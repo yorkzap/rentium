@@ -81,7 +81,6 @@ WAIVED: dict[str, str] = {
     # These are real landlord data and are the shortlist for the next pass.
     # They are waived rather than rushed: each needs its scope_path chosen and
     # its fields reviewed, and a wrong scope_path leaks across landlords.
-    "properties.PropertyArea": "layout of a unit — NEXT: 218 rows on live data",
     "properties.SharedInventoryItem": "shared-space inventory — NEXT",
     "leases.MoveOutRequest": "move-out workflow — NEXT, empty today",
     "leases.DepositDeduction": "deposit deductions — NEXT, empty today",
@@ -194,11 +193,32 @@ def test_scope_path_is_declared_and_resolves(key, spec):
     """
     assert spec.scope_path, f"{key} has no scope_path"
     model = apps.get_model(*spec.model.split("."))
-    current = model
-    for part in spec.scope_path.split("__"):
-        field = current._meta.get_field(part)
-        current = field.related_model
-    assert current is LandlordProfile, (
-        f"{key}.scope_path={spec.scope_path!r} ends at "
-        f"{current._meta.label if current else None}, not LandlordProfile"
-    )
+    # EVERY disjunct, not just the first. An entity with several parents
+    # (PropertyArea hangs off a unit, a group or a property) ORs them together,
+    # and one unchecked path is a path that reaches another landlord's rows.
+    for path in (spec.scope_path, *spec.alt_scope_paths):
+        current = model
+        for part in path.split("__"):
+            field = current._meta.get_field(part)
+            current = field.related_model
+        assert current is LandlordProfile, (
+            f"{key} scope path {path!r} ends at "
+            f"{current._meta.label if current else None}, not LandlordProfile"
+        )
+
+
+@pytest.mark.parametrize("key,spec", sorted(MANIFEST.items()))
+def test_nothing_scopes_itself_through_a_to_many(key, spec):
+    """A to-many hop in a scope path fans the row out and multiplies aggregates.
+
+    Forward FK/O2O only, for the same reason relation traversal is forward-only.
+    """
+    model = apps.get_model(*spec.model.split("."))
+    for path in (spec.scope_path, *spec.alt_scope_paths):
+        current = model
+        for part in path.split("__"):
+            field = current._meta.get_field(part)
+            assert field.many_to_one or field.one_to_one, (
+                f"{key} scope path {path!r} traverses {part!r}, which is to-many"
+            )
+            current = field.related_model

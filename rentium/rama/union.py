@@ -962,6 +962,101 @@ def property_layout(landlord) -> dict:
     }
 
 
+def _recorded_areas(prop):
+    """The layout a landlord actually recorded for this listing.
+
+    Two corrections to what this used to be, both found on live data:
+
+    1. It read ONLY `prop.primary_area_associations` — areas whose `property`
+       FK is this listing. But layout hangs off the UNIT (CLAUDE.md: a bedroom
+       inside a unit is layout, not an offering), so the Garden Suite reported
+       `recorded_internal_area_count: 0` while 22 areas — including two
+       bedrooms — sat on its unit. RAMA then answered "there's no bedroom count
+       recorded" without querying anything, because the snapshot in its context
+       already said so. A wrong number in the prompt is worse than a missing
+       one: it stops the question being asked.
+
+    2. A ROOM listing does not own the unit's layout. Its own areas and the
+       ones marked exclusive to it are its layout; the household kitchen is
+       shared space, not this room's.
+
+    Seeded placeholders stay excluded: they are scaffolding for maintenance and
+    inspections, not layout the landlord told us about, and reporting them
+    would turn "unknown" into invented fact.
+    """
+    from django.db.models import Q  # noqa: PLC0415
+
+    from rentium.properties.models import Property, PropertyArea  # noqa: PLC0415
+
+    recorded = PropertyArea.objects.filter(is_seeded_default=False)
+    if prop.property_category == Property.PropertyCategory.ROOM:
+        return recorded.filter(Q(property=prop) | Q(exclusive_to=prop)).distinct()
+    where = Q(property=prop)
+    if prop.unit_id:
+        where |= Q(unit_id=prop.unit_id)
+    return recorded.filter(where).distinct()
+
+
+def _unit_layout_counts(landlord) -> dict:
+    """unit_id → what the landlord recorded about that unit's layout.
+
+    Computed once for the whole snapshot rather than per listing.
+    """
+    from django.db.models import Count, Q  # noqa: PLC0415
+
+    from rentium.properties.models import PropertyUnit  # noqa: PLC0415
+
+    rows = (
+        PropertyUnit.objects.filter(landlord=landlord)
+        .select_related("holding")
+        .annotate(
+            beds=Count("areas", filter=Q(
+                areas__area_type="BEDROOM", areas__is_seeded_default=False)),
+            baths=Count("areas", filter=Q(
+                areas__area_type="BATHROOM", areas__is_seeded_default=False)),
+            recorded=Count("areas", filter=Q(areas__is_seeded_default=False)),
+        )
+    )
+    return {
+        unit.pk: {
+            "name": unit.name,
+            "holding": unit.holding.name if unit.holding_id else None,
+            "bedrooms": unit.beds or None,
+            "bathrooms": unit.baths or None,
+            "recorded_area_count": unit.recorded,
+        }
+        for unit in rows
+    }
+
+
+def _listing_layout_note(prop, unit_layouts) -> str:
+    """Why a listing shows zero recorded areas, when its unit does not.
+
+    Asked "how many bedrooms are there in the garden suite?", RAMA read the
+    LISTING called Garden Suite — `recorded_internal_area_count: 0` — and
+    answered "no bedroom count recorded", while the UNIT called Garden Suite
+    two rows away had two bedrooms recorded. A bare zero next to a name reads
+    as a fact about the place. It has to say whose zero it is.
+    """
+    if not prop.unit_id:
+        return ""
+    layout = unit_layouts.get(prop.unit_id)
+    if not layout or not layout["recorded_area_count"]:
+        return ""
+    parts = []
+    if layout["bedrooms"]:
+        parts.append(f"{layout['bedrooms']} bedroom(s)")
+    if layout["bathrooms"]:
+        parts.append(f"{layout['bathrooms']} bathroom(s)")
+    detail = ", ".join(parts) or f"{layout['recorded_area_count']} area(s)"
+    return (
+        f"No areas are recorded against this LISTING. Its unit "
+        f"{layout['name']!r} ({layout['holding']}) has {detail} recorded. "
+        f"Answer with the unit's layout and say it is the unit's — do not "
+        f"report this listing as having no recorded layout."
+    )
+
+
 def property_inventory(landlord, *, limit: int = 100) -> dict:
     """List physical holdings and every rentable listing within them.
 
@@ -1006,6 +1101,8 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
         "rented_or_committed": 0,  # same as has_lease_commitment (legacy)
         "term_overlaps_this_calendar_month": 0,
     }
+
+    unit_layouts = _unit_layout_counts(landlord)
 
     for prop in qs:
         status_counts[prop.status] = status_counts.get(prop.status, 0) + 1
@@ -1089,13 +1186,7 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
                 "count": area.count,
                 "description": area.description or None,
             }
-            # Seeded placeholders are excluded on purpose: they are
-            # scaffolding for maintenance/inspections, not layout the landlord
-            # told us about. Reporting them would turn "unknown" into invented
-            # fact.
-            for area in prop.primary_area_associations.filter(
-                is_seeded_default=False
-            )
+            for area in _recorded_areas(prop)
         ]
         row = {
             "id": str(prop.pk),
@@ -1127,6 +1218,12 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
                 "internal_areas": internal_areas,
                 "recorded_internal_area_count": sum(
                     area["count"] for area in internal_areas
+                ),
+                **(
+                    {"layout_recorded_on_unit_instead": _note}
+                    if not internal_areas
+                    and (_note := _listing_layout_note(prop, unit_layouts))
+                    else {}
                 ),
                 "room_count_guidance": (
                     "For a complete unit, 'rooms' can mean bedrooms or all internal "
@@ -1206,6 +1303,23 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
                 ],
             }
         )
+
+    # Two units called "Garden Suite" — one at 3213 Wascana St with nothing
+    # recorded, one at 950 McKenzie Ave with two bedrooms. Asked "how many
+    # bedrooms are there in the garden suite?", RAMA picked one and answered
+    # "not recorded", which was true of that row and false of the portfolio.
+    # Both rows carried their holding and it still read them as one place, so
+    # the ambiguity has to be stated, not merely derivable.
+    _name_counts: dict[str, int] = {}
+    for row in unit_rows:
+        _name_counts[row["name"]] = _name_counts.get(row["name"], 0) + 1
+    for row in unit_rows:
+        if _name_counts[row["name"]] > 1:
+            row["name_is_ambiguous"] = (
+                f"{_name_counts[row['name']]} units are called {row['name']!r}. "
+                f"This one is at {row['holding']}. NEVER answer about "
+                f"{row['name']!r} without saying which, or ask the landlord."
+            )
 
     room_hierarchy: list[dict] = []
     hierarchy_index: dict[tuple[str, str, str], dict] = {}

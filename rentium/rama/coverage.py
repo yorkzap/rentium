@@ -192,6 +192,7 @@ def unchecked_denials(
     entities_read: set[str],
     *,
     landlord_message: str = "",
+    proper_nouns: frozenset[str] = frozenset(),
 ) -> dict[str, frozenset[str]]:
     """Concepts denied in `text` whose own table this turn never read.
 
@@ -212,16 +213,24 @@ def unchecked_denials(
        the ledger, found it genuinely empty, and stopped. That check was
        correct and the conclusion was still wrong, because the other place held
        $1,600. One source can confirm a thing exists; it can never rule it out.
+    4. The word is not the NAME of something in the landlord's portfolio.
+       "How many bedrooms are there in the garden suite?" matched "suite"
+       against property_unit ("Unit within a holding (floor / suite)") and sent
+       RAMA away from property_area — which held both bedrooms — to a table
+       that could not answer. A name that happens to contain a domain word is
+       still a name. `proper_nouns` comes from the landlord's own units,
+       holdings, properties and people.
     """
     index = primary_index()
     read = set(entities_read or ())
     asked = set(_words(landlord_message or ""))
     if not asked:
         return {}
+    names = {_stem(word) for word in (proper_nouns or ())}
     flagged: dict[str, frozenset[str]] = {}
     for sentence in denial_sentences(text):
         for word in _words(sentence):
-            if word not in asked:
+            if word not in asked or word in names:
                 continue
             owners = index.get(word)
             if not owners or len(owners) > 3:
