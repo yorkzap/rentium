@@ -10,9 +10,23 @@ import json
 import logging
 import uuid
 
+from django.conf import settings
+
 from config.celery_app import app
 
 logger = logging.getLogger(__name__)
+
+# See comms/tasks.py: any task that runs a model turn must grant it more than
+# the project-wide 60s soft limit, or the turn's own graceful stop is dead code.
+_TURN_LIMITS = {
+    "soft_time_limit": settings.RAMA_TURN_TASK_SOFT_TIME_LIMIT,
+    "time_limit": settings.RAMA_TURN_TASK_TIME_LIMIT,
+}
+# One whole turn per landlord, off the interactive path.
+_BATCH_TURN_LIMITS = {
+    "soft_time_limit": settings.RAMA_TURN_BATCH_SOFT_TIME_LIMIT,
+    "time_limit": settings.RAMA_TURN_BATCH_TIME_LIMIT,
+}
 
 # Per-kind title + a short instruction on what the FSA should produce —
 # kept here (not in the model) so it's easy to extend per finding type.
@@ -108,7 +122,7 @@ def run_sergeants() -> dict:
     return sergeants.run_all()
 
 
-@app.task(bind=True, max_retries=2)
+@app.task(bind=True, max_retries=2, **_TURN_LIMITS)
 def analyze_finding(self, event_id: str) -> None:
     from django.core.exceptions import ValidationError
 
@@ -173,7 +187,7 @@ def analyze_finding(self, event_id: str) -> None:
     )
 
 
-@app.task
+@app.task(**_BATCH_TURN_LIMITS)
 def run_weekly_deliberation() -> dict:
     """One Treasurer analysis per landlord per week.
 

@@ -162,6 +162,40 @@ def _filterable_names(spec: EntitySpec) -> str:
     return ", ".join(local)
 
 
+_PERIOD_IN_FILTER = re.compile(
+    r"^\s*(month|year)(?::[a-z_]+)?\s*=\s*(.+?)\s*$", re.I,
+)
+
+
+def _lift_period_out_of_filters(filters: str, month: str, year: str, fmap: dict):
+    """Accept `month=2026-08` written as a FILTER instead of an argument.
+
+    `month:due_date` is real syntax — for group_by — and the model reasonably
+    assumed it worked in filters too, spending two of its eight rounds on
+    "Can't filter on 'month'" and "Can't filter on 'month:due_date'". The
+    intent is unambiguous and the destination already exists, so honour it
+    rather than teach the distinction. An explicit month= argument still wins.
+    """
+    kept = []
+    for clause in (filters or "").split(","):
+        match = _PERIOD_IN_FILTER.match(clause)
+        if match is None:
+            if clause.strip():
+                kept.append(clause.strip())
+            continue
+        which, value = match.group(1).casefold(), match.group(2)
+        if which in fmap:
+            # An entity that really has a column called `month` means it; the
+            # convenience must never shadow a declared field.
+            kept.append(clause.strip())
+            continue
+        if which == "month" and not month.strip():
+            month = value
+        elif which == "year" and not year.strip():
+            year = value
+    return ", ".join(kept), month, year
+
+
 def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = None):
     """Returns (include_kwargs, exclude_kwargs, error)."""
     include: dict = {}
@@ -531,7 +565,11 @@ def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
     Model = apps.get_model(*spec.model.split("."))
     fmap = spec.field_map()
 
-    include, exclude, ferr = _parse_filters(filters or "", fmap, spec)
+    filters, month, year = _lift_period_out_of_filters(
+        filters or "", month, year, fmap,
+    )
+
+    include, exclude, ferr = _parse_filters(filters, fmap, spec)
     if ferr:
         return {"error": ferr}
 

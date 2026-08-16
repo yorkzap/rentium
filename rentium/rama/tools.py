@@ -221,6 +221,20 @@ def read(landlord, entity: str = "", filters: str = "", fields: str = "",
       not expected income — exclude it with `is_damage_claim!=true` when
       reporting what you expect to collect.
     - Voided/reversed entries are already excluded; the reply says so.
+    - A DISCOUNT IS NOT A NEGATIVE LEDGER LINE. Discounts, first-month
+      prorations and rent increases are all `rent_adjustment` rows against a
+      tenant; the ledger only ever shows the already-adjusted figure, so
+      searching it for `amount<0` finds nothing and proves nothing. Ask:
+        entity='rent_adjustment', filters='adjustment_type=DISCOUNT',
+        month='2026-08'
+      `target_amount` is the rent actually charged when set; `amount` is the
+      amount off (or the percentage — check `calculation_method` before
+      summing a mix of the two).
+
+    BEFORE YOU SAY SOMETHING DOES NOT EXIST: check that you read the record
+    type that would hold it. "No X recorded" after querying the wrong entity is
+    a wrong answer, not a cautious one. Call data_catalogue if you are unsure
+    where a concept lives.
     """
     from .domain_read import read as _fn
     return _fn(

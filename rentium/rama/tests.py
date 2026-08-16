@@ -963,8 +963,14 @@ def test_chat_tool_round_limit(landlord, settings):
         ]
     )
     body = _chat(_client_for(landlord), endless, {"message": "loop"}).json()
+    # This model never stops calling tools, so the wrap-up round gets no prose
+    # out of it either and the canned dead-end still ships. A model with an
+    # answer in hand gets it delivered instead — see test_budget_wrap_up.py.
     assert "steps" in body["reply"]  # softened dead-end, not a hard discard
-    assert len(endless.requests) == 8  # bounded model loop; deterministic routes do more
+    # 8 tool rounds, then one final round with no tools offered, asking it to
+    # answer from what it already gathered rather than discarding all of it.
+    assert len(endless.requests) == 9  # bounded model loop; deterministic routes do more
+    assert endless.requests[-1]["tools"] == []
 
 
 # ------------------------------------------------ deterministic confirm loop

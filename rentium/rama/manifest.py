@@ -452,6 +452,105 @@ LEDGER_ENTRY = EntitySpec(
     ],
 )
 
+# A discount in Rentium is NOT a negative ledger entry. It is a RentAdjustment
+# against a LeaseTenant, which changes what gets CHARGED — the ledger only ever
+# shows the adjusted figure. Asked "did I give anyone a discount this month?",
+# RAMA reasoned from generic accounting, searched the ledger for `amount<0`,
+# found nothing, and answered "No — I don't see any discounts recorded", while a
+# $1,600 DISCOUNT sat in this table. Not being able to see a thing produced a
+# confident denial that it existed, which is worse than any error message.
+RENT_ADJUSTMENT = EntitySpec(
+    key="rent_adjustment",
+    model="leases.RentAdjustment",
+    label="Rent adjustment (discount / proration / increase)",
+    # NOT `created_by`, which is the shortest path to a LandlordProfile and the
+    # wrong one: it records who typed the adjustment, not whose portfolio it
+    # belongs to. Scope is ownership, so it is declared, never inferred.
+    scope_path="lease_tenant__lease__landlord",
+    date_field="effective_date",
+    default_order="-effective_date",
+    fields=[
+        FieldSpec(
+            "adjustment_type", "Kind", "enum",
+            display="get_adjustment_type_display", groupable=True,
+        ),
+        FieldSpec(
+            "calculation_method", "How it was calculated", "enum",
+            display="get_calculation_method_display", groupable=True,
+        ),
+        # Dollars off for FLAT_AMOUNT, percent for PERCENTAGE — summing across
+        # a mix of both is meaningless, so the two are told apart by grouping
+        # on calculation_method.
+        FieldSpec("amount", "Amount off / on", "money", aggregatable=True),
+        # The figure actually charged when set, overriding the arithmetic above.
+        # This is the $400 the landlord remembered.
+        FieldSpec(
+            "target_amount", "Rent charged instead", "money",
+            aggregatable=True, nullable=True,
+        ),
+        FieldSpec("reason", "Reason"),
+        FieldSpec("effective_date", "Effective from", "date"),
+        FieldSpec("end_date", "Until", "date", nullable=True),
+        FieldSpec("is_recurring", "Every cycle", "bool", groupable=True),
+    ],
+)
+
+# The middle of the hierarchy (holding → unit → property). Both were invisible,
+# so "which units are in the McKenzie house?" had no answer at all.
+PROPERTY_HOLDING = EntitySpec(
+    key="property_holding",
+    model="properties.PropertyHolding",
+    label="Property holding (the physical address)",
+    scope_path="landlord",
+    lookup=("name", "address"),
+    label_field="name",
+    fields=[
+        FieldSpec("name", "Name"),
+        FieldSpec("kind", "Kind", "enum", display="get_kind_display",
+                  groupable=True),
+        FieldSpec("address", "Address"),
+        # Free text, so not groupable — a group per distinct spelling reads
+        # like a summary and isn't one.
+        FieldSpec("city", "City"),
+    ],
+)
+
+PROPERTY_UNIT = EntitySpec(
+    key="property_unit",
+    model="properties.PropertyUnit",
+    label="Unit within a holding (floor / suite)",
+    scope_path="landlord",
+    lookup=("name",),
+    label_field="name",
+    fields=[
+        FieldSpec("name", "Name"),
+        FieldSpec("unit_type", "Unit type", "enum",
+                  display="get_unit_type_display", groupable=True),
+        # WHOLE vs BY_ROOM decides whether bedrooms are layout or lettable
+        # offerings — see CLAUDE.md. A question about rooms means nothing
+        # without it.
+        FieldSpec("rental_mode", "Offered as", "enum",
+                  display="get_rental_mode_display", groupable=True),
+        FieldSpec("layout_complete", "Layout recorded", "bool", groupable=True),
+        FieldSpec("missing_layout_notes", "Layout gaps", filterable=False),
+    ],
+)
+
+OCCUPANCY = EntitySpec(
+    key="occupancy",
+    model="leases.Occupancy",
+    label="Who physically lives in a room, and when",
+    scope_path="lease__landlord",
+    date_field="move_in",
+    default_order="-move_in",
+    fields=[
+        FieldSpec("move_in", "Moved in", "date"),
+        # Genuinely nullable and meaningful: blank = still living there.
+        FieldSpec("move_out", "Moved out", "date", nullable=True),
+        FieldSpec("note", "Note", filterable=False),
+    ],
+)
+
 INSPECTION = EntitySpec(
     key="inspection",
     model="leases.ConditionInspection",
@@ -707,8 +806,20 @@ def relation_label_path(spec: EntitySpec, name: str) -> str | None:
     if relation is None:
         return None
     target = MANIFEST[relation.target]
+    fields = target.field_map()
     label_field = target.resolve_label()
-    if not label_field or label_field not in target.field_map():
+    if label_field not in fields:
+        # An entity's display name is often a PROPERTY, not a column —
+        # LeaseTenant.display_name picks the signed-up name over the invited
+        # one. You cannot GROUP BY a property, and returning None here meant
+        # "group these adjustments by tenant" was simply refused. The lookup
+        # fields are declared columns chosen to identify a row to a human,
+        # which is the same job.
+        label_field = next(
+            (f for f in target.resolve_lookup() if f in fields),
+            "",
+        )
+    if not label_field:
         return None
     return f"{name}__{label_field}"
 
@@ -720,7 +831,8 @@ MANIFEST: dict[str, EntitySpec] = {
     e.key: e
     for e in (
         PROPERTY, LEASE, LEASE_TENANT, WORK_ORDER, INQUIRY, APPOINTMENT,
-        LEDGER_ENTRY, INSPECTION, INVENTORY, CONVERSATION, PROPERTY_GROUP,
+        LEDGER_ENTRY, RENT_ADJUSTMENT, INSPECTION, INVENTORY, CONVERSATION,
+        PROPERTY_GROUP, PROPERTY_HOLDING, PROPERTY_UNIT, OCCUPANCY,
         BUSINESS_DOCUMENT, LEASE_FORM,
     )
 }

@@ -283,6 +283,26 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_TIME_LIMIT = 5 * 60
 CELERY_TASK_SOFT_TIME_LIMIT = 60
+# A RAMA turn is an interactive model loop, not an ordinary job: it runs several
+# provider round-trips and is meant to stop itself politely at
+# RAMA_TURN_BUDGET_SECONDS. The default 60s soft limit sat BELOW that budget, so
+# Celery killed the task before the graceful stop could ever fire and the
+# landlord got "something broke" instead of a partial answer. Turn-running tasks
+# opt into this larger limit; run_turn clamps its own budget to whatever the
+# caller actually grants, so the two can never disagree again.
+RAMA_TURN_BUDGET_SECONDS = 90
+# Room for the final model round that produces the answer, plus persistence and
+# the outbound send, after the loop stops accepting new rounds.
+RAMA_TURN_TASK_HEADROOM_SECONDS = 30
+RAMA_TURN_TASK_SOFT_TIME_LIMIT = (
+    RAMA_TURN_BUDGET_SECONDS + RAMA_TURN_TASK_HEADROOM_SECONDS
+)
+RAMA_TURN_TASK_TIME_LIMIT = RAMA_TURN_TASK_SOFT_TIME_LIMIT + 60
+# Batch tasks (morning briefings, weekly deliberation) run one whole turn PER
+# LANDLORD, so they need many turns' worth. They are off the interactive path,
+# so the ceiling is generous.
+RAMA_TURN_BATCH_SOFT_TIME_LIMIT = 15 * 60
+RAMA_TURN_BATCH_TIME_LIMIT = RAMA_TURN_BATCH_SOFT_TIME_LIMIT + 5 * 60
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 CELERY_WORKER_SEND_TASK_EVENTS = True
 CELERY_TASK_SEND_SENT_EVENT = True

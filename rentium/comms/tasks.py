@@ -9,7 +9,24 @@ from __future__ import annotations
 import logging
 import uuid
 
+from django.conf import settings
+
 from config.celery_app import app
+
+# A turn is an interactive model loop that stops itself at
+# RAMA_TURN_BUDGET_SECONDS. Under the project-wide 60s soft limit that stop was
+# unreachable and Celery killed the turn instead, so the landlord got "something
+# broke" in place of the partial answer we were already holding. run_turn clamps
+# itself to whatever it is granted, so these two can no longer drift apart.
+_TURN_LIMITS = {
+    "soft_time_limit": settings.RAMA_TURN_TASK_SOFT_TIME_LIMIT,
+    "time_limit": settings.RAMA_TURN_TASK_TIME_LIMIT,
+}
+# One whole turn per landlord, off the interactive path.
+_BATCH_TURN_LIMITS = {
+    "soft_time_limit": settings.RAMA_TURN_BATCH_SOFT_TIME_LIMIT,
+    "time_limit": settings.RAMA_TURN_BATCH_TIME_LIMIT,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +44,7 @@ def whatsapp_conversation_id(wa_id: str) -> uuid.UUID:
     return uuid.uuid5(WHATSAPP_CONVERSATION_NAMESPACE, f"wa:{wa_id}")
 
 
-@app.task
+@app.task(**_BATCH_TURN_LIMITS)
 def send_morning_briefings() -> dict:
     """Beat entry point: one deterministic digest per landlord, sent to
     every channel that opted in (prefs.briefing = true). $0 LLM by default
@@ -162,7 +179,7 @@ def _stage_telegram_document(
         return ""
 
 
-@app.task(bind=True, max_retries=2)
+@app.task(bind=True, max_retries=2, **_TURN_LIMITS)
 def handle_telegram_message(
     self,
     landlord_id: str,
@@ -308,7 +325,7 @@ def _deliver_attachments(landlord, chat_id, attachments, transport) -> None:
             logger.exception("attachment delivery failed for %s", kind)
 
 
-@app.task(bind=True, max_retries=2)
+@app.task(bind=True, max_retries=2, **_TURN_LIMITS)
 def handle_whatsapp_message(self, landlord_id: str, wa_id: str, text: str) -> None:
     """Same seam as handle_telegram_message, for WhatsApp. Only LANDLORD chats
     reach here (the webhook sends a tenant a canned reply), so RAMA's

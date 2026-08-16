@@ -33,6 +33,8 @@ from . import autonomy as autonomy_policy
 from . import memory
 from .capabilities import select_tool_schemas
 from .capabilities import supported_tool_for_request
+from .coverage import look_here_first
+from .coverage import unchecked_denials
 from .intent_contract import contract_for_effects
 from .intent_contract import contract_from_messages
 from .intent_contract import validate_step as validate_intent_step
@@ -72,9 +74,113 @@ MAX_TOOL_ROUNDS = 8
 # `read` turns that into a single call, which is the actual fix. The extra
 # headroom is for the genuinely multi-step turn, and the check runs at loop top
 # so one slow final call can still overshoot it.
-TURN_BUDGET_SECONDS = 75
+TURN_BUDGET_SECONDS = getattr(settings, "RAMA_TURN_BUDGET_SECONDS", 90)
+# Below this a turn can't do useful work, so we'd rather answer late than answer
+# nothing; the caller's hard limit still bounds us either way.
+MIN_TURN_BUDGET_SECONDS = 25
+
+
+def _caller_soft_deadline() -> float | None:
+    """Seconds the CALLER will let this turn run, if it says so.
+
+    Celery kills a task at its soft time limit with SoftTimeLimitExceeded. When
+    that limit is smaller than TURN_BUDGET_SECONDS the graceful stop below is
+    unreachable — the turn dies mid-flight and the landlord is told "something
+    broke" instead of getting the partial answer we were holding. Rather than
+    hand-matching two numbers in two files (they had already drifted 75 vs 60),
+    the loop asks how much time it actually has.
+    """
+    try:
+        from celery import current_task  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - celery is a hard dependency
+        return None
+    task = current_task
+    if task is None or getattr(task, "request", None) is None:
+        return None  # not inside a worker: the caller imposes no deadline
+    # Per-call limits (apply_async(soft_time_limit=…)) win over the task's own,
+    # which win over the app default.
+    limits = getattr(task.request, "timelimit", None) or (None, None)
+    soft = limits[0]
+    if soft is None:
+        soft = getattr(task, "soft_time_limit", None)
+    if soft is None:
+        soft = getattr(settings, "CELERY_TASK_SOFT_TIME_LIMIT", None)
+    return float(soft) if soft else None
+
+
+def _turn_budget_seconds() -> float:
+    """TURN_BUDGET_SECONDS, clamped to fit inside the caller's deadline."""
+    soft = _caller_soft_deadline()
+    if soft is None:
+        return float(TURN_BUDGET_SECONDS)
+    headroom = float(
+        getattr(settings, "RAMA_TURN_TASK_HEADROOM_SECONDS", 30),
+    )
+    return max(
+        float(MIN_TURN_BUDGET_SECONDS),
+        min(float(TURN_BUDGET_SECONDS), soft - headroom),
+    )
 HISTORY_TURNS = 12
 MAX_MESSAGE_CHARS = 6000
+
+# Sent when a turn runs out of rounds or seconds. Both exhaustion paths used to
+# discard every tool result and emit a canned apology — on one observed turn,
+# ten successful reads including the exact rows the landlord asked about. The
+# data was in hand; only the sentence was missing.
+_WRAP_UP_NOW = (
+    "STOP — you are out of budget for this turn and cannot call another tool.\n"
+    "Answer the landlord's question NOW from the tool results already in this "
+    "conversation.\n"
+    "- Give every figure you actually retrieved, per row, with its identifier.\n"
+    "- If those results don't fully answer the question, say what you found and "
+    "name the specific part that is still unknown.\n"
+    "- Do not promise to go and look again, and do not claim you changed "
+    "anything.\n"
+    "A partial answer built on real data is what is wanted. An apology with no "
+    "data in it is not."
+)
+
+
+def _wrap_up_reply(
+    provider,
+    *,
+    model,
+    system,
+    messages,
+    api_key,
+    audit,
+    reason: str,
+    fallback: str,
+):
+    """Spend the last of the budget turning gathered results into an answer.
+
+    Returns a Turn. Falls back to `fallback` if the model has nothing to say or
+    the provider fails — running out of budget must never become an exception.
+    """
+    try:
+        wrapped = provider.complete(
+            model=model,
+            system=system,
+            # tools omitted, not empty: this round must produce prose. Both
+            # adapters drop the key when tools are falsy.
+            messages=[*messages, {"role": "user", "content": _WRAP_UP_NOW}],
+            tools=[],
+            api_key=api_key,
+        )
+    except ProviderError as exc:
+        audit(
+            RamaAudit.Kind.ERROR,
+            {"error": "wrap_up_failed", "reason": reason, "detail": str(exc)},
+        )
+        return Turn(text=fallback)
+    text = (wrapped.text or "").strip()
+    if not text:
+        return Turn(text=fallback)
+    audit(
+        RamaAudit.Kind.ERROR,
+        {"error": reason, "guard": reason, "recovered": True},
+    )
+    return Turn(text=text)
 # A previewed plan is honored as "the thing the landlord just said yes to" only
 # while it's fresh; after this it's stale and the model must re-preview.
 PENDING_ACTION_TTL_SECONDS = PENDING_PLAN_TTL_SECONDS
@@ -3068,6 +3174,44 @@ def _capability_gap_hint(landlord, message: str, conversation_id) -> str:
     )
 
 
+# Reads that are safe to serve from this turn's own cache. Writes and previews
+# are excluded on purpose: their result depends on state a previous call in the
+# same turn may have changed.
+_REPEATABLE_READS = frozenset({"read", "data_catalogue", "resolve_person"})
+
+
+def _execute_once(tool_name, arguments, *, landlord, seen: dict):
+    """Run a read, or hand back this turn's identical earlier answer.
+
+    Watching a turn burn its step budget: the model read Aishwarya's row, got
+    `rent_amount: 0.00`, decided that could not be the answer, and issued the
+    byte-identical query twice more before running out of rounds. Re-running it
+    cannot produce a different row, so the repeat is spent proving that — and a
+    tool result is the only channel that reliably reaches the model, so the
+    cached copy carries the observation with it.
+    """
+    if tool_name not in _REPEATABLE_READS:
+        return execute(tool_name, arguments, landlord=landlord)
+    key = (tool_name, json.dumps(arguments, sort_keys=True, default=str))
+    if key in seen:
+        cached = seen[key]
+        if isinstance(cached, dict):
+            return {
+                **cached,
+                "note": (
+                    "You already ran this exact query in this turn and this is "
+                    "the same answer — it cannot change. If it doesn't contain "
+                    "what you need, the data is somewhere else: change the "
+                    "entity or the filters, or tell the landlord what you found "
+                    "and what is missing."
+                ),
+            }
+        return cached
+    result = execute(tool_name, arguments, landlord=landlord)
+    seen[key] = result
+    return result
+
+
 def _refuse_if_already_done(tool_name, arguments, result, landlord):
     """Replace a preview with a refusal when the write is already on the books.
 
@@ -5667,6 +5811,7 @@ def _run_turn_unlocked(
             message,
             schemas,
             limit=max(6, int(getattr(settings, "RAMA_TOOL_RETRIEVAL_LIMIT", 12))),
+            landlord=landlord,
         )
         required_capability = str(
             intent_contract.get("required_capability") or "",
@@ -5683,6 +5828,12 @@ def _run_turn_unlocked(
             schemas = [*schemas[:-1], required_schema]
     max_rounds = SUB_TURN_MAX_ROUNDS if depth >= 1 else MAX_TOOL_ROUNDS
     tools_used: list[str] = ["_live_context"]
+    # Manifest entities this turn actually queried, so a reply that reports the
+    # ABSENCE of something can be checked against whether we looked where it
+    # lives. See rama/coverage.py for the August 2026 denial that motivated it.
+    entities_read: set[str] = set()
+    # This turn's read results, keyed by tool + arguments — see _execute_once.
+    read_results: dict = {}
     # Tools whose RESULT said a change landed. Distinct from tools_used: a
     # model-issued write call has its confirm blanked, so it previews and
     # writes nothing — see _is_write_result.
@@ -7773,7 +7924,9 @@ def _run_turn_unlocked(
                 12,
                 int(getattr(settings, "RAMA_TOOL_RETRIEVAL_LIMIT", 12)),
             ),
+            landlord=landlord,
         )
+    turn_budget = _turn_budget_seconds()
     try:
         # A compile recovery earns exactly one extra model round. Ordinary and
         # endlessly tool-calling turns keep the existing hard round limit.
@@ -7781,7 +7934,7 @@ def _run_turn_unlocked(
         round_number = 0
         model_loop_started = time.monotonic()
         while round_number < round_budget:
-            if time.monotonic() - model_loop_started >= TURN_BUDGET_SECONDS:
+            if time.monotonic() - model_loop_started >= turn_budget:
                 audit(
                     RamaAudit.Kind.ERROR,
                     {
@@ -7789,13 +7942,20 @@ def _run_turn_unlocked(
                         "rounds": round_number,
                     },
                 )
-                turn = Turn(
-                    text=(
+                turn = _wrap_up_reply(
+                    provider,
+                    model=model,
+                    system=system,
+                    messages=messages,
+                    api_key=api_key,
+                    audit=audit,
+                    reason="turn_time_budget_exhausted",
+                    fallback=(
                         "I stopped this turn because the model kept looking "
                         "without producing an executable answer. Nothing was "
                         "changed. Please retry; RAMA will not keep a request "
                         "open indefinitely."
-                    )
+                    ),
                 )
                 break
             round_number += 1
@@ -7840,6 +8000,7 @@ def _run_turn_unlocked(
                                     )
                                 ),
                             ),
+                            landlord=landlord,
                         )
                     continue
                 break
@@ -7900,7 +8061,12 @@ def _run_turn_unlocked(
                         if receipt not in delegated_auto:
                             delegated_auto.append(receipt)
                 else:
-                    result = execute(call.name, effective_arguments, landlord=landlord)
+                    result = _execute_once(
+                        call.name,
+                        effective_arguments,
+                        landlord=landlord,
+                        seen=read_results,
+                    )
                 # Before this preview can become a proposal: is it already done?
                 # A preview is side-effect free, so replacing it here costs
                 # nothing and means the duplicate is never shown at all.
@@ -7916,6 +8082,12 @@ def _run_turn_unlocked(
                 ):
                     turn_attachments.append(result["_attachment"])
                 tools_used.append(call.name)
+                # Which record types this turn actually looked in. A denial the
+                # landlord will read as "zero" has to be backed by a read of
+                # somewhere the thing could have been — see rama/coverage.py.
+                _entity_arg = str(effective_arguments.get("entity") or "").strip()
+                if _entity_arg:
+                    entities_read.add(_entity_arg)
                 if _is_write_result(result):
                     turn_writes.append(call.name)
                 audit(
@@ -8079,8 +8251,15 @@ def _run_turn_unlocked(
                 )
         else:
             partial = (turn.text or "").strip()
-            turn = Turn(
-                text=(
+            turn = _wrap_up_reply(
+                provider,
+                model=model,
+                system=system,
+                messages=messages,
+                api_key=api_key,
+                audit=audit,
+                reason="turn_step_budget_exhausted",
+                fallback=(
                     (
                         partial
                         + "\n\n(I hit my step limit for one turn — say 'continue' "
@@ -8230,26 +8409,47 @@ def _run_turn_unlocked(
         and not _stalled
         and asks_for_what_the_books_hold(turn.text, landlord_message=message)
     )
+    # A denial is a claim about the books, and it needs the same standard of
+    # evidence as any other. "No — I don't see any discounts recorded" was true
+    # of everywhere RAMA looked and false of the portfolio, because the table
+    # holding discounts was never queried. Same continuation round, with an
+    # instruction naming where the concept actually lives.
+    _unchecked = (
+        {}
+        if (pending_specs or not turn.text or _stalled or _asked_for_own_data)
+        else unchecked_denials(
+            turn.text, entities_read, landlord_message=message,
+        )
+    )
     if (
-        (_stalled or _asked_for_own_data)
-        and time.monotonic() - model_loop_started < TURN_BUDGET_SECONDS
+        (_stalled or _asked_for_own_data or _unchecked)
+        and time.monotonic() - model_loop_started < turn_budget
     ):
+        if _stalled:
+            _error, _guard = "promised_without_delivering", "promises_without_delivering"
+        elif _asked_for_own_data:
+            _error, _guard = "asked_landlord_for_stored_data", "asks_for_what_the_books_hold"
+        else:
+            _error, _guard = "denied_without_checking", "unchecked_denials"
         audit(
             RamaAudit.Kind.ERROR,
             {
-                "error": (
-                    "promised_without_delivering"
-                    if _stalled
-                    else "asked_landlord_for_stored_data"
-                ),
-                "guard": (
-                    "promises_without_delivering"
-                    if _stalled
-                    else "asks_for_what_the_books_hold"
-                ),
+                "error": _error,
+                "guard": _guard,
                 "text": turn.text[:500],
+                **(
+                    {"concepts": sorted(_unchecked), "entities_read": sorted(entities_read)}
+                    if _unchecked
+                    else {}
+                ),
             },
         )
+        if _stalled:
+            _instruction = _DELIVER_NOW
+        elif _asked_for_own_data:
+            _instruction = _LOOK_IT_UP
+        else:
+            _instruction = look_here_first(_unchecked)
         messages.append({"role": "assistant", "text": turn.text})
         messages.append(
             # "content", not "text" — a user message that carries its text under
@@ -8257,7 +8457,7 @@ def _run_turn_unlocked(
             # catches, so this recovery round returned an HTTP 500 and the
             # landlord got no reply at all. providers.base.validate_wire now
             # rejects the shape with a catchable ProviderError.
-            {"role": "user", "content": _DELIVER_NOW if _stalled else _LOOK_IT_UP},
+            {"role": "user", "content": _instruction},
         )
         try:
             follow_up = provider.complete(

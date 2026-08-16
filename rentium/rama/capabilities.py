@@ -7,12 +7,15 @@ small relevant surface instead of all 100+ schemas on every turn.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .registry import REGISTRY
 from .tool_meta import meta_for
+
+logger = logging.getLogger(__name__)
 
 _TOKEN = re.compile(r"[a-z0-9]+")
 
@@ -882,11 +885,48 @@ def supported_tool_for_request(request: str) -> str | None:
     return None
 
 
+def _portfolio_first_names(landlord) -> frozenset[str]:
+    """Name tokens belonging to real people in this landlord's books.
+
+    Lexical retrieval cannot know that "aishwarya" is a person: the word shares
+    nothing with resolve_person's description ("Find tenants by partial name or
+    email"), so asked whether Aishwarya and Naveen got a discount, RAMA was never
+    offered the one tool built for exactly that and spent six `read` calls
+    guessing at filter names — `lease_tenant__name`, then `name`, then the same
+    query three times. The landlord's own data knows the word is a name.
+    """
+    from rentium.leases.models import LeaseTenant  # noqa: PLC0415
+
+    rows = LeaseTenant.objects.filter(lease__landlord=landlord).values_list(
+        "invited_name", "tenant__user__name",
+    )
+    tokens: set[str] = set()
+    for invited, account in rows:
+        for full in (invited or "", account or ""):
+            for part in full.casefold().split():
+                cleaned = "".join(c for c in part if c.isalpha())
+                # Two-letter fragments and initials match too much prose.
+                if len(cleaned) >= 3:
+                    tokens.add(cleaned)
+    return frozenset(tokens)
+
+
+def names_someone_in_the_portfolio(message: str, landlord) -> bool:
+    if landlord is None or not (message or "").strip():
+        return False
+    words = {
+        "".join(c for c in word if c.isalpha())
+        for word in (message or "").casefold().split()
+    }
+    return bool(words & _portfolio_first_names(landlord))
+
+
 def select_tool_schemas(
     message: str,
     schemas: list[dict],
     *,
     limit: int = 12,
+    landlord=None,
 ) -> list[dict]:
     """Return a stable, relevant subset from an already role-filtered surface."""
     if len(schemas) <= limit:
@@ -906,6 +946,14 @@ def select_tool_schemas(
     forced = supported_tool_for_request(message)
     if forced and forced in by_name and by_name[forced] not in selected:
         selected.append(by_name[forced])
+    # The landlord named a real person. Whatever else the question is about,
+    # resolving that name is step one and costs one call instead of six.
+    if "resolve_person" in by_name and by_name["resolve_person"] not in selected:
+        try:
+            if names_someone_in_the_portfolio(message, landlord):
+                selected.append(by_name["resolve_person"])
+        except Exception:  # noqa: BLE001 - retrieval must never break a turn
+            logger.exception("portfolio name pin failed")
     # Lease drafts almost always need invite as the next step.
     if forced == "create_lease" and "invite_tenant_to_lease" in by_name:
         invite = by_name["invite_tenant_to_lease"]

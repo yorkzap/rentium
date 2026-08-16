@@ -38,7 +38,12 @@ class OpenAIProvider(Provider):
                 {"role": "system", "content": system},
                 *[self._to_wire(m) for m in messages],
             ],
-            "tools": [
+        }
+        # Omitted, not sent empty: OpenAI rejects `"tools": []`, and a call with
+        # no tools is a real case — the out-of-budget wrap-up asks for prose over
+        # results already gathered.
+        if tools:
+            payload["tools"] = [
                 {
                     "type": "function",
                     "function": {
@@ -48,8 +53,7 @@ class OpenAIProvider(Provider):
                     },
                 }
                 for t in tools
-            ],
-        }
+            ]
         max_tokens = int(
             getattr(settings, "RAMA_MAX_TOKENS", DEFAULT_MAX_TOKENS)
         )

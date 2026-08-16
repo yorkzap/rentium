@@ -40,21 +40,27 @@ class AnthropicProvider(Provider):
                 ),
             ),
         )
+        payload = {
+            "model": model,
+            "max_tokens": _max_tokens(),
+            "system": system,
+            "messages": [self._to_wire(m) for m in messages],
+        }
+        # Omitted, not sent empty: a call with no tools means "answer in prose"
+        # (the out-of-budget wrap-up), and OpenAI rejects an empty tools array
+        # outright. Both adapters treat falsy tools the same way so the caller
+        # doesn't have to know which provider it is talking to.
+        if tools:
+            payload["tools"] = [
+                {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "input_schema": t["parameters"],
+                }
+                for t in tools
+            ]
         try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=_max_tokens(),
-                system=system,
-                tools=[
-                    {
-                        "name": t["name"],
-                        "description": t["description"],
-                        "input_schema": t["parameters"],
-                    }
-                    for t in tools
-                ],
-                messages=[self._to_wire(m) for m in messages],
-            )
+            response = client.messages.create(**payload)
         except anthropic.APIStatusError as exc:
             raise ProviderError(
                 f"Anthropic API error {exc.status_code}: {exc.message}"
