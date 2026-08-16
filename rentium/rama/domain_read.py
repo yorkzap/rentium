@@ -39,8 +39,9 @@ from .manifest import (
     EntitySpec,
     FieldSpec,
     relation_label_path,
-    relations_for,
+    relation_paths,
     resolve_path,
+    resolve_relation,
 )
 
 # Longest operators first so ">=" isn't mis-split as ">".
@@ -154,12 +155,104 @@ def _filterable_names(spec: EntitySpec) -> str:
     that is precisely how it ended up reading the ledger once per lease.
     """
     local = [k for k, f in spec.field_map().items() if f.filterable]
-    rels = sorted(relations_for(spec))
+    rels = relation_paths(spec)
     if rels:
         local.append(
-            "and through relations: " + ", ".join(f"{r}__…" for r in rels),
+            "and these relations — each usable as `rel__field=…` or named "
+            "directly as `rel=<id or name>`: " + ", ".join(rels),
         )
     return ", ".join(local)
+
+
+_UUID = re.compile(r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$",
+                   re.I)
+
+
+def _identity_paths(prefix: str, target: EntitySpec) -> list[str]:
+    """Declared text columns on the far side that identify one row to a human.
+
+    `resolve_lookup()` is already exactly that list — it is what `link` searches
+    when the landlord names a thing — so a relation becomes filterable by name
+    without anybody declaring anything twice.
+    """
+    fmap = target.field_map()
+    return [
+        f"{prefix}__{fname}"
+        for fname in target.resolve_lookup()
+        if (fs := fmap.get(fname)) is not None
+        and fs.filterable
+        and not fs.source
+        and fs.type in ("string", "enum")
+    ]
+
+
+def _pk_shaped(target: EntitySpec, value: str) -> bool:
+    """Is this value shaped like the far side's primary key?
+
+    Checked against the actual pk field rather than assumed, so a numeric value
+    against a UUID key falls through to a name match instead of reaching the
+    database and coming back as a ValidationError about a malformed uuid — a
+    true statement about the wrong reading of the question.
+    """
+    from django.apps import apps  # noqa: PLC0415
+
+    pk = apps.get_model(*target.model.split("."))._meta.pk.get_internal_type()
+    if pk == "UUIDField":
+        return bool(_UUID.match(value))
+    if pk in ("AutoField", "BigAutoField", "SmallAutoField", "IntegerField",
+              "BigIntegerField"):
+        return value.isdigit()
+    return False
+
+
+def _relation_clause(spec: EntitySpec, fname: str, suffix: str, raw: str):
+    """`lease=RMT652523-C281` — filter on the RELATION, not a field of it.
+
+    Returns (handled, Q or None, error).
+
+    The model reaches for this constantly and it used to be refused outright:
+    asked whether Aishwarya and Naveen got a discount, it wrote
+    `filters='lease=<uuid>'` on rent_adjustment, was told no such field existed,
+    and spent a round rewriting the same intent as a path to a named column. It
+    recovered, but a round is a third of the turn's budget, and the request was
+    never ambiguous — a relation has exactly one primary key and one human name.
+
+    An identifier goes to the primary key; anything else is matched against the
+    same columns `link` searches, so "the Maple Street lease" works as written.
+    Scope is untouched: the queryset is already filtered to the landlord, so
+    naming another landlord's id here matches nothing of theirs.
+    """
+    from django.db.models import Q
+
+    resolved = resolve_relation(spec, fname)
+    if resolved is None:
+        return False, None, None
+    prefix, target = resolved
+    value = raw.strip()
+    if not value:
+        return True, None, f"{fname}= needs a value (an id, or part of a name)."
+    if suffix not in ("=", "!=", "__icontains"):
+        return True, None, (
+            f"{fname} is a relation, so only = , != and ~ apply to it. For "
+            f"ranges and comparisons filter on one of its fields: "
+            f"{fname}__<field>."
+        )
+
+    if _pk_shaped(target, value):
+        return True, Q(**{f"{prefix}__pk": value}), None
+
+    paths = _identity_paths(prefix, target) or [
+        p for p in [relation_label_path(spec, fname)] if p
+    ]
+    if not paths:
+        return True, None, (
+            f"{fname} can't be matched by name — filter on one of its fields "
+            f"instead: {fname}__<field>."
+        )
+    cond = Q()
+    for path in paths:
+        cond |= Q(**{f"{path}__icontains": value})
+    return True, cond, None
 
 
 _PERIOD_IN_FILTER = re.compile(
@@ -197,11 +290,17 @@ def _lift_period_out_of_filters(filters: str, month: str, year: str, fmap: dict)
 
 
 def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = None):
-    """Returns (include_kwargs, exclude_kwargs, error)."""
+    """Returns (include_kwargs, exclude_kwargs, q_objects, error).
+
+    `q_objects` carries the clauses that are an OR internally — matching a
+    relation by name searches several columns at once — and is ANDed with the
+    rest, so it narrows like every other clause.
+    """
     include: dict = {}
     exclude: dict = {}
+    conditions: list = []
     if not filters.strip():
-        return include, exclude, None
+        return include, exclude, conditions, None
     for clause in filters.split(","):
         clause = clause.strip()
         if not clause:
@@ -209,7 +308,7 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = 
         handled, inc, exc, err = _emptiness_clause(clause, fmap)
         if handled:
             if err:
-                return None, None, err
+                return None, None, None, err
             include.update(inc)
             exclude.update(exc)
             continue
@@ -219,7 +318,7 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = 
                 op_tok, suffix = tok, suf
                 break
         if op_tok is None:
-            return None, None, (
+            return None, None, None, (
                 f"Bad filter {clause!r} — use field=value, >, <, >=, <=, "
                 f"~ (contains), != , 'field is empty', or a range "
                 f"field=2026-08-01..2026-08-31 ."
@@ -227,13 +326,21 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = 
         fname, raw = clause.split(op_tok, 1)
         fname = fname.strip()
 
-        # Local field, then a relation path (lease__start_date), then sugar.
+        # Local field, then the relation itself (lease=…), then a relation path
+        # (lease__start_date), then sugar. A declared field of the same name
+        # always wins — the manifest is the authority on what a word means here.
         fs = fmap.get(fname)
         path = fs.lookup_path if (fs is not None and fs.filterable) else None
         if path is None:
+            handled, cond, err = _relation_clause(spec, fname, suffix, raw)
+            if handled:
+                if err:
+                    return None, None, None, err
+                conditions.append(~cond if suffix == "!=" else cond)
+                continue
             path, fs, err = resolve_path(spec, fname)
             if err:
-                return None, None, err
+                return None, None, None, err
         if path is None or fs is None or not fs.filterable:
             aliased = _alias_lookup(spec, fname, fmap)
             if aliased is not None:
@@ -241,7 +348,7 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = 
                 # goes through as-is.
                 include[aliased] = raw.strip()
                 continue
-            return None, None, (
+            return None, None, None, (
                 f"Can't filter on {fname!r}. Filterable fields: "
                 f"{_filterable_names(spec)}."
             )
@@ -254,7 +361,7 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = 
             try:
                 lo, hi = _coerce(fs, low), _coerce(fs, high)
             except ValueError as exc:
-                return None, None, str(exc)
+                return None, None, None, str(exc)
             include[f"{path}__gte"] = lo
             include[f"{path}__lte"] = hi
             continue
@@ -262,7 +369,7 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = 
         try:
             value = _coerce(fs, raw)
         except ValueError as exc:
-            return None, None, str(exc)
+            return None, None, None, str(exc)
         if suffix == "=":  # equality: iexact for text/enum, exact otherwise
             key = f"{path}__iexact" if fs.type in ("string", "enum") else path
             include[key] = value
@@ -270,7 +377,7 @@ def _parse_filters(filters: str, fmap: dict[str, FieldSpec], spec: EntitySpec = 
             exclude[path] = value
         else:
             include[f"{path}{suffix}"] = value
-    return include, exclude, None
+    return include, exclude, conditions, None
 
 
 # --------------------------------------------------------------------------- #
@@ -389,7 +496,7 @@ def _parse_group_by(group_by: str, spec: EntitySpec):
                 return None, None, err
         if fs is None or not fs.groupable:
             allowed = ", ".join(spec.groupable_map()) or "none on this entity"
-            rels = ", ".join(sorted(relations_for(spec)))
+            rels = ", ".join(relation_paths(spec))
             return None, None, (
                 f"Can't group by {token!r}. Groupable fields: {allowed}. "
                 f"Relations (grouped by their name): {rels or 'none'}. "
@@ -407,6 +514,12 @@ def _parse_order_by(order_by: str, spec: EntitySpec, agg_keys: set[str]):
         return None, set(), None
     descending = token.startswith("-")
     name = token.lstrip("-").strip()
+    if ":" in name:
+        # The model orders by the aggregate the way it SPELLED the aggregate —
+        # `order_by='-sum:amount'` against `aggregate='sum:amount'`. Refusing
+        # that cost a round on a query that was otherwise exactly right.
+        func, _, fname = name.partition(":")
+        name = _agg_key(func.strip().lower(), fname.strip())
     if name in agg_keys:  # order a grouped table by its own totals
         return ("-" if descending else "") + name, set(), None
     fs = spec.field_map().get(name)
@@ -487,13 +600,91 @@ def _parse_period(month: str, year: str, between: str, spec: EntitySpec):
     )
 
 
-def _select_fields(fields: str, spec: EntitySpec) -> list[FieldSpec]:
-    fmap = spec.field_map()
-    if fields.strip():
-        picked = [fmap[n.strip()] for n in fields.split(",") if n.strip() in fmap]
-        if picked:
-            return picked
-    return list(spec.fields)
+#: Every row has one, on every entity, and the model asks for it constantly —
+#: it is how it refers to a row in the next call. Not a manifest field because
+#: no entity should have to declare it.
+_ID_ALIASES = ("id", "pk")
+
+
+class _Column:
+    """A column to return: what was asked for, and how to get it off a row.
+
+    `owner` is the attribute chain to the object that HOLDS the field, so a
+    display method (`get_adjustment_type_display`) is called on the right object
+    rather than on the row two relations away.
+    """
+
+    __slots__ = ("alias", "owner", "fs")
+
+    def __init__(self, alias: str, owner: tuple, fs: FieldSpec | None):
+        self.alias, self.owner, self.fs = alias, owner, fs
+
+
+def _resolve_column(spec: EntitySpec, name: str):
+    """(column, error) for one requested field name."""
+    fs = spec.field_map().get(name)
+    if fs is not None:
+        return _Column(name, (), fs), None
+    if name in _ID_ALIASES:
+        return _Column(name, (), None), None
+
+    # The relation itself — `lease_tenant__lease` means "which lease", and the
+    # answer a human wants is its number, not its uuid.
+    label_path = relation_label_path(spec, name)
+    if label_path is not None:
+        parts = label_path.split("__")
+        target = resolve_relation(spec, name)[1]
+        return _Column(name, tuple(parts[:-1]), target.field_map()[parts[-1]]), None
+
+    path, fs, err = resolve_path(spec, name)
+    if err:
+        return None, err
+    if path is None or fs is None:
+        return None, f"not a field or a relation on {spec.key}"
+    return _Column(name, tuple(path.split("__")[:-1]), fs), None
+
+
+def _readable_names(spec: EntitySpec) -> str:
+    rels = ", ".join(relation_paths(spec)) or "none"
+    return (
+        f"{', '.join(spec.field_map())}, id — and through relations "
+        f"(as `rel__field`, or `rel` alone for its name): {rels}"
+    )
+
+
+def _select_fields(fields: str, spec: EntitySpec):
+    """(columns, rejected, error). Loud about what it could not give you, and
+    still gives you the rest.
+
+    Both halves were learned the hard way. Silently dropping unknown names is
+    what this used to do, and it cost a whole turn: asked which lease a discount
+    belonged to, the model requested `fields='lease_tenant__lease, …'`, got rows
+    without those keys and no word about why, and re-asked six times before the
+    budget ran out and it told the landlord it could not tell.
+
+    Failing the whole call for one bad name in a list of ten is no better — the
+    model re-sends nearly the same list, because the reply says which name was
+    wrong but the fix is one edit away from a list it has already typed out. So:
+    return every column that resolves, and name the ones that didn't next to the
+    rows, where they cannot be missed.
+    """
+    names = [n.strip() for n in (fields or "").split(",") if n.strip()]
+    if not names:
+        return [_Column(f.name, (), f) for f in spec.fields], {}, None
+    columns, rejected = [], {}
+    for name in names:
+        column, err = _resolve_column(spec, name)
+        if err:
+            rejected[name] = err
+            continue
+        columns.append(column)
+    if not columns:
+        named = "; ".join(f"{name}: {why}" for name, why in rejected.items())
+        return None, rejected, (
+            f"None of those fields exist. {named}. Readable: "
+            f"{_readable_names(spec)}."
+        )
+    return columns, rejected, None
 
 
 def _render(obj, fs: FieldSpec):
@@ -507,6 +698,17 @@ def _render(obj, fs: FieldSpec):
     if fs.type == "date" and hasattr(v, "isoformat"):
         return v.isoformat()
     return v
+
+
+def _render_column(obj, column: _Column):
+    owner = obj
+    for attr in column.owner:
+        owner = getattr(owner, attr, None)
+        if owner is None:
+            return None
+    if column.fs is None:  # id / pk
+        return str(getattr(owner, "pk", "")) or None
+    return _render(owner, column.fs)
 
 
 def _referenced_names(text: str, spec: EntitySpec) -> set[str]:
@@ -569,7 +771,7 @@ def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
         filters or "", month, year, fmap,
     )
 
-    include, exclude, ferr = _parse_filters(filters, fmap, spec)
+    include, exclude, conditions, ferr = _parse_filters(filters, fmap, spec)
     if ferr:
         return {"error": ferr}
 
@@ -585,7 +787,13 @@ def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
     if gerr:
         return {"error": gerr}
     ordering, order_refs, oerr = _parse_order_by(
-        order_by, spec, {key for key, _ in agg_specs},
+        order_by, spec,
+        # Aggregate keys and the annotated group keys (month:/year:) are real
+        # names in the grouped queryset. A group key that is just a column path
+        # is not an alias, so it stays out — ordering by it would silently mean
+        # something else.
+        {key for key, _ in agg_specs}
+        | {alias for alias, expr in group_keys if not isinstance(expr, str)},
     )
     if oerr:
         return {"error": oerr}
@@ -609,6 +817,8 @@ def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
 
     if include:
         qs = qs.filter(**include)
+    for condition in conditions:
+        qs = qs.filter(condition)
     if exclude:
         qs = qs.exclude(**exclude)
     qs = qs.order_by(spec.default_order)
@@ -638,18 +848,41 @@ def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
         if "error" in summary:
             return {**result, **summary}
         result.update(summary)
+        if (fields or "").strip():
+            # Say that `fields` was ignored. Dropping it in silence is the same
+            # defect as dropping an unknown field name in silence, and it cost
+            # the same turn: asked for adjustments grouped by lease WITH the
+            # row detail, the model got groups, saw no rows, and re-sent the
+            # identical call four more times.
+            result["fields_ignored"] = (
+                "A grouped/aggregated result is a summary, so `fields` does not "
+                "apply — `groups` carries the group key and the aggregates, "
+                "nothing else. For the individual rows, call read again with "
+                "the same filters, your `fields`, and NO group_by/aggregate."
+            )
         # A grouped/aggregated answer is a summary; rows would just be the page
         # again under a total that covers everything. Ask for them separately.
         return result
 
-    wanted = _select_fields(fields or "", spec)
+    wanted, rejected, serr = _select_fields(fields or "", spec)
+    if serr:
+        return {**result, "error": serr}
+    if rejected:
+        # One shared list, not one per rejected name — five bad names in a list
+        # of twenty must not return the catalogue five times.
+        result["fields_unavailable"] = rejected
+        result["fields_available"] = _readable_names(spec)
     if ordering:
         qs = qs.order_by(ordering)
-    rows = [{fs.name: _render(o, fs) for fs in wanted} for o in qs[:lim]]
+    # One join per traversed column, instead of one query per row.
+    joins = {"__".join(c.owner) for c in wanted if c.owner}
+    if joins:
+        qs = qs.select_related(*joins)
+    rows = [{c.alias: _render_column(o, c) for c in wanted} for o in qs[:lim]]
     result.update(
         {
             "returned": len(rows),
-            "fields": [fs.name for fs in wanted],
+            "fields": [c.alias for c in wanted],
             "rows": rows,
             "truncated": total > len(rows),
         },

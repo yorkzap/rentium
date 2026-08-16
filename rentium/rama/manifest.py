@@ -795,6 +795,48 @@ def resolve_path(spec: EntitySpec, path: str, _depth: int = 0):
     return f"{head}__{inner_path}", inner_spec, None
 
 
+def relation_paths(spec: EntitySpec) -> list[str]:
+    """Every relation reachable within MAX_RELATION_DEPTH, as dotted paths.
+
+    Listing only the immediate neighbours is how "group these adjustments by
+    lease" got refused with a list that did not contain the word "lease":
+    RentAdjustment hangs off LeaseTenant, and the lease is one hop further.
+    """
+    out: list[str] = []
+    frontier = [("", spec)]
+    for _ in range(MAX_RELATION_DEPTH):
+        nxt = []
+        for prefix, current in frontier:
+            for name, relation in sorted(relations_for(current).items()):
+                path = f"{prefix}{name}"
+                if path in out:
+                    continue
+                out.append(path)
+                nxt.append((f"{path}__", MANIFEST[relation.target]))
+        frontier = nxt
+    return out
+
+
+def resolve_relation(spec: EntitySpec, path: str):
+    """Resolve 'lease_tenant__lease' to (orm_prefix, target EntitySpec), or None.
+
+    A path that ends AT a relation rather than at one of its fields. The model
+    writes these because they are the shortest way to say what it means —
+    "adjustments on this lease" is `lease_tenant__lease=<id>`, and RentAdjustment
+    has no direct lease FK to shorten it to.
+    """
+    parts = [p for p in (path or "").split("__") if p]
+    if not parts or len(parts) > MAX_RELATION_DEPTH:
+        return None
+    current = spec
+    for part in parts:
+        relation = relations_for(current).get(part)
+        if relation is None:
+            return None
+        current = MANIFEST[relation.target]
+    return "__".join(parts), current
+
+
 def relation_label_path(spec: EntitySpec, name: str) -> str | None:
     """The human column to group a relation by — 'lease' → 'lease__lease_number'.
 
@@ -802,10 +844,12 @@ def relation_label_path(spec: EntitySpec, name: str) -> str | None:
     correct answer nobody can read. The manifest already knows each entity's
     human name via resolve_label().
     """
-    relation = relations_for(spec).get(name)
-    if relation is None:
+    resolved = resolve_relation(spec, name)
+    if resolved is None:
         return None
-    target = MANIFEST[relation.target]
+    # A path, not just a neighbour: "group these adjustments by lease" is
+    # `lease_tenant__lease`, because RentAdjustment hangs off the tenancy.
+    name, target = resolved
     fields = target.field_map()
     label_field = target.resolve_label()
     if label_field not in fields:

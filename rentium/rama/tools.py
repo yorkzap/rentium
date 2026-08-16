@@ -138,9 +138,14 @@ def search_capabilities(landlord, query: str = "") -> dict:
             "!= . Also 'field is empty' / 'field is set', and ranges with "
             "'field=2026-08-01..2026-08-31'. You may filter on a RELATED "
             "entity's field with 'rel__field', e.g. "
-            "'lease__start_date=2026-08-01..2026-08-31'. "
+            "'lease__start_date=2026-08-01..2026-08-31', or on the RELATION "
+            "ITSELF by id or by name — 'lease=<uuid>', 'lease=RMT652523-C281', "
+            "'lease_tenant=Naveen', 'lease_tenant__lease=<uuid>'. "
             "Example: 'status=active, total_rent>800, parking_included=true'.",
-    fields="Optional comma list of fields to return. Default: all of them.",
+    fields="Optional comma list of fields to return. Default: all of them. "
+           "May include 'id', a RELATED entity's field ('lease_tenant__lease"
+           "__start_date'), or a relation name on its own "
+           "('lease_tenant__lease' returns the lease number).",
     limit="Max rows to return, 1-100 (default 20). Does NOT limit totals.",
     aggregate="Comma list of 'count' or 'FUNC:field' with FUNC in "
               "sum/avg/min/max/count. Example: 'count, sum:amount'. "
@@ -169,10 +174,16 @@ def read(landlord, entity: str = "", filters: str = "", fields: str = "",
     `totals` (and `groups`) computed across EVERY matching row — not just the
     page `limit` returns. Use it instead of listing rows and counting them.
 
-    ACROSS ENTITIES: filter and group on a related entity's fields with
+    ACROSS ENTITIES: filter, group and RETURN a related entity's fields with
     `rel__field`. Call data_catalogue to see each entity's relations. Do this
     instead of looping — one query per row will exhaust the turn before it
-    answers.
+    answers. A relation named on its own means "which one": `fields=
+    'lease_tenant__lease'` returns the lease number, and
+    `filters='lease_tenant__lease=<id or number>'` narrows to it.
+
+    A `fields_unavailable` key in the result names every field you asked for
+    that this entity cannot give you, and why. The other fields are still in
+    `rows`. Do not re-send the same list — drop or correct the named ones.
 
     "EVERYONE" / "ALL" / "ANYONE" QUESTIONS NEED TWO READS. A group_by can only
     show rows that EXIST, so grouping deposits by lease silently omits every
