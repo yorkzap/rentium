@@ -10,3 +10,6 @@
 venv
 .git
 .envs/
+rentium/media/
+._*
+**/._*

@@ -1,0 +1,7 @@
+tunnel: rentium-api
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  - hostname: api.rentium.ca
+    service: http://nginx:8080
+  - service: http_status:404

@@ -100,7 +100,8 @@ COPY --from=client-builder --chown=django:django ${APP_HOME} ${APP_HOME}
 
 
 # make django owner of the WORKDIR directory as well.
-RUN chown -R django:django ${APP_HOME}
+RUN mkdir -p ${APP_HOME}/rentium/media \
+  && chown -R django:django ${APP_HOME}
 
 USER django
 
