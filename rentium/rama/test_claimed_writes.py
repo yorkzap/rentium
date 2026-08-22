@@ -597,3 +597,107 @@ def test_a_preview_with_no_plan_behind_it_is_retracted(landlord, settings):
     assert "869.78" not in result.reply
     assert "305.22" not in result.reply
     assert "no pending action" in result.reply.casefold()
+
+
+# --------------------------------------------------------- headings vs claims
+
+#: The verbatim reply that was retracted. The landlord asked which rooms were
+#: recorded versus guessed, got a correct read-only answer, and was told "I
+#: said that as though it were done — it isn't".
+THE_RETRACTED_ANSWER = (
+    "Quick summary — I used the unit/listing layout fields in the system. "
+    "“Recorded” means the listing or its parent unit has explicit "
+    "layout fields.\n"
+    "\n"
+    "Recorded on the listing itself\n"
+    "• Bonus room J — kitchen, balcony, bathroom, bedroom recorded "
+    "(recorded_internal_area_count 4).\n"
+    "• Room K — 1 bedroom recorded (recorded_internal_area_count 1).\n"
+)
+
+
+def test_a_section_heading_is_not_a_write_claim():
+    """The landlord's own question contained the verb, so the answer had to."""
+    assert claims(THE_RETRACTED_ANSWER) is False
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Recorded on the listing itself\n• Room K — 1 bedroom",
+        "Recorded from the unit layout\n- Main Floor: 3 bedrooms",
+        "Updated by the last inspection\n1. Room C — clean",
+        "Sent for August\n* 3 reminders",
+    ],
+)
+def test_headings_over_a_list_pass_through(reply):
+    assert claims(reply) is False
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # Still a claim: an object behind the verb, whatever follows it.
+        "Recorded the $100 payment against the deposit charge for Room C\n"
+        "• e-transfer\n• August 3",
+        "Recorded the payment\n• $100 e-transfer",
+        "Updated your lease\n• rent now $2,000",
+        # Still a claim: it is a sentence, not a heading.
+        "Recorded as etransfer.\n• Room C",
+        "Logged as cash.\n• $400",
+        # Still a claim: nothing follows, so it heads nothing.
+        "Recorded on the ledger",
+        "Recorded payment",
+    ],
+)
+def test_a_fabrication_dressed_as_a_heading_is_still_caught(reply):
+    assert claims(reply) is True
+
+
+def test_the_retraction_audit_records_the_question(landlord, settings):
+    """A misfire must be diagnosable from the audit trail alone.
+
+    This guard has now misfired in three directions; each time the only way to
+    see why was to reproduce the whole turn against live data.
+    """
+    import inspect
+
+    from rentium.rama import service
+
+    source = inspect.getsource(service)
+    assert '"asked": (message or "")[:300]' in source
+
+
+# ------------------------------------- an unbacked "yes" must not eat the answer
+
+def test_a_grounded_answer_survives_the_missing_plan():
+    """Retract the ask, keep what was found.
+
+    Asked which rooms were recorded versus guessed, RAMA read property_area
+    twice, answered correctly, offered to fill the gaps — and the landlord got
+    "I couldn't prepare an executable plan. Please resend the changes" and none
+    of the answer. Same defect as a budget stop discarding ten good reads.
+    """
+    from rentium.rama.service import _read_something_real, _strip_confirmation_ask
+
+    assert _read_something_real(["_live_context", "read"]) is True
+    assert _read_something_real(["_live_context"]) is False
+    assert _read_something_real([]) is False
+
+    reply = (
+        "Recorded layout\n"
+        "• Main Floor — 3 bedrooms, 2 bathrooms\n"
+        "• Garden Suite — 2 bedrooms\n"
+        "Shall I proceed?"
+    )
+    kept = _strip_confirmation_ask(reply)
+    assert "Main Floor — 3 bedrooms, 2 bathrooms" in kept
+    assert "Shall I proceed?" not in kept
+
+
+def test_stripping_never_returns_nothing():
+    """A reply that is ONLY an ask still has to say something."""
+    from rentium.rama.service import _strip_confirmation_ask
+
+    assert _strip_confirmation_ask("Shall I proceed?").strip()
+    assert _strip_confirmation_ask("").strip() == ""

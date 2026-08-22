@@ -2806,6 +2806,21 @@ def _explicit_room_creation_rows(
     return rows
 
 
+#: Tools that only ever look. A turn that ran one of these has evidence behind
+#: its prose; a turn that ran nothing at all invented whatever it said.
+#: `_live_context` is excluded deliberately — it is injected on every turn and
+#: proves nothing about whether the model went and looked.
+_LOOKED_AT_THE_BOOKS = ("read", "data_catalogue", "resolve_person", "link",
+                        "portfolio_snapshot", "search_capabilities")
+
+
+def _read_something_real(tools_used) -> bool:
+    return any(
+        name in _LOOKED_AT_THE_BOOKS or name.startswith(("list_", "get_", "show_"))
+        for name in (tools_used or ())
+    )
+
+
 def _looks_like_confirmation_request(text: str) -> bool:
     """True for model prose claiming that an executable preview exists."""
     return bool(
@@ -2876,6 +2891,24 @@ def _solicits_confirmation(text: str) -> bool:
     return bool(_SOLICITS_CONFIRM.search(text or ""))
 
 
+#: The sentence that asks for a Yes. Only that clause is unbacked when no plan
+#: exists; the findings around it can be perfectly real.
+_CONFIRMATION_ASK = re.compile(
+    r"^[^\n]*(?:" + _SOLICITS_CONFIRM.pattern + r"|reply\s+yes\s+to\s+confirm"
+    r"|confirm\s+yes)[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_confirmation_ask(text: str) -> str:
+    """Drop the lines asking for approval, keep everything that was found."""
+    kept = [
+        line for line in (text or "").splitlines()
+        if not _CONFIRMATION_ASK.match(line.strip())
+    ]
+    return "\n".join(kept).strip() or (text or "")
+
+
 def _sentences(text: str) -> list[str]:
     return [part for part in re.split(r"(?<=[.!?])\s+|\n+", text or "") if part.strip()]
 
@@ -2929,6 +2962,48 @@ _LABEL_COLON = re.compile(
 )
 
 
+#: A section HEADING, not an assertion.
+#:
+#: Asked "what rooms have we actually recorded for my units, versus ones the
+#: system guessed?", the model answered correctly and headed one half of the
+#: answer "Recorded on the listing itself", followed by bullets. _BARE_PAST_WRITE
+#: saw a past-tense write verb opening a line and the landlord got "I said that
+#: as though it were done — it isn't" in place of a true, read-only answer.
+#:
+#: The question itself contains the verb, so the answer cannot avoid it. Four
+#: conditions together, each one keeping a real fabrication in scope:
+#:   - the line OPENS with the verb, and is short;
+#:   - it has no sentence-ending punctuation ("Recorded as etransfer." does, and
+#:     stays a claim);
+#:   - the verb is not followed by a determiner or an amount ("Recorded the $100
+#:     payment against the deposit charge" is, and stays a claim);
+#:   - and it actually heads a list, so a bare "Recorded payment" on its own is
+#:     still judged as the sentence it is.
+_HEADING_LINE = re.compile(
+    r"^" + _DID + r"\b(?!\s+(?:the|a|an|this|that|these|those|my|your|his|her"
+    r"|their|its|\$|[0-9]))[^.!?:]{0,50}$",
+    re.IGNORECASE,
+)
+_LIST_ITEM = re.compile(r"^\s*(?:[-*\u2022\u2023\u25e6]|\d+[.)])\s+\S")
+
+
+def _section_headings(text: str) -> set[str]:
+    """Lines that head a bulleted section rather than assert anything."""
+    lines = (text or "").splitlines()
+    headings: set[str] = set()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or not _HEADING_LINE.match(stripped):
+            continue
+        for following in lines[index + 1:]:
+            if not following.strip():
+                continue
+            if _LIST_ITEM.match(following):
+                headings.add(stripped)
+            break
+    return headings
+
+
 def _prose_only(text: str) -> str:
     """Drop rendered rows so only the model's own sentences are judged."""
     kept = []
@@ -2954,7 +3029,10 @@ def claims_completed_write(text: str) -> bool:
     and has no false-positive shape. The subject-less branch is skipped for
     rendered rows and report headlines; see the discriminators above.
     """
+    headings = _section_headings(text)
     for sentence in _sentences(_prose_only(text)):
+        if sentence.strip() in headings:
+            continue
         if _NOT_A_CLAIM.search(sentence):
             continue
         if "?" in sentence:  # "Shall I record it?" is an offer, not a claim
@@ -8618,7 +8696,26 @@ def _run_turn_unlocked(
                 f"• {item['target']}: {item['error']}"
                 for item in excluded_preview_errors
             )
+        elif _read_something_real(tools_used):
+            # The turn DID look at the books, so the informational half of the
+            # reply is grounded — only the "reply yes" is unbacked. Replacing
+            # the whole thing threw the answer away: asked which rooms were
+            # recorded versus guessed, RAMA read property_area twice, answered
+            # correctly, offered to fill the gaps, and the landlord got
+            # "Please resend the changes" and none of the answer.
+            #
+            # This is the same defect as a budget stop discarding ten good
+            # reads. Keep what was found; retract only the claim.
+            reply = (
+                _strip_confirmation_ask(reply).rstrip()
+                + "\n\nNothing is queued for confirmation, though — I haven't "
+                "prepared an action yet. Tell me which change you want and "
+                "I'll build a preview for you to approve."
+            )
         else:
+            # No tool ran at all, so every figure in that preview was invented
+            # — the $1,175 allocation the ledger disagreed with. Nothing here
+            # is safe to keep.
             reply = (
                 "I couldn't prepare an executable plan. There is no pending "
                 "action and nothing is waiting for confirmation. Please resend "
@@ -8669,7 +8766,12 @@ def _run_turn_unlocked(
             audit(
                 RamaAudit.Kind.ERROR,
                 {"error": "claimed_write_without_writing",
-             "guard": "claims_completed_write", "claim": reply[:500]},
+                 "guard": "claims_completed_write",
+                 "claim": reply[:500],
+                 # What the landlord actually asked. Without it a misfire can
+                 # only be diagnosed by reproducing the whole turn live, and
+                 # this guard has now misfired in three different directions.
+                 "asked": (message or "")[:300]},
             )
             gap = _capability_gap_hint(landlord, message, conversation_id)
             reply = (
