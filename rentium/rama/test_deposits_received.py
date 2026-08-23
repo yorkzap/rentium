@@ -305,6 +305,100 @@ def test_frozen_charge_set_aborts_if_one_charge_changes_before_confirmation(
     assert LedgerEntry.objects.filter(entry_type=EntryType.PAYMENT).count() == 1
 
 
+def test_pending_lease_deposits_can_be_billed_and_paid_in_one_confirmation(
+    landlord, bc_lease, siya,
+):
+    from rentium.leases.models import Lease
+
+    bc_lease.status = Lease.LeaseStatus.PENDING_SIGNATURES
+    bc_lease.security_deposit = Decimal("650.00")
+    bc_lease.cleaning_deposit = Decimal("350.00")
+    bc_lease.save(
+        update_fields=["status", "security_deposit", "cleaning_deposit"],
+    )
+    rent_count_before = LedgerEntry.objects.filter(
+        lease=bc_lease,
+        entry_type=EntryType.RENT_CHARGE,
+    ).count()
+    assert not LedgerEntry.objects.filter(
+        lease=bc_lease,
+        entry_type__in=[EntryType.DEPOSIT_CHARGE, EntryType.PAYMENT],
+    ).exists()
+
+    needs_method = _pay(
+        landlord,
+        lease_number=bc_lease.lease_number,
+        charge_query="security and cleaning deposits",
+    )
+    assert needs_method["needs"] == "payment_method"
+
+    preview = _pay(
+        landlord,
+        lease_number=bc_lease.lease_number,
+        charge_query="security and cleaning deposits",
+        payment_method="etransfer",
+    )
+    assert preview["needs_confirm"] is True
+    assert preview["preview"]["total"] == "1000.00"
+    assert preview["resolved_arguments"]["materialize_deposits"] == "yes"
+    assert "does not activate the lease" in preview["preview"]["billing_note"]
+
+    done = _pay(landlord, **preview["resolved_arguments"], confirm="yes")
+
+    assert done["ok"] is True
+    assert done["total"] == "1000.00"
+    charges = LedgerEntry.objects.filter(
+        lease=bc_lease,
+        entry_type=EntryType.DEPOSIT_CHARGE,
+    )
+    assert set(charges.values_list("amount", flat=True)) == {
+        Decimal("650.00"),
+        Decimal("350.00"),
+    }
+    assert LedgerEntry.objects.filter(
+        lease=bc_lease,
+        entry_type=EntryType.PAYMENT,
+    ).count() == 2
+    assert LedgerEntry.objects.filter(
+        lease=bc_lease,
+        entry_type=EntryType.RENT_CHARGE,
+    ).count() == rent_count_before
+    bc_lease.refresh_from_db()
+    assert bc_lease.status == Lease.LeaseStatus.PENDING_SIGNATURES
+
+    from rentium.ledger.billing import generate_initial_charges
+
+    generate_initial_charges(bc_lease)
+    assert LedgerEntry.objects.filter(
+        lease=bc_lease,
+        entry_type=EntryType.DEPOSIT_CHARGE,
+    ).count() == 2
+
+
+def test_early_deposit_confirmation_aborts_if_lease_terms_changed(
+    landlord, bc_lease, siya,
+):
+    bc_lease.security_deposit = Decimal("650.00")
+    bc_lease.cleaning_deposit = Decimal("350.00")
+    bc_lease.save(update_fields=["security_deposit", "cleaning_deposit"])
+    preview = _pay(
+        landlord,
+        lease_number=bc_lease.lease_number,
+        charge_query="security and cleaning deposits",
+        payment_method="cash",
+    )
+    bc_lease.cleaning_deposit = Decimal("400.00")
+    bc_lease.save(update_fields=["cleaning_deposit"])
+
+    changed = _pay(landlord, **preview["resolved_arguments"], confirm="yes")
+
+    assert changed["code"] == "DEPOSIT_TERMS_CHANGED"
+    assert not LedgerEntry.objects.filter(
+        lease=bc_lease,
+        entry_type__in=[EntryType.DEPOSIT_CHARGE, EntryType.PAYMENT],
+    ).exists()
+
+
 def test_the_name_is_read_out_of_the_charge_query_too(
     landlord, bc_lease, siya, her_deposits,
 ):

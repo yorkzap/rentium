@@ -9,6 +9,7 @@ Every mutating tool:
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -3816,6 +3817,149 @@ _AMOUNT_FROM_THE_BOOKS = (
 )
 
 
+def _deposit_spec_snapshot(spec: dict) -> dict:
+    return {
+        "key": spec["key"],
+        "kind": spec["kind"],
+        "amount": str(spec["amount"]),
+        "description": spec["description"],
+        "tenant_id": str(spec["tenant"].pk) if spec["tenant"] is not None else "",
+    }
+
+
+def _matching_unbilled_deposits(lease, query: str, *, tenant=None) -> list[dict]:
+    from rentium.ledger.billing import deposit_charge_specs
+
+    specs = deposit_charge_specs(lease)
+    if tenant is not None:
+        specs = [
+            spec
+            for spec in specs
+            if spec["tenant"] is None or spec["tenant"].pk == tenant.pk
+        ]
+    tokens = set(re.findall(r"[a-z]{3,}", (query or "").casefold()))
+    if tokens:
+        scored = [
+            (
+                sum(tok in spec["description"].casefold() for tok in tokens),
+                spec,
+            )
+            for spec in specs
+        ]
+        best = max((score for score, _ in scored), default=0)
+        specs = [spec for score, spec in scored if score == best and score > 0]
+    return specs
+
+
+def _preview_unbilled_deposit_payment(  # noqa: PLR0913
+    *,
+    lease,
+    amount: str,
+    charge_query: str,
+    payment_method: str,
+    payment_date: str,
+    reference_number: str,
+    notes: str,
+    tenant_query: str,
+    payer,
+) -> dict:
+    """Preview paying contractual deposits before activation billed them."""
+    specs = _matching_unbilled_deposits(lease, charge_query, tenant=payer)
+    if not specs:
+        return {
+            "error": "no_matching_charge",
+            "message": (
+                "That lease has no contractual deposit matching this request, "
+                "and no open ledger charge to settle."
+            ),
+        }
+
+    stated = str(amount or "").replace("$", "").replace(",", "").strip()
+    total = sum((spec["amount"] for spec in specs), Decimal("0.00"))
+    if stated:
+        try:
+            paid = Decimal(stated)
+        except (InvalidOperation, ValueError):
+            return {"error": f"Invalid amount {amount!r}."}
+        if paid <= 0:
+            return {"error": "A payment must be a positive amount."}
+        if len(specs) > 1 and paid != total:
+            return {
+                "question_for_user": (
+                    f"Those deposits total ${total}, but you said ${paid}. Which "
+                    "deposit received a partial payment?"
+                ),
+                "needs": "charge_query",
+                "clarification": {"field": "charge_query"},
+            }
+    else:
+        paid = total
+
+    method_out = _parse_payment_method(payment_method, amount_label=f"${paid}")
+    if "method" not in method_out:
+        return method_out
+    day = date.today()
+    if payment_date:
+        try:
+            day = date.fromisoformat(payment_date.strip()[:10])
+        except ValueError:
+            return {
+                "error": f"payment_date must be YYYY-MM-DD, got {payment_date!r}."
+            }
+
+    where = lease.property.name if lease.property_id else lease.lease_number
+    allocations = []
+    for spec in specs:
+        allocation = spec["amount"] if len(specs) > 1 else paid
+        allocations.append(
+            {
+                "charge": f"{spec['description']} ({where}, ${spec['amount']})",
+                "payment": str(allocation),
+                "still_owing_after": str(
+                    max(spec["amount"] - allocation, Decimal("0.00")),
+                ),
+                "source": "lease terms; charge will be created on confirmation",
+            },
+        )
+
+    snapshot = [_deposit_spec_snapshot(spec) for spec in specs]
+    preview = {
+        "lease_number": lease.lease_number,
+        "total": str(paid),
+        "method": method_out["method"],
+        "payment_date": day.isoformat(),
+        "allocations": allocations,
+        "amount_source": (
+            _AMOUNT_FROM_THE_BOOKS if not stated else "Amount stated by the landlord."
+        ),
+        "billing_note": (
+            "These deposits are in the lease terms but have not been billed yet. "
+            "Confirmation atomically creates only these contractual deposit "
+            "charges and records the payments; it does not activate the lease or "
+            "generate rent."
+        ),
+    }
+    result = _preview(
+        "record_payment",
+        preview,
+        "Creates the matching contractual deposit charge(s), then records the "
+        "money received against them in one transaction.",
+    )
+    result["resolved_arguments"] = {
+        "amount": str(paid),
+        "charge_query": charge_query,
+        "payment_method": payment_method,
+        "payment_date": payment_date,
+        "reference_number": reference_number,
+        "notes": notes,
+        "tenant_query": tenant_query,
+        "lease_number": lease.lease_number,
+        "materialize_deposits": "yes",
+        "expected_deposits": json.dumps(snapshot, sort_keys=True),
+    }
+    return result
+
+
 def _amount_undeducible(candidates: list, *, scoped: bool) -> dict | None:
     """Why the books cannot state the figure here — or None if they can.
 
@@ -3868,6 +4012,8 @@ def record_payment(
     tenant_query: str = "",
     lease_number: str = "",
     charge_ids: str = "",
+    materialize_deposits: str = "",
+    expected_deposits: str = "",
     confirm: str = "",
 ) -> dict:
     """Record money against one open charge (partials OK).
@@ -3928,6 +4074,62 @@ def record_payment(
     # money, and which one is a fact only the landlord has.
     scope_tenant = payer or _tenant_named_in(landlord, charge_query)
 
+    if _confirmed(confirm) and str(materialize_deposits or "").strip().lower() in {
+        "yes",
+        "true",
+        "1",
+    }:
+        if lease is None:
+            return {"error": "An exact lease_number is required for early deposits."}
+        try:
+            expected = json.loads(expected_deposits or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return {"error": "The deposit preview contract is invalid; preview again."}
+        if not isinstance(expected, list) or not expected:
+            return {"error": "The deposit preview expired; prepare it again."}
+        expected = sorted(expected, key=lambda row: row["key"])
+        expected_keys = {str(row["key"]) for row in expected}
+        from rentium.leases.models import Lease
+        from rentium.ledger.billing import ensure_deposit_charges
+
+        with transaction.atomic():
+            locked = Lease.objects.select_for_update().get(
+                pk=lease.pk,
+                landlord=landlord,
+            )
+            current_specs = _matching_unbilled_deposits(
+                locked,
+                charge_query,
+                tenant=scope_tenant,
+            )
+            current = sorted(
+                (_deposit_spec_snapshot(spec) for spec in current_specs),
+                key=lambda row: row["key"],
+            )
+            if current != expected:
+                return {
+                    "error": (
+                        "The lease's deposit terms changed after the preview. "
+                        "Nothing was posted; prepare a fresh preview."
+                    ),
+                    "code": "DEPOSIT_TERMS_CHANGED",
+                }
+            created_charges = ensure_deposit_charges(locked, keys=expected_keys)
+            return record_payment(
+                landlord,
+                amount=amount,
+                charge_query=charge_query,
+                property_query=property_query,
+                payment_method=payment_method,
+                payment_date=payment_date,
+                reference_number=reference_number,
+                notes=notes,
+                tenant_query=tenant_query,
+                lease_number=locked.lease_number,
+                charge_ids=",".join(str(charge.pk) for charge in created_charges),
+                confirm="yes",
+            )
+
     candidates = _open_charges(
         landlord,
         charge_query,
@@ -3945,6 +4147,22 @@ def record_payment(
             "code": "CHARGE_SCOPE_CHANGED",
         }
     if not candidates:
+        if lease is not None and re.search(
+            r"\b(?:security|damage|cleaning|pet|deposits?)\b",
+            charge_query or "",
+            re.I,
+        ):
+            return _preview_unbilled_deposit_payment(
+                lease=lease,
+                amount=amount,
+                charge_query=charge_query,
+                payment_method=payment_method,
+                payment_date=payment_date,
+                reference_number=reference_number,
+                notes=notes,
+                tenant_query=tenant_query,
+                payer=scope_tenant,
+            )
         return {
             "error": "no_matching_charge",
             "message": (

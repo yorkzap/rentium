@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from decimal import Decimal
 from unittest import mock
 
 import pytest
-from django.utils import timezone
 
 from rentium.ledger.models import EntryType
 from rentium.ledger.models import LedgerEntry
@@ -43,45 +43,28 @@ def _enable(landlord):
     preferences.save()
 
 
-def _deposit(landlord, lease, description, amount):
-    from rentium.ledger import services
-
-    charge, _ = services.post_charge(
-        landlord=landlord,
-        property=lease.property,
-        lease=lease,
-        tenant=None,
-        entry_type=EntryType.DEPOSIT_CHARGE,
-        amount=Decimal(amount),
-        due_date=timezone.localdate(),
-        description=description,
-    )
-    return charge
-
-
 def test_one_short_answer_resumes_every_tool_bound_to_the_prompt(
     landlord,
     bc_lease,
+    tenant,
 ):
     """Two deposit writes ask one real-world question. The answer advances
     both saved calls into one plan without another provider round.
     """
+    from rentium.leases.models import LeaseTenant
     from rentium.rama.models import RamaPendingPlan
     from rentium.rama.service import run_turn
 
     _enable(landlord)
-    security = _deposit(
-        landlord,
-        bc_lease,
-        "Security deposit — due on signing",
-        "650.00",
+    LeaseTenant.objects.create(
+        lease=bc_lease,
+        tenant=tenant,
+        rent_amount=bc_lease.total_rent,
+        is_primary_tenant=True,
     )
-    cleaning = _deposit(
-        landlord,
-        bc_lease,
-        "Cleaning deposit — due on signing",
-        "350.00",
-    )
+    bc_lease.security_deposit = Decimal("650.00")
+    bc_lease.cleaning_deposit = Decimal("350.00")
+    bc_lease.save(update_fields=["security_deposit", "cleaning_deposit"])
     provider = ScriptedProvider(
         [
             Turn(
@@ -130,10 +113,15 @@ def test_one_short_answer_resumes_every_tool_bound_to_the_prompt(
     assert all(task.status == RamaTask.Status.VERIFIED for task in clarified)
     plan = RamaPendingPlan.objects.get(conversation_id=question.conversation_id)
     assert plan.steps.count() == EXPECTED_DEPOSIT_STEPS
-    assert {step.arguments["charge_ids"] for step in plan.steps.all()} == {
-        str(security.pk),
-        str(cleaning.pk),
+    assert all(
+        step.arguments["materialize_deposits"] == "yes"
+        for step in plan.steps.all()
+    )
+    expected_kinds = {
+        json.loads(step.arguments["expected_deposits"])[0]["kind"]
+        for step in plan.steps.all()
     }
+    assert expected_kinds == {"security_deposit", "cleaning_deposit_lease"}
     assert all(
         step.arguments["payment_method"] == "etransfer" for step in plan.steps.all()
     )
@@ -151,9 +139,9 @@ def test_one_short_answer_resumes_every_tool_bound_to_the_prompt(
     assert "Recorded $650.00" in completed.reply
     assert "Recorded $350.00" in completed.reply
     assert {
-        row.settles_id
+        row.amount
         for row in LedgerEntry.objects.filter(entry_type=EntryType.PAYMENT)
-    } == {security.pk, cleaning.pk}
+    } == {Decimal("650.00"), Decimal("350.00")}
 
 
 def test_option_matching_uses_structured_aliases_not_old_chat_prose(landlord):

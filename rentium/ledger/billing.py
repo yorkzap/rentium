@@ -228,83 +228,66 @@ def generate_rent_charges_for_lease(
     return created
 
 
-def generate_initial_charges(lease: Lease) -> None:
-    """
-    Called once when the lease flips ACTIVE: deposits + rent +
-    the rent schedule (first charge = prorated move-in period).
-    Idempotent via natural keys.
+def deposit_charge_specs(lease: Lease) -> list[dict]:
+    """Contractual deposit obligations, whether or not they are billed yet.
 
-    TWO DIFFERENT DUE DATES, deliberately:
+    This is a pure description boundary shared by activation billing and an
+    early payment received while a lease is still pending. It prevents RAMA
+    from inventing a charge and prevents the two paths from disagreeing about
+    household versus individual liability.
 
-      Rent      -> the tenancy start (you pay for August in August).
-
-      Deposits  -> the day the agreement is entered into, i.e. NOW. A security
-      and fees      deposit is not rent paid early; it is the consideration for
-                    entering the agreement, and it is due on signing. Showing a
-                    tenant who signed on July 12th that their deposit is
-                    "Scheduled — due Aug 1" is simply false, and it is false in
-                    the landlord's disfavour: it tells the tenant they may hold
-                    the money for three more weeks.
-
-                    `min(today, tenancy_start)` rather than a bare `today`, so a
-                    lease activated retroactively (backdated paperwork) doesn't
-                    end up with a deposit due AFTER the tenancy already began.
-
-    JOINT leases: the security, pet, and lease-level cleaning deposits are
-    HOUSEHOLD charges (tenant=None) — "their deposit is together". Only the
-    explicitly individual per-tenant cleaning deposits stay per-tenant.
-    SPLIT leases: one-time charges go to the primary tenant.
+    Deposits are due when the agreement is entered into, so their due date is
+    ``min(today, tenancy_start)``. Joint leases produce household charges;
+    split leases attach them to the primary tenant. Explicit per-tenant
+    cleaning deposits remain individual in either mode.
     """
     from django.utils import timezone
 
     tenancy_start = lease.move_in_date or lease.start_date
     today = timezone.now().date()
     one_time_due = min(today, tenancy_start)
-
     joint = lease_is_joint(lease)
+    specs = []
 
-    def _one_time(tenant, etype, amount, kind, note, *, joint_charge=False):
+    def add(tenant, amount, kind, note, *, joint_charge=False):
         if not amount or Decimal(amount) <= 0:
             return
         if not joint_charge and tenant is None:
             return
         key_owner = "joint" if joint_charge else tenant.pk
-        post_charge(
-            landlord=lease.landlord,
-            tenant=None if joint_charge else tenant,
-            lease=lease,
-            amount=Decimal(amount),
-            due_date=one_time_due,
-            entry_type=etype,
-            description=note,
-            idempotency_key=f"{kind}:{lease.pk}:{key_owner}",
-            metadata={
+        specs.append(
+            {
+                "tenant": None if joint_charge else tenant,
+                "amount": Decimal(amount),
+                "due_date": one_time_due,
                 "kind": kind,
-                "due_on_signing": True,
-                **({"joint": True} if joint_charge else {}),
+                "description": note,
+                "key": f"{kind}:{lease.pk}:{key_owner}",
+                "metadata": {
+                    "kind": kind,
+                    "due_on_signing": True,
+                    **({"joint": True} if joint_charge else {}),
+                },
             },
         )
 
     if joint:
-        _one_time(
+        add(
             None,
-            EntryType.DEPOSIT_CHARGE,
             lease.security_deposit,
             "security_deposit",
             "Security deposit — due on signing",
             joint_charge=True,
         )
-        _one_time(
+        add(
             None,
-            EntryType.DEPOSIT_CHARGE,
             lease.pet_deposit,
             "pet_deposit",
             "Pet damage deposit — due on signing",
             joint_charge=True,
         )
-        _one_time(
+        add(
             None,
-            EntryType.DEPOSIT_CHARGE,
             lease.cleaning_deposit,
             "cleaning_deposit_lease",
             "Cleaning deposit — due on signing",
@@ -318,23 +301,20 @@ def generate_initial_charges(lease: Lease) -> None:
             or lease.lease_tenants.filter(tenant__isnull=False).first()
         )
         primary_tenant = primary.tenant if primary else None
-        _one_time(
+        add(
             primary_tenant,
-            EntryType.DEPOSIT_CHARGE,
             lease.security_deposit,
             "security_deposit",
             "Security deposit — due on signing",
         )
-        _one_time(
+        add(
             primary_tenant,
-            EntryType.DEPOSIT_CHARGE,
             lease.pet_deposit,
             "pet_deposit",
             "Pet damage deposit — due on signing",
         )
-        _one_time(
+        add(
             primary_tenant,
-            EntryType.DEPOSIT_CHARGE,
             lease.cleaning_deposit,
             "cleaning_deposit_lease",
             "Cleaning deposit — due on signing",
@@ -345,13 +325,45 @@ def generate_initial_charges(lease: Lease) -> None:
     for lt in lease.lease_tenants.filter(
         tenant__isnull=False, cleaning_deposit__gt=0
     ):
-        _one_time(
+        add(
             lt.tenant,
-            EntryType.DEPOSIT_CHARGE,
             lt.cleaning_deposit,
             "cleaning_deposit_individual",
             "Cleaning deposit (individual) — due on signing",
         )
+
+    return specs
+
+
+def ensure_deposit_charges(lease: Lease, *, keys: set[str] | None = None) -> list:
+    """Idempotently post selected contractual deposits without posting rent."""
+    charges = []
+    for spec in deposit_charge_specs(lease):
+        if keys is not None and spec["key"] not in keys:
+            continue
+        charge, _created = post_charge(
+            landlord=lease.landlord,
+            tenant=spec["tenant"],
+            lease=lease,
+            amount=spec["amount"],
+            due_date=spec["due_date"],
+            entry_type=EntryType.DEPOSIT_CHARGE,
+            description=spec["description"],
+            idempotency_key=spec["key"],
+            metadata=spec["metadata"],
+        )
+        charges.append(charge)
+    return charges
+
+
+def generate_initial_charges(lease: Lease) -> None:
+    """Create all idempotent deposit and rent charges when a lease activates.
+
+    Early deposit receipt may already have created some deposit rows. Natural
+    idempotency keys make activation reuse those rows while still generating
+    the rent schedule.
+    """
+    ensure_deposit_charges(lease)
 
     generate_rent_charges_for_lease(lease)
 

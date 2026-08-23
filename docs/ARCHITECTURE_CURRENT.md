@@ -185,6 +185,14 @@ Exact lease and record IDs remain hard database scope boundaries throughout the
 continuation; confirmation uses the frozen IDs and aborts if their live state
 changed after preview.
 
+Deposit payment can precede full lease activation. `ledger.billing` exposes one
+pure contractual-deposit specification used by both activation billing and the
+payment capability. When an exact lease has deposit terms but no ledger charges,
+RAMA previews those lease-derived obligations and one confirmation atomically
+creates only the selected idempotent deposit charges and settles them. It does
+not activate the lease or generate rent, and it aborts if the lease terms change
+between preview and confirmation.
+
 The web surface defaults to AUTO and keeps one conversation while the landlord
 switches between AUTO, Ops, and Treasurer. Strategic finance requests run the
 bounded Treasurer deliberation pipeline; ordinary finance lookups use the

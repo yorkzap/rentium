@@ -1514,6 +1514,8 @@ def create_expense(
     tenant_query="Optional exact payer name/email, especially for a joint household charge.",
     lease_number="Exact lease number when already resolved. This is a hard scope boundary; preserve it across follow-ups.",
     charge_ids="Exact comma-separated charge UUIDs selected by an earlier preview or clarification. Normally leave blank.",
+    materialize_deposits="INTERNAL preview contract. Leave blank; the server sets this only when contractual deposits are not billed yet.",
+    expected_deposits="INTERNAL frozen lease-deposit snapshot. Leave blank; preserve it unchanged only from resolved_arguments.",
 )
 def record_payment(
     landlord,
@@ -1527,6 +1529,8 @@ def record_payment(
     tenant_query: str = "",
     lease_number: str = "",
     charge_ids: str = "",
+    materialize_deposits: str = "",
+    expected_deposits: str = "",
     confirm: str = "",
 ) -> dict:
     """Record money RECEIVED against a charge — rent arrived, deposit paid,
@@ -1550,6 +1554,8 @@ def record_payment(
         tenant_query=tenant_query,
         lease_number=lease_number,
         charge_ids=charge_ids,
+        materialize_deposits=materialize_deposits,
+        expected_deposits=expected_deposits,
         confirm=confirm,
     )
 
