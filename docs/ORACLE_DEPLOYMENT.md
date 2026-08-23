@@ -110,5 +110,37 @@ require changing frontend builds or exposing ports 80/443 on the VPS.
 
 ## Updates
 
-Pull or copy the new backend revision, rebuild, and run Compose again. Do not
-use `down -v`; the `-v` flag deletes production data.
+Deploy one complete Git revision. Do not copy only the files mentioned by the
+latest commit: a Python module can import an API introduced by an earlier
+commit, and database-image changes (such as pgvector) must ship with the Django
+code that uses them.
+
+A host without a Git checkout can still receive a coherent release:
+
+```console
+git archive --format=tar.gz --output=rentium-release.tar.gz HEAD
+scp rentium-release.tar.gz user@vps:/tmp/
+ssh user@vps
+sudo tar -xzf /tmp/rentium-release.tar.gz -C /opt/rentium/app
+cd /opt/rentium/app
+sudo docker compose -f docker-compose.oracle.yml build
+sudo docker compose -f docker-compose.oracle.yml up -d
+```
+
+Always build the full Compose project, including PostgreSQL—not only Django and
+Celery. Before considering the release complete, verify the migration gate,
+paired RAMA imports, container health, and the public endpoint:
+
+```console
+sudo docker compose -f docker-compose.oracle.yml exec -T django \
+  /entrypoint python manage.py migrate --check
+sudo docker compose -f docker-compose.oracle.yml exec -T django \
+  /entrypoint python manage.py shell -c \
+  'from rentium.rama.orchestrator import classify_core_read; from rentium.rama.service import run_turn; print("RAMA imports OK")'
+sudo docker compose -f docker-compose.oracle.yml ps
+curl -fsS https://api.rentium.ca/healthz
+```
+
+Keep a code backup of the prior release before extraction. Never include
+`.envs/.oracle/` in a release archive, and never use `down -v`; the `-v` flag
+deletes production data.

@@ -2202,6 +2202,26 @@ def _merge_house_layout_answer(arguments: dict, message: str) -> dict:
 
 def _preview_reply(tool: str, result: dict) -> str:
     preview = result.get("preview") or {}
+    if tool == "record_payment":
+        allocations = preview.get("allocations") or []
+        lines = [
+            "Ready to record the money received:",
+            f"• Lease: {preview.get('lease_number') or '—'}",
+            f"• Total: ${preview.get('total') or preview.get('this_payment') or '—'}",
+            f"• Method: {preview.get('method') or '—'}",
+            f"• Date: {preview.get('payment_date') or 'today'}",
+        ]
+        for allocation in allocations:
+            lines.append(
+                f"• ${allocation.get('payment') or '—'} → "
+                f"{allocation.get('charge') or 'charge'}"
+            )
+        if preview.get("amount_source"):
+            lines.append(f"• Amount source: {preview['amount_source']}")
+        if preview.get("billing_note"):
+            lines.append(f"• Note: {preview['billing_note']}")
+        lines.append("Reply yes to record it, or no to cancel.")
+        return "\n".join(lines)
     if tool == "rename_business_document":
         amount = preview.get("amount")
         currency = preview.get("currency") or "CAD"
@@ -2567,6 +2587,23 @@ def _batch_preview_reply(
                     f"Apply a one-time {str(args.get('adjustment_type') or '').lower()} "
                     f"of ${args.get('amount')} to "
                     f"{args.get('lease_number') or target}"
+                )
+        elif step.tool == "record_payment":
+            detail = (
+                f"Record ${args.get('amount') or 'the outstanding balance'} "
+                f"received for {args.get('charge_query') or 'the selected charge'} "
+                f"on {args.get('lease_number') or target}"
+            )
+            if args.get("payment_method"):
+                detail += f" by {args['payment_method']}"
+            try:
+                deposits = json.loads(args.get("expected_deposits") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                deposits = []
+            if deposits:
+                detail += "; contractual amounts: " + ", ".join(
+                    f"${row.get('amount')} {str(row.get('description') or '').lower()}"
+                    for row in deposits
                 )
         else:
             detail = (
@@ -4054,6 +4091,76 @@ def _first_month_rent_adjustment_intent(
             }
         )
     return {"tool": "apply_rent_adjustment", "arguments": arguments}
+
+
+_RECORD_RECEIVED_RE = re.compile(
+    r"\b(?:record|log|post|enter|mark)\b[^.!?]{0,180}"
+    r"\b(?:received|paid|came\s+in|collected)\b"
+    r"|\b(?:received|collected)\b[^.!?]{0,180}"
+    r"\b(?:record|log|post|enter|mark)\b",
+    re.IGNORECASE,
+)
+_RECEIVED_CHARGE_RE = re.compile(
+    r"\b(?:security|damage|cleaning|pet)?\s*deposits?\b"
+    r"|\b(?:rent|payment|balance|fee)\b",
+    re.IGNORECASE,
+)
+
+
+def _received_payment_intent(
+    landlord,
+    message: str,
+    reference: dict | None = None,
+) -> dict | None:
+    """Compile an explicit money-received instruction without a model round.
+
+    The model is useful for conversational ambiguity, but it must not be a
+    prerequisite for a certified operation whose verb, event and business
+    object are all explicit.  Entity resolution is portfolio-backed: several
+    named tenants resolve to their one shared lease, never to a guessed payer
+    and never to similarly worded charges elsewhere in the portfolio.
+    """
+    text = _landlord_words(message or "").strip()
+    if not text or not _RECORD_RECEIVED_RE.search(text):
+        return None
+    if not _RECEIVED_CHARGE_RE.search(text):
+        return None
+
+    from .orchestrator import resolve_lease_from_message
+
+    lease, gaps = resolve_lease_from_message(landlord, text, reference or {})
+    if lease is None:
+        return {
+            "error": "\n".join(
+                dict.fromkeys(
+                    str(gap) for gap in gaps if str(gap or "").strip()
+                ),
+            )
+            or "I could not resolve one exact lease for that payment.",
+        }
+
+    arguments = {
+        "lease_number": lease.lease_number,
+        "charge_query": text,
+    }
+    amount = _amount_from_message(text)
+    if amount:
+        arguments["amount"] = amount
+    method = next(
+        (
+            value
+            for pattern, value in (
+                (r"\be-?transfer\b|\binterac\b", "etransfer"),
+                (r"\bcash\b", "cash"),
+                (r"\bcheque\b|\bcheck\b", "cheque"),
+            )
+            if re.search(pattern, text, re.IGNORECASE)
+        ),
+        "",
+    )
+    if method:
+        arguments["payment_method"] = method
+    return {"tool": "record_payment", "arguments": arguments}
 
 
 def _rent_adjustment_preview_reply(result: dict) -> str:
@@ -6484,6 +6591,49 @@ def _run_turn_unlocked(
             "the plan is still waiting for a yes/no)\n"
             + json.dumps(plan_brief(pending_plan), default=str)
         )
+
+    # Explicit money-received instructions are certified server-side.  Resolve
+    # every named party to one lease, then let record_payment derive amounts
+    # from that lease's open (or contractual, not-yet-billed) charges.  This
+    # route also owns the durable payment-method clarification, so provider
+    # availability and model tool selection cannot strand a routine receipt.
+    if deterministic_reply is None and pending_plan is None:
+        payment_intent = _received_payment_intent(
+            landlord,
+            message,
+            visible_reference,
+        )
+        if payment_intent is not None:
+            if payment_intent.get("error"):
+                deterministic_reply = str(payment_intent["error"])
+            else:
+                result = _run_deterministic_tool(
+                    payment_intent["tool"],
+                    payment_intent["arguments"],
+                )
+                if result.get("question_for_user"):
+                    deterministic_reply = str(result["question_for_user"])
+                elif result.get("needs_confirm"):
+                    stable = dict(
+                        result.get("resolved_arguments")
+                        or payment_intent["arguments"]
+                    )
+                    plan = save_single(
+                        landlord,
+                        conversation_id,
+                        payment_intent["tool"],
+                        stable,
+                        intent_contract=intent_contract,
+                    )
+                    deterministic_reply = _preview_reply(
+                        payment_intent["tool"], result,
+                    )
+                else:
+                    deterministic_reply = str(
+                        result.get("error")
+                        or result.get("message")
+                        or result
+                    )
 
     # Several explicit rent-period targets are compiled together before the
     # model loop. This is the common "make Aug $X for A and $Y for B" case: one

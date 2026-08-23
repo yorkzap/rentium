@@ -375,6 +375,93 @@ def test_pending_lease_deposits_can_be_billed_and_paid_in_one_confirmation(
     ).count() == 2
 
 
+def test_named_household_received_deposits_compile_without_provider(
+    landlord, bc_lease,
+):
+    """Replay the production wording through the complete visible-turn path.
+
+    Two names describe the household scope, not an ambiguous payer.  The
+    backend resolves their shared lease, asks only how the money arrived, and
+    carries that answer into one executable preview without calling a model.
+    """
+    from unittest import mock
+
+    from rentium.leases.models import Lease
+    from rentium.leases.models import LeaseTenant
+    from rentium.rama.models import RamaPendingPlan
+    from rentium.rama.models import RamaPreferences
+    from rentium.rama.service import run_turn
+
+    preferences = RamaPreferences.for_landlord(landlord)
+    preferences.enabled = True
+    preferences.provider = "xai"
+    preferences.api_key = "test-key"
+    preferences.save()
+    bc_lease.status = Lease.LeaseStatus.PENDING_SIGNATURES
+    bc_lease.security_deposit = Decimal("650.00")
+    bc_lease.cleaning_deposit = Decimal("350.00")
+    bc_lease.save(
+        update_fields=["status", "security_deposit", "cleaning_deposit"],
+    )
+    from rentium.users.models import TenantProfile
+    from rentium.users.tests.factories import UserFactory
+
+    aiswarya = TenantProfile.objects.create(
+        user=UserFactory(name="Aiswarya Chenthamara"),
+    )
+    naveen = TenantProfile.objects.create(
+        user=UserFactory(name="Naveen Prasanth Singaravel"),
+    )
+    LeaseTenant.objects.create(
+        lease=bc_lease,
+        tenant=aiswarya,
+        invited_name="Aiswarya Chenthamara",
+        invited_email="aiswarya@example.com",
+        rent_amount=Decimal("0.00"),
+    )
+    LeaseTenant.objects.create(
+        lease=bc_lease,
+        tenant=naveen,
+        invited_name="Naveen Prasanth Singaravel",
+        invited_email="naveen@example.com",
+        rent_amount=bc_lease.total_rent,
+        is_primary_tenant=True,
+    )
+    provider = mock.Mock()
+    provider.complete.side_effect = AssertionError("provider must not be called")
+
+    with mock.patch("rentium.rama.service.get_provider", return_value=provider):
+        question = run_turn(
+            landlord,
+            "hi can u record aiswarya and naveen's security deposit and "
+            "cleaning deposit as received",
+            role="general",
+            channel="telegram",
+        )
+        preview = run_turn(
+            landlord,
+            "e-transfer",
+            question.conversation_id,
+            role="general",
+            channel="telegram",
+        )
+
+    assert question.deterministic is True
+    assert "e-transfer, cash, or cheque" in question.reply
+    assert preview.deterministic is True
+    assert provider.complete.call_count == 0
+    plan = RamaPendingPlan.objects.get(conversation_id=question.conversation_id)
+    step = plan.steps.get()
+    assert step.tool == "record_payment"
+    assert step.arguments["lease_number"] == bc_lease.lease_number
+    assert step.arguments["payment_method"] == "etransfer"
+    assert step.arguments["materialize_deposits"] == "yes"
+    assert "$1000.00" in preview.reply
+    assert not LedgerEntry.objects.filter(
+        entry_type__in=[EntryType.DEPOSIT_CHARGE, EntryType.PAYMENT],
+    ).exists()
+
+
 def test_early_deposit_confirmation_aborts_if_lease_terms_changed(
     landlord, bc_lease, siya,
 ):

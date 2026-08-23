@@ -221,6 +221,17 @@ def _resolve_lease_for_core_read(  # noqa: C901
     return lease, []
 
 
+def resolve_lease_from_message(landlord, message: str, reference: dict | None = None):
+    """Resolve one lease from an exact number, visible reference, or parties.
+
+    This is deliberately shared by deterministic reads and writes.  A write
+    router must not grow its own tenant-name matching rules and then target a
+    different lease from the read router.  Ambiguity remains a hard stop and
+    is returned as structured human-readable gaps.
+    """
+    return _resolve_lease_for_core_read(landlord, message, reference or {})
+
+
 def _render_signing_answer(lease, intent: IntentEnvelope, packet) -> str:
     roster = packet.metadata
     if intent.name == "lease_identity":
