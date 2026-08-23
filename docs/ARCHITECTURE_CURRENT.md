@@ -1,6 +1,6 @@
 # Current Rentium architecture
 
-This note describes the architecture as of July 2026. It supersedes older
+This note describes the architecture as of August 2026. It supersedes older
 module lists where they conflict, while the deeper RAMA and operations guides
 remain useful for implementation detail.
 
@@ -172,6 +172,18 @@ this order: transport reply-to, explicit entity, source event/client context,
 then the last visible outbound message in the active episode. An idle/reset
 episode boundary suspends clarifications and expires confirmations, so a file
 or question from days earlier cannot silently become the subject of a new turn.
+
+Ordinary capability clarifications are also executable state, never prose-only
+memory. A tool opts into the generic continuation contract by returning the
+missing field plus structured choices/options. RAMA persists the exact tool and
+its already-resolved arguments in a `RamaTask`, binds that task to the visible
+question, and applies a short reply only to that prompt in the active episode.
+Several calls asking the same question can resume together into one confirmation
+batch without another provider call. Composite workflows may retain richer
+domain-specific clarification engines and do not opt into this one-field path.
+Exact lease and record IDs remain hard database scope boundaries throughout the
+continuation; confirmation uses the frozen IDs and aborts if their live state
+changed after preview.
 
 The web surface defaults to AUTO and keeps one conversation while the landlord
 switches between AUTO, Ops, and Treasurer. Strategic finance requests run the

@@ -1512,6 +1512,8 @@ def create_expense(
     reference_number="Optional bank/e-transfer/cheque reference from the UI or landlord.",
     notes="Optional factual payment note; never invent one.",
     tenant_query="Optional exact payer name/email, especially for a joint household charge.",
+    lease_number="Exact lease number when already resolved. This is a hard scope boundary; preserve it across follow-ups.",
+    charge_ids="Exact comma-separated charge UUIDs selected by an earlier preview or clarification. Normally leave blank.",
 )
 def record_payment(
     landlord,
@@ -1523,6 +1525,8 @@ def record_payment(
     reference_number: str = "",
     notes: str = "",
     tenant_query: str = "",
+    lease_number: str = "",
+    charge_ids: str = "",
     confirm: str = "",
 ) -> dict:
     """Record money RECEIVED against a charge — rent arrived, deposit paid,
@@ -1544,6 +1548,8 @@ def record_payment(
         reference_number=reference_number,
         notes=notes,
         tenant_query=tenant_query,
+        lease_number=lease_number,
+        charge_ids=charge_ids,
         confirm=confirm,
     )
 

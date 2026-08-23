@@ -202,6 +202,109 @@ def test_a_tenant_name_scopes_the_charges(landlord, bc_lease, siya, her_deposits
     assert result["preview"]["total"] == "400.00", result
 
 
+def test_an_exact_lease_is_a_hard_boundary_even_when_other_deposits_match(
+    landlord, bc_lease, her_deposits,
+):
+    """The production failure supplied an exact lease number, but charge
+    resolution still returned deposits from Room 1, Garden Suite and Room C.
+    Exact entity references must constrain SQL, not merely decorate a prompt.
+    """
+    from rentium.leases.models import Lease
+
+    other = Lease.objects.create(
+        landlord=landlord,
+        property=bc_lease.property,
+        lease_type=Lease.LeaseType.BC_RESIDENTIAL_TENANCY,
+        status=Lease.LeaseStatus.ACTIVE,
+        start_date=TODAY,
+        is_month_to_month=True,
+        total_rent="1200.00",
+    )
+    _deposit(
+        landlord,
+        other,
+        description="Security deposit — due on signing",
+        kind="security_deposit",
+        amount="600.00",
+    )
+    _deposit(
+        landlord,
+        other,
+        description="Cleaning deposit — due on signing",
+        kind="cleaning_deposit_lease",
+        amount="300.00",
+    )
+
+    result = _pay(
+        landlord,
+        lease_number=bc_lease.lease_number,
+        charge_query="security and cleaning deposits",
+        payment_method="etransfer",
+    )
+
+    assert result["needs_confirm"] is True, result
+    assert result["preview"]["total"] == "400.00"
+    assert {
+        row["charge_id"] for row in result["preview"]["allocations"]
+    } == {str(charge.pk) for charge in her_deposits}
+    assert set(result["resolved_arguments"]["charge_ids"].split(",")) == {
+        str(charge.pk) for charge in her_deposits
+    }
+
+
+def test_ambiguous_charge_returns_machine_resumable_choices(landlord, bc_lease):
+    from rentium.ledger import services as ledger_services
+
+    for month in ("August", "September"):
+        ledger_services.post_charge(
+            landlord=landlord,
+            property=bc_lease.property,
+            lease=bc_lease,
+            tenant=None,
+            entry_type=EntryType.RENT_CHARGE,
+            amount=Decimal("850.00"),
+            due_date=TODAY,
+            description=f"Monthly rent — {month}",
+        )
+
+    result = _pay(
+        landlord,
+        lease_number=bc_lease.lease_number,
+        charge_query="rent",
+        amount="850.00",
+        payment_method="etransfer",
+    )
+
+    assert result["needs"] == "charge_ids"
+    assert result["clarification"]["field"] == "charge_ids"
+    assert len(result["clarification"]["options"]) == 2
+    assert all(option["value"] for option in result["clarification"]["options"])
+
+
+def test_frozen_charge_set_aborts_if_one_charge_changes_before_confirmation(
+    landlord, bc_lease, her_deposits,
+):
+    preview = _pay(
+        landlord,
+        lease_number=bc_lease.lease_number,
+        charge_query="security and cleaning deposits",
+        payment_method="etransfer",
+    )
+    stable = preview["resolved_arguments"]
+
+    _pay(
+        landlord,
+        amount="250.00",
+        charge_ids=str(her_deposits[0].pk),
+        payment_method="etransfer",
+        confirm="yes",
+    )
+    changed = _pay(landlord, **stable, confirm="yes")
+
+    assert changed["code"] == "CHARGE_SCOPE_CHANGED"
+    assert LedgerEntry.objects.filter(entry_type=EntryType.PAYMENT).count() == 1
+
+
 def test_the_name_is_read_out_of_the_charge_query_too(
     landlord, bc_lease, siya, her_deposits,
 ):

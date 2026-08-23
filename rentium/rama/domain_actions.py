@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
+from uuid import UUID
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -3648,7 +3649,15 @@ def _tenant_named_in(landlord, text: str):
     return next(iter(found.values()))
 
 
-def _open_charges(landlord, query: str = "", property_query: str = "", tenant=None):
+def _open_charges(
+    landlord,
+    query: str = "",
+    property_query: str = "",
+    tenant=None,
+    *,
+    lease=None,
+    charge_ids: list[str] | None = None,
+):
     """Charges with something still owing, newest first.
 
     Query words are OR-matched against description (and rent month tokens).
@@ -3666,6 +3675,14 @@ def _open_charges(landlord, query: str = "", property_query: str = "", tenant=No
         .select_related("property", "tenant", "tenant__user", "lease")
         .order_by("-effective_date")
     )
+    # An exact entity reference is a hard boundary, not a search hint.  The
+    # caller may have spent several turns resolving the household/lease; never
+    # throw that work away and offer similarly-worded charges elsewhere in the
+    # portfolio.
+    if lease is not None:
+        rows = rows.filter(lease=lease)
+    if charge_ids:
+        rows = rows.filter(pk__in=charge_ids)
     if tenant is not None:
         rows = rows.filter(
             Q(tenant=tenant) | Q(lease__lease_tenants__tenant=tenant),
@@ -3747,6 +3764,14 @@ def _parse_payment_method(payment_method: str, *, amount_label: str = "") -> dic
                 f"e-transfer, cash, or cheque?"
             ),
             "needs": "payment_method",
+            "clarification": {
+                "field": "payment_method",
+                "choices": {
+                    "etransfer": ["e-transfer", "etransfer", "e transfer", "interac"],
+                    "cash": ["cash"],
+                    "cheque": ["cheque", "check"],
+                },
+            },
         }
     method = _PAYMENT_METHODS.get(raw_method)
     if method is None:
@@ -3760,6 +3785,14 @@ def _parse_payment_method(payment_method: str, *, amount_label: str = "") -> dic
                 f"Was it an e-transfer, cash, or a cheque?"
             ),
             "needs": "payment_method",
+            "clarification": {
+                "field": "payment_method",
+                "choices": {
+                    "etransfer": ["e-transfer", "etransfer", "e transfer", "interac"],
+                    "cash": ["cash"],
+                    "cheque": ["cheque", "check"],
+                },
+            },
         }
     return {"method": method}
 
@@ -3833,6 +3866,8 @@ def record_payment(
     reference_number: str = "",
     notes: str = "",
     tenant_query: str = "",
+    lease_number: str = "",
+    charge_ids: str = "",
     confirm: str = "",
 ) -> dict:
     """Record money against one open charge (partials OK).
@@ -3858,6 +3893,26 @@ def record_payment(
         if amt <= 0:
             return {"error": "A payment must be a positive amount."}
 
+    # Resolve exact scope before fuzzy words.  `lease_number` is commonly
+    # carried forward from an earlier read turn; ignoring it caused a payment
+    # for one household to fan out across every deposit in the portfolio.
+    lease = None
+    if (lease_number or "").strip():
+        lease, lease_error = _resolve_lease(
+            landlord, lease_number=(lease_number or "").strip(),
+        )
+        if lease_error:
+            return {"error": lease_error}
+
+    try:
+        exact_charge_ids = [
+            str(UUID(value.strip()))
+            for value in (charge_ids or "").replace(";", ",").split(",")
+            if value.strip()
+        ]
+    except ValueError:
+        return {"error": "charge_ids must contain valid charge UUIDs."}
+
     # Who the money is about is resolved BEFORE which charge it settles: a
     # deposit description never carries a tenant's name, so a sentence naming
     # one has to narrow the charges or the name matches nothing at all.
@@ -3874,8 +3929,21 @@ def record_payment(
     scope_tenant = payer or _tenant_named_in(landlord, charge_query)
 
     candidates = _open_charges(
-        landlord, charge_query, property_query, tenant=scope_tenant,
+        landlord,
+        charge_query,
+        property_query,
+        tenant=scope_tenant,
+        lease=lease,
+        charge_ids=exact_charge_ids,
     )
+    if exact_charge_ids and {str(c.pk) for c in candidates} != set(exact_charge_ids):
+        return {
+            "error": (
+                "The selected charge set changed after the preview. Nothing was "
+                "posted; prepare a fresh payment preview from the current ledger."
+            ),
+            "code": "CHARGE_SCOPE_CHANGED",
+        }
     if not candidates:
         return {
             "error": "no_matching_charge",
@@ -3885,6 +3953,23 @@ def record_payment(
                 "charge this was for — or post the charge first."
             ),
         }
+
+    # Narrow a singular high-signal description before deriving its amount.
+    # Previously this scoring lived only in the stated-amount branch.  Thus
+    # "security deposit" with amount omitted matched security *and* cleaning
+    # (both contain "deposit") and bundled both before the scorer ever ran.
+    # A combined request such as "security and cleaning deposits" remains a
+    # tie and intentionally keeps both.
+    if len(candidates) > 1 and (charge_query or "").strip():
+        tokens = set(re.findall(r"[a-z]{3,}", charge_query.casefold()))
+        scored = [
+            (sum(tok in (c.description or "").casefold() for tok in tokens), c)
+            for c in candidates
+        ]
+        best = max(score for score, _ in scored)
+        top = [c for score, c in scored if score == best]
+        if best and len(top) == 1:
+            candidates = top
 
     derived = False
     if amt is None:
@@ -3901,7 +3986,7 @@ def record_payment(
         derived = True
         amt = sum((_outstanding_on(c) for c in candidates), Decimal("0.00"))
         if len(candidates) > 1:
-            return _relay_as_record_payment(
+            relayed = _relay_as_record_payment(
                 record_payment_allocation(
                     landlord,
                     charge_ids=",".join(str(c.pk) for c in candidates),
@@ -3911,12 +3996,24 @@ def record_payment(
                     amount_source=_AMOUNT_FROM_THE_BOOKS,
                 ),
             )
+            if relayed.get("needs_confirm"):
+                relayed["resolved_arguments"] = {
+                    "amount": str(amt),
+                    "charge_ids": ",".join(str(c.pk) for c in candidates),
+                    "payment_method": payment_method,
+                    "payment_date": payment_date,
+                    "reference_number": reference_number,
+                    "notes": notes,
+                    "tenant_query": tenant_query,
+                    "lease_number": lease_number,
+                }
+            return relayed
 
     # Auto multi-charge when one transfer covers security + cleaning, etc.
     if len(candidates) > 1:
         split = _suggest_deposit_split(candidates, amt)
         if split is not None:
-            return _relay_as_record_payment(
+            relayed = _relay_as_record_payment(
                 record_payment_allocation(
                     landlord,
                     amount=str(amt),
@@ -3926,6 +4023,18 @@ def record_payment(
                     confirm=confirm,
                 ),
             )
+            if relayed.get("needs_confirm"):
+                relayed["resolved_arguments"] = {
+                    "amount": str(amt),
+                    "charge_ids": ",".join(str(c.pk) for c in split),
+                    "payment_method": payment_method,
+                    "payment_date": payment_date,
+                    "reference_number": reference_number,
+                    "notes": notes,
+                    "tenant_query": tenant_query,
+                    "lease_number": lease_number,
+                }
+            return relayed
         # Prefer a unique high-signal match over asking every time.
         #
         # Scored, not filtered. "Siya security deposit" against a security and
@@ -3945,6 +4054,26 @@ def record_payment(
             if best and len(top) == 1:
                 candidates = top
         if len(candidates) > 1:
+            options = []
+            for c in candidates[:6]:
+                aliases = [
+                    c.description or "",
+                    c.property.name if c.property_id else "",
+                    c.lease.lease_number if c.lease_id else "",
+                ]
+                if c.lease_id:
+                    aliases.extend(
+                        c.lease.lease_tenants.values_list(
+                            "tenant__user__name", flat=True,
+                        ),
+                    )
+                options.append(
+                    {
+                        "value": str(c.pk),
+                        "label": _charge_label(c),
+                        "aliases": [str(a) for a in aliases if str(a).strip()],
+                    },
+                )
             return {
                 "question_for_user": (
                     "Which charge was this payment for?\n"
@@ -3956,6 +4085,11 @@ def record_payment(
                     "+ cleaning deposits), say so and I will split it."
                 ),
                 "candidates": [_charge_label(c) for c in candidates[:6]],
+                "needs": "charge_ids",
+                "clarification": {
+                    "field": "charge_ids",
+                    "options": options,
+                },
             }
 
     charge = candidates[0]
@@ -4001,12 +4135,23 @@ def record_payment(
             f"overpaid; otherwise re-send with the right amount."
         )
     if not _confirmed(confirm):
-        return _preview(
+        result = _preview(
             "record_payment",
             preview,
             "Records money received against this charge. Nothing moves in the "
             "real world — this is the book entry.",
         )
+        result["resolved_arguments"] = {
+            "amount": str(amt),
+            "charge_ids": str(charge.pk),
+            "payment_method": payment_method,
+            "payment_date": payment_date,
+            "reference_number": reference_number,
+            "notes": notes,
+            "tenant_query": tenant_query,
+            "lease_number": lease_number,
+        }
+        return result
 
     try:
         entry, created = ledger_services.record_payment(

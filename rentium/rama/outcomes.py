@@ -42,10 +42,14 @@ class CommandOutcome:
         result = result or {}
         if result.get("error"):
             return cls(OutcomeKind.FAILED, str(result["error"]), data=result)
-        if result.get("needs_input"):
-            missing = tuple(str(x) for x in (result.get("missing") or ()))
+        if result.get("needs_input") or result.get("question_for_user"):
+            raw_missing = result.get("missing") or ()
+            if not raw_missing and (result.get("needs") or result.get("missing_field")):
+                raw_missing = (result.get("needs") or result.get("missing_field"),)
+            missing = tuple(str(x) for x in raw_missing)
             message = str(
-                result.get("question")
+                result.get("question_for_user")
+                or result.get("question")
                 or result.get("detail")
                 or result.get("needs_input")
                 or "More information is required.",

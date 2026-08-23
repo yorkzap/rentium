@@ -5752,6 +5752,7 @@ def _run_turn_unlocked(
 
     visible_input = None
     visible_reference: dict = {"source": "none"}
+    clarification_tasks_to_bind = []
     if depth == 0:
         from .conversations import record_visible_message
         from .conversations import reference_context
@@ -5827,6 +5828,10 @@ def _run_turn_unlocked(
         )
         if plan is not None:
             bind_plan_prompt(plan, row)
+        if clarification_tasks_to_bind:
+            from .clarifications import bind_prompt
+
+            bind_prompt(clarification_tasks_to_bind, row)
         return row
 
     try:
@@ -6038,6 +6043,24 @@ def _run_turn_unlocked(
     turn_attachments: list[dict] = []
     turn = Turn()
 
+    def _capture_clarification(tool_name: str, arguments: dict, result: dict):
+        if depth != 0 or not isinstance(result, dict):
+            return None
+        from .clarifications import persist_tool_clarification
+
+        task = persist_tool_clarification(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            episode=visible_input.episode if visible_input else None,
+            source_message=visible_input,
+            tool=tool_name,
+            arguments=arguments,
+            result=result,
+        )
+        if task is not None:
+            clarification_tasks_to_bind.append(task)
+        return task
+
     def _run_deterministic_tool(tool_name: str, arguments: dict) -> dict:
         # The routers below call this directly, so they never pass through
         # role_tool_schemas(). Without this check a role's tool list describes
@@ -6062,7 +6085,117 @@ def _run_turn_unlocked(
                 "deterministic_routing": True,
             },
         )
+        _capture_clarification(tool_name, arguments, result)
         return result
+
+    # Deterministic conversation-control state.  It is initialized before
+    # clarification continuation because a resumed task is itself one of the
+    # deterministic routes.
+    plan_progress: dict | None = None
+    deterministic_reply: str | None = _visible_reference_answer(
+        landlord, visible_text if visible_text is not None else message, visible_reference
+    )
+    forced_expense_intent: dict | None = None
+    orphaned_confirmation_proposal = ""
+    pending_plan = load_fresh_plan(landlord, conversation_id)
+
+    # If the latest visible prompt asked for one structured input, resume the
+    # exact saved capability before any topic router or provider call.  Several
+    # calls may share a prompt (for example two charges needing the same payment
+    # method); the one reply advances all of them and any previews become one
+    # confirmation batch.
+    if deterministic_reply is None and pending_plan is None and depth == 0:
+        from .clarifications import answer_for
+        from .clarifications import cancel as cancel_clarifications
+        from .clarifications import finish as finish_clarification
+        from .clarifications import prompted_tasks
+
+        prompt_id = str(visible_reference.get("message_id") or "")
+        resumable = prompted_tasks(
+            landlord=landlord,
+            conversation_id=conversation_id,
+            prompt_id=prompt_id,
+        )
+        if resumable and re.search(
+            r"\b(?:cancel|never\s*mind|nevermind|forget it|stop)\b",
+            message or "",
+            re.I,
+        ):
+            cancel_clarifications(resumable)
+            deterministic_reply = "Cancelled — nothing was changed."
+        elif resumable:
+            resumed_specs: list[dict] = []
+            resumed_questions: list[str] = []
+            resumed_errors: list[str] = []
+            unresolved_answer = False
+            for task in resumable:
+                resolved = answer_for(task, message)
+                if resolved is None:
+                    unresolved_answer = True
+                    question = str(
+                        ((task.context or {}).get("clarification") or {}).get(
+                            "question",
+                        )
+                        or "Please choose one of the options I listed."
+                    )
+                    if question not in resumed_questions:
+                        resumed_questions.append(question)
+                    continue
+                field, value = resolved
+                arguments = dict(task.input or {})
+                arguments[field] = value
+                arguments["confirm"] = ""
+                result = _run_deterministic_tool(task.capability_key, arguments)
+                if isinstance(result, dict) and result.get("needs_confirm"):
+                    stable = dict(result.get("resolved_arguments") or arguments)
+                    resumed_specs.append(
+                        {
+                            "kind": "single",
+                            "tool": task.capability_key,
+                            "arguments": stable,
+                            "target": str(
+                                (result.get("preview") or {}).get("property")
+                                or stable.get("lease_number")
+                                or stable.get("property_query")
+                                or task.capability_key.replace("_", " ")
+                            ),
+                        },
+                    )
+                    finish_clarification(
+                        task,
+                        message="The missing input was accepted and a preview was prepared.",
+                        preview=True,
+                    )
+                elif isinstance(result, dict) and result.get("question_for_user"):
+                    finish_clarification(
+                        task,
+                        message="That input was accepted; the capability needs another fact.",
+                    )
+                    question = str(result["question_for_user"])
+                    if question not in resumed_questions:
+                        resumed_questions.append(question)
+                elif isinstance(result, dict) and result.get("error"):
+                    finish_clarification(task, message="The input was checked.")
+                    resumed_errors.append(str(result["error"]))
+                else:
+                    finish_clarification(task, message="The capability resumed.")
+
+            if resumed_specs:
+                plan = save_batch(
+                    landlord,
+                    conversation_id,
+                    resumed_specs,
+                    intent_contract=intent_contract,
+                )
+                deterministic_reply = _batch_preview_reply(plan, [])
+            elif resumed_questions:
+                deterministic_reply = "\n".join(resumed_questions)
+            elif resumed_errors:
+                deterministic_reply = "I couldn't continue that task:\n" + "\n".join(
+                    f"• {error}" for error in resumed_errors
+                )
+            elif unresolved_answer:
+                deterministic_reply = "Please answer the question above so I can continue."
 
     def _prepare_explicit_creation_batch(rows: list[dict]) -> str:
         specs: list[dict] = []
@@ -6121,13 +6254,6 @@ def _run_turn_unlocked(
     # model never reconstructs tool calls (that was the endless re-preview
     # loop). Lease terminations and similar own-confirm steps pause execution
     # for their own explicit "yes" (tiered confirm).
-    plan_progress: dict | None = None
-    deterministic_reply: str | None = _visible_reference_answer(
-        landlord, visible_text if visible_text is not None else message, visible_reference
-    )
-    forced_expense_intent: dict | None = None
-    orphaned_confirmation_proposal = ""
-    pending_plan = load_fresh_plan(landlord, conversation_id)
 
     # A plan survives 30 minutes, so one left over from an earlier subject is
     # still sitting there when the conversation has moved on — and a "yes"
@@ -8102,6 +8228,8 @@ def _run_turn_unlocked(
     pending_specs: list[dict] = []
     excluded_preview_errors: list[dict] = []
     unresolved_write_inputs: list[str] = []
+    clarification_questions: list[str] = []
+    tool_question_relayed = False
     planned_property_aliases: dict[str, str] = {}
     turn_tools = schemas
     proposal_compile_attempted = False
@@ -8289,6 +8417,11 @@ def _run_turn_unlocked(
                         "result": safe_result,
                     },
                 )
+                _capture_clarification(call.name, effective_arguments, result)
+                if isinstance(result, dict) and result.get("question_for_user"):
+                    question = str(result["question_for_user"]).strip()
+                    if question and question not in clarification_questions:
+                        clarification_questions.append(question)
                 if isinstance(result, dict) and result.get("needs_confirm"):
                     # A preview's warnings must reach the landlord verbatim.
                     # For a SINGLE write the reply is the model's own prose
@@ -8425,7 +8558,7 @@ def _run_turn_unlocked(
                     )
                 elif (
                     isinstance(result, dict)
-                    and result.get("needs_input")
+                    and (result.get("needs_input") or result.get("question_for_user"))
                     and registered_tool is not None
                     and "confirm" in registered_tool.parameters["properties"]
                 ):
@@ -8440,6 +8573,14 @@ def _run_turn_unlocked(
                         "content": json.dumps(safe_result),
                     },
                 )
+            if clarification_questions:
+                # The capability has already decided exactly what is missing.
+                # A further provider round can only paraphrase (or lose) that
+                # contract, and was the two-minute timeout in the payment
+                # transcript.  Relay the tool-owned question and stop now.
+                turn = Turn(text="\n".join(clarification_questions))
+                tool_question_relayed = True
+                break
         else:
             partial = (turn.text or "").strip()
             turn = _wrap_up_reply(
@@ -8730,7 +8871,11 @@ def _run_turn_unlocked(
             turn.text.strip()
             or "I wasn't able to produce an answer — try rephrasing."
         )
-    response_deterministic = False
+    response_deterministic = tool_question_relayed
+    if tool_question_relayed and unresolved_write_inputs:
+        reply = "I couldn't prepare an executable preview yet:\n" + "\n".join(
+            f"• {question}" for question in unresolved_write_inputs
+        )
 
     # If it stalled again, do not ship a second promise. Say what the turn's
     # tools actually found, or admit the stall — either beats making the
