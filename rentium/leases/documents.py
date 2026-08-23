@@ -159,14 +159,18 @@ def co_host_rows(lease) -> list[Row]:
     """Co-landlords on the lease — additional landlord parties shown on the
     agreement. Prefers the real signatory records (co-signers) and falls back to
     the lightweight co_hosts JSON (name-only, legacy)."""
+    from rentium.leases.parties import lease_signing_parties
+
     rows = []
     seen = set()
-    for sig in lease.landlord_signatories.all():
-        name = (sig.display_name or "").strip()
+    for party in lease_signing_parties(lease):
+        if party.role != "CO_LANDLORD":
+            continue
+        name = party.name.strip()
         if not name:
             continue
         seen.add(name.lower())
-        contact = " · ".join(p for p in [sig.email, sig.phone] if p)
+        contact = " · ".join(p for p in [party.email, party.phone] if p)
         rows.append(
             Row("Co-landlord", f"{name}{f' — {contact}' if contact else ''}")
         )
@@ -180,26 +184,23 @@ def co_host_rows(lease) -> list[Row]:
 
 
 def signature_rows(lease) -> list[Row]:
-    rows = [
-        Row(
-            f"Landlord — {lease.landlord.user.name}",
-            f"Signed {fmt_date(lease.landlord_signed_date.date())}"
-            if lease.landlord_signed and lease.landlord_signed_date
-            else "Awaiting signature",
-        )
-    ]
-    for lt in lease.lease_tenants.all():
-        if lt.declined:
-            rows.append(Row(f"Tenant — {lt.display_name}", "Declined"))
-        elif lt.has_signed and lt.signed_date:
-            rows.append(
-                Row(
-                    f"Tenant — {lt.display_name}",
-                    f"Signed {fmt_date(lt.signed_date.date())}",
-                )
+    from datetime import datetime
+
+    from rentium.leases.parties import lease_signing_parties
+
+    rows = []
+    for party in lease_signing_parties(lease):
+        status = "Awaiting signature"
+        if party.has_signed:
+            signed_at = (
+                datetime.fromisoformat(party.signed_at) if party.signed_at else None
             )
-        else:
-            rows.append(Row(f"Tenant — {lt.display_name}", "Awaiting signature"))
+            status = (
+                f"Signed {fmt_date(signed_at.date())}"
+                if signed_at
+                else "Signed (date unavailable)"
+            )
+        rows.append(Row(f"{party.role_label} — {party.name}", status))
     return rows
 
 

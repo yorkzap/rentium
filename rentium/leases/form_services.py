@@ -692,32 +692,58 @@ def unfilled_required_fields(form: LeaseForm) -> list[str]:
 
 def roster_candidates(lease) -> dict[tuple[str, int], dict]:
     """The lease's own parties, keyed by the slot they would fill."""
-    candidates: dict[tuple[str, int], dict] = {}
+    from rentium.leases.parties import lease_signing_parties
 
-    landlord_user = _landlord_user(lease)
-    candidates[(SignerRole.LANDLORD, 0)] = {
-        "user": landlord_user,
-        "name": getattr(landlord_user, "name", "") or "",
-        "email": getattr(landlord_user, "email", "") or "",
-        "phone": getattr(landlord_user, "phone", "") or "",
+    candidates: dict[tuple[str, int], dict] = {}
+    signatories = {
+        str(row.pk): row
+        for row in lease.landlord_signatories.select_related("member").all()
     }
-    for index, signatory in enumerate(lease.landlord_signatories.order_by("created_at")):
-        candidates[(SignerRole.CO_LANDLORD, index)] = {
-            "landlord_signatory": signatory,
-            "user": signatory.member,
-            "name": signatory.name,
-            "email": signatory.email,
-            "phone": signatory.phone or "",
-        }
-    tenants = lease.lease_tenants.filter(declined=False).order_by("created_at")
-    for index, lease_tenant in enumerate(tenants):
-        candidates[(SignerRole.TENANT, index)] = {
-            "lease_tenant": lease_tenant,
-            "user": lease_tenant.tenant.user if lease_tenant.tenant_id else None,
-            "name": lease_tenant.display_name,
-            "email": _tenant_email(lease_tenant),
-            "phone": _tenant_phone(lease_tenant),
-        }
+    tenants = {
+        str(row.pk): row
+        for row in lease.lease_tenants.filter(declined=False).select_related(
+            "tenant__user"
+        )
+    }
+    indexes = {
+        SignerRole.LANDLORD: 0,
+        SignerRole.CO_LANDLORD: 0,
+        SignerRole.TENANT: 0,
+    }
+    for party in lease_signing_parties(lease):
+        role = {
+            "LANDLORD": SignerRole.LANDLORD,
+            "CO_LANDLORD": SignerRole.CO_LANDLORD,
+            "TENANT": SignerRole.TENANT,
+        }[party.role]
+        index = indexes[role]
+        indexes[role] += 1
+        if role == SignerRole.LANDLORD:
+            user = _landlord_user(lease)
+            candidates[(role, index)] = {
+                "user": user,
+                "name": party.name,
+                "email": party.email,
+                "phone": party.phone,
+            }
+        elif role == SignerRole.CO_LANDLORD:
+            signatory = signatories[party.id]
+            candidates[(role, index)] = {
+                "landlord_signatory": signatory,
+                "user": signatory.member,
+                "name": party.name,
+                "email": party.email,
+                "phone": party.phone,
+            }
+        else:
+            lease_tenant = tenants[party.id]
+            candidates[(role, index)] = {
+                "lease_tenant": lease_tenant,
+                "user": lease_tenant.tenant.user if lease_tenant.tenant_id else None,
+                "name": party.name,
+                "email": party.email,
+                "phone": party.phone,
+            }
     return candidates
 
 

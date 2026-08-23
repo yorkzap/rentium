@@ -4,7 +4,7 @@ Rentium keeps the Next.js frontend on Vercel and runs the stateful backend
 services on one Linux VPS:
 
 - Django/Gunicorn
-- PostgreSQL
+- PostgreSQL 16 with pgvector (full-text + vector retrieval in one database)
 - Redis
 - one Celery worker and Celery beat
 - nginx as the origin proxy
@@ -49,7 +49,9 @@ remain behind authenticated Django download endpoints.
 6. Verify `http://127.0.0.1:8000/healthz`, then verify
    `https://api.rentium.ca/` externally.
 
-The migration service must complete successfully before Django or Celery can
+The pinned pgvector/PostgreSQL image is multi-architecture (including the
+Oracle VM's ARM64 shape). The migration service enables the `vector` extension
+and must complete successfully before Django or Celery can
 start. External providers such as SendGrid, Geoapify, Telegram, Anthropic, and
 OpenAI remain disabled until their keys are added to
 `.envs/.oracle/.providers`.

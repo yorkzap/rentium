@@ -108,6 +108,51 @@ def is_model_certified(provider: str, model: str) -> bool:
     )
 
 
+def is_model_certified_for_lane(
+    provider: str,
+    model: str,
+    domain_lane: str,
+    *,
+    model_version: str = "",
+) -> bool:
+    """Certification used by v3; catalog membership is not evidence."""
+    from django.db import OperationalError
+    from django.db import ProgrammingError
+    from django.db.models import Q
+    from django.utils import timezone
+
+    from .models import RamaModelCertification
+
+    try:
+        rows = RamaModelCertification.objects.filter(
+            provider=(provider or "").strip().lower(),
+            model=(model or "").strip(),
+            domain_lane=domain_lane,
+            status=RamaModelCertification.Status.CERTIFIED,
+        ).filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
+        if model_version:
+            rows = rows.filter(model_version=model_version)
+        return rows.exists()
+    except (OperationalError, ProgrammingError):
+        # During a rolling deploy old workers may briefly run before the new
+        # migration. Fail closed: uncertified models remain read-only.
+        return False
+
+
+def orchestration_mode(landlord, channel: str) -> str:
+    """Resolve a safe per-landlord, per-channel rollout mode."""
+    from .models import RamaPreferences
+
+    prefs = RamaPreferences.for_landlord(landlord)
+    field = (
+        "telegram_orchestration_mode"
+        if (channel or "").casefold() == "telegram"
+        else "web_orchestration_mode"
+    )
+    value = str(getattr(prefs, field, "legacy") or "legacy").casefold()
+    return value if value in {"legacy", "shadow", "v3"} else "legacy"
+
+
 def platform_api_key(provider: str) -> str:
     env_name = PROVIDER_ENV_KEYS.get((provider or "").strip().lower(), "")
     if not env_name:

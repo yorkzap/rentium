@@ -1225,6 +1225,9 @@ def list_documents(
         )
     agreement_rows = []
     for lease in lease_qs.order_by("-start_date")[: max(1, min(limit, 80))]:
+        from rentium.leases.parties import lease_signing_roster
+
+        signing_roster = lease_signing_roster(lease)
         place = (
             lease.property.name
             if lease.property_id
@@ -1247,7 +1250,9 @@ def list_documents(
                     "description": "Lease.document_file (signed/generated agreement PDF)",
                     "file_name": main_name,
                     "has_file": True,
-                    "is_signed": bool(lease.landlord_signed),
+                    "is_signed": signing_roster["signature_requirements_satisfied"],
+                    "owner_has_signed": bool(lease.landlord_signed),
+                    "signing_roster": signing_roster,
                     "lease_id": str(lease.pk),
                     "lease_number": lease.lease_number or "",
                     "property": place,
@@ -1262,6 +1267,7 @@ def list_documents(
                 "property": place,
                 "status": lease.status,
                 "landlord_signed": bool(lease.landlord_signed),
+                "signing_roster": signing_roster,
                 "document_file_name": main_name or None,
                 "has_stored_document_file": has_main,
                 # Live PDF is always generated even when document_file is empty

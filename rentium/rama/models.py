@@ -9,8 +9,11 @@ RAMA models.
 
 import uuid
 
+from django.contrib.postgres.search import SearchVectorField
 from django.db import models
 from django.core.validators import MinValueValidator
+from pgvector.django import VectorField
+from pgvector.django import HnswIndex
 
 
 class RamaPreferences(models.Model):
@@ -28,6 +31,11 @@ class RamaPreferences(models.Model):
         ANTHROPIC = "anthropic", "Anthropic (Claude)"
         OPENAI = "openai", "OpenAI"
 
+    class OrchestrationMode(models.TextChoices):
+        LEGACY = "legacy", "Legacy"
+        SHADOW = "shadow", "V3 shadow"
+        V3 = "v3", "V3 trusted core"
+
     landlord = models.OneToOneField(
         "users.LandlordProfile",
         on_delete=models.CASCADE,
@@ -37,6 +45,17 @@ class RamaPreferences(models.Model):
     enabled = models.BooleanField(
         default=False,
         help_text="When off, the Ask RAMA panel is hidden for this landlord.",
+    )
+    web_orchestration_mode = models.CharField(
+        max_length=12,
+        choices=OrchestrationMode.choices,
+        default=OrchestrationMode.LEGACY,
+        help_text="Per-channel RAMA rollout mode; legacy is the instant rollback.",
+    )
+    telegram_orchestration_mode = models.CharField(
+        max_length=12,
+        choices=OrchestrationMode.choices,
+        default=OrchestrationMode.LEGACY,
     )
     provider = models.CharField(
         max_length=40,
@@ -1944,3 +1963,253 @@ class TreasurerRequest(models.Model):
         if self.status not in (self.Status.OPEN, self.Status.RELAYED):
             return False
         return self.expires_at is None or self.expires_at > timezone.now()
+
+
+class RamaModelCertification(models.Model):
+    """A model/version's evidence-backed permission for one domain lane."""
+
+    class Status(models.TextChoices):
+        CANDIDATE = "CANDIDATE", "Candidate"
+        CERTIFIED = "CERTIFIED", "Certified"
+        REVOKED = "REVOKED", "Revoked"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    provider = models.CharField(max_length=40)
+    model = models.CharField(max_length=120)
+    model_version = models.CharField(max_length=120, blank=True, default="")
+    domain_lane = models.CharField(max_length=80)
+    eval_suite_version = models.CharField(max_length=80)
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.CANDIDATE
+    )
+    metrics = models.JSONField(default=dict)
+    eval_run_id = models.UUIDField(null=True, blank=True)
+    certified_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "provider",
+                    "model",
+                    "model_version",
+                    "domain_lane",
+                    "eval_suite_version",
+                ],
+                name="rama_unique_model_certification",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["provider", "model", "domain_lane", "status"],
+                name="rama_ramamo_provide_eb54e8_idx",
+            )
+        ]
+
+
+class RamaEvidenceTrace(models.Model):
+    """Redacted, queryable trace metadata for v3 and shadow comparisons."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        on_delete=models.CASCADE,
+        related_name="rama_evidence_traces",
+    )
+    conversation_id = models.UUIDField(db_index=True)
+    message_id = models.UUIDField(null=True, blank=True)
+    engine_mode = models.CharField(max_length=12)
+    answer_mode = models.CharField(max_length=16)
+    coverage = models.CharField(max_length=16)
+    provider = models.CharField(max_length=40, blank=True, default="")
+    model = models.CharField(max_length=120, blank=True, default="")
+    intent = models.CharField(max_length=120, blank=True, default="")
+    subject = models.JSONField(default=dict)
+    evidence_summary = models.JSONField(default=dict)
+    violations = models.JSONField(default=list)
+    input_hash = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    redacted_input = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["landlord", "engine_mode", "created_at"],
+                name="rama_ramaev_landlor_66dc51_idx",
+            )
+        ]
+
+
+class RamaEvalCase(models.Model):
+    """A reviewed, redacted regression or holdout conversation."""
+
+    class Split(models.TextChoices):
+        DEVELOPMENT = "development", "Development"
+        REGRESSION = "regression", "Regression"
+        HOLDOUT = "holdout", "Hidden holdout"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=180)
+    suite_version = models.CharField(max_length=80)
+    split = models.CharField(max_length=16, choices=Split.choices)
+    domain_lane = models.CharField(max_length=80)
+    severity = models.CharField(max_length=16, default="critical")
+    transcript = models.JSONField(default=list)
+    expected = models.JSONField(default=dict)
+    prohibited_claims = models.JSONField(default=list)
+    source_trace = models.ForeignKey(
+        RamaEvidenceTrace,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="eval_cases",
+    )
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["name", "suite_version"], name="rama_unique_eval_case"
+            )
+        ]
+
+
+class RamaEvalRun(models.Model):
+    class Status(models.TextChoices):
+        RUNNING = "RUNNING", "Running"
+        PASSED = "PASSED", "Passed"
+        FAILED = "FAILED", "Failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    provider = models.CharField(max_length=40)
+    model = models.CharField(max_length=120)
+    model_version = models.CharField(max_length=120, blank=True, default="")
+    suite_version = models.CharField(max_length=80)
+    domain_lane = models.CharField(max_length=80)
+    attempts_per_case = models.PositiveSmallIntegerField(default=5)
+    status = models.CharField(
+        max_length=12,
+        choices=Status.choices,
+        default=Status.RUNNING,
+    )
+    metrics = models.JSONField(default=dict)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+
+class RamaEvalResult(models.Model):
+    run = models.ForeignKey(
+        RamaEvalRun,
+        on_delete=models.CASCADE,
+        related_name="results",
+    )
+    case = models.ForeignKey(
+        RamaEvalCase,
+        on_delete=models.PROTECT,
+        related_name="results",
+    )
+    attempt = models.PositiveSmallIntegerField()
+    passed = models.BooleanField(default=False)
+    scores = models.JSONField(default=dict)
+    failures = models.JSONField(default=list)
+    trace = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["run", "case", "attempt"], name="rama_unique_eval_attempt"
+            )
+        ]
+
+
+class RamaKnowledgeSource(models.Model):
+    """Versioned official law/reference source or private landlord document."""
+
+    class Kind(models.TextChoices):
+        OFFICIAL = "OFFICIAL", "Official source"
+        PRIVATE = "PRIVATE", "Private landlord source"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    landlord = models.ForeignKey(
+        "users.LandlordProfile",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="rama_knowledge_sources",
+    )
+    kind = models.CharField(max_length=12, choices=Kind.choices)
+    title = models.CharField(max_length=300)
+    authority = models.CharField(max_length=200, blank=True, default="")
+    canonical_url = models.URLField(max_length=1000, blank=True, default="")
+    jurisdiction = models.CharField(max_length=80, blank=True, default="")
+    effective_from = models.DateField(null=True, blank=True)
+    effective_to = models.DateField(null=True, blank=True)
+    version = models.CharField(max_length=100, blank=True, default="")
+    sha256 = models.CharField(max_length=64, db_index=True)
+    metadata = models.JSONField(default=dict)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["kind", "landlord", "sha256"],
+                name="rama_unique_knowledge_source",
+                nulls_distinct=False,
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(kind="OFFICIAL", landlord__isnull=True)
+                    | models.Q(kind="PRIVATE", landlord__isnull=False)
+                ),
+                name="rama_knowledge_scope_matches_kind",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["kind", "jurisdiction", "active"],
+                name="rama_ramakn_kind_idx",
+            )
+        ]
+
+
+class RamaKnowledgeChunk(models.Model):
+    source = models.ForeignKey(
+        RamaKnowledgeSource, on_delete=models.CASCADE, related_name="chunks"
+    )
+    ordinal = models.PositiveIntegerField()
+    heading = models.CharField(max_length=300, blank=True, default="")
+    context = models.TextField(blank=True, default="")
+    content = models.TextField()
+    citation_label = models.CharField(max_length=300, blank=True, default="")
+    search_vector = SearchVectorField(null=True)
+    embedding = VectorField(dimensions=1536, null=True, blank=True)
+    embedding_model = models.CharField(max_length=120, blank=True, default="")
+    token_count = models.PositiveIntegerField(default=0)
+    metadata = models.JSONField(default=dict)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source", "ordinal"], name="rama_unique_knowledge_chunk"
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["source", "ordinal"], name="rama_ramakn_source_idx"
+            ),
+            HnswIndex(
+                name="rama_chunk_embedding_hnsw",
+                fields=["embedding"],
+                m=16,
+                ef_construction=64,
+                opclasses=["vector_cosine_ops"],
+            ),
+        ]

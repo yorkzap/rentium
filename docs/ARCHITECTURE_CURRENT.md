@@ -13,12 +13,13 @@ remain useful for implementation detail.
 - PostgreSQL is the system of record. Redis backs Celery and Django caching.
 - Celery handles messaging, document analysis, geocoding, event replay,
   scheduled finance work, SLA checks, and RAMA background analysis.
-- Local development runs the backend in Docker Compose. Django source and
-  local media are bind-mounted from the backend checkout. Production media
-  uses S3-compatible Django storage.
-- `api.rentium.ca` reaches the locally hosted backend through the Cloudflare
-  tunnel. `app.rentium.ca` is legacy redirect input and is never emitted by
-  RAMA.
+- Local development runs the backend in Docker Compose. The current production
+  stack (`docker-compose.oracle.yml`) runs Django, PostgreSQL + pgvector, Redis,
+  Celery, nginx, and durable media volumes on one portable Linux VPS. S3-compatible
+  storage remains supported but is not required.
+- `api.rentium.ca` reaches nginx on the VPS through the `rentium-api` Cloudflare
+  tunnel; PostgreSQL, Redis, and Django are not publicly exposed. The frontend
+  remains on Vercel. See `docs/ORACLE_DEPLOYMENT.md`.
 
 ## Property hierarchy
 
@@ -117,10 +118,37 @@ Group common areas carry an explicit `is_group_common` marker and a
 it to all group common areas. Moving or removing the room safely removes the
 old associations and preserves a valid primary area for the remaining group.
 
-## RAMA request path
+## RAMA request paths
 
-RAMA is not a free-form chatbot with direct database access. Its request path
-is:
+RAMA is not a free-form chatbot with direct database access. It now has a
+trusted evidence-first core alongside the existing broad legacy orchestrator.
+Each landlord can use `legacy`, `shadow`, or `v3` independently for web and
+Telegram; `legacy` remains the instant rollback.
+
+Trusted core reads follow:
+
+```text
+visible turn + typed context
+→ IntentEnvelope
+→ deterministic landlord-scoped entity resolution
+→ one domain projection returning FactPacket
+→ coverage/negative-claim validation
+→ deterministic critical-fact renderer
+→ AnswerEnvelope (CERTIFIED / ABSTAINED)
+→ redacted evidence trace
+```
+
+`FactPacket` carries subject, facet, timestamp, typed facts with exact
+model/record/field sources, and `COMPLETE`, `PARTIAL`, or `CONFLICTING`
+coverage. Only a complete packet may permit a specifically enumerated negative
+conclusion. An unavailable field can therefore never become “no.” Canonical
+projections currently cover lease signing, lease terms/status, property
+structure/offerings, ledger account position, and maintenance case status.
+The complete lease signer projection is shared by agreement/PDF rendering,
+lease forms, REST, and RAMA; it includes the owner, every lease-specific
+co-landlord, and every non-cancelled tenant.
+
+The legacy/broad request path remains:
 
 ```text
 Web chat or linked landlord channel
@@ -149,7 +177,17 @@ The web surface defaults to AUTO and keeps one conversation while the landlord
 switches between AUTO, Ops, and Treasurer. Strategic finance requests run the
 bounded Treasurer deliberation pipeline; ordinary finance lookups use the
 faster read-only Treasurer turn. Arbitrary model IDs are permitted for chat and
-reads, but only curated/certified model IDs receive model-authored write schemas.
+reads. Legacy write-schema compatibility still uses the curated catalogue during
+rollout. V3 certification is separate and evidence-backed per provider, model,
+model version, domain lane, and eval-suite version; uncertified models stay
+exploratory/read-only.
+
+RAG is not used for current rent, signatures, payments, property state, or work
+orders. Those facts come from live domain projections. PostgreSQL full-text
+search plus pgvector is reserved for versioned official legal/reference text
+and landlord-private documents, with jurisdiction/effective-date prefilters,
+contextual chunks, reciprocal-rank fusion, and mandatory citations. Official
+legal sources must match the configured authority allowlist.
 
 `rama/capabilities.py` indexes registered operations by business-language
 aliases, descriptions, risk, and schema. A turn sees a small relevant subset

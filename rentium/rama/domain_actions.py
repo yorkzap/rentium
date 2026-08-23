@@ -3053,7 +3053,7 @@ def tenant_lease_status(landlord, *, person_query: str = "") -> dict:
 def list_lease_roster(
     landlord, *, property_query: str = "", lease_number: str = ""
 ) -> dict:
-    """Who is on a lease: signed, pending invites, declined, rent shares, primary.
+    """Every signing party on a lease, plus tenant rents and invite lifecycle.
 
     Each active tenant includes invite_lifecycle with last_seen_at (when they
     last opened the invite link or viewed the agreement/PDF). Use this for
@@ -3065,11 +3065,15 @@ def list_lease_roster(
         return _prop_err(err)
     from decimal import Decimal
 
+    from rentium.leases.parties import lease_signing_fact_packet
+
     active = _active_tenant_slots(lease)
     declined = list(lease.lease_tenants.filter(declined=True)[:20])
     total = lease.total_rent
     allocated = sum((Decimal(a.rent_amount) for a in active), Decimal("0"))
     active_rows = [_slot_label(a) for a in active]
+    packet = lease_signing_fact_packet(lease)
+    roster = packet.metadata
     return {
         "lease_number": lease.lease_number,
         "lease_status": lease.status,
@@ -3079,6 +3083,20 @@ def list_lease_roster(
         "unallocated_rent": str(Decimal(total or 0) - allocated),
         "active_tenants": active_rows,
         "declined_or_cancelled": [_slot_label(d) for d in declined],
+        # Canonical legal/signature roster.  Unlike active_tenants this includes
+        # the owner and every lease-specific co-landlord.
+        "signing_parties": roster["parties"],
+        "landlords": roster["landlords"],
+        "tenants": roster["tenants"],
+        "unsigned_expected_signers": roster["unsigned_expected_signers"],
+        "activation_requirements": roster["activation_requirements"],
+        "signature_activation_blockers": roster["signature_activation_blockers"],
+        "signature_requirements_satisfied": roster[
+            "signature_requirements_satisfied"
+        ],
+        "policy_note": roster["policy_note"],
+        "evidence": packet.to_dict(),
+        "coverage": packet.coverage.value,
         "seen_summary": [
             {
                 "name": row["name"],
@@ -3111,6 +3129,7 @@ def list_lease_roster(
                 "last_seen_at is the latest invite-link open or authenticated "
                 "agreement/PDF view. It proves access, not that they read every clause."
             ),
+            "signatures": roster["policy_note"],
         },
     }
 

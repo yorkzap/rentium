@@ -81,6 +81,11 @@ def _settings_payload(landlord, prefs: RamaPreferences | None = None) -> dict:
         "model": prefs.model or cfg.model,
         "has_api_key": bool((prefs.api_key or "").strip()),
         "configured": cfg.is_configured(),
+        "orchestration": {
+            "web": prefs.web_orchestration_mode,
+            "telegram": prefs.telegram_orchestration_mode,
+            "available_modes": ["legacy", "shadow", "v3"],
+        },
         "providers": sorted(PROVIDERS),
         "models": MODEL_CATALOG,
         # Provider is always selectable; "ready" means it can actually be
@@ -231,6 +236,30 @@ def settings_view(request):
     if "clear_api_key" in data and data.get("clear_api_key"):
         prefs.api_key = ""
 
+    orchestration = data.get("orchestration")
+    if orchestration is not None:
+        if not isinstance(orchestration, dict):
+            return Response(
+                {"detail": "orchestration must be an object."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        valid_modes = {
+            choice for choice, _ in RamaPreferences.OrchestrationMode.choices
+        }
+        for channel, field in (
+            ("web", "web_orchestration_mode"),
+            ("telegram", "telegram_orchestration_mode"),
+        ):
+            if channel not in orchestration:
+                continue
+            mode = str(orchestration[channel] or "").casefold()
+            if mode not in valid_modes:
+                return Response(
+                    {"detail": f"Unknown {channel} orchestration mode {mode!r}."},
+                    status=http_status.HTTP_400_BAD_REQUEST,
+                )
+            setattr(prefs, field, mode)
+
     # Optional per-role (decision-layer / analysis) model config.
     for role in ("general", "fsa", "treasurer"):
         role_err = _apply_role_prefs(prefs, data, role)
@@ -299,6 +328,11 @@ def _chat_response(result) -> Response:
             "pending_plan": result.pending_plan,
             "auto_executed": result.auto_executed,
             "attachments": result.attachments,
+            "answer_mode": result.answer_mode,
+            "coverage": result.coverage,
+            "evidence": result.evidence,
+            "trace_id": str(result.trace_id) if result.trace_id else None,
+            "engine_mode": result.engine_mode,
         },
     )
 
@@ -520,20 +554,48 @@ def chat_view(request):
             },
             status=http_status.HTTP_403_FORBIDDEN,
         )
-    if not cfg.is_configured():
-        return Response(
-            {
-                "detail": (
-                    "Add your API key under Account → RAMA (e.g. an xAI Grok key), "
-                    "then try again."
-                ),
-            },
-            status=http_status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-
     message, conversation_id, err = _validated_chat_input(request)
     if err is not None:
         return err
+
+    # Certified deterministic reads do not depend on a model provider.  Keep
+    # the existing provider requirement for every request the v3 core does not
+    # yet cover, but never block a supported fact query because an API key is
+    # absent or its provider is down.
+    if not cfg.is_configured():
+        from .conversations import visible_history
+        from .orchestrator import classify_core_read
+        from .runtime import orchestration_mode
+
+        has_lease_context = False
+        if conversation_id:
+            has_lease_context = any(
+                (row.get("semantic_payload") or {}).get("subject", {}).get("type")
+                == "lease"
+                for row in visible_history(
+                    landlord=landlord,
+                    conversation_id=conversation_id,
+                    limit=6,
+                )
+            )
+        core_supported = (
+            orchestration_mode(landlord, "web") == "v3"
+            and classify_core_read(
+                message,
+                has_lease_context=has_lease_context,
+            )
+            is not None
+        )
+        if not core_supported:
+            return Response(
+                {
+                    "detail": (
+                        "Add your API key under Account → RAMA (e.g. an xAI Grok "
+                        "key), then try again."
+                    ),
+                },
+                status=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
     # If the landlord attached photo(s) in the chat, tell the model so it can
     # attach_photo_to_listing them (the image itself is staged server-side).

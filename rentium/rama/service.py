@@ -5465,6 +5465,12 @@ class TurnResult:
     auto_executed: list[dict] = field(default_factory=list)
     # Set instead of raising: {"detail": str, "code": str, "status_hint": int}
     error: dict | None = None
+    # Backward-compatible evidence metadata for the v3 trusted/exploratory UI.
+    answer_mode: str = "EXPLORATORY"
+    coverage: str = "PARTIAL"
+    evidence: dict = field(default_factory=dict)
+    trace_id: uuid.UUID | None = None
+    engine_mode: str = "legacy"
 
 
 #: Shown when a turn dies of something nobody anticipated. It says only what is
@@ -5548,6 +5554,98 @@ def run_turn(
                 deterministic=True,
             )
         try:
+            from .conversations import visible_history
+            from .orchestrator import classify_core_read
+            from .orchestrator import prepare_core_read
+            from .orchestrator import run_core_read_turn
+            from .runtime import orchestration_mode
+
+            channel = str(kwargs.get("channel") or "web")
+            rollout_mode = orchestration_mode(landlord, channel)
+            visible_message = str(kwargs.get("visible_text") or message).strip()
+            history = visible_history(
+                landlord=landlord,
+                conversation_id=conversation_id,
+                limit=6,
+            )
+            latest_subject = next(
+                (
+                    row
+                    for row in reversed(history)
+                    if (row.get("semantic_payload") or {}).get("subject")
+                ),
+                {},
+            )
+            reference = {
+                "semantic_payload": latest_subject.get("semantic_payload") or {},
+                "entity_refs": latest_subject.get("entity_refs") or [],
+            }
+            intent = classify_core_read(
+                visible_message,
+                has_lease_context=bool(
+                    (reference.get("semantic_payload") or {}).get("subject")
+                ),
+            )
+            if rollout_mode == "v3" and intent is not None:
+                result = run_core_read_turn(
+                    landlord=landlord,
+                    message=visible_message,
+                    conversation_id=conversation_id,
+                    channel=channel,
+                    message_id=kwargs.get("message_id"),
+                    reply_to_message_id=kwargs.get("reply_to_message_id"),
+                    external_key=str(kwargs.get("external_key") or ""),
+                    external_message_id=str(kwargs.get("external_message_id") or ""),
+                    reply_to_external_id=str(kwargs.get("reply_to_external_id") or ""),
+                )
+                if result is not None:
+                    return result
+            elif rollout_mode == "shadow" and intent is not None:
+                shadow = prepare_core_read(landlord, visible_message, reference)
+                if shadow is not None:
+                    from .evals import record_evidence_trace
+
+                    roster = shadow.evidence.get("metadata") or {}
+                    known_values = [
+                        value
+                        for party in roster.get("parties") or []
+                        for value in (
+                            party.get("name"),
+                            party.get("email"),
+                            party.get("phone"),
+                        )
+                        if value
+                    ]
+                    record_evidence_trace(
+                        landlord=landlord,
+                        conversation_id=conversation_id,
+                        message_id=None,
+                        engine_mode="shadow",
+                        answer_mode=shadow.answer_mode,
+                        coverage=shadow.coverage,
+                        provider="deterministic",
+                        model="evidence-core-v3-shadow",
+                        intent=shadow.intent.name if shadow.intent else "",
+                        subject=shadow.subject,
+                        packet=shadow.evidence,
+                        raw_input=visible_message,
+                        known_values=known_values,
+                    )
+                    RamaAudit.objects.create(
+                        landlord=landlord,
+                        conversation_id=conversation_id,
+                        kind=RamaAudit.Kind.TOOL_CALL,
+                        provider="deterministic",
+                        model="evidence-core-v3-shadow",
+                        content={
+                            "trace_id": str(shadow.trace_id),
+                            "intent": shadow.intent.name if shadow.intent else "",
+                            "coverage": shadow.coverage,
+                            "answer_mode": shadow.answer_mode,
+                            "subject": shadow.subject,
+                            "shadow": True,
+                        },
+                    )
             return _run_turn_unlocked(
                 landlord, message, conversation_id, **kwargs,
             )

@@ -10,7 +10,12 @@ from .models import (
     RamaCapabilityGap,
     RamaDocument,
     RamaDocumentEvent,
+    RamaEvalCase,
+    RamaEvalRun,
+    RamaEvidenceTrace,
+    RamaKnowledgeSource,
     RamaMemory,
+    RamaModelCertification,
     RamaPreferences,
     RamaSavedWorkflow,
     RamaTask,
@@ -79,10 +84,102 @@ class RamaCapabilityGapAdmin(admin.ModelAdmin):
 class RamaPreferencesAdmin(admin.ModelAdmin):
     """Support view — landlords edit these in the dashboard settings UI."""
 
-    list_display = ("landlord", "enabled", "provider", "model", "updated_at")
+    list_display = (
+        "landlord",
+        "enabled",
+        "provider",
+        "model",
+        "web_orchestration_mode",
+        "telegram_orchestration_mode",
+        "updated_at",
+    )
     list_filter = ("enabled", "provider")
     search_fields = ("landlord__user__email", "landlord__user__name")
     readonly_fields = ("updated_at",)
+
+
+@admin.register(RamaModelCertification)
+class RamaModelCertificationAdmin(admin.ModelAdmin):
+    list_display = (
+        "provider",
+        "model",
+        "model_version",
+        "domain_lane",
+        "status",
+        "eval_suite_version",
+        "certified_at",
+    )
+    list_filter = ("status", "provider", "domain_lane", "eval_suite_version")
+    readonly_fields = (
+        "metrics",
+        "eval_run_id",
+        "certified_at",
+        "created_at",
+        "updated_at",
+    )
+
+
+@admin.register(RamaEvidenceTrace)
+class RamaEvidenceTraceAdmin(admin.ModelAdmin):
+    list_display = (
+        "created_at",
+        "landlord",
+        "engine_mode",
+        "answer_mode",
+        "coverage",
+        "intent",
+    )
+    list_filter = ("engine_mode", "answer_mode", "coverage", "intent")
+    readonly_fields = [field.name for field in RamaEvidenceTrace._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(RamaEvalCase)
+class RamaEvalCaseAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "suite_version",
+        "split",
+        "domain_lane",
+        "severity",
+        "active",
+    )
+    list_filter = ("suite_version", "split", "domain_lane", "severity", "active")
+
+
+@admin.register(RamaEvalRun)
+class RamaEvalRunAdmin(admin.ModelAdmin):
+    list_display = (
+        "started_at",
+        "provider",
+        "model",
+        "domain_lane",
+        "suite_version",
+        "status",
+    )
+    list_filter = ("status", "provider", "domain_lane", "suite_version")
+    readonly_fields = ("metrics", "started_at", "finished_at")
+
+
+@admin.register(RamaKnowledgeSource)
+class RamaKnowledgeSourceAdmin(admin.ModelAdmin):
+    list_display = (
+        "title",
+        "kind",
+        "authority",
+        "jurisdiction",
+        "version",
+        "active",
+        "updated_at",
+    )
+    list_filter = ("kind", "jurisdiction", "active")
+    search_fields = ("title", "authority", "canonical_url", "sha256")
+    readonly_fields = ("sha256", "created_at", "updated_at")
 
 
 @admin.register(RamaAudit)

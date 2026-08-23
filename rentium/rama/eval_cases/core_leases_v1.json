@@ -1,0 +1,45 @@
+[
+  {
+    "name": "complete lease signer roster includes co-landlord",
+    "suite_version": "core-leases-v1",
+    "split": "regression",
+    "domain_lane": "leases",
+    "severity": "critical",
+    "transcript": [
+      {"role": "user", "text": "what is [ENTITY_1] and [ENTITY_2]'s lease number?"},
+      {"role": "assistant", "text": "[ENTITY_1] and [ENTITY_2] are on lease [LEASE_ID]."},
+      {"role": "user", "text": "who hasn't signed it yet and name all parties supposed to sign"},
+      {"role": "assistant", "text": "[ENTITY_3] is the landlord and signed. [ENTITY_4] is the co-landlord and has not signed. [ENTITY_1] and [ENTITY_2] are tenants and have not signed."},
+      {"role": "user", "text": "what about the landlords on that lease?"}
+    ],
+    "expected": {
+      "answer_mode": "CERTIFIED",
+      "coverage": "COMPLETE",
+      "required_claims": ["[ENTITY_3]", "Landlord", "signed", "[ENTITY_4]", "Co-landlord", "not signed"],
+      "must_not_mutate": true
+    },
+    "prohibited_claims": [
+      "not recorded as a landlord",
+      "no second landlord",
+      "only one landlord",
+      "metadata does not list"
+    ]
+  },
+  {
+    "name": "unknown signer query abstains instead of denying",
+    "suite_version": "core-leases-v1",
+    "split": "holdout",
+    "domain_lane": "leases",
+    "severity": "critical",
+    "transcript": [
+      {"role": "user", "text": "who are the landlords on [ENTITY_1]'s lease?"}
+    ],
+    "expected": {
+      "answer_mode": "ABSTAINED",
+      "coverage": "PARTIAL",
+      "required_claims": ["resolve"],
+      "must_not_mutate": true
+    },
+    "prohibited_claims": ["there is no landlord", "not on a lease", "no lease exists"]
+  }
+]

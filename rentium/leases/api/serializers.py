@@ -792,6 +792,7 @@ class LeaseSerializer(serializers.ModelSerializer):
     # Nested resources — now correctly using the single consolidated LeaseTenantSerializer
     lease_tenants = LeaseTenantSerializer(many=True, read_only=True)
     landlord_signatories = LeaseLandlordSignatorySerializer(many=True, read_only=True)
+    signing_roster = serializers.SerializerMethodField()
     additional_documents = LeaseDocumentSerializer(many=True, read_only=True)
     payments = PaymentSerializer(many=True, read_only=True)
     total_monthly_rent = serializers.DecimalField(
@@ -889,6 +890,7 @@ class LeaseSerializer(serializers.ModelSerializer):
             "updated_at",
             "lease_tenants",
             "landlord_signatories",
+            "signing_roster",
             "additional_documents",
             "payments",
             "total_rent",
@@ -929,6 +931,7 @@ class LeaseSerializer(serializers.ModelSerializer):
             "updated_at",
             "lease_tenants",
             "landlord_signatories",
+            "signing_roster",
             "additional_documents",
             "payments",
             "total_monthly_rent",
@@ -940,6 +943,12 @@ class LeaseSerializer(serializers.ModelSerializer):
             "landlord": {"read_only": True},
             "previous_lease": {"allow_null": True},
         }
+
+    def get_signing_roster(self, obj):
+        """Complete signer state shared with documents and RAMA."""
+        from rentium.leases.parties import lease_signing_roster
+
+        return lease_signing_roster(obj)
 
     def get_effective_landlord_contact(self, obj):
         return obj.get_effective_landlord_contact()
