@@ -583,7 +583,7 @@ READ_TOOLS = (
     "list_payment_reminders", "list_notifications",
     "list_saved_workflows",
     "deposit_position", "tenant_statement", "list_import_batches",
-    "read_staged_entries",
+    "read_staged_entries", "money_overview", "review_bank_statements",
 )
 
 # The General can directly run common landlord workflows. Every write still

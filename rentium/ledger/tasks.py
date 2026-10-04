@@ -69,3 +69,41 @@ def send_due_soon_reminders():
 @app.task
 def check_sla_breaches():
     return daily.flag_sla_breaches()
+
+
+@app.task(soft_time_limit=120, time_limit=150)
+def prepare_bank_statement(batch_id, job_id, mapping, date_format, worksheet):
+    """Parse and propose matches; never post ledger entries in a worker."""
+    from django.db import transaction
+    from . import reconciliation
+    from .models import BankStatement
+
+    try:
+        with transaction.atomic():
+            source = BankStatement.objects.select_related("batch__landlord").get(
+                batch_id=batch_id
+            )
+            statement = reconciliation.locked_statement(source.batch.landlord, batch_id)
+            if (
+                statement.staging.get("job_id") != job_id
+                or statement.staging.get("state") != "QUEUED"
+            ):
+                return
+            statement.staging = {}
+            statement.save(update_fields=["staging"])
+            reconciliation.map_statement(
+                source.batch.landlord, batch_id, mapping, date_format, worksheet
+            )
+            statement.staging = {"state": "READY", "job_id": job_id}
+            statement.save(update_fields=["staging"])
+    except Exception as exc:
+        # Staging is atomic: failure keeps the previous draft and original file.
+        # Error text is controlled for unknown exceptions (no worker internals).
+        message = (
+            str(exc)
+            if isinstance(exc, (ValueError, reconciliation.Error))
+            else "Preparation failed. Retry, or split the file into smaller exports."
+        )
+        BankStatement.objects.filter(batch_id=batch_id, staging__job_id=job_id).update(
+            staging={"state": "FAILED", "message": message}
+        )

@@ -2,6 +2,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from . import import_views
+from . import money_views
 from .views import (
     LedgerEntryViewSet,
     summary_view,
@@ -15,6 +16,10 @@ router = DefaultRouter()
 router.register("entries", LedgerEntryViewSet, basename="ledger-entry")
 
 urlpatterns = [
+    path("money-overview/", money_views.money_overview, name="money-overview"),
+    path("review-options/", money_views.review_options, name="review-options"),
+    path("statements/", money_views.statements, name="statements"),
+    path("statements/<uuid:batch_id>/", money_views.statement_detail, name="statement-detail"),
     path("summary/", summary_view, name="summary"),
     path(
         "tenant-statement/",

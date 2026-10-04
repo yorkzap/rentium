@@ -387,6 +387,7 @@ TOOL_META: dict[str, ToolMeta] = {
     "commit_import_batch": ToolMeta(
         risk="high", own_confirm=True, autonomy=Autonomy.NEVER
     ),
+    "reconcile_bank_statement": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
     "discard_import_batch": ToolMeta(risk="medium", own_confirm=True),
     "mark_notifications_read": ToolMeta(risk="low"),
     "delete_draft_lease": ToolMeta(

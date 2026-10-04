@@ -5,6 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from decimal import InvalidOperation
 
+from django.core.exceptions import ValidationError as ModelValidationError
 from django.db.models import Count
 from django.db.models import Q
 from django.db.models import Sum
@@ -1028,9 +1029,11 @@ def summary_view(request):
     except ValueError:
         months_back = 6
 
-    entries = LedgerEntry.objects.filter(landlord=landlord)
-    if request.query_params.get("property"):
-        entries = entries.filter(property_id=request.query_params["property"])
+    from ..money import scoped_entries
+    try:
+        entries = scoped_entries(landlord, property_id=request.query_params.get("property") or None)
+    except (services.LedgerError, ModelValidationError, ValueError) as exc:
+        raise ValidationError(str(exc)) from exc
     live = entries.not_voided()
     today = date.today()
 
@@ -1046,52 +1049,10 @@ def summary_view(request):
     def next_month(d):
         return date(d.year + (d.month // 12), (d.month % 12) + 1, 1)
 
-    monthly = []
-    for start in month_starts(months_back):
-        end = next_month(start)
-
-        expected = live.expected_income().filter(
-            due_date__gte=start, due_date__lt=end
-        ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-
-        # Reported beside expected income, never folded into it: a damage claim
-        # is contested and settles at move-out, not on this month's rent run.
-        damage_claimed = live.damage_claims().filter(
-            due_date__gte=start, due_date__lt=end
-        ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-
-        collected = live.filter(
-            entry_type=EntryType.PAYMENT,
-            settles__entry_type__in=INCOME_CHARGE_TYPES,
-            effective_date__gte=start,
-            effective_date__lt=end,
-        ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-
-        spent = live.filter(
-            entry_type=EntryType.EXPENSE,
-            effective_date__gte=start,
-            effective_date__lt=end,
-        ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-
-        # Deposits stay out of income (refundable liability) but the UI must
-        # be able to say what actually hit the bank this month.
-        deposits_in = services.deposits_collected_between(
-            landlord, start, end,
-            property_id=request.query_params.get("property") or None,
-        )
-
-        monthly.append(
-            {
-                "month": start.strftime("%Y-%m"),
-                "label": start.strftime("%b %Y"),
-                "expected_income": str(expected),
-                "collected_income": str(collected),
-                "expenses": str(spent),
-                "net": str(collected - spent),
-                "deposits_collected": str(deposits_in),
-                "damage_claimed": str(damage_claimed),
-            }
-        )
+    from ..money import period_money
+    monthly = [period_money(landlord, start, next_month(start),
+                            property_id=request.query_params.get("property") or None)
+               for start in month_starts(months_back)]
 
     # One set of open charges, partitioned — rather than four ad-hoc filters
     # that can drift apart. `outstanding_total` stays income-only and
@@ -1148,7 +1109,10 @@ def summary_view(request):
             "deposits_outstanding": deposits["total"],
             "deposits_outstanding_count": deposits["count"],
             "deposits_overdue_count": deposits["overdue_count"],
-            "deposits_held": str(services.deposits_held(landlord)),
+            "deposits_held": str(services.deposits_held(landlord)) if not request.query_params.get("property") else str(
+                (live.filter(entry_type=EntryType.PAYMENT, settles__entry_type=EntryType.DEPOSIT_CHARGE).aggregate(s=Sum("amount"))["s"] or Decimal("0"))
+                - (live.filter(entry_type=EntryType.DEPOSIT_RETURN).aggregate(s=Sum("amount"))["s"] or Decimal("0"))
+            ),
             "expenses_not_yet_paid": str(unsettled["total"] or Decimal("0.00")),
             "expenses_not_yet_paid_count": unsettled["count"] or 0,
             "collected_this_month_total": str(collected_this_month_total),

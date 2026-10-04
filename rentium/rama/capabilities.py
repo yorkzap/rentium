@@ -203,6 +203,9 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "commit import",
         "finalize import batch",
     ),
+    "reconcile_bank_statement": ("match bank statement", "approve bank matches", "reconcile transactions", "review statement", "allocate bank payment"),
+    "money_overview": ("cash flow", "money received", "monthly money", "unpaid bills", "money overview"),
+    "review_bank_statements": ("statement exceptions", "unmatched transactions", "bank review", "saved statements"),
     "update_lease": (
         "edit lease terms",
         "change rent",

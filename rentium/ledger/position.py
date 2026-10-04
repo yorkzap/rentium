@@ -156,7 +156,7 @@ class Scope:
         if self.kind == "property":
             return Q(property=self.property)
         if self.kind == "holding":
-            return Q(holding=self.holding)
+            return Q(holding=self.holding) | Q(property__holding=self.holding)
         if self.kind == "tenant":
             # Household charges on a joint lease carry tenant=None — they are
             # owed by this tenant in full, so they must be in scope.

@@ -181,7 +181,7 @@ def list_import_batches(landlord) -> dict:
     """Uploaded historical batches and their state."""
     from rentium.ledger.models import ImportBatch
 
-    batches = ImportBatch.objects.filter(landlord=landlord).prefetch_related("rows")
+    batches = ImportBatch.objects.filter(landlord=landlord, bank_statement__isnull=True).prefetch_related("rows")
     rows = []
     for batch in batches:
         staged = list(batch.rows.all())
@@ -208,7 +208,8 @@ def list_import_batches(landlord) -> dict:
             "discard every row, and none of it is in the ledger. COMMITTED "
             "batches are already ledger entries, so reading their rows again "
             "and adding them to a ledger total double-counts. You cannot "
-            "commit a batch; only the landlord can."
+            "commit a historical batch; only the landlord can. Bank exports use "
+            "review_bank_statements and reconcile_bank_statement instead."
         ),
     }
 
@@ -225,10 +226,13 @@ def read_staged_entries(landlord, batch_id: str = "", limit: str = "") -> dict:
                 "error": "no_such_batch",
                 "message": "I could not find that import batch.",
             }
+        if hasattr(batch, "bank_statement"):
+            from .money_workflows import review_bank_statements
+            return review_bank_statements(landlord, batch_id)
     else:
         batch = (
             ImportBatch.objects.filter(
-                landlord=landlord, status=ImportBatch.Status.DRAFT
+                landlord=landlord, status=ImportBatch.Status.DRAFT, bank_statement__isnull=True
             )
             .order_by("-created_at")
             .first()

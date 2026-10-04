@@ -67,22 +67,11 @@ def month_money(landlord, start: date, end: date, *, property_id=None) -> dict:
     if property_id:
         live = live.filter(property_id=property_id)
 
-    expected = live.expected_income().filter(
-        due_date__gte=start, due_date__lt=end
-    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-
-    # Kept out of `expected` and surfaced on its own so RAMA states it as a
-    # claim to be settled at move-out, not as rent it is waiting on.
-    damage_claimed = live.damage_claims().filter(
-        due_date__gte=start, due_date__lt=end
-    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-
-    collected = live.filter(
-        entry_type=EntryType.PAYMENT,
-        settles__entry_type__in=INCOME_CHARGE_TYPES,
-        effective_date__gte=start,
-        effective_date__lt=end,
-    ).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+    from rentium.ledger.money import period_money
+    period = period_money(landlord, start, end, property_id=property_id)
+    expected = Decimal(period["expected_income"])
+    collected = Decimal(period["collected_income"])
+    damage_claimed = Decimal(period["damage_claimed"])
 
     expense_qs = (
         live.filter(
@@ -109,6 +98,7 @@ def month_money(landlord, start: date, end: date, *, property_id=None) -> dict:
     )
 
     return {
+        **period,
         "month": start.strftime("%Y-%m"),
         "label": start.strftime("%b %Y"),
         "as_of_year_hint": (

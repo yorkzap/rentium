@@ -1,8 +1,21 @@
 # Current Rentium architecture
 
-This note describes the architecture as of August 2026. It supersedes older
+This note describes the architecture through October 2026. It supersedes older
 module lists where they conflict, while the deeper RAMA and operations guides
 remain useful for implementation detail.
+
+## Money workflow (October 2026)
+
+`ledger.money` now owns the shared monthly projection consumed by the Money
+workspace, legacy summary and RAMA. Cash clearing dates and incurred expense
+dates are distinct; recorded cash is never presented as a bank balance.
+`ledger.reconciliation` joins bank source rows, existing charges, expenses and
+document evidence in a saved review. REST and RAMA use the same exact batch
+preview and atomic, idempotent approval. Larger files prepare in Celery; workers
+cannot post money. `BankStatement` / `BankTransaction` extend the import layer
+without repurposing historical staged entries. See [MONEY_WORKFLOW.md](MONEY_WORKFLOW.md)
+for contracts, limits, verification and deployment. Implementation is local;
+the first real-statement pilot remains a deployment step.
 
 ## Runtime boundaries
 

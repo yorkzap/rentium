@@ -26,6 +26,7 @@ class CapabilitySpec:
 # Read capabilities are supplied by roles.READ_TOOLS.  This is the complete,
 # fail-closed write/action surface available to the landlord-facing General.
 GENERAL_WRITE_TOOLS: tuple[str, ...] = (
+    "reconcile_bank_statement",
     "plan_operation",
     "plan_move_tenant",
     "amend_constitution",

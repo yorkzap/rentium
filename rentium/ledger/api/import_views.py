@@ -25,7 +25,7 @@ def _landlord(request):
 
 def _batch_or_404(request, batch_id):
     return ImportBatch.objects.filter(
-        pk=batch_id, landlord=_landlord(request)
+        pk=batch_id, landlord=_landlord(request), bank_statement__isnull=True
     ).first()
 
 
@@ -80,7 +80,7 @@ def batches_view(request):
     landlord = _landlord(request)
     if request.method == "GET":
         return Response(
-            {"batches": [_batch_payload(b) for b in ImportBatch.objects.filter(landlord=landlord)]}
+            {"batches": [_batch_payload(b) for b in ImportBatch.objects.filter(landlord=landlord, bank_statement__isnull=True)]}
         )
 
     upload = request.FILES.get("file")

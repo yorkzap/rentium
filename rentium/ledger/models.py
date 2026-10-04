@@ -834,6 +834,39 @@ class StagedLedgerEntry(models.Model):
 # update_or_create per holding, so a correction overwrites the previous figure
 # and no trend can ever be computed from it.
 # ---------------------------------------------------------------------------
+class BankStatement(models.Model):
+    """Source evidence and a persisted approval snapshot, never a second ledger."""
+
+    batch = models.OneToOneField(ImportBatch, on_delete=models.PROTECT, related_name="bank_statement")
+    account = models.CharField(max_length=120)
+    currency = models.CharField(max_length=3, default="CAD")
+    source_hash = models.CharField(max_length=64)
+    worksheet = models.CharField(max_length=255, blank=True)
+    date_format = models.CharField(max_length=20, default="%Y-%m-%d")
+    revision = models.PositiveIntegerField(default=0)
+    preview = models.JSONField(default=dict, blank=True)
+    receipt = models.JSONField(default=dict, blank=True)
+    staging = models.JSONField(default=dict, blank=True)
+
+
+class BankTransaction(models.Model):
+    statement = models.ForeignKey(BankStatement, on_delete=models.PROTECT, related_name="transactions")
+    row_number = models.PositiveIntegerField()
+    raw = models.JSONField(default=dict)
+    booked_on = models.DateField(null=True)
+    signed_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True)
+    description = models.CharField(max_length=1000, blank=True)
+    reference = models.CharField(max_length=255, blank=True)
+    fingerprint = models.CharField(max_length=64, blank=True, db_index=True)
+    parse_error = models.CharField(max_length=255, blank=True)
+    decision = models.JSONField(default=dict, blank=True)
+    result = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["row_number"]
+        constraints = [models.UniqueConstraint(fields=["statement", "row_number"], name="bank_source_row_unique")]
+
+
 class HoldingFinancials(models.Model):
     """Acquisition facts for one holding. One row; these rarely change."""
 

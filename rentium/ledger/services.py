@@ -117,6 +117,7 @@ def post_charge(
     return entry, created
 
 
+@transaction.atomic
 def record_payment(
     *,
     charge: LedgerEntry,
@@ -139,6 +140,14 @@ def record_payment(
     the household balance clears collectively while who-paid-what stays
     on the record. Defaults to charge.tenant for split-billing charges.
     """
+    LedgerEntry.objects.select_for_update().get(pk=charge.pk)
+    charge.refresh_from_db()
+    if idempotency_key:
+        existing = _get_by_idempotency_key(idempotency_key)
+        if existing:
+            if existing.settles_id != charge.pk or existing.amount != Decimal(amount):
+                raise LedgerError("This idempotency key belongs to a different settlement.")
+            return existing, False
     if charge.entry_type not in CHARGE_TYPES:
         raise LedgerError("Payments must be recorded against a charge.")
     if charge.voided:
@@ -344,6 +353,7 @@ def record_split_payment(
     return posted
 
 
+@transaction.atomic
 def post_credit(
     *,
     charge: LedgerEntry,
@@ -355,6 +365,14 @@ def post_credit(
 ) -> tuple[LedgerEntry, bool]:
     """A discount/goodwill credit against a charge. The charge keeps its
     original amount (audit truth: 'rent was $1,300, landlord credited $200')."""
+    LedgerEntry.objects.select_for_update().get(pk=charge.pk)
+    charge.refresh_from_db()
+    if idempotency_key:
+        existing = _get_by_idempotency_key(idempotency_key)
+        if existing:
+            if existing.settles_id != charge.pk or existing.amount != Decimal(amount):
+                raise LedgerError("This idempotency key belongs to a different settlement.")
+            return existing, False
     if charge.entry_type not in CHARGE_TYPES:
         raise LedgerError("Credits apply to charges.")
     if charge.voided:
@@ -447,6 +465,7 @@ def post_expense(
     return entry, created
 
 
+@transaction.atomic
 def mark_expense_paid(
     entry: LedgerEntry, *, paid_on=None, created_by=None
 ) -> LedgerEntry:
@@ -457,6 +476,8 @@ def mark_expense_paid(
     one whitelisted column (LedgerEntry.MUTABLE_AFTER_POST). Everything that says
     what the expense WAS stays as immutable as it ever was.
     """
+    LedgerEntry.objects.select_for_update().get(pk=entry.pk)
+    entry.refresh_from_db()
     if entry.entry_type != EntryType.EXPENSE:
         raise LedgerError("Only an expense has a bank-clearing date.")
     if entry.voided:
@@ -478,8 +499,11 @@ def mark_expense_paid(
     return entry
 
 
+@transaction.atomic
 def unmark_expense_paid(entry: LedgerEntry) -> LedgerEntry:
     """Back to 'not yet taken from bank'. A mis-click is a mis-click, not a void."""
+    LedgerEntry.objects.select_for_update().get(pk=entry.pk)
+    entry.refresh_from_db()
     if entry.entry_type != EntryType.EXPENSE:
         raise LedgerError("Only an expense has a bank-clearing date.")
     entry.paid_on = None
@@ -510,6 +534,7 @@ def _sync_source_document_payment_state(entry: LedgerEntry) -> None:
         return
 
 
+@transaction.atomic
 def void_entry(entry: LedgerEntry, *, reason, created_by=None) -> LedgerEntry:
     """
     Void = post an equal-and-opposite REVERSAL. Rules:
@@ -518,6 +543,10 @@ def void_entry(entry: LedgerEntry, *, reason, created_by=None) -> LedgerEntry:
     - voiding a payment/credit automatically 'reopens' the charge,
       because computed status ignores voided settlements.
     """
+    if entry.settles_id:
+        LedgerEntry.objects.select_for_update().get(pk=entry.settles_id)
+    LedgerEntry.objects.select_for_update().get(pk=entry.pk)
+    entry.refresh_from_db()
     if entry.voided:
         raise LedgerError("Entry is already voided.")
     if entry.entry_type == EntryType.REVERSAL:

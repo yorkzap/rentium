@@ -37,3 +37,4 @@ requests==2.32.3
 chardet==5.2.0  # requests 2.32.x supports chardet < 6 when it is installed
 anthropic==0.117.0  # RAMA default provider (rentium/rama/providers/anthropic.py)
 phonenumbers==8.13.48
+openpyxl==3.1.5  # Read-only tabular bank statement import

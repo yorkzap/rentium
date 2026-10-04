@@ -266,6 +266,8 @@ def commit_batch(batch: ImportBatch, *, created_by=None) -> dict:
     already committed (committed_entry set) is skipped, and every write
     carries idempotency_key=f"import:{row.id}" so a retried commit can
     never double-post even across separate calls."""
+    if hasattr(batch, "bank_statement"):
+        raise LedgerError("Bank statements require their saved reconciliation preview. Open Money → Review statements.")
     if batch.status == ImportBatch.Status.DISCARDED:
         raise LedgerError("This batch was discarded.")
 
