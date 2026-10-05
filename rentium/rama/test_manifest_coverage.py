@@ -71,6 +71,14 @@ WAIVED: dict[str, str] = {
     # --- import staging: not the books until it is posted -------------------
     "ledger.ImportBatch": "in-flight bank import; the ledger is the record",
     "ledger.StagedLedgerEntry": "unposted import row; not money yet",
+    "ledger.BankStatement": (
+        "read via owner-scoped review_bank_statements; use its guarded preview "
+        "instead of treating a source export as posted ledger money"
+    ),
+    "ledger.BankTransaction": (
+        "source rows, decisions and receipts are read via review_bank_statements; "
+        "generic financial aggregation must not double-count them"
+    ),
     # --- superseded ---------------------------------------------------------
     "leases.Payment": (
         "superseded by the ledger, which is the append-only source of truth "

@@ -3599,6 +3599,8 @@ def test_tool_meta_covers_every_write_tool():
         # Uploaded historical data. Reading a staged batch mutates nothing —
         # commit_import_batch is the separately classified guarded mutation.
         "list_import_batches", "read_staged_entries",
+        # Shared projections and saved bank-review reads do not post money.
+        "money_overview", "review_bank_statements",
         # plan builders only compose previews; the runner executes real tools
         "plan_operation", "plan_move_tenant",
     }
