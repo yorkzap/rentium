@@ -1,0 +1,530 @@
+{
+  "provider": "openai",
+  "model": "gpt-5-mini",
+  "workflow_version": 1,
+  "backend_revision": "6651407",
+  "frontend_revision": "4d0862a",
+  "scope": "Eight synthetic scenarios, five attempts each; extra ambiguity check after durable continuation refinement",
+  "passed": 40,
+  "attempts": 40,
+  "critical_failures": 0,
+  "results": [
+    {
+      "case": "expense",
+      "attempt": 1,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "expense",
+      "attempt": 2,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "expense",
+      "attempt": 3,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "expense",
+      "attempt": 4,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "expense",
+      "attempt": 5,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "payment",
+      "attempt": 1,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "payment",
+      "attempt": 2,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "payment",
+      "attempt": 3,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "payment",
+      "attempt": 4,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "payment",
+      "attempt": 5,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "onboarding",
+      "attempt": 1,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "onboarding",
+      "attempt": 2,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "onboarding",
+      "attempt": 3,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "onboarding",
+      "attempt": 4,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "onboarding",
+      "attempt": 5,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "move",
+      "attempt": 1,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "move",
+      "attempt": 2,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "move",
+      "attempt": 3,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow",
+        "plan_daily_workflow",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "move",
+      "attempt": 4,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "search_capabilities",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "move",
+      "attempt": 5,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "property",
+      "attempt": 1,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "property",
+      "attempt": 2,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "property",
+      "attempt": 3,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "property",
+      "attempt": 4,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "property",
+      "attempt": 5,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "composition",
+      "attempt": 1,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "search_capabilities",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "composition",
+      "attempt": 2,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "composition",
+      "attempt": 3,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "composition",
+      "attempt": 4,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "composition",
+      "attempt": 5,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "ambiguous",
+      "attempt": 1,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "ambiguous",
+      "attempt": 2,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "search_capabilities",
+        "read",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "ambiguous",
+      "attempt": 3,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow",
+        "read"
+      ]
+    },
+    {
+      "case": "ambiguous",
+      "attempt": 4,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "search_capabilities",
+        "plan_daily_workflow",
+        "read"
+      ]
+    },
+    {
+      "case": "ambiguous",
+      "attempt": 5,
+      "passed": true,
+      "failures": [],
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "tools": [
+        "_live_context",
+        "plan_daily_workflow",
+        "plan_daily_workflow"
+      ]
+    },
+    {
+      "case": "unsupported",
+      "attempt": 1,
+      "passed": true,
+      "failures": [],
+      "provider": "deterministic",
+      "model": "capability-boundary",
+      "tools": [
+        "_live_context"
+      ]
+    },
+    {
+      "case": "unsupported",
+      "attempt": 2,
+      "passed": true,
+      "failures": [],
+      "provider": "deterministic",
+      "model": "capability-boundary",
+      "tools": [
+        "_live_context"
+      ]
+    },
+    {
+      "case": "unsupported",
+      "attempt": 3,
+      "passed": true,
+      "failures": [],
+      "provider": "deterministic",
+      "model": "capability-boundary",
+      "tools": [
+        "_live_context"
+      ]
+    },
+    {
+      "case": "unsupported",
+      "attempt": 4,
+      "passed": true,
+      "failures": [],
+      "provider": "deterministic",
+      "model": "capability-boundary",
+      "tools": [
+        "_live_context"
+      ]
+    },
+    {
+      "case": "unsupported",
+      "attempt": 5,
+      "passed": true,
+      "failures": [],
+      "provider": "deterministic",
+      "model": "capability-boundary",
+      "tools": [
+        "_live_context"
+      ]
+    }
+  ],
+  "additional_ambiguity_results": [
+    {
+      "case": "ambiguous",
+      "attempt": 1,
+      "passed": true,
+      "failures": []
+    },
+    {
+      "case": "ambiguous",
+      "attempt": 2,
+      "passed": true,
+      "failures": []
+    },
+    {
+      "case": "ambiguous",
+      "attempt": 3,
+      "passed": true,
+      "failures": []
+    },
+    {
+      "case": "ambiguous",
+      "attempt": 4,
+      "passed": true,
+      "failures": []
+    },
+    {
+      "case": "ambiguous",
+      "attempt": 5,
+      "passed": true,
+      "failures": []
+    }
+  ]
+}
