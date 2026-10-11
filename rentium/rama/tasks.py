@@ -119,7 +119,40 @@ def run_sergeants() -> dict:
     """Beat entry point: run every Sergeant. Idempotent — see sergeants.py."""
     from . import sergeants
 
-    return sergeants.run_all()
+    result = sergeants.run_all()
+    result["daily_workflows"] = prepare_daily_workflows()
+    return result
+
+
+@app.task
+def prepare_daily_workflows(landlord_id=None):
+    """Recovery sweep for in-app drafts. Never sends notifications or writes money."""
+    from .daily_workflows import prepare_attention
+    from .models import RamaPreferences
+
+    owners = RamaPreferences.objects.filter(workflows_enabled=True).select_related(
+        "landlord"
+    )
+    if landlord_id:
+        owners = owners.filter(landlord_id=landlord_id)
+    from .models import RamaTask
+    from .workflow_delivery import refresh_waiting
+
+    count = 0
+    for prefs in owners:
+        for task in RamaTask.objects.filter(landlord=prefs.landlord, status="WAITING"):
+            refresh_waiting(task)
+            if task.workflow_key == "onboarding_delivery":
+                deliver_workflow_invitation.delay(str(task.pk))
+        count += prepare_attention(prefs.landlord)
+    return count
+
+
+@app.task(soft_time_limit=45, time_limit=60)
+def deliver_workflow_invitation(task_id):
+    from .workflow_delivery import deliver_invitation
+
+    deliver_invitation(task_id)
 
 
 @app.task(bind=True, max_retries=2, **_TURN_LIMITS)

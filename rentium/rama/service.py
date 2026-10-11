@@ -563,7 +563,12 @@ def _plan_fallback_reply(progress: dict) -> str:
         if result.get("documents_page"):
             parts.append(f"Open document: {result['documents_page']}")
     for it in progress.get("failed") or []:
-        err = (it.get("result") or {}).get("error") or "failed"
+        err = (
+            (it.get("result") or {}).get("error")
+            or (it.get("result") or {}).get("detail")
+            or it.get("error")
+            or "Needs review"
+        )
         parts.append(f"Failed: {it.get('target') or it.get('tool')} — {err}")
     for it in progress.get("skipped") or []:
         parts.append(f"Skipped: {it.get('target') or it.get('tool')}")
@@ -573,7 +578,9 @@ def _plan_fallback_reply(progress: dict) -> str:
             f"Next: {awaiting.get('target') or awaiting.get('tool')} needs its "
             "own confirmation — reply yes to run it, or no to stop here.",
         )
-    return "\n".join(parts) or "Done."
+    if progress.get("status") == "waiting":
+        parts.append(progress.get("summary") or "Waiting for external work.")
+    return "\n".join(parts) or progress.get("summary") or "No actions were executed."
 
 
 def _document_rename_intent(message: str) -> dict | None:
@@ -672,7 +679,8 @@ def _rename_intent(landlord, message: str) -> dict | None:
     # tail as the new listing name produced absurd names such as
     # "Room 1 and Room 5 to Room 2, then assign …".
     if re.search(
-        r"\b(?:then|assign|move|put)\b|(?:,|\band\b).+\bto\b",
+        r"\b(?:then|assign|move|put)\b|(?:,|\band\b).+\bto\b"
+        r"|\band\s+(?:record|log|add|create|post|invite|set|update|mark|send)\b",
         new_name,
         flags=re.IGNORECASE,
     ):
@@ -3932,6 +3940,10 @@ def _first_month_rent_adjustment_intent(
     lease and never lets the model perform the subtraction or choose among
     same-name leases.
     """
+    from .capabilities import is_listing_rent_request
+
+    if is_listing_rent_request(message):
+        return None
     text = _landlord_words(message or "").strip()
     low = text.casefold().replace("’", "'")
     scope_answer = ""
@@ -4351,6 +4363,10 @@ def _rent_period_adjustment_intent(
     phrases: each clause must contain an action, a rent period, one target
     amount, and a tenant/lease that resolves uniquely in the live portfolio.
     """
+    from .capabilities import is_listing_rent_request
+
+    if is_listing_rent_request(message):
+        return None
     text = _landlord_words(message or "").strip()
     clauses = [part.strip(" ,.;") for part in _PARALLEL_RENT_SPLIT.split(text)]
     if len(clauses) == 1:
@@ -5580,13 +5596,10 @@ class TurnResult:
     engine_mode: str = "legacy"
 
 
-#: Shown when a turn dies of something nobody anticipated. It says only what is
-#: certainly true — nothing was changed, the message is kept — because the one
-#: thing a crashed turn cannot do is describe what it was in the middle of.
+# A crashed turn cannot safely claim that no earlier action committed.
 _TURN_CRASHED = (
-    "Something broke while I was working on that, so I stopped. Nothing was "
-    "changed. Your message is saved — try asking again, and if it keeps "
-    "failing, rephrase it or ask me for a smaller piece of it."
+    "Something broke while I was working on that, so I stopped. Your message "
+    "is saved. Check the saved progress and records before retrying any changes."
 )
 
 
@@ -6085,8 +6098,24 @@ def _run_turn_unlocked(
     )
 
     intent_contract = _intent_contract_for_turn(
-        landlord, conversation_id, message,
+        landlord,
+        conversation_id,
+        message,
     )
+    if intent_contract.get("unsupported_operation"):
+        reply = intent_contract["reason"]
+        audit(RamaAudit.Kind.ASSISTANT_MESSAGE, {"text": reply, "deterministic": True})
+        outbound = record_outbound(reply)
+        return TurnResult(
+            conversation_id=conversation_id,
+            reply=reply,
+            episode_id=outbound.episode_id if outbound else None,
+            message_id=outbound.pk if outbound else None,
+            provider="deterministic",
+            model="capability-boundary",
+            tools_used=["_live_context"],
+            deterministic=True,
+        )
     if intent_contract:
         system += (
             "\n\n## EXECUTABLE INTENT CONTRACT (server-enforced)\n"
@@ -6097,6 +6126,66 @@ def _run_turn_unlocked(
         )
 
     schemas = role_tool_schemas(role, depth)
+    from .workflow_contracts import WORKFLOW_TOOLS
+    from .workflow_contracts import enabled as daily_workflows_enabled
+
+    use_daily_workflows = daily_workflows_enabled(landlord) and any(
+        schema.get("name") == "plan_daily_workflow" for schema in schemas
+    )
+    # The pilot replaces planning for its certified daily pathways. Existing
+    # named capabilities outside that scope keep their guarded legacy route.
+    required_capability = intent_contract.get("required_capability")
+    if required_capability and required_capability not in {
+        *WORKFLOW_TOOLS, "plan_move_tenant", "setup_room_tenancy",
+    }:
+        use_daily_workflows = False
+    if use_daily_workflows:
+        system += (
+            "\n\nDAILY WORKFLOWS: Use plan_daily_workflow for money, tenant "
+            "onboarding and property changes. Include EVERY requested action in "
+            "one plan. Individual domain write tools are execution adapters, not "
+            "separate model calls. Before constructing steps_json, use "
+            "search_capabilities to read the exact argument schemas for every "
+            "action; never guess field names. "
+            "For a lease plus invite, put create_lease and invite_tenant_to_lease "
+            "in one steps_json; the invitation lease_number must be "
+            '{"$step":"lease","path":"lease.lease_number"}. '
+            "Use live facts and exact IDs, then bind dependent steps to earlier "
+            "results. Ask for missing facts together. Do not improvise business "
+            "rules or claim a partial/queued result is completed. Invitations "
+            "must be explicitly requested and included in the preview."
+        )
+        from .capabilities import search_capability_catalogue
+
+        actions = search_capability_catalogue(
+            message,
+            allowed_names=WORKFLOW_TOOLS,
+            limit=6,
+        )
+        system += (
+            "\n\nWORKFLOW ACTION CONTRACTS (arguments inside steps_json):\n"
+            + json.dumps(
+                [
+                    {
+                        "tool": row["key"],
+                        "description": row["description"],
+                        "parameters": REGISTRY[row["key"]].parameters,
+                    }
+                    for row in actions
+                ],
+                default=str,
+            )
+        )
+        schemas = [
+            schema
+            for schema in schemas
+            if schema.get("name") == "plan_daily_workflow"
+            or "confirm" not in schema.get("parameters", {}).get("properties", {})
+        ]
+    else:
+        schemas = [
+            schema for schema in schemas if schema.get("name") != "plan_daily_workflow"
+        ]
     if not is_model_certified(provider_name, model):
         schemas = [
             schema
@@ -7134,8 +7223,19 @@ def _run_turn_unlocked(
                 low_msg,
             )
         )
-        if paid_intent and not re.search(
-            r"\bcleaning (?:deposit|fee)\b", low_msg,
+        creating_expense = bool(
+            re.search(
+                r"\b(?:record|log|add|create|post)\b.{0,100}\b(?:expense|cost|purchase)\b",
+                low_msg,
+            )
+        )
+        if (
+            paid_intent
+            and not creating_expense
+            and not re.search(
+                r"\bcleaning (?:deposit|fee)\b",
+                low_msg,
+            )
         ):
             amt_m = re.search(r"\$?\s*(\d+\.\d{2})\b", message or "")
             desc = re.sub(
@@ -8521,6 +8621,26 @@ def _run_turn_unlocked(
                     # writes, but it cannot approve its own proposal.
                     effective_arguments["confirm"] = ""
                 if (
+                    registered_tool
+                    and "confirm" in registered_tool.parameters["properties"]
+                    and (
+                        not is_model_certified(provider_name, model)
+                        or not role_allows_tool(role, call.name)
+                    )
+                ):
+                    result = {
+                        "error": "This model or role may not prepare write plans."
+                    }
+                elif (
+                    use_daily_workflows
+                    and registered_tool
+                    and "confirm" in registered_tool.parameters["properties"]
+                    and call.name != "plan_daily_workflow"
+                ):
+                    result = {
+                        "error": "Prepare all requested actions together with plan_daily_workflow. Use $step references for records that earlier actions will create; do not preview dependent actions separately."
+                    }
+                elif (
                     role == "general"
                     and depth == 0
                     and call.name in DELEGATION_TOOL_NAMES
@@ -8665,7 +8785,17 @@ def _run_turn_unlocked(
                             },
                         )
                     else:
-                        _append_pending_spec(pending_specs, spec)
+                        if call.name == "plan_daily_workflow":
+                            # A corrected whole-workflow preview supersedes its
+                            # earlier validation errors, not an excluded action.
+                            excluded_preview_errors[:] = [
+                                row for row in excluded_preview_errors
+                                if row["target"] != "plan daily workflow"
+                            ]
+                        if call.name == "plan_daily_workflow":
+                            pending_specs[:] = [spec]
+                        else:
+                            _append_pending_spec(pending_specs, spec)
 
                     # Make the future name addressable by later calls in this
                     # same model turn. The pending step itself already uses the

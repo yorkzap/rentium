@@ -190,11 +190,13 @@ DEFAULT_META = ToolMeta(risk="high", own_confirm=True, autonomy=Autonomy.NEVER)
 AUTO_CATEGORIES = frozenset({"admin", "inventory", "memory"})
 
 TOOL_META: dict[str, ToolMeta] = {
+    "plan_daily_workflow": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
+    "prepare_tenant_move": ToolMeta(
+        risk="legal", own_confirm=True, autonomy=Autonomy.NEVER
+    ),
     # These compile other already-vetted operations into a persisted preview;
     # they never execute their own prose and are always explicitly confirmed.
-    "plan_operation": ToolMeta(
-        risk="high", own_confirm=True, autonomy=Autonomy.NEVER
-    ),
+    "plan_operation": ToolMeta(risk="high", own_confirm=True, autonomy=Autonomy.NEVER),
     "plan_move_tenant": ToolMeta(
         risk="high", own_confirm=True, autonomy=Autonomy.NEVER
     ),
@@ -284,9 +286,7 @@ TOOL_META: dict[str, ToolMeta] = {
     "log_capability_gap": ToolMeta(risk="low"),
     "update_property": ToolMeta(risk="low"),
     "update": ToolMeta(risk="medium"),  # generic manifest write (previewed)
-    "delete_property": ToolMeta(
-        risk="high", blockers=delete_property_blockers
-    ),
+    "delete_property": ToolMeta(risk="high", blockers=delete_property_blockers),
     "create_property_group": ToolMeta(risk="low"),
     # Records a decision about the backlog; touches no landlord data, and the
     # preview carries from_status so the inverse is exact.
@@ -342,15 +342,15 @@ TOOL_META: dict[str, ToolMeta] = {
     # The persisted preview itself is the explicit confirmation boundary; do
     # not ask once per row again inside a landlord-approved batch.
     "apply_rent_adjustment": ToolMeta(
-        risk="high", own_confirm=False, autonomy=Autonomy.NEVER,
+        risk="high",
+        own_confirm=False,
+        autonomy=Autonomy.NEVER,
     ),
     "record_utility_bill": ToolMeta(
         risk="high", independent_writes=True, autonomy=Autonomy.NEVER
     ),
     # Creates a viewing + emails prospect; irreversible outbound.
-    "convert_inquiry_to_viewing": ToolMeta(
-        risk="high", autonomy=Autonomy.NEVER
-    ),
+    "convert_inquiry_to_viewing": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
     # Ledger control — append-only services only; never autonomous.
     "void_ledger_entry": ToolMeta(
         risk="high", own_confirm=True, autonomy=Autonomy.NEVER
@@ -390,9 +390,7 @@ TOOL_META: dict[str, ToolMeta] = {
     "reconcile_bank_statement": ToolMeta(risk="high", autonomy=Autonomy.NEVER),
     "discard_import_batch": ToolMeta(risk="medium", own_confirm=True),
     "mark_notifications_read": ToolMeta(risk="low"),
-    "delete_draft_lease": ToolMeta(
-        risk="medium", blockers=delete_draft_lease_blockers
-    ),
+    "delete_draft_lease": ToolMeta(risk="medium", blockers=delete_draft_lease_blockers),
     # Legal/financial: these always pause for their own confirm in a plan.
     "terminate_lease": ToolMeta(
         risk="legal", own_confirm=True, blockers=terminate_lease_blockers

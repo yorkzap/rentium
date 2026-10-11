@@ -88,6 +88,18 @@ def _resolve_maintenance_target(landlord, query: str):
     if not q:
         return None, None, None, {"error": "Say which listing or unit this is for."}
 
+    # Frozen workflow targets use IDs; preserve the unit scope on replay.
+    try:
+        import uuid
+
+        exact_id = uuid.UUID(q)
+    except (ValueError, TypeError):
+        exact_id = None
+    if exact_id:
+        unit = PropertyUnit.objects.filter(landlord=landlord, pk=exact_id).first()
+        if unit is not None:
+            return None, unit, None, None
+
     # A listing name is the most specific thing, so try it first.
     prop, err = _resolve_property(landlord, q)
     if not err:
@@ -156,6 +168,18 @@ def _resolve_expense_scope(landlord, query: str, holding_name: str = ""):
     if not q:
         # Portfolio-wide: a cost that belongs to the business, not a place.
         return None, None, None, None
+
+    # Frozen workflow targets use IDs; preserve the unit scope on replay.
+    try:
+        import uuid
+
+        exact_id = uuid.UUID(q)
+    except (ValueError, TypeError):
+        exact_id = None
+    if exact_id:
+        unit = PropertyUnit.objects.filter(landlord=landlord, pk=exact_id).first()
+        if unit is not None:
+            return None, unit, None, None
 
     # A listing name is the most specific thing, so try it first.
     prop, err = _resolve_property(landlord, q)
@@ -2705,7 +2729,9 @@ def invite_tenant_to_lease(
             lease.status = Lease.LeaseStatus.PENDING_SIGNATURES
             lease.save(update_fields=["status", "updated_at"])
 
-        lt.invite_sent_at = timezone.now()
+        from .workflow_contracts import enabled as workflows_enabled
+
+        lt.invite_sent_at = None if workflows_enabled(landlord) else timezone.now()
         lt.save(update_fields=["invite_sent_at", "updated_at"])
 
         # Critical: rebalance ALL unsigned active shares so add-roommate
@@ -2719,20 +2745,27 @@ def invite_tenant_to_lease(
     invite_url = lt.get_invite_url(frontend)
     email_sent = False
     email_error = None
-    try:
-        email_sent = bool(send_tenant_invite(lt))
-    except Exception as exc:  # noqa: BLE001
-        email_error = str(exc)
+    delivery_task = None
+    if workflows_enabled(landlord):
+        from .workflow_delivery import queue_invitation
+
+        delivery_task = queue_invitation(lt, landlord)
+    else:
+        try:
+            email_sent = bool(send_tenant_invite(lt))
+        except Exception as exc:  # noqa: BLE001
+            email_error = str(exc)
     linked = bool(getattr(lt, "tenant_id", None))
     from rentium.leases.models import LeaseInviteEvent
     from rentium.leases.services import record_invite_event
 
-    record_invite_event(
-        lt,
-        LeaseInviteEvent.Kind.SENT,
-        actor=getattr(landlord, "user", None),
-        metadata={"email_sent": email_sent, "source": "rama"},
-    )
+    if delivery_task is None:
+        record_invite_event(
+            lt,
+            LeaseInviteEvent.Kind.SENT,
+            actor=getattr(landlord, "user", None),
+            metadata={"email_sent": email_sent, "source": "rama"},
+        )
     if linked:
         record_invite_event(
             lt,
@@ -2742,7 +2775,9 @@ def invite_tenant_to_lease(
         )
 
     roster = [_slot_label(a) for a in _active_tenant_slots(lease)]
-    if linked:
+    if delivery_task:
+        note = "Invitation and rent shares saved. Delivery is queued; tenant signatures remain outstanding."
+    elif linked:
         note = (
             "Linked their existing Rentium account — no invite email needed; "
             "they can sign in and sign the lease directly. Rent rebalanced "
@@ -2758,6 +2793,14 @@ def invite_tenant_to_lease(
         "linked_existing_account": linked,
         "mode": mode,
         "cancelled_prior": cancelled_label,
+        **(
+            {
+                "delivery_task_id": str(delivery_task.pk),
+                "workflow_waiting": "Invitation saved; delivery is pending.",
+            }
+            if delivery_task
+            else {}
+        ),
         "email_sent": email_sent,
         "email_error": email_error,
         "lease_tenant_id": str(lt.pk),
@@ -2773,8 +2816,10 @@ def invite_tenant_to_lease(
         "invite_url": invite_url,
         "active_tenants_now": roster,
         "rent_shares_sum": str(
-            sum((__import__("decimal").Decimal(a["rent_amount"]) for a in roster),
-                __import__("decimal").Decimal("0"))
+            sum(
+                (__import__("decimal").Decimal(a["rent_amount"]) for a in roster),
+                __import__("decimal").Decimal("0"),
+            )
         ),
         "note": note,
     }

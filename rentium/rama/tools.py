@@ -119,13 +119,17 @@ def data_catalogue(landlord, entity: str = "") -> dict:
 def search_capabilities(landlord, query: str = "") -> dict:
     """Find the RAMA operations relevant to a request in business language.
     Call this when the right operation is not in the initially offered tool
-    set. Returns capability keys, descriptions, risk, and confirmation policy;
+    set. Returns capability keys, descriptions, argument schemas, risk, and confirmation policy;
     it never changes data."""
     from .capabilities import search_capability_catalogue
+    from .registry import REGISTRY
 
+    capabilities = search_capability_catalogue(query, limit=12)
+    for capability in capabilities:
+        capability["parameters"] = REGISTRY[capability["key"]].parameters
     return {
         "query": query,
-        "capabilities": search_capability_catalogue(query, limit=12),
+        "capabilities": capabilities,
     }
 
 

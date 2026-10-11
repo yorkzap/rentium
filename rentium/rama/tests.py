@@ -3529,26 +3529,38 @@ def test_plan_update_status(landlord):
 
 
 def test_plan_move_tenant_composition(landlord):
-    from rentium.leases.models import Lease
+    from datetime import timedelta
+    from django.utils import timezone
+    from rentium.leases.models import Lease, LeaseTenant
 
     src = _mk_prop(landlord, "Room A")
     dst = _mk_prop(landlord, "Room B")
-    _mk_lease(landlord, src, Lease.LeaseStatus.ACTIVE, rent="777.00")
-
+    lease = _mk_lease(landlord, src, Lease.LeaseStatus.ACTIVE, rent="777.00")
+    LeaseTenant.objects.create(
+        lease=lease,
+        invited_email="sam@example.com",
+        invited_name="Sam",
+        rent_amount="777",
+    )
     out = registry.execute(
         "plan_move_tenant",
-        {"tenant": "sam@example.com", "from_property": "Room A", "to_property": "Room B"},
+        {
+            "tenant": "sam@example.com",
+            "from_property": "Room A",
+            "to_property": "Room B",
+            "start_date": str(timezone.localdate() + timedelta(days=30)),
+        },
         landlord=landlord,
     )
+    assert "plan" in out, out
     plan = out["plan"]
-    tools_used = [s["tool"] for s in plan["steps"]]
-    assert tools_used == ["terminate_lease", "setup_room_tenancy"]
+    assert [s["tool"] for s in plan["steps"]] == ["prepare_tenant_move"]
     assert plan["steps"][0]["requires_own_confirm"] is True
-    setup = plan["steps"][1]["arguments"]
-    assert setup["room_name"] == "Room B"
-    assert setup["total_rent"] == "777.00"  # defaults from the old lease
-    assert setup["tenant_email"] == "sam@example.com"
-    assert dst.pk
+    args = plan["steps"][0]["arguments"]
+    assert args["to_property"] == str(dst.pk)
+    assert args["total_rent"] == "777.00"
+    lease.refresh_from_db()
+    assert lease.status == Lease.LeaseStatus.ACTIVE
 
 
 def test_plan_operation_scoped_to_landlord(landlord, other_landlord):

@@ -22,6 +22,16 @@ _TOKEN = re.compile(r"[a-z0-9]+")
 # Business-language aliases that do not naturally occur in Python function
 # names.  Keep these focused: descriptions remain the general retrieval corpus.
 CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "plan_daily_workflow": (
+        "onboard tenant",
+        "prepare tenancy",
+        "move tenant",
+        "several changes",
+        "workflow",
+        "then invite",
+        "then inspection",
+        "record payments and expenses",
+    ),
     "manage_lease_forms": (
         "attach a form",
         "RTB-8",
@@ -203,9 +213,26 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
         "commit import",
         "finalize import batch",
     ),
-    "reconcile_bank_statement": ("match bank statement", "approve bank matches", "reconcile transactions", "review statement", "allocate bank payment"),
-    "money_overview": ("cash flow", "money received", "monthly money", "unpaid bills", "money overview"),
-    "review_bank_statements": ("statement exceptions", "unmatched transactions", "bank review", "saved statements"),
+    "reconcile_bank_statement": (
+        "match bank statement",
+        "approve bank matches",
+        "reconcile transactions",
+        "review statement",
+        "allocate bank payment",
+    ),
+    "money_overview": (
+        "cash flow",
+        "money received",
+        "monthly money",
+        "unpaid bills",
+        "money overview",
+    ),
+    "review_bank_statements": (
+        "statement exceptions",
+        "unmatched transactions",
+        "bank review",
+        "saved statements",
+    ),
     "update_lease": (
         "edit lease terms",
         "change rent",
@@ -439,6 +466,7 @@ CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 CORE_CAPABILITIES = (
+    "plan_daily_workflow",
     "search_capabilities",
     "portfolio_snapshot",
     "data_catalogue",
@@ -530,6 +558,17 @@ def search_capability_catalogue(
     ]
 
 
+def is_listing_rent_request(text: str) -> bool:
+    """Advertised prices belong to offerings, never to a tenant's ledger."""
+    return bool(
+        re.search(
+            r"\b(?:asking|advertised|advertising|listing|market)\s+(?:monthly\s+)?(?:rent|price)\b",
+            text or "",
+            re.I,
+        )
+    )
+
+
 def supported_tool_for_request(request: str) -> str | None:
     """Fail capability-gap logging closed for operations already implemented.
 
@@ -540,6 +579,8 @@ def supported_tool_for_request(request: str) -> str | None:
     text = " ".join((request or "").casefold().split())
     if not text:
         return None
+    if is_listing_rent_request(text):
+        return "update_property"
     if re.search(
         r"\b(morning|daily|every ?day|scheduled|recurring)\b.*"
         r"\b(update|updates|briefing|brief|digest|summary|message|report)\b",

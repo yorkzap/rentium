@@ -14,6 +14,8 @@ Rules (same as the dashboard / API):
 
 from __future__ import annotations
 
+import uuid
+
 import datetime as _dt
 import json
 import re
@@ -302,6 +304,17 @@ def _resolve_holding(landlord, holding_name: str):
     q = (holding_name or "").strip()
     if not q:
         return None, "holding_name is required."
+    try:
+        exact_id = uuid.UUID(q)
+    except (ValueError, TypeError):
+        exact_id = None
+    if exact_id:
+        holding = PropertyHolding.objects.filter(landlord=landlord, pk=exact_id).first()
+        return (
+            (holding, None)
+            if holding
+            else (None, "No holding with that ID in this portfolio.")
+        )
     qs = PropertyHolding.objects.filter(landlord=landlord, name__icontains=q)
     n = qs.count()
     if n == 0:
@@ -4088,6 +4101,13 @@ def setup_room_tenancy(
 
     Prefer this over many separate tools for “add Room G + lease + invite + inspection”.
     """
+    from .workflow_contracts import enabled
+
+    if enabled(landlord):
+        from .daily_workflows import onboarding_plan
+
+        return onboarding_plan(landlord, locals())
+
     from rentium.properties.models import Property
     from rentium.rama import domain_actions as actions
 

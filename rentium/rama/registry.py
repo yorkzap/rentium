@@ -18,11 +18,14 @@ from typing import Any, Callable
 from . import tools as tool_functions
 from . import landlord_capabilities
 from . import money_workflows
+from . import daily_workflows
 
 _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
 # The whole tool surface, in the order the model sees it.
 TOOL_FUNCTIONS: tuple[Callable, ...] = (
+    daily_workflows.plan_daily_workflow,
+    daily_workflows.prepare_tenant_move,
     money_workflows.money_overview,
     money_workflows.review_bank_statements,
     money_workflows.reconcile_bank_statement,

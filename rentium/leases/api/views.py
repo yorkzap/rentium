@@ -1110,26 +1110,29 @@ class LeaseTenantViewSet(viewsets.ModelViewSet):
 
         # Send the invite. This used to be a `# TODO: fire invite email`, which meant
         # the invite link only worked if the landlord copy-pasted it by hand.
-        email_sent = False
-        if instance.invited_email and not instance.tenant_id:
-            try:
-                from rentium.showcase.emails import send_tenant_invite
-
-                email_sent = send_tenant_invite(instance)
-            except Exception:
-                # send() never raises — it logs and returns False — but an import-time
-                # failure shouldn't cost the landlord the LeaseTenant row they just
-                # created. They can resend from the lease page.
-                pass
+        from rentium.rama.workflow_contracts import enabled as workflows_enabled
         from rentium.leases.models import LeaseInviteEvent
         from rentium.leases.services import record_invite_event
 
-        record_invite_event(
-            instance,
-            LeaseInviteEvent.Kind.SENT,
-            actor=user,
-            metadata={"email_sent": email_sent},
-        )
+        if workflows_enabled(lease.landlord):
+            from rentium.rama.workflow_delivery import queue_invitation
+
+            queue_invitation(instance, lease.landlord)
+        else:
+            email_sent = False
+            if instance.invited_email and not instance.tenant_id:
+                try:
+                    from rentium.showcase.emails import send_tenant_invite
+
+                    email_sent = send_tenant_invite(instance)
+                except Exception:
+                    pass
+            record_invite_event(
+                instance,
+                LeaseInviteEvent.Kind.SENT,
+                actor=user,
+                metadata={"email_sent": email_sent},
+            )
         if instance.tenant_id:
             record_invite_event(
                 instance,

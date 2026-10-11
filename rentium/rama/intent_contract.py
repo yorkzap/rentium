@@ -87,6 +87,17 @@ def contract_from_messages(messages: list[str]) -> dict:
         text = str(raw or "").strip()
         if not text or _CONTROL_ONLY.fullmatch(text):
             continue
+        if requests_bank_transfer(text):
+            return {
+                "version": 1,
+                "source_text": text[:1000],
+                "unsupported_operation": "bank_transfer",
+                "reason": (
+                    "RAMA cannot send money between bank accounts. No money was "
+                    "moved and no ledger change was prepared. After a transfer "
+                    "has happened, it can help record or reconcile it."
+                ),
+            }
         capability = supported_tool_for_request(text)
         if not capability:
             if index == 0 and not _CONTEXTUAL_FOLLOW_UP.fullmatch(text):
@@ -113,11 +124,26 @@ def contract_from_messages(messages: list[str]) -> dict:
     return {}
 
 
+def requests_bank_transfer(text: str) -> bool:
+    """Sending external funds is different from recording a completed payment."""
+    return bool(
+        re.search(r"\b(?:transfer|send|wire)\b", text, re.I)
+        and re.search(r"\b(?:bank account|banking|wire transfer)\b", text, re.I)
+        and not re.search(
+            r"\b(?:record|reconcile|log|already|transferred|sent)\b", text, re.I
+        )
+    )
+
+
 def validate_step(
-    contract: dict | None, tool: str, arguments: dict | None,
+    contract: dict | None,
+    tool: str,
+    arguments: dict | None,
 ) -> list[str]:
     """Return semantic mismatches between one proposed effect and its intent."""
     contract = contract or {}
+    if contract.get("unsupported_operation"):
+        return [contract["reason"]]
     effects = contract.get("effects") or []
     if effects:
         args = arguments or {}

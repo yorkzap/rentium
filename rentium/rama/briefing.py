@@ -38,6 +38,7 @@ def build_briefing_text(landlord, *, phrase: bool = False) -> str:
 
     insights = list(
         RamaInsight.objects.filter(landlord=landlord, status=RamaInsight.Status.OPEN)
+        .exclude(kind="rama.workflow.attention")
         .order_by("-severity", "-created_at")[:5]
     )
     if insights:

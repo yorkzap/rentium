@@ -14,8 +14,8 @@ document evidence in a saved review. REST and RAMA use the same exact batch
 preview and atomic, idempotent approval. Larger files prepare in Celery; workers
 cannot post money. `BankStatement` / `BankTransaction` extend the import layer
 without repurposing historical staged entries. See [MONEY_WORKFLOW.md](MONEY_WORKFLOW.md)
-for contracts, limits, verification and deployment. Implementation is local;
-the first real-statement pilot remains a deployment step.
+for contracts, limits, verification and deployment. The money workspace was
+deployed October 5; the first real-statement approval remains the owner's pilot.
 
 ## Runtime boundaries
 
@@ -130,6 +130,15 @@ Group common areas carry an explicit `is_group_common` marker and a
 `shared_with_landlord` legal classification. Joining a room to a group attaches
 it to all group common areas. Moving or removing the room safely removes the
 old associations and preserves a valid primary area for the remaining group.
+
+## Daily workflow rollout (October 2026)
+
+The per-landlord daily workflow extension is documented in
+[`RAMA_DAILY_WORKFLOWS.md`](RAMA_DAILY_WORKFLOWS.md). It adds complete structured
+previews, database postcondition checks, durable progress/retry references and
+an invitation delivery outbox to the existing task/plan runner. The model uses
+one bounded planner for covered writes; domain services retain business rules.
+The flag defaults off and requires live-model acceptance before pilot enablement.
 
 ## RAMA request paths
 

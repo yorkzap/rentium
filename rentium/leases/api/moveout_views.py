@@ -343,20 +343,20 @@ class MoveOutViewSet(viewsets.ModelViewSet):
                 self.get_serializer(mo).data, status=status.HTTP_201_CREATED
             )
 
-        mo = MoveOutRequest.objects.create(
-            lease=lease,
-            initiated_by=MoveOutRequest.InitiatedBy.LANDLORD,
-            kind=kind,
-            requested_end_date=requested_end,
-            reason=reason,
-            form_type=rules.mutual_agreement_form,
-            rent_handling=rent_handling,
-            rules_snapshot=snapshot,
-        )
-        mo.sign(as_landlord=True)
-        mo.save()
-        ensure_mutual_agreement_form(mo, actor=request.user)
-        mo._publish("lease.moveout_requested")
+        from rentium.leases.moveout_services import propose_mutual_moveout
+
+        try:
+            mo = propose_mutual_moveout(
+                landlord=profile,
+                lease=lease,
+                requested_end=requested_end,
+                reason=reason,
+                rent_handling=rent_handling,
+                actor=request.user,
+            )
+        except DjangoValidationError as exc:
+            raise ValidationError({"detail": exc.messages}) from exc
+
         return Response(self.get_serializer(mo).data, status=status.HTTP_201_CREATED)
 
     # ------------------------------------------------------------ actions

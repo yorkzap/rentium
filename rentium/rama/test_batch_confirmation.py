@@ -168,7 +168,8 @@ def test_chained_renames_and_future_name_assignments_run_on_one_yes(landlord):
     task = RamaTask.objects.get(pk=plan.task_id)
     assert task.status == RamaTask.Status.VERIFIED
     assert task.receipts.count() == 4
-    assert all(receipt.verification["verified"] for receipt in task.receipts.all())
+    # Legacy tools record effects but no longer pretend to have DB verifiers.
+    assert all(not receipt.verification["verified"] for receipt in task.receipts.all())
     assert any(receipt.entity_refs for receipt in task.receipts.all())
 
 

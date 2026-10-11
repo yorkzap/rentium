@@ -15,9 +15,9 @@ The confirm state machine, deterministic end to end:
   demand their own explicit "yes". A single-step plan never double-asks:
   its preview asked exactly about that step.
 - Failure of a step marks it FAILED and SKIPPEDs the remaining steps sharing
-  its item_key; other items continue. No cross-item transaction — each tool
-  is already internally atomic, and honest PARTIAL reporting beats
-  all-or-nothing lock-holding.
+  its item_key; other items continue. Each attempted action has a savepoint.
+  A portfolio lock serializes confirmations; successful effects, task progress
+  and receipts commit together. External invitation delivery uses an outbox.
 
 validate_plan() is the safety valve for arbitrary step lists: today it
 double-checks playbook output; later a smarter planner model can emit steps
@@ -28,7 +28,11 @@ from __future__ import annotations
 
 import json
 import re
+import logging
 
+from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.utils import timezone
 
 from .command_engine import create_task
@@ -187,6 +191,7 @@ def validate_plan(
 
 
 # ------------------------------------------------------------ persistence
+@transaction.atomic
 def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
     """Persist a playbook plan payload (latest plan per conversation wins)."""
     intent_contract = plan_payload.get("intent_contract") or {}
@@ -195,6 +200,39 @@ def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
     )
     if errors:
         raise ValueError("Invalid RAMA plan: " + " ".join(errors))
+    from .workflow_contracts import WORKFLOW_TOOLS, enabled, freeze_arguments
+
+    plan_payload = json.loads(json.dumps(plan_payload, default=str))
+    workflow = enabled(landlord) and all(
+        step["tool"] in WORKFLOW_TOOLS for step in plan_payload["steps"]
+    )
+    if workflow:
+        # All entry points use the same domain preview, including single writes
+        # and model-collected batches. Never use model prose as the effect list.
+        if not plan_payload.get("previews"):
+            from .daily_workflows import plan_daily_workflow
+
+            compiled = plan_daily_workflow(
+                landlord,
+                json.dumps(plan_payload["steps"]),
+                plan_payload.get("summary") or "Review these changes",
+            )
+            if "plan" not in compiled:
+                raise ValueError(
+                    compiled.get("error")
+                    or compiled.get("question_for_user")
+                    or "The workflow needs more information before approval."
+                )
+            plan_payload["steps"] = compiled["plan"]["steps"]
+            plan_payload["previews"] = compiled["plan"]["previews"]
+        for step in plan_payload["steps"]:
+            if not _argument_step_refs(step.get("arguments") or {}):
+                step["arguments"], step["facts_hash"] = freeze_arguments(
+                    step["tool"],
+                    step.get("arguments") or {},
+                    landlord,
+                )
+    plan_payload = json.loads(json.dumps(plan_payload, default=str))
     clear_plan(landlord, conversation_id)
     from .conversations import CONFIRMATION_TTL
     from .models import RamaConversation
@@ -232,6 +270,11 @@ def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
             data={"operation": plan_payload.get("operation") or "plan"},
         ).as_dict(),
     )
+    if workflow:
+        lanes = {WORKFLOW_TOOLS[step["tool"]] for step in plan_payload["steps"]}
+        task.workflow_key = next(iter(lanes)) if len(lanes) == 1 else "daily_work"
+        task.stage = "approval"
+        task.save(update_fields=["workflow_key", "stage", "updated_at"])
     plan = RamaPendingPlan.objects.create(
         conversation_id=conversation_id,
         landlord=landlord,
@@ -253,10 +296,12 @@ def save_plan(landlord, conversation_id, plan_payload: dict) -> RamaPendingPlan:
             arguments=s.get("arguments") or {},
             target_label=s.get("target") or "",
             item_key=s.get("item_key") or str(i),
-            requires_own_confirm=bool(s.get("requires_own_confirm")),
+            requires_own_confirm=meta_for(s["tool"]).own_confirm,
         )
         for i, s in enumerate(plan_payload.get("steps") or [])
     )
+    task.context = {**task.context, "plan_id": str(plan.plan_id)}
+    task.save(update_fields=["context", "updated_at"])
     return plan
 
 
@@ -271,24 +316,35 @@ def save_single(
         if arguments.get(key):
             label = str(arguments[key])
             break
+    if arguments.get("property_query"):
+        from .resolve import resolve_property
+
+        prop, error = resolve_property(landlord, str(arguments["property_query"]))
+        if not error:
+            label = prop.name
     return save_plan(
         landlord,
         conversation_id,
-        attach_contract({
-            "operation": "single",
-            "summary": f"{tool} {label}".strip(),
-            "steps": [
-                {
-                    "tool": tool,
-                    "arguments": {
-                        k: v for k, v in (arguments or {}).items() if k != "confirm"
+        attach_contract(
+            {
+                "operation": "single",
+                "summary": f"{tool.replace('_', ' ').capitalize()} · {label}".strip(
+                    " ·"
+                ),
+                "steps": [
+                    {
+                        "tool": tool,
+                        "arguments": {
+                            k: v for k, v in (arguments or {}).items() if k != "confirm"
+                        },
+                        "target": label,
+                        "item_key": "single",
+                        "requires_own_confirm": meta_for(tool).own_confirm,
                     },
-                    "target": label,
-                    "item_key": "single",
-                    "requires_own_confirm": meta_for(tool).own_confirm,
-                },
-            ],
-        }, intent_contract),
+                ],
+            },
+            intent_contract,
+        ),
     )
 
 
@@ -496,6 +552,7 @@ def plan_to_payload(plan: RamaPendingPlan) -> dict:
     payload = {
         "operation": plan.operation,
         "summary": plan.summary,
+        "previews": (plan.task.input or {}).get("previews", []) if plan.task_id else [],
         "blocked": plan.blocked,
         "steps": [
             {
@@ -539,6 +596,7 @@ def plan_brief(plan: RamaPendingPlan) -> dict:
         "status": plan.status,
         "awaiting_own_confirm": plan.status
         == RamaPendingPlan.Status.AWAITING_STEP_CONFIRM,
+        "previews": (plan.task.input or {}).get("previews", []) if plan.task_id else [],
         "steps": [
             {
                 "n": s.order + 1,
@@ -571,7 +629,52 @@ def _step_outcome(step: RamaPlanStep) -> dict:
     }
 
 
+@transaction.atomic
 def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
+    """Serialize confirmations and persist domain effects and receipts together."""
+    type(landlord).objects.select_for_update().get(pk=landlord.pk)
+    locked = (
+        RamaPendingPlan.objects.select_for_update()
+        .filter(
+            plan_id=plan.plan_id,
+            landlord=landlord,
+        )
+        .first()
+    )
+    if locked is None:
+        task = RamaTask.objects.filter(
+            landlord=landlord,
+            context__plan_id=str(plan.plan_id),
+        ).first()
+        if task and task.context.get("execution_result"):
+            return task.context["execution_result"]
+        return {
+            "status": "failed",
+            "summary": "This plan is no longer pending.",
+            "executed": [],
+            "failed": [],
+            "skipped": [],
+        }
+    if locked.expires_at and locked.expires_at <= timezone.now():
+        if locked.task and locked.task.status not in RamaTask.TERMINAL_STATUSES:
+            locked.task.transition_to(RamaTask.Status.EXPIRED)
+        locked.delete()
+        return {
+            "status": "failed",
+            "summary": "The approval expired. Prepare a fresh preview.",
+            "executed": [],
+            "failed": [],
+            "skipped": [],
+        }
+    result = json.loads(json.dumps(_run_plan(locked, landlord, audit), default=str))
+    if locked.task_id:
+        task = RamaTask.objects.get(pk=locked.task_id)
+        task.context = {**task.context, "execution_result": result}
+        task.save(update_fields=["context", "updated_at"])
+    return result
+
+
+def _run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
     """Execute the plan from its cursor. Returns what actually happened:
 
     {"executed": [...], "failed": [...], "skipped": [...],
@@ -626,6 +729,44 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
         }
     if task is not None and task.status != RamaTask.Status.EXECUTING:
         task.transition_to(RamaTask.Status.EXECUTING)
+    # Lock and validate every remaining grounded target before this attempt.
+    if task and task.workflow_key:
+        from .workflow_contracts import fingerprint, target_facts
+
+        pending_ids = {
+            step.step_id for step in steps if step.status == RamaPlanStep.Status.PENDING
+        }
+        try:
+            for index, saved in enumerate(task.input.get("steps") or [], start=1):
+                if saved.get("step_id", f"step-{index}") not in pending_ids:
+                    continue
+                expected = saved.get("facts_hash")
+                if (
+                    expected
+                    and fingerprint(
+                        target_facts(
+                            saved["tool"],
+                            saved.get("arguments") or {},
+                            landlord,
+                            lock=True,
+                        )
+                    )
+                    != expected
+                ):
+                    raise ValueError("Records changed after the preview.")
+        except (ValueError, LookupError, ObjectDoesNotExist, ValidationError):
+            task.transition_to(
+                RamaTask.Status.PARTIAL if task.progress else RamaTask.Status.FAILED,
+                error="Records changed after the preview.",
+            )
+            plan.delete()
+            return {
+                "status": "partial" if task.progress else "failed",
+                "summary": "Records changed after the preview. Review a fresh plan; no further actions ran.",
+                "executed": [],
+                "failed": [{"error": "STALE_PLAN"}],
+                "skipped": [],
+            }
     multi_step = len(steps) > 1
     # A "yes" while paused confirms exactly the step we paused on.
     step_confirmed_order = (
@@ -731,11 +872,84 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
             failed.append(_step_outcome(step))
             continue
 
-        result = execute(
-            step.tool,
-            {**resolved_arguments, "confirm": "yes"},
-            landlord=landlord,
-        )
+        verification = {"verified": False, "source": "unverified_tool_result"}
+        try:
+            from .workflow_contracts import verify
+
+            with transaction.atomic():
+                from .workflow_delivery import execution_context
+
+                expected_effects = (
+                    next(
+                        (
+                            p.get("effects")
+                            for p in task.input.get("previews", [])
+                            if p.get("step_id") == step.step_id
+                        ),
+                        None,
+                    )
+                    if task
+                    else None
+                )
+                if task and task.workflow_key and _argument_step_refs(step.arguments):
+                    # Derive normalized postconditions from the domain adapter
+                    # once predecessor IDs exist. The approved arguments remain
+                    # fixed; this cannot introduce additional actions.
+                    preview = execute(
+                        step.tool,
+                        {**resolved_arguments, "confirm": ""},
+                        landlord=landlord,
+                    )
+                    if not preview.get("needs_confirm"):
+                        raise ValueError("The dependent action no longer validates.")
+                    expected_effects = preview.get("preview")
+                    resolved_arguments.update(preview.get("resolved_arguments") or {})
+                    from .workflow_contracts import freeze_arguments
+
+                    resolved_arguments, _ = freeze_arguments(
+                        step.tool, resolved_arguments, landlord
+                    )
+
+                with execution_context(task, step.step_id):
+                    result = execute(
+                        step.tool,
+                        {**resolved_arguments, "confirm": "yes"},
+                        landlord=landlord,
+                    )
+                if not isinstance(result, dict):
+                    result = {"error": "The action returned no structured outcome."}
+                initial_outcome = CommandOutcome.from_tool_result(result)
+                if initial_outcome.kind in {
+                    OutcomeKind.FAILED,
+                    OutcomeKind.NEEDS_INPUT,
+                    OutcomeKind.PREVIEW,
+                }:
+                    transaction.set_rollback(True)
+                if task and task.workflow_key:
+                    verification = verify(
+                        step.tool,
+                        resolved_arguments,
+                        result,
+                        landlord,
+                        expected=expected_effects,
+                    )
+                    outcome = CommandOutcome.from_tool_result(result)
+                    if (
+                        outcome.kind in {OutcomeKind.COMPLETED, OutcomeKind.NOOP}
+                        and not verification["verified"]
+                    ):
+                        result = {
+                            **result,
+                            "partial": True,
+                            "detail": "The action returned, but its completion checks did not pass.",
+                            "verification": verification,
+                        }
+        except Exception:
+            logging.getLogger(__name__).exception("RAMA step failed: %s", step.tool)
+            result = {
+                "error": "This step could not finish. Its saved progress is available for review.",
+                "code": "EXECUTION_FAILED",
+            }
         safe_result = json.loads(json.dumps(result, default=str))
         if audit is not None:
             audit(
@@ -749,7 +963,8 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
                 },
             )
         step.result = safe_result
-        if isinstance(result, dict) and result.get("error"):
+        outcome = CommandOutcome.from_tool_result(safe_result)
+        if outcome.kind not in {OutcomeKind.COMPLETED, OutcomeKind.NOOP}:
             step.status = RamaPlanStep.Status.FAILED
             dead_items.add(step.item_key)
             failed_step_ids.add(step.step_id)
@@ -763,11 +978,11 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
                     task=task,
                     capability_key=step.capability_key or step.tool,
                     inputs=resolved_arguments,
+                    execution_key=step.step_id,
                     effects=safe_result,
-                    verification={
-                        "verified": True,
-                        "source": "tool_result",
-                    },
+                    verification=verification,
+                    entity_refs=verification.get("entity_refs"),
+                    links=verification.get("links"),
                 )
                 step.receipt = receipt
             executed.append(_step_outcome(step))
@@ -775,6 +990,19 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
         if step.receipt_id:
             update_fields.append("receipt")
         step.save(update_fields=update_fields)
+        if task is not None:
+            progress = {row["step_id"]: row for row in task.progress}
+            progress[step.step_id] = {
+                "step_id": step.step_id,
+                "tool": step.tool,
+                "arguments": resolved_arguments,
+                "status": step.status,
+                "result": safe_result,
+                "verification": verification,
+                "receipt_id": str(step.receipt_id) if step.receipt_id else None,
+            }
+            task.progress = list(progress.values())
+            task.save(update_fields=["progress", "updated_at"])
         plan.cursor = step.order + 1
         # An executed own-confirm step consumes its confirmation.
         if step.order == step_confirmed_order:
@@ -782,15 +1010,52 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
         plan.status = RamaPendingPlan.Status.PENDING_CONFIRM
         plan.save(update_fields=["cursor", "status", "updated_at"])
 
+    if task is not None:
+        progress = {row["step_id"]: row for row in task.progress}
+        for step in steps:
+            if (
+                step.status != RamaPlanStep.Status.PENDING
+                and step.step_id not in progress
+            ):
+                progress[step.step_id] = {
+                    "step_id": step.step_id,
+                    "tool": step.tool,
+                    "arguments": step.arguments,
+                    "status": step.status,
+                    "result": step.result,
+                    "verification": {"verified": False},
+                }
+        task.progress = list(progress.values())
+        task.save(update_fields=["progress", "updated_at"])
+        if awaiting and task.workflow_key:
+            from .workflow_contracts import fingerprint, target_facts
+
+            for index, saved in enumerate(task.input.get("steps") or [], start=1):
+                if saved.get("step_id", f"step-{index}") in {
+                    step.step_id
+                    for step in steps
+                    if step.status == RamaPlanStep.Status.PENDING
+                } and saved.get("facts_hash"):
+                    saved["facts_hash"] = fingerprint(
+                        target_facts(
+                            saved["tool"], saved.get("arguments") or {}, landlord
+                        )
+                    )
+            task.save(update_fields=["input", "updated_at"])
+
     if awaiting is None:
         # Finished (fully or partially) — the outstanding-plan row goes away.
         status = "partial" if failed or skipped else "done"
         if task is not None:
-            if failed:
+            if failed or skipped:
                 task.transition_to(
-                    RamaTask.Status.FAILED,
+                    RamaTask.Status.PARTIAL
+                    if executed or any(row.result.get("partial") for row in steps)
+                    else RamaTask.Status.FAILED,
                     outcome=CommandOutcome(
-                        OutcomeKind.FAILED,
+                        OutcomeKind.PARTIAL
+                        if executed or any(row.result.get("partial") for row in steps)
+                        else OutcomeKind.FAILED,
                         "The plan completed with failures.",
                         data={
                             "executed": len(executed),
@@ -801,14 +1066,32 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
                     error="One or more plan steps failed verification.",
                 )
             else:
+                waiting = [
+                    row.result.get("workflow_waiting")
+                    for row in steps
+                    if row.result.get("workflow_waiting")
+                ]
                 task.transition_to(
-                    RamaTask.Status.VERIFIED,
+                    RamaTask.Status.WAITING if waiting else RamaTask.Status.VERIFIED,
                     outcome=CommandOutcome(
-                        OutcomeKind.COMPLETED,
-                        "The confirmed plan completed and was verified.",
+                        OutcomeKind.WAITING if waiting else OutcomeKind.COMPLETED,
+                        "; ".join(waiting)
+                        if waiting
+                        else "The confirmed plan completed.",
                         data={"executed": len(executed)},
                     ).as_dict(),
                 )
+                if waiting:
+                    status = "waiting"
+        if task:
+            task.stage = (
+                "waiting"
+                if task.status == RamaTask.Status.WAITING
+                else "review"
+                if failed or skipped
+                else "completed"
+            )
+            task.save(update_fields=["stage", "updated_at"])
         plan.delete()
     else:
         status = "awaiting_step"
@@ -834,6 +1117,8 @@ def run_plan(plan: RamaPendingPlan, landlord, audit=None) -> dict:
             f"paused at step {awaiting['n']} ({awaiting['target']}) for its own confirmation",
         )
     summary = "; ".join(bits) or "nothing to do"
+    if task and task.status == RamaTask.Status.WAITING:
+        summary += "; " + task.outcome.get("message", "Waiting for external work.")
 
     return {
         "task": {

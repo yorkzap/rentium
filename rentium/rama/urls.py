@@ -5,6 +5,13 @@ from . import views
 app_name = "rama"
 
 urlpatterns = [
+    path("tasks/", views.workflow_tasks_view, name="workflow-tasks"),
+    path("tasks/<uuid:task_id>/", views.workflow_task_view, name="workflow-task"),
+    path(
+        "tasks/<uuid:task_id>/resume/",
+        views.workflow_resume_view,
+        name="workflow-resume",
+    ),
     path("chat/", views.chat_view, name="chat"),
     path("plans/<uuid:plan_id>/confirm/", views.plan_confirm_view, name="plan-confirm"),
     path("plans/<uuid:plan_id>/cancel/", views.plan_cancel_view, name="plan-cancel"),
@@ -74,7 +81,9 @@ urlpatterns = [
         views.capability_gaps_view,
         name="capability-gaps",
     ),
-    path("insights/<int:insight_id>/", views.insight_detail_view, name="insight-detail"),
+    path(
+        "insights/<int:insight_id>/", views.insight_detail_view, name="insight-detail"
+    ),
     path("holdings/", views.holdings_view, name="holdings"),
     path("bank-balances/", views.bank_balances_view, name="bank-balances"),
     path("config/", views.config_view, name="config"),

@@ -845,94 +845,41 @@ def plan_move_tenant(
     pick: str = "",
     confirm: str = "",
 ) -> dict:
-    """Build a PLAN that moves a tenant between two of this landlord's rooms:
-    terminate the current lease (pauses for its own confirmation), then set up
-    the new tenancy on the target room (lease + signing invite + move-in
-    inspection). tenant: name or email. start_date YYYY-MM-DD (default today);
-    total_rent defaults to the old lease's rent. Show the plan, then stop."""
-    from rentium.leases.models import Lease
+    """Preview a named tenant's move through shared tenancy services.
 
-    from .resolve import resolve_property
+    Prepare a draft replacement lease and propose a mutual move-out agreement.
+    Tenant consent and replacement-lease activation remain outstanding. Never
+    immediately terminate the source lease or transfer its balances.
+    """
+    from .daily_workflows import prepare_tenant_move
 
-    # `pick` reaches resolve_property. It was previously absent from the
-    # signature, so the registry dropped it: the model was told "multiple
-    # listings match — pass pick", passed pick=oldest, and got the identical
-    # error back with no way forward.
-    src, err = resolve_property(landlord, from_property, pick=pick)
-    if err:
-        return {"error": f"from_property: {err}"}
-    dst, err = resolve_property(landlord, to_property, pick=pick)
-    if err:
-        return {"error": f"to_property: {err}"}
-    if src.pk == dst.pk:
-        return {"error": "from_property and to_property are the same listing."}
-
-    lease = (
-        Lease.objects.filter(landlord=landlord, property=src)
-        .exclude(status__in=_FINAL_LEASE_STATUSES)
-        .order_by("-created_at")
-        .first()
+    proposal = prepare_tenant_move(
+        landlord,
+        tenant,
+        from_property,
+        to_property,
+        start_date,
+        total_rent,
     )
-    if lease is None:
-        return {"error": f"No open lease on {src.name} to move anyone from."}
-
-    comp = Composition()
-    term_blockers = lease_terminate_blockers(lease)
-    if lease.status == Lease.LeaseStatus.DRAFT:
-        comp.steps.append(
-            Step(
-                tool="delete_draft_lease",
-                arguments={"lease_number": lease.lease_number},
-                target_label=f"{src.name} — draft {lease.lease_number}",
-                item_key=f"move:{src.pk}",
-                note="draft paperwork only",
-            )
-        )
-    elif term_blockers:
-        comp.blocked.append(
-            _blocked(src.name, term_blockers[0]["reason"], term_blockers[0]["detail"], ["skip"])
-        )
-    else:
-        comp.steps.append(
-            Step(
-                tool="terminate_lease",
-                arguments={"lease_number": lease.lease_number},
-                target_label=f"{src.name} — lease {lease.lease_number}",
-                item_key=f"move:{src.pk}",
-                note="voids open charges, closes occupancy",
-            )
-        )
-
-    rent = (total_rent or "").strip() or str(lease.total_rent)
-    # setup_room_tenancy only creates the lease when start_date is present —
-    # a move always needs the new lease, so default to today.
-    from datetime import date as _date
-
-    start = (start_date or "").strip() or _date.today().isoformat()
-    tenant_str = (tenant or "").strip()
-    is_email = "@" in tenant_str
-    comp.steps.append(
-        Step(
-            tool="setup_room_tenancy",
-            arguments={
-                "room_name": dst.name,
-                "address": dst.address or "",
-                "city": dst.city or "",
-                "group_name": dst.group.name if dst.group_id else "",
-                "use_existing_if_name_matches": "1",
-                "start_date": start,
-                "total_rent": rent,
-                "tenant_name": "" if is_email else tenant_str,
-                "tenant_email": tenant_str if is_email else "",
-            },
-            target_label=f"{dst.name} — new tenancy for {tenant_str}",
-            item_key=f"move:{dst.pk}",
-            note="new lease + signing invite + move-in inspection",
-        )
-    )
-
-    summary = (
-        f"Move {tenant_str} from {src.name} to {dst.name}: end the current "
-        f"lease, then set up the new tenancy at ${rent}."
-    )
-    return _plan_payload("move_tenant", summary, comp)
+    if not proposal.get("needs_confirm"):
+        return proposal
+    args = proposal["resolved_arguments"]
+    return {
+        **proposal,
+        "plan": {
+            "operation": "move_tenant",
+            "summary": "Propose the move agreement and prepare the replacement draft lease; wait for consent.",
+            "steps": [
+                {
+                    "step_id": "prepare-move",
+                    "tool": "prepare_tenant_move",
+                    "arguments": args,
+                    "target": tenant,
+                    "item_key": "move",
+                    "requires_own_confirm": True,
+                }
+            ],
+            "blocked": [],
+            "previews": [{"step_id": "prepare-move", "effects": proposal["preview"]}],
+        },
+    }

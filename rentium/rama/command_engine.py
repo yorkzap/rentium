@@ -93,8 +93,10 @@ def record_receipt(  # noqa: PLR0913
     verification: dict | None = None,
     entity_refs: list[dict] | None = None,
     links: list[dict] | None = None,
+    execution_key: str = "",
 ) -> tuple[RamaActionReceipt, bool]:
-    key = idempotency_key(task, capability_key, inputs)
+    key_inputs = {"inputs": inputs, "step": execution_key} if execution_key else inputs
+    key = idempotency_key(task, capability_key, key_inputs)
     existing = RamaActionReceipt.objects.filter(
         landlord=task.landlord,
         idempotency_key=key,
@@ -110,7 +112,7 @@ def record_receipt(  # noqa: PLR0913
         inputs=inputs,
         effects=effects,
         entity_refs=entity_refs if entity_refs is not None else inferred_refs,
-        verification=verification or {"verified": True},
+        verification=verification if verification is not None else {"verified": False},
         links=links if links is not None else inferred_links,
     )
     return receipt, True
@@ -123,6 +125,10 @@ def settle_task(task: RamaTask, outcome: CommandOutcome) -> None:
         status = RamaTask.Status.AWAITING_CONFIRMATION
     elif outcome.kind == OutcomeKind.NEEDS_INPUT:
         status = RamaTask.Status.NEEDS_INPUT
+    elif outcome.kind == OutcomeKind.PARTIAL:
+        status = RamaTask.Status.PARTIAL
+    elif outcome.kind == OutcomeKind.WAITING:
+        status = RamaTask.Status.WAITING
     else:
         status = RamaTask.Status.FAILED
     task.transition_to(

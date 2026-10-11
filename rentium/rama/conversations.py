@@ -55,6 +55,11 @@ def _close_episode(episode: RamaEpisode, *, at, reason: str) -> None:
     episode.save(update_fields=["ended_at", "end_reason"])
 
     for task in episode.tasks.exclude(status__in=RamaTask.TERMINAL_STATUSES):
+        if task.workflow_key and task.status in {
+            RamaTask.Status.WAITING,
+            RamaTask.Status.PARTIAL,
+        }:
+            continue  # workflow progress outlives chat; approval never does
         if task.status == RamaTask.Status.AWAITING_CONFIRMATION:
             task.transition_to(RamaTask.Status.EXPIRED)
         else:

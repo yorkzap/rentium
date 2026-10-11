@@ -28,8 +28,9 @@ invalidate the preview. Preview authority expires after 30 minutes; drafts do
 not expire with RAMA's chat episode.
 
 The previous 2024 workbook informed the workflow. This change does **not** import
-its history or mutate existing records. No production migration or deployment
-has been performed as part of the implementation.
+its history or mutate existing records. The workspace and additive migrations
+were deployed October 5, 2026; the first real-statement approval remains the
+owner's pilot.
 
 ## Financial meaning and evidence
 

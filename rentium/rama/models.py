@@ -52,6 +52,7 @@ class RamaPreferences(models.Model):
         default=OrchestrationMode.LEGACY,
         help_text="Per-channel RAMA rollout mode; legacy is the instant rollback.",
     )
+    workflows_enabled = models.BooleanField(default=False)
     telegram_orchestration_mode = models.CharField(
         max_length=12,
         choices=OrchestrationMode.choices,
@@ -317,6 +318,8 @@ class RamaTask(models.Model):
         READY = "READY", "Ready"
         AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION", "Awaiting confirmation"
         EXECUTING = "EXECUTING", "Executing"
+        WAITING = "WAITING", "Waiting for external work"
+        PARTIAL = "PARTIAL", "Partially completed"
         VERIFIED = "VERIFIED", "Verified"
         FAILED = "FAILED", "Failed"
         CANCELLED = "CANCELLED", "Cancelled"
@@ -346,6 +349,7 @@ class RamaTask(models.Model):
             Status.EXPIRED,
         },
         Status.READY: {
+            Status.WAITING,
             Status.AWAITING_CONFIRMATION,
             Status.EXECUTING,
             Status.CANCELLED,
@@ -362,6 +366,9 @@ class RamaTask(models.Model):
             Status.EXPIRED,
         },
         Status.EXECUTING: {
+            Status.NEEDS_INPUT,
+            Status.WAITING,
+            Status.PARTIAL,
             Status.AWAITING_CONFIRMATION,
             Status.VERIFIED,
             Status.FAILED,
@@ -371,6 +378,21 @@ class RamaTask(models.Model):
         Status.FAILED: set(),
         Status.CANCELLED: set(),
         Status.SUSPENDED: {Status.NEEDS_INPUT, Status.CANCELLED, Status.EXPIRED},
+        Status.WAITING: {
+            Status.READY,
+            Status.VERIFIED,
+            Status.PARTIAL,
+            Status.FAILED,
+            Status.SUSPENDED,
+            Status.CANCELLED,
+            Status.NEEDS_INPUT,
+        },
+        Status.PARTIAL: {
+            Status.NEEDS_INPUT,
+            Status.READY,
+            Status.SUSPENDED,
+            Status.CANCELLED,
+        },
         Status.EXPIRED: set(),
     }
 
@@ -403,6 +425,19 @@ class RamaTask(models.Model):
         related_name="prompted_tasks",
     )
     capability_key = models.CharField(max_length=120, db_index=True)
+    workflow_key = models.CharField(
+        max_length=80, blank=True, default="", db_index=True
+    )
+    workflow_version = models.PositiveIntegerField(default=1)
+    stage = models.CharField(max_length=80, blank=True, default="")
+    parent = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="attempts",
+    )
+    progress = models.JSONField(default=list, blank=True)
     status = models.CharField(
         max_length=30, choices=Status.choices, default=Status.RECEIVED, db_index=True
     )
@@ -419,6 +454,13 @@ class RamaTask(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["landlord", "idempotency_key"],
+                condition=models.Q(capability_key="deliver_tenant_invitation"),
+                name="rama_invitation_delivery_unique",
+            ),
+        ]
         indexes = [
             models.Index(
                 fields=["landlord", "conversation_id", "-created_at"],
@@ -450,7 +492,7 @@ class RamaTask(models.Model):
 
 
 class RamaActionReceipt(models.Model):
-    """Immutable evidence that a RAMA command completed and was verified."""
+    """Immutable execution evidence with an explicit verification result."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     landlord = models.ForeignKey(

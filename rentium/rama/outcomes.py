@@ -20,6 +20,8 @@ class OutcomeKind(str, Enum):
     PREVIEW = "PREVIEW"
     COMPLETED = "COMPLETED"
     NOOP = "NOOP"
+    PARTIAL = "PARTIAL"
+    WAITING = "WAITING"
     FAILED = "FAILED"
 
 
@@ -42,6 +44,23 @@ class CommandOutcome:
         result = result or {}
         if result.get("error"):
             return cls(OutcomeKind.FAILED, str(result["error"]), data=result)
+        if result.get("partial"):
+            return cls(
+                OutcomeKind.PARTIAL,
+                str(
+                    result.get("detail")
+                    or "Some actions completed; remaining actions need attention."
+                ),
+                data=result,
+            )
+        if result.get("waiting") or result.get("queued") or result.get("pending"):
+            return cls(
+                OutcomeKind.WAITING,
+                str(
+                    result.get("detail") or "Waiting for the requested work to finish."
+                ),
+                data=result,
+            )
         if result.get("needs_input") or result.get("question_for_user"):
             raw_missing = result.get("missing") or ()
             if not raw_missing and (result.get("needs") or result.get("missing_field")):

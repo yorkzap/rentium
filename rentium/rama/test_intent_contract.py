@@ -5,8 +5,8 @@ import uuid
 import pytest
 
 from rentium.leases.models import RentAdjustment
-from rentium.rama.intent_contract import contract_from_messages
 from rentium.rama.intent_contract import contract_for_effects
+from rentium.rama.intent_contract import contract_from_messages
 from rentium.rama.intent_contract import validate_effect_set
 from rentium.rama.intent_contract import validate_step
 from rentium.rama.plan_runner import run_plan
@@ -25,6 +25,18 @@ def _contract(lease_number: str = "RMT652523-C281") -> dict:
             ),
         ],
     )
+
+
+def test_external_bank_transfer_cannot_be_substituted_with_a_bookkeeping_write():
+    contract = contract_from_messages([
+        "Transfer $1000 from my bank account to Alice's bank account now.",
+    ])
+    assert contract["unsupported_operation"] == "bank_transfer"
+    for tool in ("create_expense", "record_payment", "update_bank_balance"):
+        assert validate_step(contract, tool, {"amount": "1000"})
+    assert not contract_from_messages([
+        "Record the $1000 already transferred from my bank account.",
+    ]).get("unsupported_operation")
 
 
 def test_contract_survives_a_terse_follow_up_and_preserves_final_total():
@@ -144,7 +156,7 @@ def test_batch_contract_requires_every_effect_exactly_once():
                 "effective_date": "2026-08-01",
                 "target_lease_total": "400.00",
             },
-        }
+        },
     ]
 
     errors = validate_effect_set(contract, one_step)

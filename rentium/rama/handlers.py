@@ -30,3 +30,37 @@ def _dispatch(event):
 
 for _event_type in SENTINEL_EVENT_TYPES:
     on(_event_type)(_dispatch)
+
+
+@on("*")
+def refresh_daily_workflow_findings(event):
+    """Domain events only trigger read/prepare work, never new business writes."""
+    if not event.event_type.startswith(("lease.", "ledger.", "property.")):
+        return
+    from .models import RamaPreferences
+    from .tasks import prepare_daily_workflows
+
+    owner_id = (event.payload or {}).get("landlord_id")
+    if not owner_id and event.lease_id:
+        from rentium.leases.models import Lease
+
+        owner_id = (
+            Lease.objects.filter(pk=event.lease_id)
+            .values_list("landlord_id", flat=True)
+            .first()
+        )
+    if not owner_id and event.property_id:
+        from rentium.properties.models import Property
+
+        owner_id = (
+            Property.objects.filter(pk=event.property_id)
+            .values_list("landlord_id", flat=True)
+            .first()
+        )
+    if (
+        owner_id
+        and RamaPreferences.objects.filter(
+            landlord_id=owner_id, workflows_enabled=True
+        ).exists()
+    ):
+        prepare_daily_workflows.delay(str(owner_id))

@@ -72,6 +72,126 @@ def _landlord(request):
     return profile
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def workflow_tasks_view(request):
+    from .daily_workflows import task_payload
+    from .models import RamaTask, RamaInsight
+    from .workflow_contracts import enabled
+
+    landlord = _landlord(request)
+    from .workflow_delivery import refresh_waiting
+
+    for task in RamaTask.objects.filter(landlord=landlord, status="WAITING").exclude(
+        workflow_key=""
+    ):
+        refresh_waiting(task)
+    superseded = (
+        RamaTask.objects.filter(landlord=landlord, parent__isnull=False)
+        .exclude(capability_key="deliver_tenant_invitation")
+        .exclude(status="CANCELLED")
+        .values("parent_id")
+    )
+    rows = (
+        RamaTask.objects.filter(landlord=landlord)
+        .exclude(workflow_key="")
+        .exclude(pk__in=superseded)
+        .exclude(capability_key="deliver_tenant_invitation", parent__isnull=False)
+        .prefetch_related("receipts", "attempts")
+        .order_by("-updated_at")[:30]
+    )
+    attention = RamaInsight.objects.filter(
+        landlord=landlord, kind="rama.workflow.attention", status="OPEN"
+    )[:20]
+    return Response(
+        {
+            "enabled": enabled(landlord),
+            "tasks": [task_payload(row) for row in rows],
+            "attention": [{"id": row.pk, **row.facts} for row in attention],
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def workflow_task_view(request, task_id):
+    from .daily_workflows import task_payload
+    from .models import RamaTask
+
+    task = (
+        RamaTask.objects.filter(landlord=_landlord(request), pk=task_id)
+        .exclude(workflow_key="")
+        .first()
+    )
+    if task is None:
+        return Response({"detail": "Not found."}, status=404)
+    return Response(task_payload(task))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def workflow_resume_view(request, task_id):
+    from .conversations import bind_plan_prompt, record_visible_message
+    from .daily_workflows import resume_task, task_payload
+    from .models import RamaMessage, RamaTask
+    from .plan_runner import plan_brief
+    from .turn_guard import conversation_turn_guard
+
+    landlord = _landlord(request)
+    try:
+        conversation_id = uuid.UUID(
+            str(request.data.get("conversation_id") or uuid.uuid4())
+        )
+        with conversation_turn_guard(landlord.pk, conversation_id) as acquired:
+            if not acquired:
+                return Response(
+                    {
+                        "detail": "RAMA is handling another message in this conversation."
+                    },
+                    status=409,
+                )
+            record_visible_message(
+                landlord=landlord,
+                conversation_id=conversation_id,
+                direction=RamaMessage.Direction.INBOUND,
+                text="Resume workflow",
+                channel="web",
+                role="corporal",
+            )
+            plan = resume_task(landlord, task_id, conversation_id)
+            reply = (
+                plan.summary
+                + " Review the remaining actions and approve this fresh plan."
+            )
+            message = record_visible_message(
+                landlord=landlord,
+                conversation_id=conversation_id,
+                direction=RamaMessage.Direction.OUTBOUND,
+                text=reply,
+                channel="web",
+                role="corporal",
+                kind=RamaMessage.Kind.PLAN_PROMPT,
+            )
+            bind_plan_prompt(plan, message)
+    except RamaTask.DoesNotExist:
+        return Response({"detail": "Not found."}, status=404)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=409)
+    return Response(
+        {
+            "conversation_id": str(conversation_id),
+            "episode_id": str(message.episode_id),
+            "message_id": str(message.pk),
+            "reply": reply,
+            "provider": "deterministic",
+            "model": "workflow",
+            "tools_used": [],
+            "pending_plan": plan_brief(plan),
+            "workflow": task_payload(plan.task),
+        }
+    )
+
+
 def _settings_payload(landlord, prefs: RamaPreferences | None = None) -> dict:
     prefs = prefs or RamaPreferences.for_landlord(landlord)
     cfg = get_landlord_config(landlord)
@@ -187,6 +307,9 @@ def config_view(request):
             "models": MODEL_CATALOG,
             "can_override": True,
             "write_planning_certified": is_model_certified(cfg.provider, cfg.model),
+            "workflows_enabled": RamaPreferences.for_landlord(
+                landlord
+            ).workflows_enabled,
             "byok": True,
             "platform_ready": {
                 name: bool(platform_api_key(name)) for name in PROVIDERS
@@ -699,6 +822,33 @@ def plan_confirm_view(request, plan_id):
 
     landlord, plan, err = _explicit_plan(request, plan_id)
     if err is not None:
+        from .daily_workflows import task_payload
+        from .models import RamaTask
+
+        try:
+            prompt_id = uuid.UUID(str(request.data.get("prompt_message_id") or ""))
+        except (ValueError, TypeError):
+            return err
+        finished = RamaTask.objects.filter(
+            landlord=landlord,
+            context__plan_id=str(plan_id),
+            active_prompt_id=prompt_id,
+        ).first()
+        if finished and finished.context.get("execution_result"):
+            progress = finished.context["execution_result"]
+            if progress.get("status") != "awaiting_step":
+                return Response(
+                    {
+                        "conversation_id": str(finished.conversation_id),
+                        "reply": _plan_fallback_reply(progress),
+                        "provider": "deterministic",
+                        "model": "plan-runner",
+                        "tools_used": [],
+                        "pending_plan": None,
+                        "workflow": task_payload(finished),
+                        "receipts": progress.get("receipts", []),
+                    }
+                )
         return err
     try:
         inbound_id = request.data.get("message_id") or uuid.uuid4()
@@ -715,6 +865,12 @@ def plan_confirm_view(request, plan_id):
     except ValueError:
         return Response({"detail": "message_id must be a UUID."}, status=http_status.HTTP_400_BAD_REQUEST)
     progress = run_plan(plan, landlord)
+    from .daily_workflows import task_payload
+    from .models import RamaTask
+
+    completed_task = RamaTask.objects.filter(
+        pk=(progress.get("task") or {}).get("id"), landlord=landlord
+    ).first()
     reply = _plan_fallback_reply(progress)
     outstanding = RamaPendingPlan.objects.filter(plan_id=plan_id).first()
     outbound = record_visible_message(
@@ -741,6 +897,7 @@ def plan_confirm_view(request, plan_id):
             "pending_plan": plan_brief(outstanding) if outstanding else None,
             "attachments": [],
             "auto_executed": [],
+            "workflow": task_payload(completed_task) if completed_task else None,
         }
     )
 
