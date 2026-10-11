@@ -6257,7 +6257,9 @@ def _run_turn_unlocked(
             clarification_tasks_to_bind.append(task)
         return task
 
-    def _run_deterministic_tool(tool_name: str, arguments: dict) -> dict:
+    def _run_deterministic_tool(
+        tool_name: str, arguments: dict, *, source_text=None
+    ) -> dict:
         # The routers below call this directly, so they never pass through
         # role_tool_schemas(). Without this check a role's tool list describes
         # only what the MODEL may ask for — a read-only role could still reach
@@ -6265,11 +6267,20 @@ def _run_turn_unlocked(
         # Checking here covers every existing router and every future one.
         if not role_allows_tool(role, tool_name):
             return {
-                "error": (
-                    f"The {role} agent is not permitted to call {tool_name}."
-                ),
+                "error": (f"The {role} agent is not permitted to call {tool_name}."),
             }
         result = execute(tool_name, arguments, landlord=landlord)
+        if tool_name == "plan_daily_workflow" and result.get("plan"):
+            from .workflow_contracts import source_target_clarification
+
+            result = (
+                source_target_clarification(
+                    landlord,
+                    result["plan"].get("steps") or [],
+                    source_text or message,
+                )
+                or result
+            )
         safe_result = json.loads(json.dumps(result, default=str))
         tools_used.append(tool_name)
         audit(
@@ -6341,11 +6352,17 @@ def _run_turn_unlocked(
                 arguments = dict(task.input or {})
                 arguments[field] = value
                 arguments["confirm"] = ""
-                result = _run_deterministic_tool(task.capability_key, arguments)
+                original_source = (task.context.get("clarification") or {}).get("source_text")
+                result = _run_deterministic_tool(
+                    task.capability_key, arguments,
+                    source_text=f"{original_source}\n{message}" if original_source else None,
+                )
                 if isinstance(result, dict) and result.get("needs_confirm"):
                     stable = dict(result.get("resolved_arguments") or arguments)
                     resumed_specs.append(
-                        {
+                        {"kind": "plan", "payload": result["plan"]}
+                        if isinstance(result.get("plan"), dict)
+                        else {
                             "kind": "single",
                             "tool": task.capability_key,
                             "arguments": stable,
@@ -8656,6 +8673,21 @@ def _run_turn_unlocked(
                         landlord=landlord,
                         seen=read_results,
                     )
+                if (
+                    use_daily_workflows
+                    and isinstance(result, dict)
+                    and result.get("plan")
+                ):
+                    from .workflow_contracts import source_target_clarification
+
+                    clarification = source_target_clarification(
+                        landlord,
+                        result["plan"].get("steps") or [],
+                        message,
+                    )
+                    if clarification:
+                        result = clarification
+                        pending_specs.clear()
                 # Before this preview can become a proposal: is it already done?
                 # A preview is side-effect free, so replacing it here costs
                 # nothing and means the duplicate is never shown at all.

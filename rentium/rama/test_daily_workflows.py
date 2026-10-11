@@ -311,7 +311,9 @@ def test_move_prepares_draft_and_waits_without_terminating(
 
 
 @pytest.mark.parametrize("daily", [True, False])
-def test_workflow_model_cannot_bypass_planner(workflow_owner, bc_property, monkeypatch, daily):
+def test_workflow_model_cannot_bypass_planner(
+    workflow_owner, bc_property, monkeypatch, daily
+):
     from . import service
     from .models import RamaPendingPlan
     from .providers import ToolCall
@@ -344,7 +346,8 @@ def test_workflow_model_cannot_bypass_planner(workflow_owner, bc_property, monke
     monkeypatch.setattr(service, "get_provider", lambda *_: provider)
     result = service.run_turn(
         workflow_owner,
-        "Prepare some daily work for this listing." if daily
+        "Prepare some daily work for this listing."
+        if daily
         else "There is a leaking faucet at this listing; create a maintenance request.",
     )
     offered = {row["name"] for row in provider.requests[0]["tools"]}
@@ -380,6 +383,89 @@ def test_attention_is_deduplicated_and_clears_when_resolved(workflow_owner, bc_l
         kind="rama.workflow.attention",
         status="OPEN",
     ).exists()
+
+
+def test_model_chosen_id_cannot_resolve_a_duplicated_user_name(
+    workflow_owner, monkeypatch
+):
+    from rentium.properties.models import Property
+
+    from . import service
+    from .models import RamaPendingPlan
+    from .providers import ToolCall, Turn
+    from .test_batch_confirmation import ScriptedProvider
+    from .workflow_contracts import source_target_clarification
+
+    props = [
+        Property.objects.create(
+            landlord=workflow_owner,
+            name="Garden Suite",
+            address=address,
+            city="Victoria",
+            province="bc",
+            property_category="COMPLETE_UNIT",
+        )
+        for address in ("10 Example Road", "20 Example Road")
+    ]
+    steps = [
+        {
+            "tool": "update_property",
+            "arguments": {
+                "property_query": str(props[0].pk),
+                "asking_rent": "925",
+            },
+        }
+    ]
+    prefs = RamaPreferences.objects.get(landlord=workflow_owner)
+    prefs.enabled = True
+    prefs.provider = "openai"
+    prefs.model = "gpt-5-mini"
+    prefs.api_key = "test-key"
+    prefs.save()
+    provider = ScriptedProvider(
+        [
+            Turn(
+                tool_calls=[
+                    ToolCall(
+                        id="guess",
+                        name="plan_daily_workflow",
+                        arguments={
+                            "steps_json": json.dumps(steps),
+                            "summary": "Set asking rent",
+                        },
+                    )
+                ]
+            )
+        ]
+    )
+    monkeypatch.setattr(service, "get_provider", lambda *_: provider)
+    result = service.run_turn(
+        workflow_owner, "Set the asking rent of Garden Suite to $925."
+    )
+    assert not RamaPendingPlan.objects.filter(
+        conversation_id=result.conversation_id
+    ).exists()
+    assert "10 Example Road" in result.reply
+    assert "20 Example Road" in result.reply
+    assert not source_target_clarification(
+        workflow_owner,
+        steps,
+        "Set the asking rent of Garden Suite at 10 Example Road to $925.",
+    )
+    assert source_target_clarification(
+        workflow_owner,
+        steps,
+        "Set the asking rent of Garden Suite at 20 Example Road to $925.",
+    )
+    continued = service.run_turn(
+        workflow_owner,
+        "20 Example Road",
+        conversation_id=result.conversation_id,
+    )
+    plan = RamaPendingPlan.objects.get(conversation_id=continued.conversation_id)
+    assert plan.steps.get().arguments["property_query"] == str(props[1].pk)
+    assert plan.steps.get().arguments["asking_rent"] == "925"
+    assert len(provider.requests) == 1
 
 
 def test_expired_task_resumes_with_new_approval(workflow_owner, bc_property):
@@ -991,7 +1077,9 @@ def test_rent_target_pathway_verifies_exact_household_total(workflow_owner, bc_l
 
 
 def test_advertised_rent_never_compiles_to_a_tenancy_adjustment(
-    workflow_owner, bc_property, bc_lease,
+    workflow_owner,
+    bc_property,
+    bc_lease,
 ):
     from .capabilities import supported_tool_for_request
     from .service import _first_month_rent_adjustment_intent
@@ -1006,7 +1094,8 @@ def test_advertised_rent_never_compiles_to_a_tenancy_adjustment(
 
 
 def test_compound_rename_cannot_drop_a_second_requested_action(
-    workflow_owner, bc_property,
+    workflow_owner,
+    bc_property,
 ):
     from .service import _rename_intent
 

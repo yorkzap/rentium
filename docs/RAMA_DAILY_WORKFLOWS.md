@@ -21,7 +21,9 @@ Enabling this flag does not change the landlord's provider or model.
    their guarded legacy model interface. Deterministic certified routes and
    the existing onboarding/move convenience tools use the same compiler.
 2. Every independent action uses the real domain preview. Names resolve to stable
-   IDs in the owner's portfolio. New-record dependencies use typed `$step` output
+   IDs in the owner's portfolio. A model-chosen ID does not resolve a duplicated
+   listing name: the user's request must identify an address or explicit listing
+   ID. New-record dependencies use typed `$step` output
    references; the invitation can refer to the draft lease created before it.
 3. The complete effect list is stored with the task and shown in the approval UI.
    Existing episode/prompt-bound confirmation rules remain authoritative. A

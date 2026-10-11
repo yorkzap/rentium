@@ -6,6 +6,7 @@ is available for composition only when its postconditions are implemented here.
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from dataclasses import field
 from decimal import Decimal
@@ -38,6 +39,76 @@ def enabled(landlord):
         landlord=landlord,
         workflows_enabled=True,
     ).exists()
+
+
+def source_target_clarification(landlord, steps, source_text):
+    """A model-selected ID cannot resolve an ambiguous name on the user's behalf."""
+    from rentium.properties.models import Property
+
+    from .resolve import resolve_property
+
+    source = " ".join(source_text.casefold().split())
+    checked = set()
+    for step in steps:
+        args = step.get("arguments") or {}
+        for argument_name in ("property_query", "from_property", "to_property"):
+            value = args.get(argument_name)
+            if not value or isinstance(value, dict):
+                continue
+            prop, error = resolve_property(landlord, str(value))
+            if error or not prop.name or prop.pk in checked:
+                continue
+            checked.add(prop.pk)
+            name = " ".join(prop.name.casefold().split())
+            if not re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", source):
+                continue
+            candidates = list(
+                Property.objects.filter(landlord=landlord, name__iexact=prop.name),
+            )
+            if len(candidates) <= 1:
+                continue
+            selected = [
+                candidate
+                for candidate in candidates
+                if (
+                    candidate.address
+                    and " ".join(candidate.address.casefold().split()) in source
+                )
+                or re.search(
+                    rf"(?:\b(?:property|listing|offering)(?:\s+id)?\s*[:=#]?\s*|#){candidate.pk}\b",
+                    source,
+                )
+            ]
+            if len(selected) == 1 and selected[0].pk == prop.pk:
+                continue
+            choices = "; ".join(
+                f"{candidate.address}, {candidate.city} (listing #{candidate.pk})"
+                for candidate in candidates
+            )
+            return {
+                "needs_input": True,
+                "question_for_user": f"Which {prop.name} do you mean: {choices}?",
+                "clarification": {
+                    "field": "steps_json",
+                    "choices": _target_choice_plans(steps, candidates),
+                    "source_text": source_text,
+                },
+            }
+    return None
+
+
+def _target_choice_plans(steps, candidates):
+    candidate_ids = {str(candidate.pk) for candidate in candidates}
+    answers = {}
+    for candidate in candidates:
+        corrected = json.loads(json.dumps(steps, default=str))
+        for action in corrected:
+            action_args = action.get("arguments") or {}
+            for key in ("property_query", "from_property", "to_property"):
+                if str(action_args.get(key)) in candidate_ids:
+                    action_args[key] = str(candidate.pk)
+        answers[json.dumps(corrected)] = [candidate.address, f"listing {candidate.pk}"]
+    return answers
 
 
 def fingerprint(value):
