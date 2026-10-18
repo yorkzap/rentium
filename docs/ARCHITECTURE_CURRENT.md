@@ -629,3 +629,12 @@ not begun — worse than reporting none, because the landlord would act on it.
 
 Settlement is explicit: RETURNED_IN_FULL, TENANT_AGREED (written) or
 RTB_APPLIED. Nothing settles a deposit implicitly.
+
+## October 2026 tenancy and unit workspace
+
+See [TENANCY_WORKSPACE_20261018.md](TENANCY_WORKSPACE_20261018.md).
+`leases.tenancy_summary` connects notices, signatories, occupancy, physical scope
+and deposit facts for REST and RAMA. Append-only scope/assessment/presence records
+preserve signed agreements. `properties.configuration_services` owns dated,
+previewed arrangements and their activation checks. The unit page is the common
+entry point; current marketing mode does not establish occupancy or legal regime.

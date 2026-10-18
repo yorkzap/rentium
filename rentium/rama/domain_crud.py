@@ -2685,8 +2685,6 @@ def create_lease(
     if raw_bills:
         if raw_bills.startswith("{"):
             try:
-                import json
-
                 bills = json.loads(raw_bills)
             except Exception:  # noqa: BLE001
                 return {"error": "bills_included must be JSON object if provided."}

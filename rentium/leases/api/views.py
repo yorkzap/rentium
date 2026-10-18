@@ -192,6 +192,24 @@ class LeaseViewSet(viewsets.ModelViewSet):
     # rent, deposits and dates stay frozen. See LeaseNotLockedOrAmendable and
     # services.AMENDABLE_WHEN_ACTIVE.
     permission_classes = [IsLandlordOrTenantMember, LeaseNotLockedOrAmendable]
+
+    @action(detail=True, methods=["post"], permission_classes=[IsLandlordOrTenantMember], url_path="tenancy_review")
+    def tenancy_review(self, request, pk=None):
+        from django.core.exceptions import ValidationError as DomainError
+        from rest_framework.exceptions import PermissionDenied, ValidationError
+        from rentium.leases.tenancy_review import preview_tenancy_review, confirm_tenancy_review
+
+        lease = self.get_object()
+        if request.user.pk != lease.landlord.user_id:
+            raise PermissionDenied("Only the portfolio owner can review tenancy scope and owner-sharing facts.")
+        try:
+            if request.data.get("preview_token"):
+                result = confirm_tenancy_review(lease, preview_token=request.data["preview_token"], user=request.user)
+            else:
+                result = preview_tenancy_review(lease, scope=request.data.get("scope"), assessment=request.data.get("assessment"), presence=request.data.get("presence"), reason=request.data.get("reason", ""))
+        except (DomainError, KeyError, TypeError) as exc:
+            raise ValidationError(str(exc)) from exc
+        return Response(result)
     filter_backends = [
         DjangoFilterBackend,
         filters.SearchFilter,

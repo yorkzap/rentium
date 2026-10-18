@@ -456,6 +456,9 @@ def _chat_response(result) -> Response:
             "evidence": result.evidence,
             "trace_id": str(result.trace_id) if result.trace_id else None,
             "engine_mode": result.engine_mode,
+            "details": result.details,
+            "sources": result.sources,
+            "warnings": result.warnings,
         },
     )
 

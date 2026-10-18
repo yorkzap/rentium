@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -31,6 +32,8 @@ from .lease_forms import LeaseFormTemplate  # noqa: E402,F401
 from .lease_forms import SignerRole  # noqa: E402,F401
 from .moveout import MoveOutRequest  # noqa: E402,F401
 from .occupancy import Occupancy  # noqa: E402,F401
+from .tenancy_state import LeaseSpaceScope  # noqa: E402,F401
+from .tenancy_state import TenancyAssessment  # noqa: E402,F401
 
 
 class Lease(AgreementTerms):
@@ -376,62 +379,9 @@ class Lease(AgreementTerms):
             self._validate_bills_included()
 
     def _validate_no_cross_scope_overlap(self):
-        """A unit cannot be let whole and by the room at the same time.
+        from .space_services import validate_space_commitment
 
-        The two scopes describe the same physical space, so overlapping them
-        double-lets it: a family renting the whole floor and a roommate renting
-        Bedroom 2 both hold a valid agreement to the same bedroom. Checked here
-        (rather than only at mode-switch time) because a lease can be created
-        long after a switch, and re-checked on activation.
-
-        Only live leases conflict — terminated and expired ones are history.
-        """
-        from rentium.properties.models import Property
-
-        live = ("DRAFT", "PENDING", "ACTIVE")
-        if self.status not in live:
-            return
-
-        unit_id = None
-        if self.property_id and self.property.unit_id:
-            unit_id = self.property.unit_id
-        elif self.group_id and getattr(self.group, "unit_id", None):
-            unit_id = self.group.unit_id
-        if unit_id is None:
-            return
-
-        covers_whole = bool(
-            self.property_id
-            and self.property.property_category
-            == Property.PropertyCategory.COMPLETE_UNIT
-        )
-
-        others = Lease.objects.filter(status__in=live).exclude(pk=self.pk)
-        others = others.filter(
-            models.Q(property__unit_id=unit_id) | models.Q(group__unit_id=unit_id)
-        )
-        for other in others.select_related("property"):
-            other_covers_whole = bool(
-                other.property_id
-                and other.property.property_category
-                == Property.PropertyCategory.COMPLETE_UNIT
-            )
-            if covers_whole != other_covers_whole:
-                whole, room = (
-                    (self, other) if covers_whole else (other, self)
-                )
-                raise ValidationError(
-                    _(
-                        "This unit already has a live %(kind)s lease (%(number)s). "
-                        "A unit cannot be rented whole and by the room at the "
-                        "same time — end that lease first, or change what this "
-                        "one covers."
-                    )
-                    % {
-                        "kind": "whole-unit" if other_covers_whole else "room",
-                        "number": other.lease_number,
-                    }
-                )
+        validate_space_commitment(self)
 
     def _validate_bills_included(self):
         """Validate the structure and values in the bills_included field."""
@@ -530,7 +480,14 @@ class Lease(AgreementTerms):
                             )
                         )
 
+    @transaction.atomic
     def save(self, *args, **kwargs):
+        from .space_services import lease_unit, record_space_scope, space_scope
+        from rentium.properties.models import PropertyUnit
+
+        unit = lease_unit(self)
+        if unit:
+            PropertyUnit.objects.select_for_update().get(pk=unit.pk)
         if not self.lease_number:
             timestamp = int(timezone.now().timestamp())
             random_suffix = uuid.uuid4().hex[:4].upper()
@@ -538,6 +495,13 @@ class Lease(AgreementTerms):
             self.lease_number = f"{prefix}{timestamp % 1000000}-{random_suffix}"
         self.full_clean()
         super().save(*args, **kwargs)
+        if unit and self.status in {"PENDING", "ACTIVE"} and not self.scope_versions.exists():
+            scope = space_scope(self)
+            if scope["coverage"] == "COMPLETE":
+                record_space_scope(
+                    self, unit=unit, whole_unit=scope["whole_unit"], room_ids=scope["room_ids"],
+                    user=unit.landlord.user, reason="Space recorded from the physical offering when the lease was issued.",
+                )
 
     # --- Lease locking ---
     def is_locked(self):

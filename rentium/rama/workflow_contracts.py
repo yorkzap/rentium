@@ -696,7 +696,13 @@ def _verify_update_unit_layout(context):
     if unit:
         refs.append({"type": "unit", "id": str(unit.pk)})
         if tool == "set_unit_rental_mode":
-            check(unit.rental_mode == arguments["rental_mode"], "rental mode")
+            if arguments.get("effective_from"):
+                check(unit.rental_configurations.filter(
+                    mode=arguments["rental_mode"], effective_from=arguments["effective_from"],
+                    status__in=["SCHEDULED", "ACTIVE", "BLOCKED"],
+                ).exists(), "approved dated rental configuration")
+            else:
+                check(unit.rental_mode == arguments["rental_mode"], "rental mode")
         else:
             from .unit_structure import _parse_spaces
 

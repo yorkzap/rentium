@@ -49,7 +49,7 @@ def test_exempt_shared_with_landlord_lease_yields_no_item(landlord):
         postal_code="V8V 1V1",
         property_category=Property.PropertyCategory.ROOM,
     )
-    Lease.objects.create(
+    lease = Lease.objects.create(
         landlord=landlord,
         property=room,
         lease_type=Lease.LeaseType.BC_ROOMMATE_AGREEMENT,
@@ -59,6 +59,8 @@ def test_exempt_shared_with_landlord_lease_yields_no_item(landlord):
         total_rent="600.00",
         common_space_shared_with=["LANDLORD"],
     )
+    from rentium.leases.tenancy_state import TenancyAssessment
+    TenancyAssessment.objects.create(lease=lease, jurisdiction="BC", decision="EXEMPT_OWNER_SHARED", facts={"owner_identity": "Owner", "owner_confirmed": True, "shared_at_tenancy_start": True, "facilities": ["KITCHEN"]}, reason="Confirmed owner sharing")
     assert _missing_move_in_inspections(landlord) == []
 
 

@@ -4,6 +4,7 @@ import uuid
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.db import models
+from django.utils import timezone
 from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 
@@ -173,6 +174,9 @@ class PropertyHolding(models.Model):
 
     def __str__(self):
         return f"{self.name} (Landlord: {self.landlord.user.name})"
+
+
+from .rental_configuration import RentalConfiguration  # noqa: E402,F401
 
 
 class PropertyUnit(models.Model):
@@ -390,8 +394,10 @@ class PropertyQuerySet(models.QuerySet):
             landlord__showcase__is_public=True,
             is_publicly_visible=True,
             status=Property.PropertyStatus.AVAILABLE,
-            is_active_offering=True,
-        )
+        ).filter(
+            models.Q(is_active_offering=True)
+            | models.Q(rental_configurations__status="SCHEDULED", rental_configurations__effective_from__gt=timezone.localdate())
+        ).distinct()
 
 
 # --- Property Model ---

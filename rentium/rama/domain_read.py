@@ -962,7 +962,15 @@ def _read(landlord, *, entity: str = "", filters: str = "", fields: str = "",
     joins = {"__".join(c.owner) for c in wanted if c.owner}
     if joins:
         qs = qs.select_related(*joins)
-    rows = [{c.alias: _render_column(o, c) for c in wanted} for o in qs[:lim]]
+    objects = list(qs[:lim])
+    rows = [{c.alias: _render_column(o, c) for c in wanted} for o in objects]
+    if spec.key == "lease":
+        from rentium.leases.tenancy_summary import tenancy_summary
+
+        for obj, row in zip(objects, rows):
+            row["tenancy_summary"] = tenancy_summary(obj, include_deposits=False)
+    if spec.key == "business_document":
+        result["coverage_note"] = "This is only uploaded business paperwork. Empty results do not establish absence of tenancy notices; query the lease tenancy_summary.notices."
     result.update(
         {
             "returned": len(rows),

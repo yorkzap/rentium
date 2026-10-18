@@ -327,7 +327,10 @@ def _lease_covers_day(lease, day: date) -> bool:
     """True if [start_date, end_date] includes day (open-ended end = forever)."""
     if lease.start_date > day:
         return False
-    if lease.end_date is not None and lease.end_date < day:
+    from rentium.leases.space_services import scheduled_end
+
+    end = scheduled_end(lease)
+    if end is not None and end < day:
         return False
     return True
 
@@ -349,7 +352,8 @@ def _occupancy_phase(lease, today: date) -> str:
         return "pending_signatures"
     if lease.start_date > today:
         return "leased_future"
-    return "occupied_now"
+    from rentium.leases.space_services import occupancy_state
+    return "occupied_now" if occupancy_state(lease, as_of=today) == "RECORDED_OCCUPIED" else "occupancy_unconfirmed"
 
 
 def _tenant_rows_for_lease(lease) -> list[dict]:
@@ -396,16 +400,16 @@ def _lease_overlaps_month(lease, month_start: date, month_end_exclusive: date) -
 
 
 def _serialize_lease_brief(lease, today: date, *, place_name: str = "") -> dict:
+    from rentium.leases.tenancy_summary import tenancy_summary, render_tenancy_answer
+
+    tenancy = tenancy_summary(lease, as_of=today, include_deposits=False)
     phase = _occupancy_phase(lease, today)
     end = lease.end_date.isoformat() if lease.end_date else None
     covers_today = _lease_covers_day(lease, today)
     month_start, month_end = _month_bounds(today)
     overlaps_month = _lease_overlaps_month(lease, month_start, month_end)
     # "Has a commitment" ≠ "occupied today" ≠ "earning rent this calendar month"
-    has_commitment = phase.startswith("leased") or phase in (
-        "occupied_now",
-        "pending_signatures",
-    )
+    has_commitment = lease.status in {"PENDING", "ACTIVE"}
     # Agreement form (what landlords mean by "lease type") vs term shape.
     agreement_code = lease.lease_type or ""
     try:
@@ -440,15 +444,17 @@ def _serialize_lease_brief(lease, today: date, *, place_name: str = "") -> dict:
         "monthly_rent": str(lease.get_total_monthly_rent()),
         "tenants": _tenant_rows_for_lease(lease),
         "covers_today": covers_today,
-        "vacant_today": not covers_today,
-        "occupied_today": covers_today and phase == "occupied_now",
+        "vacant_today": tenancy["occupancy"] == "RECORDED_DEPARTED",
+        "occupied_today": tenancy["occupancy"] == "RECORDED_OCCUPIED",
+        "occupancy_confirmed": tenancy["occupancy"] in {"RECORDED_OCCUPIED", "RECORDED_DEPARTED"},
+        "tenancy_summary": tenancy,
         "has_future_commitment": phase
         in ("leased_future", "leased_future_pending_signatures"),
         "has_lease_commitment": has_commitment,
         # Back-compat: "rented" meant commitment — keep but prefer the fields above.
         "rented": has_commitment,
         "term_overlaps_this_calendar_month": overlaps_month,
-        "summary": _lease_occupancy_summary(lease, phase, today),
+        "summary": render_tenancy_answer(tenancy, "tenancy.occupancy"),
         "type_hint": (
             f"Agreement: {agreement_label}. Term shape: {term_shape} "
             f"({lease.start_date.isoformat()} → {end or 'open'}). "
@@ -494,7 +500,12 @@ def _active_leases_by_property(landlord, property_ids: list, today: date) -> dic
     if not property_ids:
         return {}
 
+    from rentium.properties.models import Property, PropertyArea
+    from rentium.leases.space_services import space_scope
+
     id_set = set(property_ids)
+    unit_properties = list(Property.objects.filter(landlord=landlord, pk__in=property_ids).values("pk", "unit_id"))
+    unit_ids = {row["unit_id"] for row in unit_properties if row["unit_id"]}
     statuses = (
         Lease.LeaseStatus.ACTIVE,
         Lease.LeaseStatus.PENDING_SIGNATURES,
@@ -504,6 +515,9 @@ def _active_leases_by_property(landlord, property_ids: list, today: date) -> dic
         .filter(
             Q(property_id__in=property_ids)
             | Q(lease_tenants__room_id__in=property_ids)
+            | Q(property__unit_id__in=unit_ids)
+            | Q(group__unit_id__in=unit_ids)
+            | Q(scope_versions__unit_id__in=unit_ids)
         )
         .distinct()
         .select_related("property", "group")
@@ -514,7 +528,15 @@ def _active_leases_by_property(landlord, property_ids: list, today: date) -> dic
     # property_id -> list of leases
     by_prop: dict = {pid: [] for pid in property_ids}
     for lease in leases:
-        if lease.property_id and lease.property_id in id_set:
+        scope = space_scope(lease)
+        covered_ids = set()
+        if scope["whole_unit"]:
+            covered_ids = {row["pk"] for row in unit_properties if str(row["unit_id"]) == scope["unit_id"]}
+        elif scope.get("room_ids"):
+            covered_ids = set(PropertyArea.objects.filter(pk__in=scope["room_ids"]).values_list("exclusive_to_id", flat=True)) & id_set
+        for covered in covered_ids:
+            by_prop[covered].append(lease)
+        if lease.property_id and lease.property_id in id_set and lease not in by_prop[lease.property_id]:
             by_prop[lease.property_id].append(lease)
         # Group / multi-room: attach via tenant room assignment
         for lt in lease.lease_tenants.all():
@@ -1082,6 +1104,7 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
     occ_counts = {
         "occupied_today": 0,
         "vacant_today": 0,
+        "occupancy_unconfirmed": 0,
         "occupied_now": 0,  # alias of occupied_today
         "leased_future": 0,  # vacant today but has future term commitment
         "pending_signatures": 0,
@@ -1103,9 +1126,11 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             vacant_today = brief["vacant_today"]
             if vacant_today:
                 occ_counts["vacant_today"] += 1
-            else:
+            elif brief["occupied_today"]:
                 occ_counts["occupied_today"] += 1
                 occ_counts["occupied_now"] += 1
+            else:
+                occ_counts["occupancy_unconfirmed"] += 1
             if phase in ("leased_future", "leased_future_pending_signatures"):
                 occ_counts["leased_future"] += 1
             elif phase == "pending_signatures":
@@ -1117,7 +1142,8 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
             occupancy = {
                 "phase": phase,
                 "vacant_today": vacant_today,
-                "occupied_today": not vacant_today,
+                "occupied_today": brief["occupied_today"],
+                "occupancy_confirmed": brief["occupancy_confirmed"],
                 "is_rented_or_committed": True,
                 "has_lease_commitment": True,
                 "has_future_commitment": brief["has_future_commitment"],
@@ -1131,7 +1157,7 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
                 "explanation": brief["summary"],
                 "answer_hints": {
                     "which_are_rented_today": (
-                        "occupied" if not vacant_today else "vacant today"
+                        "occupied" if brief["occupied_today"] else "vacant today" if vacant_today else "occupancy unconfirmed"
                     ),
                     "which_have_leases": "has commitment",
                     "rented_this_month": (
@@ -1142,27 +1168,27 @@ def property_inventory(landlord, *, limit: int = 100) -> dict:
                 },
             }
         else:
-            occ_counts["vacant_today"] += 1
+            occ_counts["occupancy_unconfirmed"] += 1
             occ_counts["truly_unleased"] += 1
             occ_counts["vacant"] += 1
             occupancy = {
-                "phase": "vacant",
-                "vacant_today": True,
+                "phase": "unleased_occupancy_unconfirmed",
+                "vacant_today": False,
+                "occupancy_confirmed": False,
                 "occupied_today": False,
                 "is_rented_or_committed": False,
                 "has_lease_commitment": False,
                 "has_future_commitment": False,
                 "term_overlaps_this_calendar_month": False,
-                "is_vacant_for_new_tenant_now": prop.status
-                == Property.PropertyStatus.AVAILABLE,
+                "is_vacant_for_new_tenant_now": False,
                 "listing_status_means_marketing_only": True,
                 "lease": None,
                 "explanation": (
-                    f"Vacant today ({today.isoformat()}) with no active or pending "
-                    f"lease — truly unleased. Marketing status: {prop.status}."
+                    f"No active or pending lease is recorded. Actual occupancy is unconfirmed "
+                    f"as of {today.isoformat()}. Marketing status: {prop.status}."
                 ),
                 "answer_hints": {
-                    "which_are_rented_today": "vacant today",
+                    "which_are_rented_today": "occupancy unconfirmed",
                     "which_have_leases": "no lease",
                     "rented_this_month": "no",
                 },
@@ -1437,45 +1463,12 @@ def occupancy_as_of(landlord, on_date: str = "") -> dict:
     vacant = 0
     for prop in props:
         lease = lease_map.get(prop.pk)
-        if lease and _lease_covers_day(lease, day):
-            phase = "occupied_on_date"
-            occupied += 1
-            vacant_flag = False
-            brief = _serialize_lease_brief(lease, day, place_name=prop.name)
-            # Force date-relative flags for the asked day
-            brief = {
-                **brief,
-                "covers_today": True,
-                "vacant_today": False,
-                "occupied_today": True,
-                "summary": (
-                    f"Occupied on {day.isoformat()} under lease "
-                    f"{brief.get('lease_number') or brief['lease_id']} "
-                    f"({brief['start_date']} → {brief['end_date'] or 'open'})."
-                ),
-            }
-        elif lease:
-            phase = "leased_but_not_covering_date"
-            vacant += 1
-            vacant_flag = True
-            brief = _serialize_lease_brief(lease, day, place_name=prop.name)
-            brief = {
-                **brief,
-                "covers_today": False,
-                "vacant_today": True,
-                "occupied_today": False,
-                "summary": (
-                    f"Vacant on {day.isoformat()}. Has lease "
-                    f"{brief.get('lease_number')} "
-                    f"{brief['start_date']} → {brief['end_date'] or 'open'} "
-                    f"but that term does not cover this date."
-                ),
-            }
-        else:
-            phase = "vacant"
-            vacant += 1
-            vacant_flag = True
-            brief = None
+        brief = _serialize_lease_brief(lease, day, place_name=prop.name) if lease else None
+        vacant_flag = bool(brief and brief["vacant_today"])
+        occupied_flag = bool(brief and brief["occupied_today"])
+        phase = "recorded_occupied" if occupied_flag else "recorded_departed" if vacant_flag else "occupancy_unconfirmed"
+        occupied += int(occupied_flag)
+        vacant += int(vacant_flag)
 
         rows.append(
             {
@@ -1484,7 +1477,7 @@ def occupancy_as_of(landlord, on_date: str = "") -> dict:
                 "on_date": day.isoformat(),
                 "phase": phase,
                 "vacant_on_date": vacant_flag,
-                "occupied_on_date": not vacant_flag,
+                "occupied_on_date": occupied_flag,
                 "lease": brief,
             }
         )
@@ -1510,6 +1503,7 @@ def occupancy_as_of(landlord, on_date: str = "") -> dict:
         "counts": {
             "occupied_on_date": occupied,
             "vacant_on_date": vacant,
+            "occupancy_unconfirmed": len(rows) - occupied - vacant,
             "total": len(rows),
         },
         "listings": rows,

@@ -704,6 +704,8 @@ def set_unit_rental_mode(
     rental_mode: str,
     holding: str = "",
     confirm: str = "",
+    effective_from: str = "",
+    preview_token: str = "",
 ) -> dict:
     """Switch a unit between being let as ONE home (WHOLE_UNIT) and let room by
     room (BY_ROOM). Nothing is deleted — listings for the other mode are parked
@@ -725,6 +727,22 @@ def set_unit_rental_mode(
         mode = PropertyUnit.RentalMode.BY_ROOM
     elif mode in ("WHOLE", "UNIT", "ENTIRE", "WHOLE_UNIT"):
         mode = PropertyUnit.RentalMode.WHOLE_UNIT
+
+    if effective_from:
+        from rentium.properties.configuration_services import preview_configuration, confirm_configuration
+
+        try:
+            if _confirmed(confirm):
+                if not preview_token:
+                    return {"error": "Review a dated configuration preview first."}
+                return confirm_configuration(unit, preview_token=preview_token, user=landlord.user)
+            preview = preview_configuration(unit, mode=mode, effective_from=effective_from)
+            if not preview["ok"]:
+                return {"error": "The next arrangement has unresolved commitments.", "blocked_by": preview["blocked_by"]}
+            return {**_preview("set_unit_rental_mode", preview, preview["note"]),
+                    "resolved_arguments": {"unit_name": str(unit.pk), "rental_mode": mode, "effective_from": preview["effective_from"], "preview_token": preview["preview_token"]}}
+        except ValidationError as exc:
+            return {"error": "; ".join(exc.messages)}
 
     preview = describe_rental_mode_switch(unit, mode)
     if "error" in preview:

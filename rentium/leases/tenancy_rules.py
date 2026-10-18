@@ -34,7 +34,7 @@ BC specifics encoded here:
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, timedelta
 
 
@@ -93,6 +93,10 @@ def lease_covers_whole_unit(lease) -> bool:
     """
     from rentium.properties.models import Property
 
+    revision = lease.scope_versions.first() if not lease._state.adding else None
+    if revision:
+        return revision.whole_unit
+
     if lease.property_id and lease.property.property_category == (
         Property.PropertyCategory.COMPLETE_UNIT
     ):
@@ -114,64 +118,11 @@ def lease_covers_whole_unit(lease) -> bool:
 
 
 def landlord_shares_common_areas(lease) -> bool:
-    """
-    Does the landlord (or their relatives) share kitchen/bath/common areas
-    with this tenancy? Two sources of truth, either one suffices:
-
-    1. The lease's own signed clause: common_space_shared_with containing
-       LANDLORD or LANDLORD_RELATIVES. Authoritative — it is a signed
-       statement about this specific tenancy, so it is checked first and is
-       never overridden by inferred area flags.
-    2. Area-level flags: any PropertyArea with shared_with_landlord=True
-       that belongs to (or is shared by) this lease's property/rooms, or to
-       the UNIT they sit in. This is what the property-group pages edit, and
-       what lease creation derives the clause from.
-
-    The unit lookup matters: once a floor's layout lives on its PropertyUnit
-    rather than on per-room listings, a landlord-shared kitchen recorded
-    against the unit would otherwise be invisible here — and an invisible
-    landlord-sharing flag means an RTA exemption silently stops being applied.
-    """
-    csw = set(lease.common_space_shared_with or [])
-    if csw & {"LANDLORD", "LANDLORD_RELATIVES"}:
-        return True
-
-    from django.db.models import Q
-
-    from rentium.properties.models import PropertyArea
-
-    if lease.property_id:
-        prop_ids = [lease.property_id]
-    elif lease.group_id:
-        prop_ids = list(lease.group.grouped_properties.values_list("id", flat=True))
-    else:
-        return False
-    if not prop_ids:
-        return False
-
-    scope = Q(property_id__in=prop_ids) | Q(shared_by__id__in=prop_ids)
-
-    # Areas recorded against the unit(s) and room-group(s) these listings
-    # belong to. Derived from the listings themselves, not from lease.group_id:
-    # a lease on ONE room of a shared floor has no group_id, yet the shared
-    # kitchen it uses is recorded against that room's group.
-    from rentium.properties.models import Property
-
-    parents = Property.objects.filter(id__in=prop_ids).values_list(
-        "unit_id", "group_id"
-    )
-    unit_ids = {u for u, _g in parents if u}
-    group_ids = {g for _u, g in parents if g}
-    if lease.group_id:
-        group_ids.add(lease.group_id)
-    if unit_ids:
-        scope |= Q(unit_id__in=unit_ids)
-    if group_ids:
-        scope |= Q(group_id__in=group_ids)
-
-    return (
-        PropertyArea.objects.filter(shared_with_landlord=True).filter(scope).exists()
-    )
+    """Use reviewed owner/facility facts recorded for this tenancy."""
+    # Legacy generic "shared space" flags do not identify an owner, facility,
+    # or when sharing began. They cannot establish the BC s.4(c) exemption.
+    assessment = lease.tenancy_assessments.first() if not lease._state.adding else None
+    return bool(assessment and assessment.decision == "EXEMPT_OWNER_SHARED")
 
 
 def _jurisdiction(lease) -> str:
@@ -209,7 +160,7 @@ def _resolve_rules(lease) -> TenancyRules:
     whole_unit = lease_covers_whole_unit(lease)
     custom_months = max(int(getattr(lease, "custom_tenant_notice_months", 1) or 1), 1)
 
-    if shared:
+    if shared and juris == "BC":
         # RTA s.4(c) exemption (and its equivalents): owner shares
         # kitchen/bath -> the Act doesn't govern; the lease's own terms do.
         return TenancyRules(
@@ -222,8 +173,8 @@ def _resolve_rules(lease) -> TenancyRules:
             covers_whole_unit=whole_unit,
             landlord_shares=shared,
             summary=(
-                "The landlord (or their relatives) shares kitchen/bathroom or "
-                "common areas with this tenancy, so the provincial tenancy act "
+                "The recorded owner shares a kitchen or bathroom with this tenancy, "
+                "so the BC Residential Tenancy Act "
                 "does not apply. The notice period is set by the lease itself: "
                 f"{custom_months} month(s) for the tenant; the landlord has no "
                 "statutory minimum. A signed mutual agreement "
@@ -276,7 +227,11 @@ def _resolve_rules(lease) -> TenancyRules:
 
 
 def rules_for_lease(lease) -> TenancyRules:
-    return _resolve_rules(lease)
+    rules = _resolve_rules(lease)
+    assessment = lease.tenancy_assessments.first() if not lease._state.adding else None
+    if rules.jurisdiction == "BC" and (assessment is None or assessment.decision == "REVIEW"):
+        rules = replace(rules, summary="Owner kitchen/bathroom sharing at tenancy start needs review. BC protections are applied conservatively until that review is complete. " + rules.summary)
+    return rules
 
 
 # ------------------------------------------------------ date computations

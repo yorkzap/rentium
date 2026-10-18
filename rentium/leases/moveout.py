@@ -38,7 +38,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
@@ -191,9 +191,28 @@ class MoveOutRequest(models.Model):
 
     def deposit_status(self) -> dict:
         """What must happen, by when, and what happens if it doesn't."""
+        from .tenancy_rules import _jurisdiction
+
+        assessment = self.lease.tenancy_assessments.first()
+        applies = _jurisdiction(self.lease) == "BC" and not (
+            assessment and assessment.decision == "EXEMPT_OWNER_SHARED"
+        )
+        if not applies:
+            return {
+                "settlement": self.deposit_settlement, "settled": self.deposit_settled,
+                "forwarding_address_received": self.forwarding_address_received_on.isoformat() if self.forwarding_address_received_on else None,
+                "clock_starts": None, "deadline": None, "days_left": None,
+                "overdue": False, "statutory_clock_applies": False,
+                "blocked_on": "Review this tenancy's applicable deposit terms; the BC statutory clock is not established.",
+                "what_must_happen": "Review the recorded agreement and settlement before returning or retaining deposits.",
+                "if_missed": None,
+            }
         deadline = self.deposit_deadline
         days = self.days_left_to_settle
         return {
+            "statutory_clock_applies": True,
+            "assessment_needs_review": assessment is None or assessment.decision == "REVIEW",
+            "clock_running": bool(self.deposit_clock_starts and self.deposit_clock_starts <= date.today() and not self.deposit_settled),
             "settlement": self.deposit_settlement,
             "settled": self.deposit_settled,
             "forwarding_address_received": (
@@ -252,13 +271,20 @@ class MoveOutRequest(models.Model):
         else:
             self.tenant_signed, self.tenant_signed_at = True, now
 
+    @transaction.atomic
     def accept(self, *, effective_end_date: date | None = None, rent_handling: str | None = None):
         """
         Finalize: both signatures present (or auto-accept for a valid
         notice), stamp the effective date, and apply the lease/ledger side
         effects. Idempotent-ish: raises if not PENDING.
         """
-        if self.status != self.Status.PENDING:
+        from .space_services import lease_unit
+        from rentium.properties.models import PropertyUnit
+        unit = lease_unit(self.lease)
+        if unit:
+            PropertyUnit.objects.select_for_update().get(pk=unit.pk)
+        current = type(self).objects.select_for_update().get(pk=self.pk)
+        if current.status != self.Status.PENDING:
             raise ValidationError(_("Only a pending request can be accepted."))
         self.effective_end_date = effective_end_date or self.requested_end_date
         if rent_handling:

@@ -331,6 +331,10 @@ CELERY_WORKER_HIJACK_ROOT_LOGGER = False
 #
 # Every task below is idempotent — a double-run posts nothing twice.
 CELERY_BEAT_SCHEDULE = {
+    "rentium-rental-configurations": {
+        "task": "rentium.properties.tasks.activate_due_rental_configurations",
+        "schedule": crontab(minute="*/15"),
+    },
     # expire ended leases -> generate rent charges -> due-soon reminders ->
     # inspection delivery deadlines -> SLA check. The order matters and is
     # enforced inside daily.run_all().

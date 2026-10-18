@@ -658,6 +658,12 @@ class UtilityBillSerializer(serializers.Serializer):
 class LeaseListSerializer(serializers.ModelSerializer):
     """Simplified serializer for list views"""
 
+    tenancy_summary = serializers.SerializerMethodField()
+
+    def get_tenancy_summary(self, obj):
+        from rentium.leases.tenancy_summary import tenancy_summary
+        return tenancy_summary(obj, include_deposits=False)
+
     lease_type_display = serializers.CharField(
         source="get_lease_type_display", read_only=True
     )
@@ -684,7 +690,7 @@ class LeaseListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Lease
         fields = [
-            "id",
+            "id", "tenancy_summary",
             "lease_number",
             "lease_type",
             "lease_type_display",
@@ -793,6 +799,7 @@ class LeaseSerializer(serializers.ModelSerializer):
     lease_tenants = LeaseTenantSerializer(many=True, read_only=True)
     landlord_signatories = LeaseLandlordSignatorySerializer(many=True, read_only=True)
     signing_roster = serializers.SerializerMethodField()
+    tenancy_summary = serializers.SerializerMethodField()
     additional_documents = LeaseDocumentSerializer(many=True, read_only=True)
     payments = PaymentSerializer(many=True, read_only=True)
     total_monthly_rent = serializers.DecimalField(
@@ -891,6 +898,7 @@ class LeaseSerializer(serializers.ModelSerializer):
             "lease_tenants",
             "landlord_signatories",
             "signing_roster",
+            "tenancy_summary",
             "additional_documents",
             "payments",
             "total_rent",
@@ -932,6 +940,7 @@ class LeaseSerializer(serializers.ModelSerializer):
             "lease_tenants",
             "landlord_signatories",
             "signing_roster",
+            "tenancy_summary",
             "additional_documents",
             "payments",
             "total_monthly_rent",
@@ -949,6 +958,11 @@ class LeaseSerializer(serializers.ModelSerializer):
         from rentium.leases.parties import lease_signing_roster
 
         return lease_signing_roster(obj)
+
+    def get_tenancy_summary(self, obj):
+        from rentium.leases.tenancy_summary import tenancy_summary
+
+        return tenancy_summary(obj)
 
     def get_effective_landlord_contact(self, obj):
         return obj.get_effective_landlord_contact()

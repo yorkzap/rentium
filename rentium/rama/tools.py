@@ -3804,11 +3804,13 @@ def set_unit_rental_mode(
     rental_mode: str,
     holding: str = "",
     confirm: str = "",
+    effective_from: str = "",
+    preview_token: str = "",
 ) -> dict:
     """Switch a unit between being let as ONE home (WHOLE_UNIT) and let room by
     room (BY_ROOM). Nothing is deleted — the other mode's listings are parked
     and return if you switch back. Refused while any draft, pending or active
-    lease exists anywhere in the unit. Prefer unit_name=<uuid>; when using a
+    lease overlaps. Use effective_from=YYYY-MM-DD to plan a future configuration. Prefer unit_name=<uuid>; when using a
     free-text name that exists on more than one house, pass holding=<street
     or house name> (e.g. holding='950 McKenzie Ave'). One preview, then
     confirm=yes."""
@@ -3820,6 +3822,8 @@ def set_unit_rental_mode(
         rental_mode=rental_mode,
         holding=holding,
         confirm=confirm,
+        effective_from=effective_from,
+        preview_token=preview_token,
     )
 
 

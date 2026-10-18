@@ -83,6 +83,15 @@ def expire_ended_leases() -> dict:
     )
     for lease in qs.iterator():
         try:
+            from rentium.leases.space_services import occupancy_state, scheduled_end
+            from rentium.leases.tenancy_rules import _jurisdiction
+
+            # A fixed term is not proof of vacant possession. BC tenancy can
+            # continue month-to-month; never fabricate departure via expiry.
+            if _jurisdiction(lease) == "BC" and (
+                not scheduled_end(lease) or occupancy_state(lease) != "RECORDED_DEPARTED"
+            ):
+                continue
             lease.status = Lease.LeaseStatus.EXPIRED
             lease.save(update_fields=["status", "updated_at"])
             publish(

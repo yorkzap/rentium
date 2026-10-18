@@ -56,6 +56,9 @@ class AnswerEnvelope:
     trace_id: uuid.UUID = field(default_factory=uuid.uuid4)
     subject: dict = field(default_factory=dict)
     intent: IntentEnvelope | None = None
+    details: dict = field(default_factory=dict)
+    sources: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
 
 
 _LEASE_NUMBER = re.compile(r"\bRMT[A-Z0-9-]+\b", re.IGNORECASE)
@@ -107,6 +110,11 @@ def classify_core_read(
     has_lease_context: bool = False,
 ) -> IntentEnvelope | None:
     text = str(message or "").strip()
+    from .tenancy_reads import tenancy_facet
+
+    facet = tenancy_facet(text)
+    if facet:
+        return IntentEnvelope(name=facet, domain_lane="leases", operation="read", requested_facet=facet)
     if _SIGNING_QUESTION.search(text) and (
         _LEASE_NUMBER.search(text) or has_lease_context
     ):
@@ -273,6 +281,11 @@ def prepare_core_read(
     from rentium.leases.parties import lease_signing_fact_packet
 
     reference = reference or {}
+    from .tenancy_reads import prepare_tenancy_read, tenancy_facet
+
+    facet = tenancy_facet(message)
+    if facet:
+        return prepare_tenancy_read(landlord, message, reference, facet)
     intent = classify_core_read(
         message,
         has_lease_context=bool(_reference_lease_id(reference)),
@@ -312,6 +325,7 @@ def run_core_read_turn(  # noqa: PLR0913
     external_key: str = "",
     external_message_id: str = "",
     reply_to_external_id: str = "",
+    client_context: dict | None = None,
 ):
     """Persist one evidence-first visible turn and return a normal TurnResult."""
     from .conversations import record_visible_message
@@ -332,6 +346,7 @@ def run_core_read_turn(  # noqa: PLR0913
         external_message_id=external_message_id,
         reply_to_message_id=reply_to_message_id,
         reply_to_external_id=reply_to_external_id,
+        semantic_payload={"client_context": client_context} if client_context else {},
     )
     answer = prepare_core_read(landlord, message, reference_context(inbound))
     if answer is None:
@@ -343,6 +358,9 @@ def run_core_read_turn(  # noqa: PLR0913
         "trace_id": str(answer.trace_id),
         "subject": answer.subject,
         "intent": answer.intent.name if answer.intent else "",
+        "details": answer.details,
+        "sources": answer.sources,
+        "warnings": answer.warnings,
     }
     outbound = record_visible_message(
         landlord=landlord,
@@ -401,6 +419,9 @@ def run_core_read_turn(  # noqa: PLR0913
         evidence=answer.evidence,
         trace_id=answer.trace_id,
         engine_mode="v3",
+        details=answer.details,
+        sources=answer.sources,
+        warnings=answer.warnings,
     )
 
 

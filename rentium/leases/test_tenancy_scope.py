@@ -150,6 +150,14 @@ def test_room_lease_with_landlord_shared_kitchen_is_exempt(landlord, unit):
         shared_with_landlord=True,
     )
     lease = _lease(landlord, property=room)
+    from rentium.leases.tenancy_state import TenancyAssessment
+    assert rules_for_lease(lease).rta_applies
+    TenancyAssessment.objects.create(
+        lease=lease, jurisdiction="BC", decision="EXEMPT_OWNER_SHARED",
+        facts={"owner_identity": "Recorded owner", "owner_confirmed": True,
+               "shared_at_tenancy_start": True, "facilities": ["KITCHEN"]},
+        reason="Owner confirmed kitchen sharing at tenancy start",
+    )
 
     rules = rules_for_lease(lease)
     assert lease_covers_whole_unit(lease) is False
@@ -182,6 +190,14 @@ def test_landlord_sharing_recorded_on_the_unit_is_still_found(landlord, unit):
         shared_with_landlord=True,
     )
     lease = _lease(landlord, property=room)
+    from rentium.leases.tenancy_state import TenancyAssessment
+    assert rules_for_lease(lease).rta_applies
+    TenancyAssessment.objects.create(
+        lease=lease, jurisdiction="BC", decision="EXEMPT_OWNER_SHARED",
+        facts={"owner_identity": "Recorded owner", "owner_confirmed": True,
+               "shared_at_tenancy_start": True, "facilities": ["KITCHEN"]},
+        reason="Owner confirmed kitchen sharing at tenancy start",
+    )
 
     assert landlord_shares_common_areas(lease) is True
     assert rules_for_lease(lease).rta_applies is False

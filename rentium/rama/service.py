@@ -5594,6 +5594,9 @@ class TurnResult:
     evidence: dict = field(default_factory=dict)
     trace_id: uuid.UUID | None = None
     engine_mode: str = "legacy"
+    details: dict = field(default_factory=dict)
+    sources: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
 
 
 # A crashed turn cannot safely claim that no earlier action committed.
@@ -5706,7 +5709,9 @@ def run_turn(
                     (reference.get("semantic_payload") or {}).get("subject")
                 ),
             )
-            if rollout_mode == "v3" and intent is not None:
+            # Certified tenancy reads are a shared correctness boundary, not
+            # dependent on a provider or a user's experimental engine setting.
+            if intent is not None and (rollout_mode == "v3" or intent.name.startswith("tenancy.")):
                 result = run_core_read_turn(
                     landlord=landlord,
                     message=visible_message,
@@ -5717,6 +5722,7 @@ def run_turn(
                     external_key=str(kwargs.get("external_key") or ""),
                     external_message_id=str(kwargs.get("external_message_id") or ""),
                     reply_to_external_id=str(kwargs.get("reply_to_external_id") or ""),
+                    client_context=kwargs.get("client_context"),
                 )
                 if result is not None:
                     return result
@@ -6008,7 +6014,14 @@ def _run_turn_unlocked(
         safe_context = json.loads(json.dumps(context, default=str))
     except Exception as exc:  # noqa: BLE001
         safe_context = {"error": f"live_context failed: {exc}"}
-    system = ROLE_PROMPTS[role]
+    system = ROLE_PROMPTS[role] + (
+        "\n\nEveryday read answers should normally be 1–3 short sentences: answer first, "
+        "then the decisive caveat and a relevant source link. Do not enumerate raw "
+        "tool calls, every field, or a repeated conclusion. Give a longer explanation "
+        "when requested. Never shorten a write preview by omitting material effects "
+        "or required confirmation. Lease tenancy_summary is authoritative for notices, "
+        "signing, scope and occupancy; no business documents is not proof of no notice."
+    )
     ctx = role_context(role, landlord)
     if ctx:
         system += "\n\n" + ctx

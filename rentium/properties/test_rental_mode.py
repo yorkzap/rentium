@@ -223,6 +223,9 @@ def test_two_room_leases_on_the_same_unit_are_fine(landlord, unit):
     room1 = _room(landlord, unit, "Room 1", group=group)
     room2 = _room(landlord, unit, "Room 2", group=group)
 
+    from rentium.properties.models import PropertyArea
+    for room in (room1, room2):
+        PropertyArea.objects.create(unit=unit, name=room.name, area_type="BEDROOM", exclusive_to=room)
     _lease(landlord, property=room1)
     _lease(landlord, property=room2)  # must not raise
 

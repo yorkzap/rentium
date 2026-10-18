@@ -627,6 +627,55 @@ class PropertyUnitViewSet(viewsets.ModelViewSet):
     serializer_class = PropertyUnitSerializer
     permission_classes = [IsAuthenticated]
 
+    @action(detail=True, methods=["get"], url_path="overview")
+    def overview(self, request, pk=None):
+        from ..configuration_services import unit_overview
+
+        return Response(unit_overview(self.get_object()))
+
+    @action(detail=True, methods=["post"], url_path="configuration_preview")
+    def configuration_preview(self, request, pk=None):
+        from django.core.exceptions import ValidationError as DomainError
+        from ..configuration_services import preview_configuration
+
+        try:
+            result = preview_configuration(
+                self.get_object(), mode=request.data.get("mode"),
+                effective_from=request.data.get("effective_from"),
+                offering_ids=request.data.get("offering_ids"),
+            )
+        except (DomainError, ValueError, TypeError) as exc:
+            raise ValidationError(str(exc)) from exc
+        return Response(result)
+
+    @action(detail=True, methods=["post"], url_path="configuration_confirm")
+    def configuration_confirm(self, request, pk=None):
+        from django.core.exceptions import ValidationError as DomainError
+        from ..configuration_services import confirm_configuration
+
+        try:
+            result = confirm_configuration(self.get_object(), preview_token=request.data.get("preview_token", ""), user=request.user)
+        except DomainError as exc:
+            return Response({"detail": exc.messages}, status=409)
+        return Response(result)
+
+    @action(detail=True, methods=["post"], url_path="configuration_cancel")
+    def configuration_cancel(self, request, pk=None):
+        from django.core.exceptions import ValidationError as DomainError
+        from ..configuration_services import cancel_configuration
+        from ..rental_configuration import RentalConfiguration
+
+        try:
+            unit = self.get_object()
+            if request.user.pk != unit.landlord.user_id:
+                raise PermissionDenied("Only the portfolio owner can cancel a rental arrangement.")
+            result = cancel_configuration(unit, request.data.get("configuration_id"))
+        except RentalConfiguration.DoesNotExist as exc:
+            raise ValidationError("No such configuration for this unit.") from exc
+        except DomainError as exc:
+            return Response({"detail": exc.messages}, status=409)
+        return Response(result)
+
     def get_queryset(self):
         from rentium.users.access import scope_q
 

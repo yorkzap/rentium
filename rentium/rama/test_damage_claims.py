@@ -218,6 +218,7 @@ def test_the_deadline_is_computed_once_the_forwarding_address_arrives(
     lease.save()
     request = MoveOutRequest.objects.create(
         lease=lease,
+        status=MoveOutRequest.Status.ACCEPTED,
         initiated_by=MoveOutRequest.InitiatedBy.TENANT,
         kind=MoveOutRequest.Kind.TENANT_NOTICE,
         requested_end_date=lease.move_out_date,

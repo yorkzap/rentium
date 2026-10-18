@@ -944,6 +944,31 @@ def relation_label_path(spec: EntitySpec, name: str) -> str | None:
 _RELATION_CACHE: dict[str, dict[str, RelationSpec]] = {}
 
 
+LEASE_SPACE_SCOPE = EntitySpec(
+    key="lease_space_scope", model="leases.LeaseSpaceScope", label="Recorded tenancy space",
+    scope_path="lease__landlord", default_order="-recorded_at",
+    fields=[FieldSpec("whole_unit", "Entire physical unit", "bool"), FieldSpec("room_ids", "Physical bedroom IDs", "json"), FieldSpec("reason", "Reason"), FieldSpec("snapshot", "Recorded snapshot", "json"), FieldSpec("recorded_at", "Recorded at", "date")],
+    scope_note="Append-only revisions; latest recorded_at per lease is current. Signed agreements are unchanged.",
+)
+TENANCY_ASSESSMENT = EntitySpec(
+    key="tenancy_assessment", model="leases.TenancyAssessment", label="Tenancy jurisdiction assessment",
+    scope_path="lease__landlord", default_order="-recorded_at",
+    fields=[FieldSpec("jurisdiction", "Province"), FieldSpec("decision", "Assessment"), FieldSpec("facts", "Reviewed facts", "json"), FieldSpec("reason", "Reason"), FieldSpec("recorded_at", "Recorded at", "date")],
+    scope_note="Latest revision per lease applies. Generic shared-space flags alone do not establish the BC exemption.",
+)
+RENTAL_CONFIGURATION = EntitySpec(
+    key="rental_configuration", model="properties.RentalConfiguration", label="Dated rental arrangement",
+    scope_path="unit__landlord", default_order="effective_from",
+    fields=[FieldSpec("mode", "Rental mode"), FieldSpec("effective_from", "Starts on", "date"), FieldSpec("status", "Status"), FieldSpec("offering_ids", "Listing IDs", "json"), FieldSpec("blocked_reason", "Blocked reason")],
+    scope_note="Future marketing arrangements do not prove departure or change existing lease scope.",
+)
+
+TENANCY_PRESENCE = EntitySpec(
+    key="tenancy_presence", model="leases.TenancyPresence", label="Confirmed tenancy possession",
+    scope_path="lease__landlord", default_order="-recorded_at",
+    fields=[FieldSpec("state", "Possession or departure"), FieldSpec("occurred_on", "Event date", "date"), FieldSpec("reason", "Evidence"), FieldSpec("recorded_at", "Recorded at", "date")],
+)
+
 MANIFEST: dict[str, EntitySpec] = {
     e.key: e
     for e in (
@@ -951,7 +976,7 @@ MANIFEST: dict[str, EntitySpec] = {
         LEDGER_ENTRY, RENT_ADJUSTMENT, INSPECTION, INVENTORY, CONVERSATION,
         PROPERTY_GROUP, PROPERTY_HOLDING, PROPERTY_UNIT, PROPERTY_AREA,
         OCCUPANCY,
-        BUSINESS_DOCUMENT, LEASE_FORM,
+        BUSINESS_DOCUMENT, LEASE_FORM, TENANCY_PRESENCE, LEASE_SPACE_SCOPE, TENANCY_ASSESSMENT, RENTAL_CONFIGURATION,
     )
 }
 

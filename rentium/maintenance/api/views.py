@@ -61,6 +61,16 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             "property", "unit", "unit__holding", "area", "reported_by"
         ).prefetch_related("images", "comments__author")
 
+        unit_id = self.request.query_params.get("unit")
+        if unit_id:
+            from uuid import UUID
+            from rest_framework.exceptions import ValidationError
+            try:
+                unit_id = UUID(unit_id)
+            except ValueError as exc:
+                raise ValidationError("Invalid unit ID.") from exc
+            base = base.filter(Q(unit_id=unit_id) | Q(property__unit_id=unit_id))
+
         if hasattr(user, "landlord_profile"):
             from rentium.users.access import accessible_properties, scope_q
 

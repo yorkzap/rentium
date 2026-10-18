@@ -1516,8 +1516,8 @@ def test_rest_and_rama_lease_creation_share_legal_derivation(landlord):
     )
     assert response.status_code == 201, response.data
     api_lease = Lease.objects.get(pk=response.data["id"])
-    assert rama_lease.common_space_shared_with == ["LANDLORD"]
-    assert api_lease.common_space_shared_with == ["LANDLORD"]
+    assert rama_lease.common_space_shared_with == []
+    assert api_lease.common_space_shared_with == []
 
 
 # ===================== "can u add a $200 cleaning deposit to lease X"

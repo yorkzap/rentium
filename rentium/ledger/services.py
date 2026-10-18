@@ -1199,7 +1199,12 @@ def deposit_position(landlord, *, lease) -> dict:
             }
         )
 
-    ended = lease.move_out_date or lease.end_date
+    from rentium.leases.space_services import scheduled_end
+    from rentium.leases.tenancy_rules import _jurisdiction
+
+    ended = scheduled_end(lease)
+    assessment = lease.tenancy_assessments.first()
+    bc_clock = _jurisdiction(lease) == "BC" and (assessment is None or assessment.decision != "EXEMPT_OWNER_SHARED")
 
     # The real clock starts on the LATER of the tenancy ending and the
     # forwarding address arriving in writing, so it comes from the move-out
@@ -1208,16 +1213,13 @@ def deposit_position(landlord, *, lease) -> dict:
     deadline = None
     clock_note = None
     move_out = getattr(lease, "moveout_requests", None)
-    settlement = move_out.order_by("-created_at").first() if move_out else None
+    settlement = move_out.filter(status="ACCEPTED").order_by("-created_at").first() if move_out else None
     if settlement is not None:
         status = settlement.deposit_status()
         deadline = status["deadline"]
         clock_note = status["blocked_on"] or status["what_must_happen"]
     elif ended:
-        clock_note = (
-            "No move-out record, so the 15-day clock cannot be computed — it "
-            "starts when the tenant's forwarding address arrives in writing."
-        )
+        clock_note = "No accepted end-of-tenancy record is available. Review the tenancy end, written forwarding address and jurisdiction before settling deposits."
 
     return {
         "deposit_held": str(held),
@@ -1229,15 +1231,15 @@ def deposit_position(landlord, *, lease) -> dict:
         "tenancy_ended": ended.isoformat() if ended else None,
         "claim_deadline": deadline,
         "clock_note": clock_note,
-        "lawful_routes": [
+        "lawful_routes": ([
             "the tenant agrees IN WRITING to the amount being kept, or",
             "you apply for RTB dispute resolution within 15 days of the later "
             "of the tenancy ending and receiving their forwarding address.",
-        ],
+        ] if bc_clock and (settlement is None or settlement.deposit_status().get("statutory_clock_applies", False)) else ["Review the applicable agreement and jurisdiction before settling deposits."]),
         "warning": (
             "Do not deduct unilaterally. Missing the 15-day route means the "
             "claim is lost AND double the deposit becomes payable."
-        ),
+        ) if bc_clock and (settlement is None or settlement.deposit_status().get("statutory_clock_applies", False)) else "The BC statutory clock has not been established for this tenancy.",
     }
 
 

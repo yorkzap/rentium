@@ -406,6 +406,9 @@ def set_rental_mode(unit: PropertyUnit, new_mode: str) -> dict:
     Idempotent in the sense that matters: it refuses a no-op switch rather
     than silently re-parking listings.
     """
+    unit = PropertyUnit.objects.select_for_update().get(pk=unit.pk)
+    if unit.rental_configurations.filter(status__in=["ACTIVE", "SCHEDULED", "BLOCKED"]).exists():
+        raise RentalModeError("This unit has dated arrangements. Change its configuration from the unit overview.")
     preview = describe_rental_mode_switch(unit, new_mode)
     if "error" in preview:
         raise RentalModeError(preview["error"])

@@ -400,7 +400,22 @@ def _deposit_deadlines(landlord) -> list[ActionItem]:
     return out
 
 
+def _tenancy_reviews(landlord) -> list[ActionItem]:
+    from rentium.leases.models import Lease
+    from rentium.leases.space_services import scheduled_end
+    from rentium.properties.rental_configuration import RentalConfiguration
+
+    items = []
+    for lease in Lease.objects.filter(landlord=landlord, status="ACTIVE", end_date__lt=date.today()).select_related("property"):
+        if scheduled_end(lease) is None:
+            items.append(ActionItem(key=f"lease.continuation:{lease.pk}", severity="urgent", title="Review continuing tenancy and billing", detail=f"{_place(lease)} — the fixed term ended without an established tenancy end. Review continuation and the next billing period; the unit is not automatically vacant.", url=f"/dashboard/leases/{lease.pk}", due_date=lease.end_date, source="lease"))
+    for configuration in RentalConfiguration.objects.filter(unit__landlord=landlord, status="BLOCKED").select_related("unit"):
+        items.append(ActionItem(key=f"configuration.blocked:{configuration.pk}", severity="urgent", title=f"Rental arrangement needs attention: {configuration.unit.name}", detail=configuration.blocked_reason, url=f"/dashboard/units/{configuration.unit_id}", due_date=configuration.effective_from, source="property"))
+    return items
+
+
 SOURCES = (
+    _tenancy_reviews,
     _missing_move_in_inspections,
     _inspection_delivery_due,
     _stalled_signatures,

@@ -293,30 +293,31 @@ def test_future_active_lease_is_vacant_today_but_committed(landlord):
 
     listed = registry.execute("list_properties", {}, landlord=landlord)
     by_name = {r["name"]: r for r in listed["rooms"]}
-    assert by_name["McKenzie Room D"]["occupancy"]["phase"] == "vacant"
-    assert by_name["McKenzie Room D"]["occupancy"]["vacant_today"] is True
+    assert by_name["McKenzie Room D"]["occupancy"]["phase"] == "unleased_occupancy_unconfirmed"
+    assert by_name["McKenzie Room D"]["occupancy"]["vacant_today"] is False
     assert by_name["McKenzie Room D"]["occupancy"]["is_rented_or_committed"] is False
     e = by_name["McKenzie Room E"]
     assert e["listing_status"] == "AVAILABLE"
     assert e["occupancy"]["phase"] == "leased_future"
-    assert e["occupancy"]["vacant_today"] is True
+    assert e["occupancy"]["vacant_today"] is False
+    assert e["occupancy"]["occupancy_confirmed"] is False
     assert e["occupancy"]["occupied_today"] is False
     assert e["occupancy"]["is_rented_or_committed"] is True
     assert e["occupancy"]["has_future_commitment"] is True
     assert e["occupancy"]["term_overlaps_this_calendar_month"] is False
     assert e["occupancy"]["lease"]["start_date"] == start.isoformat()
-    assert "Vacant today" in e["occupancy"]["explanation"]
-    assert listed["counts"]["by_occupancy"]["vacant_today"] == 2
+    assert "Possession is expected" in e["occupancy"]["explanation"]
+    assert listed["counts"]["by_occupancy"]["vacant_today"] == 0
     assert listed["counts"]["by_occupancy"]["occupied_today"] == 0
     assert listed["counts"]["by_occupancy"]["leased_future"] == 1
     assert listed["counts"]["by_occupancy"]["has_lease_commitment"] == 1
     assert listed["counts"]["by_occupancy"]["truly_unleased"] == 1
 
     snap = registry.execute("portfolio_snapshot", {}, landlord=landlord)
-    assert snap["portfolio"]["vacant_today"] == 2
+    assert snap["portfolio"]["vacant_today"] == 0
     assert snap["portfolio"]["occupied_today"] == 0
     assert snap["portfolio"]["has_lease_commitment"] == 1
-    assert snap["rented_listings"][0]["vacant_today"] is True
+    assert snap["rented_listings"][0]["vacant_today"] is False
     assert snap["rented_listings"][0]["term_overlaps_this_calendar_month"] is False
 
     # Currently-covering term → occupied today
@@ -331,8 +332,8 @@ def test_future_active_lease_is_vacant_today_but_committed(landlord):
     )
     listed2 = registry.execute("list_properties", {}, landlord=landlord)
     d2 = {r["name"]: r for r in listed2["rooms"]}["McKenzie Room D"]
-    assert d2["occupancy"]["phase"] == "occupied_now"
-    assert d2["occupancy"]["occupied_today"] is True
+    assert d2["occupancy"]["phase"] == "occupancy_unconfirmed"
+    assert d2["occupancy"]["occupied_today"] is False
     assert d2["occupancy"]["vacant_today"] is False
 
 
