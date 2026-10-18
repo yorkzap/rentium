@@ -68,6 +68,18 @@ review is based on the landlord's explicit confirmation of whole-suite scope and
 no owner kitchen/bathroom sharing at tenancy start; preserve the lease, notice,
 signature and ledger records byte-for-byte at the model-data level.
 
+Production verification (October 18): backend `f92b7c9` and frontend `204a75d`
+are live. Both Vercel integrations succeeded. All additive migrations are applied;
+API and container health checks pass, and Celery receives the configuration task.
+Authenticated lease-detail and unit-overview reads return 200. Garden Suite's
+authorized review was appended with idempotent replay; hashes of the lease,
+notices, tenant/landlord signatories, ledger and offerings stayed unchanged.
+The signed-in production UI shows the accepted October 31 notice, whole-unit
+scope, pending co-landlord signature and unconfirmed occupancy separately.
+The reported RAMA question was reproduced in the production chat and now returns
+those facts in three sentences with a tenancy link and collapsed evidence.
+No future rental strategy or actual possession/departure event was assumed.
+
 Legal sources checked for the design:
 - https://www.bclaws.gov.bc.ca/civix/document/id/complete/statreg/00_02078_01
 - https://www2.gov.bc.ca/gov/content/housing-tenancy/residential-tenancies/calculators-and-resources/tenancy-laws-rules/tenancies-types
